@@ -1,0 +1,3 @@
+# shaderc 0.8 vendors projects with older CMake policy declarations.
+[env]
+CMAKE_POLICY_VERSION_MINIMUM = { value = "3.5", force = false }

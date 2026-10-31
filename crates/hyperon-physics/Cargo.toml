@@ -1,0 +1,12 @@
+[package]
+name = "hyperon-physics"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Augmented Vertex Block Descent rigid-body physics for the Hyperon runtime"
+publish = false
+
+[dependencies]
+hyperon-core = { path = "../hyperon-core" }
+glam = "0.29"
+rayon = "1"

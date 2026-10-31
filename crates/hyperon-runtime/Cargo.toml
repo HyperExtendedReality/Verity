@@ -1,0 +1,12 @@
+[package]
+name = "hyperon-runtime"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+hyperon-core = { path = "../hyperon-core" }
+hyperon-box3d = { path = "../hyperon-box3d" }
+
+[dev-dependencies]
+glam = "0.29"
