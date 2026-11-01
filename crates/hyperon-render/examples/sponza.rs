@@ -51,7 +51,7 @@ impl Viewer {
         // Until GI: a blue sky above, warm stone bouncing up from below.
         renderer.set_ambient(Vec3::new(0.25, 0.3, 0.4), Vec3::new(0.12, 0.1, 0.08));
         renderer.set_sun(Some(Sun {
-            direction: Vec3::new(-0.3, -1.0, 0.2).normalize(),
+            direction: Vec3::new(-0.3, -0.2, -1.0).normalize(),
             color: Vec3::new(1.0, 0.95, 0.88) * 3.0,
         }));
         Ok(())
@@ -114,9 +114,9 @@ impl ApplicationHandler for Viewer {
                 };
                 // Orbit the open middle of the courtyard, clear of the columns.
                 let t = self.start.elapsed().as_secs_f32() * 0.08;
-                let center = Vec3::new(2.0, 3.0, 4.0);
-                let eye = center + Vec3::new(6.0 * t.cos(), 0.0, 1.2 * t.sin());
-                let target = center + Vec3::new(-6.0 * t.cos(), 2.0, -1.2 * t.sin());
+                let center = Vec3::new(2.0, -4.0, 3.0);
+                let eye = center + Vec3::new(6.0 * t.cos(), -1.2 * t.sin(), 0.0);
+                let target = center + Vec3::new(-6.0 * t.cos(), 1.2 * t.sin(), 2.0);
                 // `--view ex ey ez tx ty tz` holds the camera still, for inspection.
                 let (eye, target) = self.view.unwrap_or((eye, target));
                 renderer.set_camera(eye, target, 60f32.to_radians());
@@ -152,7 +152,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     // The export's own lights all have zero intensity; light the arcades by hand.
     for (i, x) in [-9.0f32, -3.0, 3.0, 9.0].into_iter().enumerate() {
         world.lights.push(PointLight {
-            position: [x, 1.5, 4.0 + if i % 2 == 0 { -2.5 } else { 2.5 }],
+            position: [x, -4.0 - if i % 2 == 0 { -2.5 } else { 2.5 }, 1.5],
             color: [1.0, 0.7, 0.4],
             intensity: 8.0,
             radius: 8.0,

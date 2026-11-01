@@ -7,6 +7,8 @@ license.workspace = true
 [dependencies]
 hyperon-core = { path = "../hyperon-core" }
 hyperon-render = { path = "../hyperon-render" }
+hyperon-lux = { path = "../hyperon-lux" }
+hyperon-runtime = { path = "../hyperon-runtime" }
 winit = "0.30"
 rfd = "0.15"
 arboard = "3"
@@ -14,3 +16,6 @@ serde_json = "1"
 egui = "0.36"
 egui-winit = "0.36"
 glam = "0.29"
+
+[dev-dependencies]
+hyperon-box3d = { path = "../hyperon-box3d" }

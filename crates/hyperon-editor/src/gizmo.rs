@@ -12,8 +12,11 @@ const COLORS: [Color32; 3] = [
 const HIT_RADIUS: f32 = 8.0;
 const RING_SEGMENTS: usize = 64;
 
-#[derive(Clone, Copy, Default, PartialEq, Eq)]
-enum Mode {
+/// The active viewport tool.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Mode {
+    /// Pick only; no gizmo.
+    Select,
     #[default]
     Translate,
     Rotate,
@@ -44,14 +47,13 @@ impl Gizmo {
         self.drag = None;
     }
 
-    pub fn toolbar(&mut self, ui: &mut egui::Ui) {
-        let old = self.mode;
-        ui.horizontal(|ui| {
-            ui.selectable_value(&mut self.mode, Mode::Translate, "Translate");
-            ui.selectable_value(&mut self.mode, Mode::Rotate, "Rotate");
-            ui.selectable_value(&mut self.mode, Mode::Scale, "Scale");
-        });
-        if self.mode != old {
+    pub fn mode(&self) -> Mode {
+        self.mode
+    }
+
+    pub fn set_mode(&mut self, mode: Mode) {
+        if mode != self.mode {
+            self.mode = mode;
             self.drag = None;
         }
     }
@@ -71,6 +73,9 @@ impl Gizmo {
             .is_some_and(|drag| drag.last != *transform)
         {
             self.drag = None;
+        }
+        if self.mode == Mode::Select {
+            return false;
         }
         let Some(projection) = Projection::new(viewport, camera, transform) else {
             self.drag = None;
@@ -183,6 +188,8 @@ impl Gizmo {
                 if amount.is_finite() {
                     let mut result = drag.initial.clone();
                     match drag.mode {
+                        // Select never starts a drag.
+                        Mode::Select => {}
                         Mode::Translate => {
                             result.translation = (Vec3::from_array(drag.initial.translation)
                                 + AXES[drag.axis] * amount)
@@ -285,7 +292,9 @@ impl Projection {
             return None;
         }
         let forward = camera.target - camera.eye;
-        if forward.length_squared() < 1e-8 || forward.cross(Vec3::Y).length_squared() < 1e-8 {
+        if forward.length_squared() < 1e-8
+            || forward.cross(hyperon_render::UP).length_squared() < 1e-8
+        {
             return None;
         }
         let origin = Vec3::from_array(transform.translation);
@@ -302,7 +311,7 @@ impl Projection {
             0.1,
         );
         perspective.y_axis.y *= -1.0;
-        let matrix = perspective * Mat4::look_at_rh(camera.eye, camera.target, Vec3::Y);
+        let matrix = perspective * Mat4::look_at_rh(camera.eye, camera.target, hyperon_render::UP);
         let length = depth * (camera.vertical_fov * 0.5).tan() * 2.0 * 72.0 / viewport.height();
         let mut result = Self {
             matrix,
@@ -335,7 +344,7 @@ mod tests {
     fn dragging_handles_edits_the_selected_transform() {
         let viewport = Rect::from_min_size(Pos2::ZERO, Vec2::new(800.0, 600.0));
         let camera = Camera {
-            eye: Vec3::new(0.0, 0.0, 5.0),
+            eye: Vec3::new(0.0, -5.0, 0.0),
             target: Vec3::ZERO,
             vertical_fov: std::f32::consts::FRAC_PI_2,
         };
@@ -390,6 +399,7 @@ mod tests {
                 Mode::Translate => assert!(transform.translation[0] > 0.1, "{:?}", transform),
                 Mode::Rotate => assert!(transform.rotation[2].abs() > 0.1, "{:?}", transform),
                 Mode::Scale => assert!(transform.scale[0] > 1.1, "{:?}", transform),
+                Mode::Select => unreachable!(),
             }
         }
     }
@@ -398,16 +408,17 @@ mod tests {
     fn projection_matches_vulkan_viewport_orientation() {
         let viewport = Rect::from_min_size(Pos2::new(40.0, 20.0), Vec2::new(800.0, 400.0));
         let camera = Camera {
-            eye: Vec3::new(0.0, 0.0, 5.0),
+            eye: Vec3::new(0.0, -5.0, 0.0),
             target: Vec3::ZERO,
             vertical_fov: std::f32::consts::FRAC_PI_2,
         };
         let projection = Projection::new(viewport, &camera, &Transform::default()).unwrap();
         let center = projection.project(Vec3::ZERO).unwrap();
         assert!(center.distance(viewport.center()) < 0.001);
-        assert!(projection.project(Vec3::Y).unwrap().y < center.y);
+        // Z is up on screen; behind the camera does not project.
+        assert!(projection.project(Vec3::Z).unwrap().y < center.y);
         assert!(projection.project(Vec3::X).unwrap().x > center.x);
-        assert!(projection.project(Vec3::new(0.0, 0.0, 6.0)).is_none());
+        assert!(projection.project(Vec3::new(0.0, -6.0, 0.0)).is_none());
     }
 
     #[test]

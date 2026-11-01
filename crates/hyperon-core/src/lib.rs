@@ -3,7 +3,14 @@
 //! Runtime handles are specific to the world that issued them. They remain stable
 //! across removal of other entities, but must not be used with another world.
 
+pub mod component;
+
+use std::{any::TypeId, collections::BTreeMap};
+
 use serde::{Deserialize, Serialize};
+
+pub use component::{Choice, Component, ComponentInfo, ComponentRegistry, FieldMut};
+use component::{AnyStore, Store};
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Transform {
@@ -40,11 +47,14 @@ impl Default for Material {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct Entity {
     pub name: String,
     pub transform: Transform,
     pub material: Material,
+    /// Authoring data of registered components, by [`Component::NAME`].
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub components: BTreeMap<String, serde_json::Value>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -53,6 +63,26 @@ pub struct PointLight {
     pub color: [f32; 3],
     pub intensity: f32,
     pub radius: f32,
+}
+
+/// A named viewpoint saved with the scene. `vertical_fov` is in degrees.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Camera {
+    pub name: String,
+    pub position: [f32; 3],
+    pub target: [f32; 3],
+    pub vertical_fov: f32,
+}
+
+impl Default for Camera {
+    fn default() -> Self {
+        Self {
+            name: "Camera".into(),
+            position: [6.0, -8.0, 5.0],
+            target: [0.0; 3],
+            vertical_fov: 45.0,
+        }
+    }
 }
 
 /// Directional sunlight. `direction` points in the direction light travels;
@@ -67,7 +97,7 @@ pub struct Sun {
 impl Default for Sun {
     fn default() -> Self {
         Self {
-            direction: [-0.3, -1.0, 0.2],
+            direction: [-0.3, -0.2, -1.0],
             color: [1.0, 0.95, 0.88],
             intensity: 3.0,
         }
@@ -80,6 +110,8 @@ pub enum LightingMethod {
     DirectOnly,
     #[default]
     DirectAndHemisphere,
+    /// Split Radiance Cascades GI; the hemisphere lights the scene until it is ready.
+    SplitRadianceCascades,
 }
 
 /// Scene-wide ambient lighting, expressed as linear RGB radiance.
@@ -112,6 +144,8 @@ pub struct Scene {
     pub lighting: Lighting,
     #[serde(default)]
     pub assets: Vec<String>,
+    #[serde(default)]
+    pub cameras: Vec<Camera>,
 }
 
 impl Default for Scene {
@@ -129,6 +163,7 @@ impl Default for Scene {
                         metallic: 0.8,
                         roughness: 0.3,
                     },
+                    ..Entity::default()
                 },
                 Entity {
                     name: "Ceramic".into(),
@@ -141,6 +176,7 @@ impl Default for Scene {
                         metallic: 0.0,
                         roughness: 0.45,
                     },
+                    ..Entity::default()
                 },
             ],
             lights: vec![PointLight {
@@ -152,6 +188,7 @@ impl Default for Scene {
             sun: Some(Sun::default()),
             lighting: Lighting::default(),
             assets: Vec::new(),
+            cameras: Vec::new(),
         }
     }
 }
@@ -208,6 +245,8 @@ pub struct World {
     pub sun: Option<Sun>,
     pub lighting: Lighting,
     pub assets: Vec<String>,
+    pub cameras: Vec<Camera>,
+    stores: std::collections::HashMap<TypeId, Box<dyn AnyStore>>,
 }
 
 impl World {
@@ -221,8 +260,14 @@ impl World {
         self.handles.is_empty()
     }
 
-    /// Inserts an entity and returns its stable runtime handle.
+    /// Inserts an entity and returns its stable runtime handle. Authoring
+    /// components need a registry: add them with [`World::insert_component`]
+    /// or build the world with [`World::from_scene`].
     pub fn spawn(&mut self, entity: Entity) -> EntityHandle {
+        debug_assert!(
+            entity.components.is_empty(),
+            "World::spawn ignores authoring components"
+        );
         let dense_index = self.handles.len();
         let index = match self.free.pop() {
             Some(index) => index,
@@ -280,13 +325,18 @@ impl World {
     }
 
     /// Removes and returns an entity, or returns None for a stale handle.
+    /// Its typed components are dropped.
     pub fn despawn(&mut self, handle: EntityHandle) -> Option<Entity> {
         let index = self.dense_index(handle)?;
+        for store in self.stores.values_mut() {
+            store.remove_entity(handle);
+        }
         self.handles.swap_remove(index);
         let entity = Entity {
             name: self.names.swap_remove(index),
             transform: self.transforms.swap_remove(index),
             material: self.materials.swap_remove(index),
+            components: BTreeMap::new(),
         };
         if let Some(moved) = self.handles.get(index) {
             self.slots[moved.index as usize].dense_index = Some(index);
@@ -344,68 +394,106 @@ impl World {
     pub fn handles(&self) -> &[EntityHandle] {
         &self.handles
     }
-}
 
-impl From<Scene> for World {
-    fn from(scene: Scene) -> Self {
+    fn store<T: Component>(&self) -> Option<&Store<T>> {
+        self.stores.get(&TypeId::of::<T>())?.as_any().downcast_ref()
+    }
+
+    fn store_mut<T: Component>(&mut self) -> Option<&mut Store<T>> {
+        self.stores
+            .get_mut(&TypeId::of::<T>())?
+            .as_any_mut()
+            .downcast_mut()
+    }
+
+    /// Attaches or replaces a component, returning the previous value. Returns
+    /// `Err(value)` for a stale handle.
+    pub fn insert_component<T: Component>(
+        &mut self,
+        entity: EntityHandle,
+        value: T,
+    ) -> Result<Option<T>, T> {
+        if !self.contains(entity) {
+            return Err(value);
+        }
+        let store = self
+            .stores
+            .entry(TypeId::of::<T>())
+            .or_insert_with(|| Box::new(Store::<T>::default()));
+        let store: &mut Store<T> = store.as_any_mut().downcast_mut().expect("store type");
+        Ok(store.insert(entity, value))
+    }
+
+    pub fn remove_component<T: Component>(&mut self, entity: EntityHandle) -> Option<T> {
+        self.store_mut::<T>()?.remove(entity)
+    }
+
+    pub fn component<T: Component>(&self, entity: EntityHandle) -> Option<&T> {
+        let store = self.store::<T>()?;
+        Some(&store.values[store.dense(entity)?])
+    }
+
+    pub fn component_mut<T: Component>(&mut self, entity: EntityHandle) -> Option<&mut T> {
+        let store = self.store_mut::<T>()?;
+        let dense = store.dense(entity)?;
+        Some(&mut store.values[dense])
+    }
+
+    /// Every entity with a `T`, in the store's dense (unspecified) order.
+    pub fn query<T: Component>(&self) -> impl Iterator<Item = (EntityHandle, &T)> {
+        self.store::<T>()
+            .into_iter()
+            .flat_map(|s| s.owners.iter().copied().zip(&s.values))
+    }
+
+    pub fn query_mut<T: Component>(&mut self) -> impl Iterator<Item = (EntityHandle, &mut T)> {
+        self.store_mut::<T>()
+            .into_iter()
+            .flat_map(|s| s.owners.iter().copied().zip(&mut s.values))
+    }
+
+    /// Builds a runtime world, resolving each entity's components through
+    /// `registry`. Fails on unknown or malformed components.
+    pub fn from_scene(scene: &Scene, registry: &ComponentRegistry) -> Result<Self, String> {
         let mut world = Self {
-            lights: scene.lights,
+            lights: scene.lights.clone(),
             sun: scene.sun,
             lighting: scene.lighting,
-            assets: scene.assets,
+            assets: scene.assets.clone(),
+            cameras: scene.cameras.clone(),
             ..Self::new()
         };
-        for entity in scene.entities {
-            world.spawn(entity);
+        for entity in &scene.entities {
+            let handle = world.spawn(Entity {
+                components: BTreeMap::new(),
+                ..entity.clone()
+            });
+            for (name, value) in &entity.components {
+                registry
+                    .insert(&mut world, handle, name, value)
+                    .map_err(|e| format!("{}: {e}", entity.name))?;
+            }
         }
-        world
+        Ok(world)
     }
-}
 
-impl From<&Scene> for World {
-    fn from(scene: &Scene) -> Self {
-        scene.clone().into()
-    }
-}
-
-impl From<World> for Scene {
-    fn from(world: World) -> Self {
-        let entities = world
-            .names
-            .into_iter()
-            .zip(world.transforms)
-            .zip(world.materials)
-            .map(|((name, transform), material)| Entity {
-                name,
-                transform,
-                material,
-            })
-            .collect();
-        Self {
-            entities,
-            lights: world.lights,
-            sun: world.sun,
-            lighting: world.lighting,
-            assets: world.assets,
-        }
-    }
-}
-
-impl From<&World> for Scene {
-    fn from(world: &World) -> Self {
-        Self {
-            entities: world
+    /// The scene of this world, with the components `registry` knows about.
+    pub fn to_scene(&self, registry: &ComponentRegistry) -> Scene {
+        Scene {
+            entities: self
                 .iter()
                 .map(|entity| Entity {
                     name: entity.name.to_owned(),
                     transform: entity.transform.clone(),
                     material: entity.material.clone(),
+                    components: registry.extract(self, entity.handle).collect(),
                 })
                 .collect(),
-            lights: world.lights.clone(),
-            sun: world.sun,
-            lighting: world.lighting,
-            assets: world.assets.clone(),
+            lights: self.lights.clone(),
+            sun: self.sun,
+            lighting: self.lighting,
+            assets: self.assets.clone(),
+            cameras: self.cameras.clone(),
         }
     }
 }
@@ -419,6 +507,7 @@ mod tests {
             name: name.into(),
             transform: Transform::default(),
             material: Material::default(),
+            ..Entity::default()
         }
     }
 
@@ -469,17 +558,17 @@ mod tests {
         let json = serde_json::to_string(&scene).unwrap();
         let decoded: Scene = serde_json::from_str(&json).unwrap();
         assert_eq!(decoded, scene);
-        let world = World::from(&decoded);
-        assert_eq!(Scene::from(&world), decoded);
-        assert_eq!(Scene::from(world), decoded);
+        let world = World::from_scene(&decoded, &ComponentRegistry::default()).unwrap();
+        assert_eq!(world.to_scene(&ComponentRegistry::default()), decoded);
+        assert_eq!(world.to_scene(&ComponentRegistry::default()), decoded);
     }
 
     #[test]
     fn legacy_scene_has_no_sun() {
         let scene: Scene = serde_json::from_str(r#"{"entities":[],"lights":[]}"#).unwrap();
         assert_eq!(scene.sun, None);
-        assert_eq!(World::from(&scene).sun, None);
-        assert_eq!(Scene::from(World::from(scene)).sun, None);
+        assert_eq!(World::from_scene(&scene, &ComponentRegistry::default()).unwrap().sun, None);
+        assert_eq!(World::from_scene(&scene, &ComponentRegistry::default()).unwrap().to_scene(&ComponentRegistry::default()).sun, None);
     }
 
     #[test]
@@ -487,9 +576,10 @@ mod tests {
         let scene: Scene = serde_json::from_str(r#"{"entities":[],"lights":[]}"#).unwrap();
         assert_eq!(scene.lighting, Lighting::default());
         assert_eq!(scene.assets, Vec::<String>::new());
-        let world = World::from(&scene);
-        assert_eq!(Scene::from(&world), scene);
-        assert_eq!(Scene::from(world), scene);
+        assert_eq!(scene.cameras, Vec::<Camera>::new());
+        let world = World::from_scene(&scene, &ComponentRegistry::default()).unwrap();
+        assert_eq!(world.to_scene(&ComponentRegistry::default()), scene);
+        assert_eq!(world.to_scene(&ComponentRegistry::default()), scene);
     }
 
     #[test]
@@ -512,11 +602,15 @@ mod tests {
             ground: [0.05, 0.06, 0.07],
         };
         scene.assets = vec!["models/ship.glb".into(), "models/tree.gltf".into()];
+        scene.cameras = vec![Camera {
+            name: "Nave".into(),
+            ..Camera::default()
+        }];
         let decoded: Scene = serde_json::from_str(&serde_json::to_string(&scene).unwrap()).unwrap();
         assert_eq!(decoded, scene);
-        let world = World::from(decoded.clone());
-        assert_eq!(Scene::from(&world), decoded);
-        assert_eq!(Scene::from(world), decoded);
+        let world = World::from_scene(&decoded, &ComponentRegistry::default()).unwrap();
+        assert_eq!(world.to_scene(&ComponentRegistry::default()), decoded);
+        assert_eq!(world.to_scene(&ComponentRegistry::default()), decoded);
     }
 
     #[test]
@@ -532,11 +626,83 @@ mod tests {
             let json = serde_json::to_string(&scene).unwrap();
             let decoded: Scene = serde_json::from_str(&json).unwrap();
             assert_eq!(decoded, scene);
-            let world = World::from(&decoded);
+            let world = World::from_scene(&decoded, &ComponentRegistry::default()).unwrap();
             assert_eq!(world.sun, sun);
-            assert_eq!(Scene::from(&world), decoded);
-            assert_eq!(Scene::from(world), decoded);
+            assert_eq!(world.to_scene(&ComponentRegistry::default()), decoded);
+            assert_eq!(world.to_scene(&ComponentRegistry::default()), decoded);
         }
+    }
+
+    #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+    struct Health {
+        current: f32,
+        regenerates: bool,
+    }
+
+    impl Component for Health {
+        const NAME: &'static str = "Health";
+        fn fields(&mut self) -> Vec<(&'static str, FieldMut<'_>)> {
+            vec![
+                ("Current", FieldMut::Float(&mut self.current, 0.0..=100.0)),
+                ("Regenerates", FieldMut::Bool(&mut self.regenerates)),
+            ]
+        }
+    }
+
+    #[test]
+    fn components_follow_their_entities_through_removal() {
+        let mut world = World::new();
+        let [a, b, c] = ["a", "b", "c"].map(|n| world.spawn(entity(n)));
+        for (i, e) in [a, b, c].into_iter().enumerate() {
+            let health = Health { current: i as f32, regenerates: false };
+            assert_eq!(world.insert_component(e, health), Ok(None));
+        }
+        world.despawn(a);
+        assert_eq!(world.remove_component::<Health>(b).unwrap().current, 1.0);
+        assert_eq!(world.component::<Health>(c).unwrap().current, 2.0);
+        assert!(world.component::<Health>(a).is_none());
+        assert_eq!(world.query::<Health>().map(|(e, _)| e).collect::<Vec<_>>(), [c]);
+        // A recycled slot must not see the despawned entity's component.
+        let d = world.spawn(entity("d"));
+        assert_eq!(d.index(), a.index());
+        assert!(world.component::<Health>(d).is_none());
+        assert!(world.insert_component(a, Health::default()).is_err());
+        world.component_mut::<Health>(c).unwrap().current = 5.0;
+        assert_eq!(world.query_mut::<Health>().next().unwrap().1.current, 5.0);
+    }
+
+    #[test]
+    fn registered_components_round_trip_and_unknown_ones_fail() {
+        let mut registry = ComponentRegistry::default();
+        registry.register::<Health>();
+        let mut scene = Scene::default();
+        scene.entities[1].components.insert(
+            "Health".into(),
+            serde_json::json!({ "current": 40.0, "regenerates": true }),
+        );
+        let json = serde_json::to_string(&scene).unwrap();
+        let decoded: Scene = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded, scene);
+        let world = World::from_scene(&decoded, &registry).unwrap();
+        let ceramic = world.handles()[1];
+        assert_eq!(world.component::<Health>(ceramic).unwrap().current, 40.0);
+        assert_eq!(world.to_scene(&registry), scene);
+
+        // Inspecting through reflection edits the authoring value.
+        let info = registry.get("Health").unwrap();
+        let mut value = (info.default)();
+        let changed = (info.inspect)(&mut value, &mut |fields| {
+            let FieldMut::Float(current, _) = &mut fields[0].1 else { panic!() };
+            **current = 7.0;
+            true
+        });
+        assert_eq!(changed, Ok(true));
+        assert_eq!(value["current"], 7.0);
+
+        scene.entities[0].components.insert("Mana".into(), serde_json::json!({}));
+        assert!(World::from_scene(&scene, &registry).unwrap_err().contains("Mana"));
+        scene.entities[0].components = [("Health".into(), serde_json::json!("x"))].into();
+        assert!(World::from_scene(&scene, &registry).is_err());
     }
 
     #[test]

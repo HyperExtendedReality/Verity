@@ -189,8 +189,12 @@ struct View {
 #[derive(Clone, Debug, PartialEq)]
 pub enum GiStatus {
     /// The driver is compiling the transport pipelines, in the background.
-    Compiling { since: Instant },
-    Ready { compile_time: std::time::Duration },
+    Compiling {
+        since: Instant,
+    },
+    Ready {
+        compile_time: std::time::Duration,
+    },
     Failed(String),
 }
 
@@ -203,12 +207,21 @@ fn pipeline_cache_path() -> std::path::PathBuf {
 
 /// Compile every pass in parallel through a disk-backed pipeline cache. The
 /// transport shaders are large: a cold driver compile takes minutes on one core.
-fn compile_passes(device: ash::Device, layout: vk::PipelineLayout, composite_layout: vk::PipelineLayout) -> CompiledPasses {
+fn compile_passes(
+    device: ash::Device,
+    layout: vk::PipelineLayout,
+    composite_layout: vk::PipelineLayout,
+) -> CompiledPasses {
     let initial = std::fs::read(pipeline_cache_path()).unwrap_or_default();
     let cache = unsafe {
-        device.create_pipeline_cache(&vk::PipelineCacheCreateInfo::default().initial_data(&initial), None)
+        device.create_pipeline_cache(
+            &vk::PipelineCacheCreateInfo::default().initial_data(&initial),
+            None,
+        )
     }
-    .or_else(|_| unsafe { device.create_pipeline_cache(&vk::PipelineCacheCreateInfo::default(), None) })
+    .or_else(|_| unsafe {
+        device.create_pipeline_cache(&vk::PipelineCacheCreateInfo::default(), None)
+    })
     .map_err(|e| e.to_string())?;
     let results: Vec<_> = std::thread::scope(|scope| {
         let device = &device;
@@ -216,7 +229,11 @@ fn compile_passes(device: ash::Device, layout: vk::PipelineLayout, composite_lay
             .iter()
             .map(|&(name, spirv)| {
                 scope.spawn(move || {
-                    let layout = if name.starts_with("composite") { composite_layout } else { layout };
+                    let layout = if name.starts_with("composite") {
+                        composite_layout
+                    } else {
+                        layout
+                    };
                     let entry = CString::new(name).map_err(|e| e.to_string())?;
                     // SAFETY: the SPIR-V was validated at build time; the layout outlives the pipeline.
                     unsafe { gpu::compute_pipeline(device, cache, layout, spirv, &entry) }
@@ -225,7 +242,13 @@ fn compile_passes(device: ash::Device, layout: vk::PipelineLayout, composite_lay
                 })
             })
             .collect();
-        handles.into_iter().map(|h| h.join().unwrap_or_else(|_| Err("compile thread panicked".into()))).collect()
+        handles
+            .into_iter()
+            .map(|h| {
+                h.join()
+                    .unwrap_or_else(|_| Err("compile thread panicked".into()))
+            })
+            .collect()
     });
     unsafe {
         if let Ok(data) = device.get_pipeline_cache_data(cache) {
@@ -281,7 +304,9 @@ impl Lux {
             instances: 0,
             pipelines: None,
             compile: None,
-            status: GiStatus::Compiling { since: Instant::now() },
+            status: GiStatus::Compiling {
+                since: Instant::now(),
+            },
             view: None,
             targets: None,
             command_pool: vk::CommandPool::null(),
@@ -291,7 +316,9 @@ impl Lux {
             previous_clip: None,
             previous_lights: Vec::new(),
             started: Instant::now(),
-            pass_limit: std::env::var("HYPERON_LUX_PASS_LIMIT").ok().and_then(|v| v.parse().ok()),
+            pass_limit: std::env::var("HYPERON_LUX_PASS_LIMIT")
+                .ok()
+                .and_then(|v| v.parse().ok()),
         }
     }
 
@@ -344,7 +371,12 @@ impl Lux {
         if !self.compile.as_ref().is_some_and(|c| c.is_finished()) {
             return;
         }
-        let result = self.compile.take().unwrap().join().unwrap_or_else(|_| Err("compile thread panicked".into()));
+        let result = self
+            .compile
+            .take()
+            .unwrap()
+            .join()
+            .unwrap_or_else(|_| Err("compile thread panicked".into()));
         let since = match self.status {
             GiStatus::Compiling { since } => since,
             _ => Instant::now(),
@@ -352,7 +384,9 @@ impl Lux {
         match (result, self.pipelines.as_mut()) {
             (Ok(passes), Some(pipelines)) => {
                 pipelines.passes.extend(passes);
-                self.status = GiStatus::Ready { compile_time: since.elapsed() };
+                self.status = GiStatus::Ready {
+                    compile_time: since.elapsed(),
+                };
             }
             (Ok(_), None) => {}
             (Err(error), _) => self.status = GiStatus::Failed(error),
@@ -1251,8 +1285,12 @@ impl RenderExtension for Lux {
                 let pipelines = Self::pipelines(gpu)?;
                 let device = gpu.device.clone();
                 let (layout, composite_layout) = (pipelines.layout, pipelines.composite_layout);
-                self.compile = Some(std::thread::spawn(move || compile_passes(device, layout, composite_layout)));
-                self.status = GiStatus::Compiling { since: Instant::now() };
+                self.compile = Some(std::thread::spawn(move || {
+                    compile_passes(device, layout, composite_layout)
+                }));
+                self.status = GiStatus::Compiling {
+                    since: Instant::now(),
+                };
                 self.pipelines = Some(pipelines);
             }
             if self.geometry.buffer == vk::Buffer::null() {
@@ -1287,7 +1325,8 @@ impl RenderExtension for Lux {
 
     fn record(&mut self, gpu: &mut Gpu, frame: &FrameContext) -> Result<()> {
         self.poll_compile();
-        if !self.active() || self.view.is_none() || frame.viewport[2] == 0 || frame.viewport[3] == 0 {
+        if !self.active() || self.view.is_none() || frame.viewport[2] == 0 || frame.viewport[3] == 0
+        {
             return Ok(());
         }
         unsafe { self.record_frame(gpu, frame) }

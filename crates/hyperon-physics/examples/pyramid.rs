@@ -19,6 +19,7 @@ fn main() {
                 ..Default::default()
             },
             material: Material::default(),
+            ..Entity::default()
         });
         physics.insert(world, entity, body).unwrap();
     };

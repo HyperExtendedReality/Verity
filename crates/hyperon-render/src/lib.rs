@@ -20,7 +20,7 @@ mod upload;
 
 pub use asset::{Sun, TextureFormat};
 pub use extension::{FrameContext, Gpu, RenderExtension, Targets};
-pub use scene::{Camera, Vertex};
+pub use scene::{Camera, Vertex, UP};
 pub use upload::SceneStats;
 
 use ash::{vk, Entry};
@@ -50,7 +50,8 @@ pub const MAX_POINT_SHADOWS: usize = scene::MAX_POINT_SHADOWS;
 const FRAMES: usize = 2;
 const VISIBILITY_FORMAT: vk::Format = vk::Format::R32G32_UINT;
 const HDR_FORMAT: vk::Format = vk::Format::R16G16B16A16_SFLOAT;
-const CLEAR_COLOR: [f32; 4] = [0.06, 0.07, 0.09, 1.0];
+// Neutral gray, matching the editor chrome.
+const CLEAR_COLOR: [f32; 4] = [0.086, 0.086, 0.086, 1.0];
 
 macro_rules! spirv {
     ($name:literal) => {
@@ -767,7 +768,7 @@ impl Renderer {
     /// A scene/world sun takes precedence over this and any imported glTF sun.
     pub fn set_sun(&mut self, sun: Option<Sun>) {
         self.sun = sun.map(|sun| Sun {
-            direction: sun.direction.try_normalize().unwrap_or(glam::Vec3::NEG_Y),
+            direction: sun.direction.try_normalize().unwrap_or(glam::Vec3::NEG_Z),
             ..sun
         });
         self.sun_is_imported = false;

@@ -202,7 +202,7 @@ void resolveMain(uint3 id: SV_DispatchThreadID) {
     // direct light. With GI, indirect light arrives from the extension instead.
     float3 result = 0.0;
     if (globals.counts.z == 0) {
-        float3 hemisphere = lerp(globals.ground.rgb, globals.sky.rgb, s.normal.y * 0.5 + 0.5);
+        float3 hemisphere = lerp(globals.ground.rgb, globals.sky.rgb, s.normal.z * 0.5 + 0.5);
         result = (brdf.diffuse_color + specular_albedo(brdf.f0, dfg)) * hemisphere;
     }
     if (globals.sun_direction.w > 0.0) {

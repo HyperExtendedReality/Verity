@@ -56,7 +56,7 @@ impl ApplicationHandler for Viewer {
                 renderer.load_gltf(packed.join(scene), 512)?;
             }
             renderer.set_sun(Some(Sun {
-                direction: Vec3::new(-0.3, -1.0, 0.2).normalize(),
+                direction: Vec3::new(-0.3, -0.2, -1.0).normalize(),
                 color: Vec3::splat(3.0),
             }));
             Ok(renderer)
@@ -96,9 +96,9 @@ impl ApplicationHandler for Viewer {
                     return;
                 };
                 let t = self.start.elapsed().as_secs_f32() * 0.05;
-                let center = Vec3::new(2.0, 3.0, 4.0);
-                let eye = center + Vec3::new(6.0 * t.cos(), 0.0, 1.2 * t.sin());
-                let target = center + Vec3::new(-6.0 * t.cos(), 2.0, -1.2 * t.sin());
+                let center = Vec3::new(2.0, -4.0, 3.0);
+                let eye = center + Vec3::new(6.0 * t.cos(), -1.2 * t.sin(), 0.0);
+                let target = center + Vec3::new(-6.0 * t.cos(), 1.2 * t.sin(), 2.0);
                 renderer.set_camera(eye, target, 60f32.to_radians());
                 if let Err(error) = renderer.draw_world(&self.world) {
                     eprintln!("render: {error}");
@@ -106,8 +106,11 @@ impl ApplicationHandler for Viewer {
                 }
                 self.frames += 1;
                 if self.frames.is_multiple_of(120) {
+                    let status = renderer
+                        .extension_mut::<Lux>()
+                        .map(|lux| lux.status().clone());
                     println!(
-                        "{:.2} ms/frame",
+                        "{:.2} ms/frame, GI {status:?}",
                         self.timer.elapsed().as_secs_f64() * 1000.0 / 120.0
                     );
                     self.timer = Instant::now();

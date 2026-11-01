@@ -2,8 +2,15 @@
 
 use std::time::Duration;
 
-use hyperon_box3d::{Box3dSettings, PhysicsWorld};
-use hyperon_core::{Scene, World};
+use hyperon_box3d::{Box3dSettings, PhysicsWorld, RigidBodyComponent};
+use hyperon_core::{ComponentRegistry, Scene, World};
+
+/// Every component type the runtime simulates.
+pub fn registry() -> ComponentRegistry {
+    let mut registry = ComponentRegistry::default();
+    registry.register::<RigidBodyComponent>();
+    registry
+}
 
 /// Owns the authoritative runtime world and its native physics simulation.
 ///
@@ -29,13 +36,32 @@ impl Runtime {
         }
     }
 
-    /// Creates a runtime from a scene. Physics bodies are explicitly attached
-    /// to the new world's handles using `physics.insert`.
-    pub fn from_scene(scene: Scene) -> Self {
-        Self {
-            world: scene.into(),
+    /// Creates a runtime from a scene, simulating its Rigid Body components.
+    /// Fails on unknown components or invalid values.
+    pub fn from_scene(scene: &Scene) -> Result<Self, String> {
+        let mut runtime = Self {
+            world: World::from_scene(scene, &registry())?,
             ..Self::new()
+        };
+        // Scenes are Z-up.
+        runtime.physics_settings.gravity = glam::Vec3::new(0.0, 0.0, -9.81);
+        let bodies = runtime
+            .world
+            .query::<RigidBodyComponent>()
+            .map(|(entity, body)| {
+                let name = runtime.world.get(entity).map_or("", |e| e.name);
+                body.to_body()
+                    .map(|body| (entity, body))
+                    .map_err(|e| format!("{name}: Rigid Body: {e}"))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        for (entity, body) in bodies {
+            runtime
+                .physics
+                .insert(&runtime.world, entity, body)
+                .expect("entities come from this world");
         }
+        Ok(runtime)
     }
 
     /// Returns the simulation interval used by [`Self::advance`].
@@ -99,6 +125,7 @@ mod tests {
                 ..Transform::default()
             },
             material: Material::default(),
+            ..Entity::default()
         });
         runtime
             .physics
@@ -115,5 +142,29 @@ mod tests {
         );
         assert_eq!(runtime.advance(Duration::from_millis(21)), 3);
         assert!(runtime.world.get(entity).unwrap().transform.translation[1] < 5.0);
+    }
+
+    #[test]
+    fn scene_rigid_bodies_are_simulated() {
+        let mut scene = Scene::default();
+        scene.entities[0].transform.translation = [0.0, 0.0, 5.0];
+        scene.entities[0].components.insert(
+            "Rigid Body".into(),
+            serde_json::to_value(RigidBodyComponent::default()).unwrap(),
+        );
+        let mut runtime = Runtime::from_scene(&scene).unwrap();
+        let [falling, resting] = [0, 1].map(|i| runtime.world.handles()[i]);
+        assert!(runtime.physics.contains(falling));
+        assert!(!runtime.physics.contains(resting));
+        runtime.advance(Duration::from_millis(100));
+        let fallen = runtime.world.get(falling).unwrap().transform.translation;
+        assert!(fallen[2] < 5.0 && fallen[1] == 0.0, "{fallen:?}");
+
+        scene.entities[0].components.insert(
+            "Rigid Body".into(),
+            serde_json::json!({ "shape": "Sphere", "radius": -1.0 }),
+        );
+        let error = Runtime::from_scene(&scene).err().unwrap();
+        assert!(error.contains("Copper") && error.contains("radius"), "{error}");
     }
 }

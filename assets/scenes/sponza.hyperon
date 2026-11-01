@@ -1,0 +1,27 @@
+{
+  "entities": [],
+  "lights": [],
+  "sun": {
+    "direction": [-0.3, -0.2, -1.0],
+    "color": [1.0, 0.95, 0.88],
+    "intensity": 3.0
+  },
+  "lighting": {
+    "method": "SplitRadianceCascades",
+    "sky": [0.03, 0.035, 0.045],
+    "ground": [0.015, 0.015, 0.015]
+  },
+  "assets": [
+    "assets/packed/NewSponza_Main.glb",
+    "assets/packed/NewSponza_Curtains.glb",
+    "assets/packed/NewSponza_IvyGrowth.glb"
+  ],
+  "cameras": [
+    {
+      "name": "Nave",
+      "position": [8.0, -4.0, 3.0],
+      "target": [-4.0, -4.0, 5.0],
+      "vertical_fov": 60.0
+    }
+  ]
+}

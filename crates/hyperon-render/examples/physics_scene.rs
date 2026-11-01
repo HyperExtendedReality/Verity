@@ -101,6 +101,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             base_color: [0.25, 0.32, 0.38],
             ..Material::default()
         },
+        ..Entity::default()
     });
     let cube = runtime.world.spawn(Entity {
         name: "Falling cube".into(),
@@ -112,6 +113,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             base_color: [0.8, 0.35, 0.12],
             ..Material::default()
         },
+        ..Entity::default()
     });
     runtime.physics.insert(
         &runtime.world,

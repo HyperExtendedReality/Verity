@@ -1220,6 +1220,7 @@ dependencies = [
  "cc",
  "glam",
  "hyperon-core",
+ "serde",
 ]
 
 [[package]]
@@ -1238,8 +1239,11 @@ dependencies = [
  "egui",
  "egui-winit",
  "glam",
+ "hyperon-box3d",
  "hyperon-core",
+ "hyperon-lux",
  "hyperon-render",
+ "hyperon-runtime",
  "rfd",
  "serde_json",
  "winit",
@@ -1299,6 +1303,7 @@ dependencies = [
  "glam",
  "hyperon-box3d",
  "hyperon-core",
+ "serde_json",
 ]
 
 [[package]]

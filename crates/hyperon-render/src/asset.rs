@@ -126,7 +126,7 @@ impl From<hyperon_core::Sun> for Sun {
         Self {
             direction: Vec3::from_array(sun.direction)
                 .try_normalize()
-                .unwrap_or(Vec3::NEG_Y),
+                .unwrap_or(Vec3::NEG_Z),
             color: Vec3::from_array(sun.color) * sun.intensity,
         }
     }
@@ -212,7 +212,9 @@ pub fn load_gltf(path: &Path, options: LoadOptions) -> Result<SceneData> {
     let Some(root) = gltf.default_scene().or_else(|| gltf.scenes().next()) else {
         return Ok(scene);
     };
-    let mut stack: Vec<_> = root.nodes().map(|n| (n, Mat4::IDENTITY)).collect();
+    // glTF is Y-up; a quarter turn about X makes it Z-up.
+    let z_up = Mat4::from_rotation_x(std::f32::consts::FRAC_PI_2);
+    let mut stack: Vec<_> = root.nodes().map(|n| (n, z_up)).collect();
     while let Some((node, parent)) = stack.pop() {
         let transform = parent * Mat4::from_cols_array_2d(&node.transform().matrix());
         stack.extend(node.children().map(|child| (child, transform)));
@@ -472,7 +474,7 @@ mod tests {
             direction: [0.0; 3],
             ..source
         });
-        assert_eq!(zero.direction, Vec3::NEG_Y);
+        assert_eq!(zero.direction, Vec3::NEG_Z);
     }
     fn packed(name: &str) -> Option<PathBuf> {
         let path = Path::new(env!("CARGO_MANIFEST_DIR"))

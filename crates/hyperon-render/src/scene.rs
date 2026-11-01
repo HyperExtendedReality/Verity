@@ -4,6 +4,8 @@ use bytemuck::{Pod, Zeroable};
 use glam::{Mat3, Mat4, Quat, Vec3};
 use hyperon_core::{Material, PointLight, Transform};
 
+/// Hyperon is Z-up; glTF scenes are rotated into it on import.
+pub const UP: Vec3 = Vec3::Z;
 pub const NEAR: f32 = 0.1;
 /// Far edge of the cluster slices; the projection itself has no far plane.
 pub const CLUSTER_FAR: f32 = 100.0;
@@ -38,7 +40,7 @@ pub struct Camera {
 impl Default for Camera {
     fn default() -> Self {
         Self {
-            eye: Vec3::new(6.0, 5.0, 8.0),
+            eye: Vec3::new(6.0, -8.0, 5.0),
             target: Vec3::ZERO,
             vertical_fov: 45f32.to_radians(),
         }
@@ -87,7 +89,7 @@ pub struct Cascades {
 /// sphere per slice (stable under rotation) and texel-snapped centers
 /// (stable under translation).
 pub fn cascades(camera: &Camera, aspect: f32, sun_direction: Vec3) -> Cascades {
-    let world_from_view = Mat4::look_at_rh(camera.eye, camera.target, Vec3::Y).inverse();
+    let world_from_view = Mat4::look_at_rh(camera.eye, camera.target, UP).inverse();
     let tan_y = (camera.vertical_fov * 0.5).tan();
     let tan_x = tan_y * aspect;
     let splits: [f32; CASCADES] = std::array::from_fn(|i| {
@@ -97,10 +99,11 @@ pub fn cascades(camera: &Camera, aspect: f32, sun_direction: Vec3) -> Cascades {
         SPLIT_LAMBDA * logarithmic + (1.0 - SPLIT_LAMBDA) * uniform
     });
     let direction = sun_direction.normalize();
-    let up = if direction.y.abs() > 0.99 {
-        Vec3::Z
-    } else {
+    // Any up vector works that is not parallel to the light.
+    let up = if direction.z.abs() > 0.99 {
         Vec3::Y
+    } else {
+        UP
     };
     let mut view_proj = [Mat4::IDENTITY; CASCADES];
     let mut texels = [0.0; CASCADES];
@@ -226,14 +229,14 @@ pub fn globals(
     previous_view_proj: Option<Mat4>,
     srgb: bool,
 ) -> Globals {
-    let view = Mat4::look_at_rh(camera.eye, camera.target, Vec3::Y);
+    let view = Mat4::look_at_rh(camera.eye, camera.target, UP);
     let aspect = viewport[2].max(1) as f32 / viewport[3].max(1) as f32;
     // Reverse-Z with an infinite far plane for even depth precision.
     let mut projection = Mat4::perspective_infinite_reverse_rh(camera.vertical_fov, aspect, NEAR);
     projection.y_axis.y *= -1.0;
     let view_proj = projection * view;
     let sun = lighting.sun;
-    let shadows = cascades(camera, aspect, sun.map_or(Vec3::NEG_Y, |s| s.direction));
+    let shadows = cascades(camera, aspect, sun.map_or(-UP, |s| s.direction));
     let (sun_direction, sun_color) = sun.map_or(([0.0; 4], [0.0; 4]), |sun| {
         (
             sun.direction.normalize().extend(1.0).to_array(),
@@ -478,7 +481,7 @@ mod tests {
         let c = cascades(&camera, aspect, Vec3::new(-0.3, -1.0, 0.2));
         assert!(c.splits.windows(2).all(|w| w[0] < w[1]));
         assert!((c.splits[CASCADES - 1] - SHADOW_DISTANCE).abs() < 1e-3);
-        let world_from_view = Mat4::look_at_rh(camera.eye, camera.target, Vec3::Y).inverse();
+        let world_from_view = Mat4::look_at_rh(camera.eye, camera.target, UP).inverse();
         let tan_y = (camera.vertical_fov * 0.5).tan();
         for i in 0..CASCADES {
             let near = if i == 0 { NEAR } else { c.splits[i - 1] };

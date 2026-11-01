@@ -1,12 +1,22 @@
 use std::path::Path;
 
-use egui::{Color32, DragValue, Frame, Margin, RichText, Stroke};
-use hyperon_core::{Entity, LightingMethod, Material, PointLight, Scene, Transform};
+use egui::{
+    Color32, CornerRadius, DragValue, Frame, Margin, Pos2, Rect, RichText, Sense, Stroke, Vec2,
+};
+use glam::Vec3;
+use hyperon_core::{
+    ComponentRegistry, Entity, FieldMut, LightingMethod, Material, PointLight, Scene, Transform,
+};
+use hyperon_render::UP;
+use winit::window::ResizeDirection;
+
+use crate::gizmo::Mode;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Selection {
     Entity(usize),
     Light(usize),
+    Camera(usize),
     Sun,
     Lighting,
     None,
@@ -18,142 +28,288 @@ pub enum Action {
     Open,
     Save,
     SaveAs,
+    Play,
+    Pause,
+    Step,
+    Stop,
+    Undo,
+    Redo,
+}
+
+/// Whether the scene is being edited or simulated.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum PlayState {
+    #[default]
+    Editing,
+    Playing,
+    Paused,
+}
+
+/// What the custom title bar asks of the window.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WindowCommand {
+    Minimize,
+    ToggleMaximize,
+    Close,
+    Drag,
+    Resize(ResizeDirection),
 }
 
 pub struct UiResponse {
     pub action: Option<Action>,
     pub asset_action: Option<crate::asset_browser::AssetAction>,
     pub asset_remove: Option<usize>,
+    pub window: Option<WindowCommand>,
     pub changed: bool,
     /// The unobscured scene viewport, in egui points.
     pub viewport: egui::Rect,
+}
+
+/// Fly-camera orientation and speed; `Tools::camera` follows it.
+pub struct Fly {
+    /// Radians about Z from +X.
+    pub yaw: f32,
+    /// Radians above the horizon.
+    pub pitch: f32,
+    /// Metres per second.
+    pub speed: f32,
+}
+
+impl Fly {
+    fn forward(&self) -> Vec3 {
+        let (sy, cy) = self.yaw.sin_cos();
+        let (sp, cp) = self.pitch.sin_cos();
+        Vec3::new(cp * cy, cp * sy, sp)
+    }
 }
 
 pub struct Tools {
     pub browser: crate::asset_browser::AssetBrowser,
     pub gizmo: crate::gizmo::Gizmo,
     pub camera: hyperon_render::Camera,
+    pub fly: Fly,
+    /// The right mouse button is held in the viewport: WASD moves the camera.
+    pub flying: bool,
+    pub maximized: bool,
     pub light_limit: usize,
+    /// GI readiness, shown while the scene uses Split Radiance Cascades.
+    pub gi_status: Option<String>,
+    /// Component types the inspector can add and edit.
+    pub registry: ComponentRegistry,
+    /// While not editing, the scene shows the simulation and is read-only.
+    pub play: PlayState,
+    /// Whether the editor has steps to undo and redo.
+    pub can_undo: bool,
+    pub can_redo: bool,
 }
 
 impl Default for Tools {
     fn default() -> Self {
+        let camera = hyperon_render::Camera::default();
+        let direction = (camera.target - camera.eye).normalize();
         Self {
             browser: Default::default(),
             gizmo: Default::default(),
-            camera: Default::default(),
+            fly: Fly {
+                yaw: direction.y.atan2(direction.x),
+                pitch: direction.z.asin(),
+                speed: 5.0,
+            },
+            camera,
+            flying: false,
+            maximized: false,
             light_limit: hyperon_render::MAX_LIGHTS,
+            gi_status: None,
+            registry: hyperon_runtime::registry(),
+            play: PlayState::Editing,
+            can_undo: false,
+            can_redo: false,
         }
     }
 }
 
-pub(crate) const BACKGROUND: Color32 = Color32::from_rgb(14, 16, 23);
-pub(crate) const PANEL: Color32 = Color32::from_rgb(21, 24, 33);
-pub(crate) const BAR: Color32 = Color32::from_rgb(25, 28, 39);
-pub(crate) const SURFACE: Color32 = Color32::from_rgb(34, 38, 51);
-pub(crate) const BORDER: Color32 = Color32::from_rgb(52, 57, 73);
-pub(crate) const TEXT: Color32 = Color32::from_rgb(228, 231, 241);
-pub(crate) const MUTED: Color32 = Color32::from_rgb(151, 160, 180);
-pub(crate) const ACCENT: Color32 = Color32::from_rgb(168, 151, 255);
-pub(crate) const ACCENT_DARK: Color32 = Color32::from_rgb(57, 49, 88);
-pub(crate) const AQUA: Color32 = Color32::from_rgb(108, 209, 205);
+// Neutral dark grays; hacker green for focus, synthwave neons for kinds of thing.
+pub(crate) const BACKGROUND: Color32 = Color32::from_rgb(22, 22, 22);
+pub(crate) const PANEL: Color32 = Color32::from_rgb(31, 32, 34);
+pub(crate) const BAR: Color32 = BACKGROUND;
+pub(crate) const SURFACE: Color32 = Color32::from_rgb(42, 43, 46);
+pub(crate) const HOVER: Color32 = Color32::from_rgb(52, 54, 58);
+pub(crate) const BORDER: Color32 = Color32::from_rgb(46, 48, 52);
+pub(crate) const TEXT: Color32 = Color32::from_rgb(228, 231, 233);
+pub(crate) const MUTED: Color32 = Color32::from_rgb(138, 144, 150);
+pub(crate) const ACCENT: Color32 = Color32::from_rgb(57, 255, 136);
+pub(crate) const ACCENT_DARK: Color32 = Color32::from_rgb(22, 56, 38);
+pub(crate) const PINK: Color32 = Color32::from_rgb(255, 61, 172);
+pub(crate) const CYAN: Color32 = Color32::from_rgb(38, 214, 255);
+const AMBER: Color32 = Color32::from_rgb(255, 196, 64);
+const RADIUS: u8 = 10;
+const CLOSE_HOVER: Color32 = Color32::from_rgb(214, 38, 90);
+const TITLE_HEIGHT: f32 = 36.0;
+/// How close to a window edge the pointer resizes instead of interacting.
+const RESIZE_MARGIN: f32 = 6.0;
 
 fn panel_frame(color: Color32) -> Frame {
     Frame::new()
         .fill(color)
         .stroke(Stroke::new(1.0, BORDER))
-        .inner_margin(Margin::symmetric(14, 12))
+        .corner_radius(RADIUS)
+        .inner_margin(Margin::symmetric(12, 10))
+        .outer_margin(Margin::same(4))
+}
+
+/// The pink-to-cyan-to-green synthwave rule under the title bar.
+fn neon_rule(painter: &egui::Painter, rect: Rect) {
+    let mut mesh = egui::Mesh::default();
+    let stops = [PINK, CYAN, ACCENT];
+    for (i, color) in stops.iter().enumerate() {
+        let x = rect.left() + rect.width() * i as f32 / (stops.len() - 1) as f32;
+        mesh.colored_vertex(Pos2::new(x, rect.top()), *color);
+        mesh.colored_vertex(Pos2::new(x, rect.bottom()), *color);
+        if i > 0 {
+            let v = i as u32 * 2;
+            mesh.add_triangle(v - 2, v - 1, v);
+            mesh.add_triangle(v - 1, v, v + 1);
+        }
+    }
+    painter.add(mesh);
+}
+
+/// Background-coloured fillets over the scene's square corners, so the
+/// viewport reads as a rounded card like the panels.
+fn round_corners(painter: &egui::Painter, rect: Rect, radius: f32) {
+    let corners = [
+        (rect.left_top(), egui::vec2(1.0, 1.0)),
+        (rect.right_top(), egui::vec2(-1.0, 1.0)),
+        (rect.right_bottom(), egui::vec2(-1.0, -1.0)),
+        (rect.left_bottom(), egui::vec2(1.0, -1.0)),
+    ];
+    for (corner, inward) in corners {
+        let center = corner + inward * radius;
+        let mut mesh = egui::Mesh::default();
+        mesh.colored_vertex(corner, BACKGROUND);
+        for step in 0..=8 {
+            let a = step as f32 / 8.0 * std::f32::consts::FRAC_PI_2;
+            let arc = center - egui::vec2(inward.x * a.cos(), inward.y * a.sin()) * radius;
+            mesh.colored_vertex(arc, BACKGROUND);
+            if step > 0 {
+                mesh.add_triangle(0, step, step + 1);
+            }
+        }
+        painter.add(mesh);
+    }
+    painter.rect_stroke(
+        rect,
+        radius,
+        Stroke::new(1.0, BORDER),
+        egui::StrokeKind::Inside,
+    );
 }
 
 fn section(ui: &mut egui::Ui, title: &str) {
-    ui.add_space(12.0);
+    ui.add_space(10.0);
+    ui.label(RichText::new(title).size(10.0).strong().color(MUTED));
+    ui.add_space(4.0);
+}
+
+fn panel_heading(ui: &mut egui::Ui, title: &str, detail: &str) {
     ui.horizontal(|ui| {
-        let (rect, _) = ui.allocate_exact_size(egui::vec2(3.0, 12.0), egui::Sense::hover());
-        ui.painter().rect_filled(rect, 2, ACCENT);
-        ui.label(RichText::new(title).size(10.5).strong().color(MUTED));
+        ui.label(RichText::new(title).size(12.5).strong().color(TEXT));
+        ui.label(RichText::new(detail).size(10.5).color(MUTED));
     });
     ui.add_space(6.0);
+    let rect = ui.available_rect_before_wrap();
+    ui.painter()
+        .hline(rect.x_range(), rect.top(), Stroke::new(1.0, BORDER));
+    ui.add_space(2.0);
 }
 
 fn brand_mark(ui: &mut egui::Ui) {
-    let (rect, _) = ui.allocate_exact_size(egui::vec2(32.0, 32.0), egui::Sense::hover());
-    ui.painter().rect_filled(rect, 9, ACCENT_DARK);
-    let center = rect.center();
-    let stroke = Stroke::new(2.2, ACCENT);
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(20.0, 20.0), Sense::hover());
+    ui.painter().rect_filled(rect, 5, ACCENT);
+    let c = rect.center();
+    let stroke = Stroke::new(1.8, BACKGROUND);
+    for x in [-4.0, 4.0] {
+        ui.painter()
+            .line_segment([c + egui::vec2(x, -5.0), c + egui::vec2(x, 5.0)], stroke);
+    }
     ui.painter().line_segment(
-        [
-            center + egui::vec2(-7.0, -7.0),
-            center + egui::vec2(-7.0, 7.0),
-        ],
-        stroke,
-    );
-    ui.painter().line_segment(
-        [
-            center + egui::vec2(7.0, -7.0),
-            center + egui::vec2(7.0, 7.0),
-        ],
-        stroke,
-    );
-    ui.painter().line_segment(
-        [
-            center + egui::vec2(-7.0, 4.0),
-            center + egui::vec2(7.0, -4.0),
-        ],
+        [c + egui::vec2(-4.0, 0.0), c + egui::vec2(4.0, 0.0)],
         stroke,
     );
 }
 
-fn panel_heading(ui: &mut egui::Ui, title: &str, subtitle: &str) {
-    ui.vertical(|ui| {
-        ui.label(RichText::new(title).size(14.0).strong().color(TEXT));
-        ui.label(RichText::new(subtitle).size(10.5).color(MUTED));
-    });
-}
 fn hierarchy_row(ui: &mut egui::Ui, name: &str, selected: bool, light: bool) -> bool {
-    let response = ui.add_sized(
-        [ui.available_width(), 32.0],
-        egui::Button::selectable(selected, RichText::new(format!("      {name}")).color(TEXT))
-            .right_text("")
-            .truncate()
-            .corner_radius(6),
-    );
+    let (rect, response) =
+        ui.allocate_exact_size(egui::vec2(ui.available_width(), 26.0), Sense::click());
+    let painter = ui.painter();
     if selected {
-        let indicator = egui::Rect::from_min_size(
-            response.rect.left_top() + egui::vec2(0.0, 7.0),
-            egui::vec2(3.0, response.rect.height() - 14.0),
+        painter.rect_filled(rect, 6, ACCENT_DARK);
+        painter.rect_filled(
+            Rect::from_min_size(rect.min, egui::vec2(2.0, rect.height())),
+            1,
+            ACCENT,
         );
-        ui.painter().rect_filled(indicator, 2, ACCENT);
+    } else if response.hovered() {
+        painter.rect_filled(rect, 6, HOVER);
     }
-    let center = response.rect.left_center() + egui::vec2(13.0, 0.0);
-    let color = if light { AQUA } else { ACCENT };
+    let icon = rect.left_center() + egui::vec2(14.0, 0.0);
+    let color = if light { PINK } else { CYAN };
     if light {
-        ui.painter()
-            .circle_stroke(center, 4.0, Stroke::new(1.3, color));
-        ui.painter().circle_filled(center, 1.2, color);
+        painter.circle_stroke(icon, 4.0, Stroke::new(1.2, color));
+        painter.circle_filled(icon, 1.3, color);
     } else {
-        let rect = egui::Rect::from_center_size(center, egui::vec2(8.0, 8.0));
-        ui.painter()
-            .rect_stroke(rect, 1, Stroke::new(1.2, color), egui::StrokeKind::Inside);
+        let cube = Rect::from_center_size(icon, egui::vec2(8.0, 8.0));
+        painter.rect_stroke(cube, 1, Stroke::new(1.2, color), egui::StrokeKind::Inside);
     }
+    let galley = painter.layout_no_wrap(
+        name.to_owned(),
+        egui::FontId::proportional(12.5),
+        if selected {
+            TEXT
+        } else {
+            Color32::from_gray(214)
+        },
+    );
+    let text_rect = Rect::from_min_max(
+        rect.left_top() + egui::vec2(28.0, 0.0),
+        rect.right_bottom() - egui::vec2(6.0, 0.0),
+    );
+    painter.with_clip_rect(text_rect).galley(
+        Pos2::new(text_rect.left(), rect.center().y - galley.size().y / 2.0),
+        galley,
+        TEXT,
+    );
     response.clicked()
 }
 
 fn vector<const N: usize>(ui: &mut egui::Ui, label: &str, values: &mut [f32; N]) -> bool {
     let mut changed = false;
-    ui.label(RichText::new(label).color(MUTED));
+    ui.label(RichText::new(label).size(11.5).color(MUTED));
     ui.horizontal(|ui| {
         let width = ((ui.available_width()
             - (N.saturating_sub(1) as f32 * ui.spacing().item_spacing.x))
             / N as f32)
             .max(35.0);
         for (index, value) in values.iter_mut().enumerate() {
-            let prefix = ["X ", "Y ", "Z ", "W "][index];
-            changed |= ui
-                .add_sized(
-                    [width, 23.0],
-                    DragValue::new(value).speed(0.02).prefix(prefix),
-                )
-                .changed();
+            // Axis tint on the label, like the gizmo's colours.
+            let (prefix, tint) = [
+                ("X", Color32::from_rgb(224, 92, 84)),
+                ("Y", Color32::from_rgb(120, 196, 110)),
+                ("Z", Color32::from_rgb(96, 150, 232)),
+                ("W", MUTED),
+            ][index];
+            let field = ui.add_sized(
+                [width, 22.0],
+                DragValue::new(value)
+                    .speed(0.02)
+                    .prefix(format!("{prefix}  ")),
+            );
+            ui.painter().vline(
+                field.rect.left() + 1.0,
+                field.rect.y_range().shrink(5.0),
+                Stroke::new(2.0, tint),
+            );
+            changed |= field.changed();
         }
     });
     changed
@@ -167,9 +323,15 @@ fn scalar(
     speed: f32,
 ) -> bool {
     ui.horizontal(|ui| {
-        ui.label(RichText::new(label).color(MUTED));
-        ui.add(DragValue::new(value).speed(speed).range(range))
+        ui.label(RichText::new(label).size(11.5).color(MUTED));
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            ui.add_sized(
+                [110.0, 22.0],
+                DragValue::new(value).speed(speed).range(range),
+            )
             .changed()
+        })
+        .inner
     })
     .inner
 }
@@ -178,8 +340,11 @@ fn color(ui: &mut egui::Ui, label: &str, value: &mut [f32; 3]) -> bool {
     let mut edited = *value;
     let changed = ui
         .horizontal(|ui| {
-            ui.label(RichText::new(label).color(MUTED));
-            ui.color_edit_button_rgb(&mut edited).changed()
+            ui.label(RichText::new(label).size(11.5).color(MUTED));
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.color_edit_button_rgb(&mut edited).changed()
+            })
+            .inner
         })
         .inner;
     if changed && edited != *value {
@@ -187,6 +352,337 @@ fn color(ui: &mut egui::Ui, label: &str, value: &mut [f32; 3]) -> bool {
         true
     } else {
         false
+    }
+}
+
+/// An entity's components, edited through their reflected fields. Components
+/// the registry does not know are kept as saved.
+fn components(
+    ui: &mut egui::Ui,
+    registry: &ComponentRegistry,
+    components: &mut std::collections::BTreeMap<String, serde_json::Value>,
+) -> bool {
+    let mut changed = false;
+    let mut remove = None;
+    for (name, value) in components.iter_mut() {
+        ui.push_id(name.as_str(), |ui| {
+            ui.add_space(10.0);
+            ui.horizontal(|ui| {
+                ui.label(RichText::new(name.to_uppercase()).size(10.0).strong().color(MUTED));
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.small_button("✕").on_hover_text("Remove component").clicked() {
+                        remove = Some(name.clone());
+                    }
+                });
+            });
+            ui.add_space(4.0);
+            match registry.get(name) {
+                None => {
+                    ui.label(RichText::new("Unknown component, kept as saved").color(MUTED));
+                }
+                Some(info) => match (info.inspect)(value, &mut |f| fields(ui, f)) {
+                    Ok(edited) => changed |= edited,
+                    Err(error) => {
+                        ui.label(RichText::new(error).color(Color32::from_rgb(224, 92, 84)));
+                    }
+                },
+            }
+        });
+    }
+    if let Some(name) = remove {
+        components.remove(&name);
+        changed = true;
+    }
+    let missing: Vec<_> = registry
+        .iter()
+        .filter(|info| !components.contains_key(info.name))
+        .collect();
+    if !missing.is_empty() {
+        ui.add_space(10.0);
+        ui.menu_button("＋ Add component", |ui| {
+            for info in missing {
+                if ui.button(info.name).clicked() {
+                    components.insert(info.name.to_owned(), (info.default)());
+                    changed = true;
+                    ui.close();
+                }
+            }
+        });
+    }
+    changed
+}
+
+/// A widget per reflected field; true if any changed.
+fn fields(ui: &mut egui::Ui, fields: &mut [(&'static str, FieldMut<'_>)]) -> bool {
+    let mut changed = false;
+    for (label, field) in fields.iter_mut() {
+        changed |= match field {
+            FieldMut::Float(value, range) => scalar(ui, label, value, range.clone(), 0.01),
+            FieldMut::Vec3(values, range) => {
+                let edited = vector(ui, label, values);
+                if edited {
+                    for value in values.iter_mut() {
+                        *value = value.clamp(*range.start(), *range.end());
+                    }
+                }
+                edited
+            }
+            FieldMut::Color(value) => color(ui, label, value),
+            FieldMut::Bool(value) => ui.checkbox(value, *label).changed(),
+            FieldMut::Choice(choice) => {
+                let options = choice.options();
+                let mut index = choice.index();
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new(*label).size(11.5).color(MUTED));
+                    egui::ComboBox::from_id_salt(*label)
+                        .width(ui.available_width())
+                        .selected_text(options[index])
+                        .show_ui(ui, |ui| {
+                            for (i, option) in options.iter().enumerate() {
+                                ui.selectable_value(&mut index, i, *option);
+                            }
+                        });
+                });
+                let edited = index != choice.index();
+                if edited {
+                    choice.select(index);
+                }
+                edited
+            }
+        };
+    }
+    changed
+}
+
+/// One of the title bar's window buttons, drawn like the platform's own.
+fn window_button(ui: &mut egui::Ui, glyph: WindowCommand, maximized: bool) -> bool {
+    let (rect, response) = ui.allocate_exact_size(egui::vec2(46.0, TITLE_HEIGHT), Sense::click());
+    let close = glyph == WindowCommand::Close;
+    if response.hovered() {
+        ui.painter()
+            .rect_filled(rect, 0, if close { CLOSE_HOVER } else { HOVER });
+    }
+    let c = rect.center();
+    let stroke = Stroke::new(
+        1.0,
+        if response.hovered() && close {
+            Color32::WHITE
+        } else {
+            TEXT
+        },
+    );
+    let painter = ui.painter();
+    match glyph {
+        WindowCommand::Minimize => {
+            painter.hline(c.x - 5.0..=c.x + 5.0, c.y, stroke);
+        }
+        WindowCommand::ToggleMaximize if maximized => {
+            let back = Rect::from_center_size(c + egui::vec2(2.0, -2.0), egui::vec2(8.0, 8.0));
+            painter.rect_stroke(back, 1, stroke, egui::StrokeKind::Inside);
+            let front = Rect::from_center_size(c + egui::vec2(-1.0, 1.0), egui::vec2(8.0, 8.0));
+            painter.rect_filled(front, 0, BAR);
+            painter.rect_stroke(front, 1, stroke, egui::StrokeKind::Inside);
+        }
+        WindowCommand::ToggleMaximize => {
+            painter.rect_stroke(
+                Rect::from_center_size(c, egui::vec2(10.0, 10.0)),
+                1,
+                stroke,
+                egui::StrokeKind::Inside,
+            );
+        }
+        _ => {
+            painter.line_segment(
+                [c + egui::vec2(-5.0, -5.0), c + egui::vec2(5.0, 5.0)],
+                stroke,
+            );
+            painter.line_segment(
+                [c + egui::vec2(5.0, -5.0), c + egui::vec2(-5.0, 5.0)],
+                stroke,
+            );
+        }
+    }
+    response
+        .on_hover_text(match glyph {
+            WindowCommand::Minimize => "Minimize",
+            WindowCommand::ToggleMaximize if maximized => "Restore",
+            WindowCommand::ToggleMaximize => "Maximize",
+            _ => "Close",
+        })
+        .clicked()
+}
+
+/// A toolbar tool button with a painted icon.
+fn tool_button(ui: &mut egui::Ui, mode: Mode, active: bool, hint: &str) -> bool {
+    let (rect, response) = ui.allocate_exact_size(egui::vec2(30.0, 26.0), Sense::click());
+    let painter = ui.painter();
+    if active {
+        painter.rect_filled(rect, 8, ACCENT_DARK);
+        painter.rect_stroke(rect, 8, Stroke::new(1.0, ACCENT), egui::StrokeKind::Inside);
+    } else if response.hovered() {
+        painter.rect_filled(rect, 8, HOVER);
+    }
+    let c = rect.center();
+    let stroke = Stroke::new(1.4, if active { ACCENT } else { TEXT });
+    match mode {
+        Mode::Select => {
+            let tip = c + egui::vec2(-4.0, -6.0);
+            let points = vec![
+                tip,
+                tip + egui::vec2(0.0, 11.0),
+                tip + egui::vec2(3.0, 8.0),
+                tip + egui::vec2(7.0, 8.0),
+            ];
+            painter.add(egui::Shape::closed_line(points, stroke));
+        }
+        Mode::Translate => {
+            for d in [
+                egui::vec2(1.0, 0.0),
+                egui::vec2(-1.0, 0.0),
+                egui::vec2(0.0, 1.0),
+                egui::vec2(0.0, -1.0),
+            ] {
+                let end = c + d * 7.0;
+                painter.line_segment([c, end], stroke);
+                let side = egui::vec2(-d.y, d.x) * 2.5;
+                painter.line_segment([end, end - d * 2.5 + side], stroke);
+                painter.line_segment([end, end - d * 2.5 - side], stroke);
+            }
+        }
+        Mode::Rotate => {
+            let points: Vec<Pos2> = (0..=20)
+                .map(|i| {
+                    let a = 0.6 + i as f32 / 20.0 * 5.0;
+                    c + egui::vec2(a.cos(), a.sin()) * 6.5
+                })
+                .collect();
+            let end = *points.last().unwrap();
+            painter.add(egui::Shape::line(points, stroke));
+            painter.line_segment([end, end + egui::vec2(3.0, 0.5)], stroke);
+            painter.line_segment([end, end + egui::vec2(0.5, 3.0)], stroke);
+        }
+        Mode::Scale => {
+            painter.rect_stroke(
+                Rect::from_center_size(c + egui::vec2(-1.5, 1.5), egui::vec2(9.0, 9.0)),
+                1,
+                stroke,
+                egui::StrokeKind::Inside,
+            );
+            painter.line_segment(
+                [c + egui::vec2(0.0, 0.0), c + egui::vec2(6.0, -6.0)],
+                stroke,
+            );
+            painter.line_segment(
+                [c + egui::vec2(6.0, -6.0), c + egui::vec2(2.5, -6.0)],
+                stroke,
+            );
+            painter.line_segment(
+                [c + egui::vec2(6.0, -6.0), c + egui::vec2(6.0, -2.5)],
+                stroke,
+            );
+        }
+    }
+    response.on_hover_text(hint).clicked()
+}
+
+/// Which edge the pointer is on, for resizing the undecorated window.
+fn resize_edge(screen: Rect, pointer: Pos2) -> Option<ResizeDirection> {
+    let (left, right) = (
+        pointer.x - screen.left() < RESIZE_MARGIN,
+        screen.right() - pointer.x < RESIZE_MARGIN,
+    );
+    let (top, bottom) = (
+        pointer.y - screen.top() < RESIZE_MARGIN,
+        screen.bottom() - pointer.y < RESIZE_MARGIN,
+    );
+    Some(match (left, right, top, bottom) {
+        (true, _, true, _) => ResizeDirection::NorthWest,
+        (_, true, true, _) => ResizeDirection::NorthEast,
+        (true, _, _, true) => ResizeDirection::SouthWest,
+        (_, true, _, true) => ResizeDirection::SouthEast,
+        (true, ..) => ResizeDirection::West,
+        (_, true, ..) => ResizeDirection::East,
+        (_, _, true, _) => ResizeDirection::North,
+        (.., true) => ResizeDirection::South,
+        _ => return None,
+    })
+}
+
+/// Right mouse: look and fly with WASD/QE (Shift is faster, the wheel sets
+/// speed). Otherwise the wheel dollies and the middle button pans.
+fn navigate(ui: &egui::Ui, viewport: Rect, tools: &mut Tools) {
+    let hovered = ui.rect_contains_pointer(viewport);
+    let (look, pan, delta, scroll, dt, shift) = ui.input(|i| {
+        (
+            i.pointer.secondary_down(),
+            i.pointer.middle_down(),
+            i.pointer.delta(),
+            i.smooth_scroll_delta.y,
+            i.stable_dt.min(0.1),
+            i.modifiers.shift,
+        )
+    });
+    // Flying starts only over the viewport but continues if the pointer leaves it.
+    tools.flying = look && (tools.flying || hovered);
+    let fly = &mut tools.fly;
+    let camera = &mut tools.camera;
+    let forward = fly.forward();
+    let right = forward.cross(UP).normalize_or_zero();
+    if tools.flying {
+        fly.yaw -= delta.x * 0.004;
+        fly.pitch = (fly.pitch - delta.y * 0.004).clamp(-1.54, 1.54);
+        if scroll != 0.0 {
+            fly.speed = (fly.speed * 1.15f32.powf(scroll.signum())).clamp(0.25, 200.0);
+        }
+        let axis = |positive: egui::Key, negative: egui::Key| {
+            ui.input(|i| i.key_down(positive) as i32 - i.key_down(negative) as i32) as f32
+        };
+        let forward = fly.forward();
+        let motion = forward * axis(egui::Key::W, egui::Key::S)
+            + right * axis(egui::Key::D, egui::Key::A)
+            + UP * axis(egui::Key::E, egui::Key::Q);
+        camera.eye += motion.normalize_or_zero() * fly.speed * if shift { 3.0 } else { 1.0 } * dt;
+        ui.ctx().set_cursor_icon(egui::CursorIcon::None);
+        ui.ctx().request_repaint();
+    } else if hovered {
+        if scroll != 0.0 {
+            camera.eye += forward * scroll * 0.01 * fly.speed;
+        }
+        if pan && delta != Vec2::ZERO {
+            let up = right.cross(forward);
+            camera.eye += (-right * delta.x + up * delta.y) * 0.002 * fly.speed;
+            ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
+        }
+    }
+    camera.target = camera.eye + fly.forward();
+}
+
+/// An XYZ orientation triad in the viewport corner.
+fn orientation(ui: &egui::Ui, viewport: Rect, fly: &Fly) {
+    let forward = fly.forward();
+    let right = forward.cross(UP).normalize_or_zero();
+    let up = right.cross(forward);
+    let center = Pos2::new(viewport.left() + 38.0, viewport.bottom() - 38.0);
+    let painter = ui.painter_at(viewport);
+    painter.circle_filled(center, 30.0, Color32::from_black_alpha(90));
+    let mut axes = [
+        (Vec3::X, "X", Color32::from_rgb(224, 92, 84)),
+        (Vec3::Y, "Y", Color32::from_rgb(120, 196, 110)),
+        (Vec3::Z, "Z", Color32::from_rgb(96, 150, 232)),
+    ];
+    // Far axes first, so near ones draw on top.
+    axes.sort_by(|a, b| a.0.dot(forward).total_cmp(&b.0.dot(forward)).reverse());
+    for (axis, label, tint) in axes {
+        let end = center + egui::vec2(axis.dot(right), -axis.dot(up)) * 20.0;
+        painter.line_segment([center, end], Stroke::new(2.0, tint));
+        painter.circle_filled(end, 6.5, tint);
+        painter.text(
+            end,
+            egui::Align2::CENTER_CENTER,
+            label,
+            egui::FontId::proportional(9.0),
+            BACKGROUND,
+        );
     }
 }
 
@@ -199,225 +695,405 @@ pub fn show(
     dirty: bool,
     tools: &mut Tools,
 ) -> UiResponse {
-    let Tools {
-        browser,
-        gizmo,
-        camera,
-        light_limit,
-    } = tools;
     let mut visuals = egui::Visuals::dark();
     visuals.panel_fill = PANEL;
-    visuals.window_fill = BAR;
+    visuals.window_fill = SURFACE;
+    visuals.window_stroke = Stroke::new(1.0, BORDER);
     visuals.extreme_bg_color = BACKGROUND;
     visuals.faint_bg_color = SURFACE;
     visuals.override_text_color = Some(TEXT);
-    visuals.widgets.noninteractive.bg_fill = PANEL;
+    visuals.window_corner_radius = CornerRadius::same(12);
+    visuals.menu_corner_radius = CornerRadius::same(12);
+    for (widget, fill) in [
+        (&mut visuals.widgets.noninteractive, PANEL),
+        (&mut visuals.widgets.inactive, SURFACE),
+        (&mut visuals.widgets.hovered, HOVER),
+        (&mut visuals.widgets.active, ACCENT_DARK),
+        (&mut visuals.widgets.open, SURFACE),
+    ] {
+        widget.bg_fill = fill;
+        widget.weak_bg_fill = fill;
+        widget.corner_radius = CornerRadius::same(7);
+        widget.bg_stroke = Stroke::new(1.0, BORDER);
+    }
     visuals.widgets.noninteractive.bg_stroke = Stroke::new(1.0, BORDER);
-    visuals.widgets.inactive.bg_fill = SURFACE;
-    visuals.widgets.inactive.bg_stroke = Stroke::new(1.0, BORDER);
-    visuals.widgets.hovered.bg_fill = Color32::from_rgb(49, 52, 70);
-    visuals.widgets.hovered.bg_stroke = Stroke::new(1.0, ACCENT);
-    visuals.widgets.active.bg_fill = ACCENT_DARK;
+    visuals.widgets.inactive.bg_stroke = Stroke::NONE;
+    visuals.widgets.hovered.bg_stroke = Stroke::new(1.0, Color32::from_gray(80));
+    visuals.widgets.active.bg_stroke = Stroke::new(1.0, ACCENT);
     visuals.selection.bg_fill = ACCENT_DARK;
     visuals.selection.stroke = Stroke::new(1.0, ACCENT);
     ui.style_mut().visuals = visuals;
-    ui.spacing_mut().item_spacing = egui::vec2(8.0, 6.0);
-    ui.spacing_mut().button_padding = egui::vec2(9.0, 5.0);
-    ui.spacing_mut().interact_size.y = 28.0;
+    ui.spacing_mut().item_spacing = egui::vec2(6.0, 5.0);
+    ui.spacing_mut().button_padding = egui::vec2(8.0, 4.0);
+    ui.spacing_mut().interact_size.y = 24.0;
     ui.style_mut()
         .text_styles
-        .insert(egui::TextStyle::Body, egui::FontId::proportional(13.0));
+        .insert(egui::TextStyle::Body, egui::FontId::proportional(12.5));
     ui.style_mut()
         .text_styles
-        .insert(egui::TextStyle::Button, egui::FontId::proportional(12.0));
+        .insert(egui::TextStyle::Button, egui::FontId::proportional(12.5));
     let previous_selection = *selected;
 
     if matches!(*selected, Selection::Entity(i) if i >= scene.entities.len())
         || matches!(*selected, Selection::Light(i) if i >= scene.lights.len())
+        || matches!(*selected, Selection::Camera(i) if i >= scene.cameras.len())
     {
         *selected = Selection::None;
     }
     let mut action = None;
     let mut asset_action = None;
     let mut asset_remove = None;
+    let mut window = None;
     let mut changed = false;
     let filename = path
         .and_then(Path::file_name)
         .and_then(|name| name.to_str())
         .unwrap_or("Untitled");
 
+    // Window edges resize the undecorated window, unless it is maximized.
+    let screen = ui.max_rect();
+    if !tools.maximized
+        && !tools.flying
+        && let Some(direction) = ui
+            .ctx()
+            .pointer_hover_pos()
+            .and_then(|p| resize_edge(screen, p))
+    {
+        use ResizeDirection as R;
+        ui.ctx().set_cursor_icon(match direction {
+            R::East | R::West => egui::CursorIcon::ResizeHorizontal,
+            R::North | R::South => egui::CursorIcon::ResizeVertical,
+            R::NorthEast | R::SouthWest => egui::CursorIcon::ResizeNeSw,
+            R::NorthWest | R::SouthEast => egui::CursorIcon::ResizeNwSe,
+        });
+        if ui.input(|i| i.pointer.primary_pressed()) {
+            window = Some(WindowCommand::Resize(direction));
+        }
+    }
+
+    // Q W E R pick tools, like other engine editors.
+    if !tools.flying && !ui.ctx().egui_wants_keyboard_input() {
+        for (key, mode) in [
+            (egui::Key::Q, Mode::Select),
+            (egui::Key::W, Mode::Translate),
+            (egui::Key::E, Mode::Rotate),
+            (egui::Key::R, Mode::Scale),
+        ] {
+            if ui.input(|i| i.key_pressed(key) && !i.modifiers.any()) {
+                tools.gizmo.set_mode(mode);
+            }
+        }
+    }
+
+    egui::Panel::top("editor_title")
+        .exact_size(TITLE_HEIGHT)
+        .frame(Frame::new().fill(BAR))
+        .show(ui, |ui| {
+            let bar = ui.max_rect();
+            neon_rule(
+                ui.painter(),
+                Rect::from_min_max(
+                    Pos2::new(bar.left(), bar.bottom() - 1.5),
+                    bar.right_bottom(),
+                ),
+            );
+            ui.horizontal_centered(|ui| {
+                ui.spacing_mut().item_spacing.x = 2.0;
+                // Menus sit flat on the bar until hovered.
+                ui.visuals_mut().widgets.inactive.weak_bg_fill = Color32::TRANSPARENT;
+                ui.add_space(10.0);
+                brand_mark(ui);
+                ui.add_space(8.0);
+                for (label, menu) in [("File", 0), ("Edit", 1), ("Create", 2)] {
+                    ui.menu_button(RichText::new(label).size(12.5), |ui| {
+                        ui.set_min_width(190.0);
+                        match menu {
+                            0 => {
+                                for (text, shortcut, item) in [
+                                    ("New scene", "Ctrl+N", Action::New),
+                                    ("Open…", "Ctrl+O", Action::Open),
+                                    ("Save", "Ctrl+S", Action::Save),
+                                    ("Save as…", "Ctrl+Shift+S", Action::SaveAs),
+                                ] {
+                                    if ui
+                                        .add(egui::Button::new(text).shortcut_text(shortcut))
+                                        .clicked()
+                                    {
+                                        action = Some(item);
+                                        ui.close();
+                                    }
+                                }
+                                ui.separator();
+                                if ui.button("Exit").clicked() {
+                                    window = Some(WindowCommand::Close);
+                                    ui.close();
+                                }
+                            }
+                            1 => {
+                                let editing = tools.play == PlayState::Editing;
+                                for (enabled, label, shortcut, choice) in [
+                                    (tools.can_undo, "Undo", "Ctrl+Z", Action::Undo),
+                                    (tools.can_redo, "Redo", "Ctrl+Y", Action::Redo),
+                                ] {
+                                    if ui
+                                        .add_enabled(
+                                            editing && enabled,
+                                            egui::Button::new(label).shortcut_text(shortcut),
+                                        )
+                                        .clicked()
+                                    {
+                                        action = Some(choice);
+                                        ui.close();
+                                    }
+                                }
+                                ui.separator();
+                                ui.add_enabled(
+                                    false,
+                                    egui::Button::new("Copy entity").shortcut_text("Ctrl+C"),
+                                );
+                                ui.add_enabled(
+                                    false,
+                                    egui::Button::new("Paste entity").shortcut_text("Ctrl+V"),
+                                );
+                                ui.label(
+                                    RichText::new("Use the shortcuts in the viewport")
+                                        .size(10.5)
+                                        .color(MUTED),
+                                );
+                            }
+                            _ => {
+                                if tools.play != PlayState::Editing {
+                                    ui.disable();
+                                }
+                                if ui
+                                    .add(egui::Button::new("Cube").shortcut_text("Insert"))
+                                    .clicked()
+                                {
+                                    add_cube(scene, selected);
+                                    changed = true;
+                                    ui.close();
+                                }
+                                if ui
+                                    .add_enabled(
+                                        scene.lights.len() < tools.light_limit,
+                                        egui::Button::new("Point light").shortcut_text("L"),
+                                    )
+                                    .clicked()
+                                {
+                                    add_light(scene, selected);
+                                    changed = true;
+                                    ui.close();
+                                }
+                                if ui.button("Camera").clicked() {
+                                    add_camera(scene, selected, &tools.camera);
+                                    changed = true;
+                                    ui.close();
+                                }
+                            }
+                        }
+                    });
+                }
+                // The rest of the bar drags the window; double-click maximizes.
+                let buttons = 46.0 * 3.0;
+                let free = Rect::from_min_max(
+                    Pos2::new(ui.cursor().left() + 8.0, ui.max_rect().top()),
+                    Pos2::new(ui.max_rect().right() - buttons, ui.max_rect().bottom()),
+                );
+                let drag = ui.interact(free, ui.id().with("title_drag"), Sense::click_and_drag());
+                if drag.double_clicked() {
+                    window = Some(WindowCommand::ToggleMaximize);
+                } else if drag.drag_started() {
+                    window = Some(WindowCommand::Drag);
+                }
+                let title = format!("{filename}{}", if dirty { "  •" } else { "" });
+                ui.painter().text(
+                    free.center(),
+                    egui::Align2::CENTER_CENTER,
+                    title,
+                    egui::FontId::proportional(12.5),
+                    if dirty { TEXT } else { MUTED },
+                );
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.spacing_mut().item_spacing.x = 0.0;
+                    for glyph in [
+                        WindowCommand::Close,
+                        WindowCommand::ToggleMaximize,
+                        WindowCommand::Minimize,
+                    ] {
+                        if window_button(ui, glyph, tools.maximized) {
+                            window = Some(glyph);
+                        }
+                    }
+                });
+            });
+        });
+
     egui::Panel::top("editor_toolbar")
+        .exact_size(48.0)
         .frame(
             Frame::new()
-                .fill(BAR)
+                .fill(PANEL)
                 .stroke(Stroke::new(1.0, BORDER))
-                .inner_margin(Margin::symmetric(16, 8)),
+                .corner_radius(RADIUS)
+                .inner_margin(Margin::symmetric(10, 5))
+                .outer_margin(Margin::symmetric(4, 4)),
         )
         .show(ui, |ui| {
             ui.horizontal_centered(|ui| {
-                brand_mark(ui);
-                ui.vertical(|ui| {
-                    ui.spacing_mut().item_spacing.y = 0.0;
-                    ui.label(RichText::new("HYPERON").size(14.0).strong().color(TEXT));
-                    ui.label(
-                        RichText::new("SCENE EDITOR")
-                            .size(9.0)
-                            .strong()
-                            .color(ACCENT),
-                    );
-                });
-                ui.add_space(18.0);
+                ui.spacing_mut().item_spacing.x = 3.0;
+                let playing = tools.play == PlayState::Playing;
+                if ui
+                    .button(RichText::new(if playing { "⏸ Pause" } else { "▶ Play" }).color(ACCENT))
+                    .on_hover_text("Simulate the scene · Ctrl+P")
+                    .clicked()
+                {
+                    action = Some(if playing { Action::Pause } else { Action::Play });
+                }
+                if ui
+                    .add_enabled(tools.play == PlayState::Paused, egui::Button::new("⏭ Step"))
+                    .on_hover_text("Advance one physics tick")
+                    .clicked()
+                {
+                    action = Some(Action::Step);
+                }
+                if ui
+                    .add_enabled(tools.play != PlayState::Editing, egui::Button::new("⏹ Stop"))
+                    .on_hover_text("Stop and restore the scene")
+                    .clicked()
+                {
+                    action = Some(Action::Stop);
+                }
+                ui.add_space(8.0);
+                ui.separator();
+                ui.add_space(8.0);
+                if tools.play != PlayState::Editing {
+                    ui.disable();
+                }
+                let mode = tools.gizmo.mode();
+                for (tool, hint) in [
+                    (Mode::Select, "Select · Q"),
+                    (Mode::Translate, "Move · W"),
+                    (Mode::Rotate, "Rotate · E"),
+                    (Mode::Scale, "Scale · R"),
+                ] {
+                    if tool_button(ui, tool, mode == tool, hint) {
+                        tools.gizmo.set_mode(tool);
+                    }
+                }
+                ui.add_space(8.0);
                 ui.separator();
                 ui.add_space(8.0);
                 if ui
-                    .button("New")
-                    .on_hover_text("New scene · Ctrl+N")
+                    .button(RichText::new("＋ Cube").color(CYAN))
+                    .on_hover_text("Add a cube · Insert")
                     .clicked()
                 {
-                    action = Some(Action::New);
+                    add_cube(scene, selected);
+                    changed = true;
                 }
                 if ui
-                    .button("Open")
-                    .on_hover_text("Open scene · Ctrl+O")
-                    .clicked()
-                {
-                    action = Some(Action::Open);
-                }
-                if ui
-                    .button("Save as")
-                    .on_hover_text("Save scene as · Ctrl+Shift+S")
-                    .clicked()
-                {
-                    action = Some(Action::SaveAs);
-                }
-                if ui
-                    .add(
-                        egui::Button::new(
-                            RichText::new("Save scene")
-                                .strong()
-                                .color(Color32::from_rgb(20, 17, 32)),
-                        )
-                        .fill(ACCENT)
-                        .corner_radius(6),
+                    .add_enabled(
+                        scene.lights.len() < tools.light_limit,
+                        egui::Button::new(RichText::new("＋ Light").color(PINK)),
                     )
-                    .on_hover_text("Save scene · Ctrl+S")
+                    .on_hover_text("Add a point light · L")
                     .clicked()
                 {
-                    action = Some(Action::Save);
+                    add_light(scene, selected);
+                    changed = true;
                 }
-                if ui.available_width() > 160.0 {
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        ui.label(
-                            RichText::new(if dirty {
-                                "Modified"
-                            } else if path.is_none() {
-                                "New"
-                            } else {
-                                "Saved"
-                            })
-                            .size(11.0)
-                            .color(if dirty { ACCENT } else { AQUA }),
-                        );
-                        ui.label(RichText::new(filename).size(12.0).color(TEXT));
-                        ui.label(RichText::new("SCENE /").size(10.0).color(MUTED));
-                    });
+                if ui
+                    .button(RichText::new("＋ Camera"))
+                    .on_hover_text("Save the current view as a scene camera")
+                    .clicked()
+                {
+                    add_camera(scene, selected, &tools.camera);
+                    changed = true;
                 }
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.label(
+                        RichText::new("RMB + WASD fly  ·  Q/E down/up  ·  wheel speed  ·  MMB pan")
+                            .size(10.5)
+                            .color(MUTED),
+                    );
+                    ui.add_space(10.0);
+                    ui.add(
+                        DragValue::new(&mut tools.fly.speed)
+                            .range(0.25..=200.0)
+                            .speed(0.1)
+                            .suffix(" m/s"),
+                    )
+                    .on_hover_text("Fly speed");
+                    ui.label(RichText::new("Speed").size(11.0).color(AMBER));
+                });
             });
         });
 
     egui::Panel::bottom("editor_status")
+        .exact_size(24.0)
         .frame(
             Frame::new()
-                .fill(BACKGROUND)
-                .inner_margin(Margin::symmetric(16, 6)),
+                .fill(BAR)
+                .inner_margin(Margin::symmetric(12, 0)),
         )
         .show(ui, |ui| {
-            ui.horizontal(|ui| {
-                let status = if dirty {
-                    "UNSAVED CHANGES"
-                } else if path.is_none() {
-                    "UNTITLED SCENE"
-                } else {
-                    "SAVED"
-                };
-                let (dot, _) = ui.allocate_exact_size(egui::vec2(7.0, 7.0), egui::Sense::hover());
+            ui.horizontal_centered(|ui| {
+                let (dot, _) = ui.allocate_exact_size(egui::vec2(8.0, 8.0), Sense::hover());
                 ui.painter()
-                    .circle_filled(dot.center(), 3.0, if dirty { ACCENT } else { AQUA });
-                ui.label(RichText::new(status).size(10.0).strong().color(MUTED));
-                ui.separator();
+                    .circle_filled(dot.center(), 3.0, if dirty { PINK } else { ACCENT });
+                ui.label(
+                    RichText::new(if tools.play != PlayState::Editing {
+                        "Playing · changes are discarded on Stop"
+                    } else if dirty {
+                        "Unsaved changes"
+                    } else if path.is_none() {
+                        "Untitled scene"
+                    } else {
+                        "Saved"
+                    })
+                    .size(11.0)
+                    .color(MUTED),
+                );
+                ui.label(RichText::new("·").color(MUTED));
                 ui.label(
                     RichText::new(format!(
-                        "{} {}   ·   {} {}",
+                        "{} objects  ·  {} lights  ·  {} models",
                         scene.entities.len(),
-                        if scene.entities.len() == 1 {
-                            "object"
-                        } else {
-                            "objects"
-                        },
                         scene.lights.len(),
-                        if scene.lights.len() == 1 {
-                            "light"
-                        } else {
-                            "lights"
-                        }
+                        scene.assets.len()
                     ))
                     .size(11.0)
                     .color(MUTED),
                 );
-                if ui.available_width() > 240.0 {
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        ui.label(
-                            RichText::new("CTRL + S  SAVE    /    TAB  SELECT")
-                                .size(10.0)
-                                .color(MUTED),
-                        );
-                    });
-                }
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    let eye = tools.camera.eye;
+                    ui.label(
+                        RichText::new(format!(
+                            "Camera  {:.1}, {:.1}, {:.1}   ·   Z up",
+                            eye.x, eye.y, eye.z
+                        ))
+                        .size(11.0)
+                        .color(MUTED),
+                    );
+                });
             });
         });
 
     egui::Panel::left("editor_hierarchy")
         .resizable(true)
-        .default_size(240.0)
-        .min_size(170.0)
-        .max_size(350.0)
+        .default_size(250.0)
+        .min_size(180.0)
+        .max_size(380.0)
         .frame(panel_frame(PANEL))
         .show(ui, |ui| {
-            panel_heading(ui, "Scene", "OUTLINER");
-            ui.add_space(12.0);
-            ui.horizontal_wrapped(|ui| {
-                if ui.button("+ Object").clicked() {
-                    scene.entities.push(Entity {
-                        name: format!("Entity {}", scene.entities.len() + 1),
-                        transform: Transform::default(),
-                        material: Material::default(),
-                    });
-                    *selected = Selection::Entity(scene.entities.len() - 1);
-                    changed = true;
-                }
-                if ui
-                    .add_enabled(
-                        scene.lights.len() < *light_limit,
-                        egui::Button::new("+ Light"),
-                    )
-                    .on_hover_text(format!(
-                        "Scene can add up to {} point lights after imported lights",
-                        *light_limit
-                    ))
-                    .clicked()
-                {
-                    scene.lights.push(PointLight {
-                        position: [0.0, 3.0, 0.0],
-                        color: [1.0, 1.0, 1.0],
-                        intensity: 30.0,
-                        radius: 15.0,
-                    });
-                    *selected = Selection::Light(scene.lights.len() - 1);
-                    changed = true;
-                }
-            });
-            ui.add_space(5.0);
-            ui.separator();
+            panel_heading(
+                ui,
+                "Hierarchy",
+                &format!(
+                    "{}",
+                    scene.entities.len() + scene.lights.len() + scene.cameras.len()
+                ),
+            );
             egui::ScrollArea::vertical().show(ui, |ui| {
                 section(ui, "ENTITIES");
                 if scene.entities.is_empty() {
@@ -434,11 +1110,6 @@ pub fn show(
                     }
                 }
                 section(ui, "IMPORTED MODELS");
-                ui.label(
-                    RichText::new("Whole scene geometry · not editable entities")
-                        .size(11.0)
-                        .color(MUTED),
-                );
                 if scene.assets.is_empty() {
                     ui.label(RichText::new("No imported models").color(MUTED).italics());
                 }
@@ -449,7 +1120,7 @@ pub fn show(
                                 egui::Layout::right_to_left(egui::Align::Center),
                                 |ui| {
                                     if ui
-                                        .small_button("Remove")
+                                        .small_button("✕")
                                         .on_hover_text("Remove model from scene")
                                         .clicked()
                                     {
@@ -459,27 +1130,43 @@ pub fn show(
                                         .file_name()
                                         .and_then(|name| name.to_str())
                                         .unwrap_or(asset);
-                                    ui.add(egui::Label::new(name).truncate())
-                                        .on_hover_text(asset);
+                                    ui.add(
+                                        egui::Label::new(
+                                            RichText::new(name).color(Color32::from_gray(214)),
+                                        )
+                                        .truncate(),
+                                    )
+                                    .on_hover_text(asset);
                                 },
                             );
                         });
                     });
                 }
+                section(ui, "CAMERAS");
+                if scene.cameras.is_empty() {
+                    ui.label(RichText::new("No cameras").color(MUTED).italics());
+                }
+                for (index, camera) in scene.cameras.iter().enumerate() {
+                    let name = if camera.name.is_empty() {
+                        "Unnamed camera"
+                    } else {
+                        &camera.name
+                    };
+                    if hierarchy_row(ui, name, *selected == Selection::Camera(index), false) {
+                        *selected = Selection::Camera(index);
+                    }
+                }
                 section(ui, "LIGHTING");
                 if hierarchy_row(ui, "Environment", *selected == Selection::Lighting, true) {
                     *selected = Selection::Lighting;
                 }
-                if hierarchy_row(ui, "Sun · Directional", *selected == Selection::Sun, true) {
+                if hierarchy_row(ui, "Sun", *selected == Selection::Sun, true) {
                     *selected = Selection::Sun;
-                }
-                if scene.lights.is_empty() {
-                    ui.label(RichText::new("No point lights").color(MUTED).italics());
                 }
                 for index in 0..scene.lights.len() {
                     if hierarchy_row(
                         ui,
-                        &format!("Point Light {}", index + 1),
+                        &format!("Point light {}", index + 1),
                         *selected == Selection::Light(index),
                         true,
                     ) {
@@ -492,26 +1179,29 @@ pub fn show(
     egui::Panel::right("editor_inspector")
         .resizable(true)
         .default_size(300.0)
-        .min_size(220.0)
-        .max_size(420.0)
+        .min_size(230.0)
+        .max_size(440.0)
         .frame(panel_frame(PANEL))
         .show(ui, |ui| {
-            panel_heading(ui, "Inspector", "PROPERTIES");
-            ui.add_space(10.0);
-            ui.separator();
+            panel_heading(ui, "Inspector", "");
+            if tools.play != PlayState::Editing {
+                ui.disable();
+            }
             let mut delete = false;
             egui::ScrollArea::vertical().show(ui, |ui| match *selected {
                 Selection::Entity(index) => {
                     let entity = &mut scene.entities[index];
                     section(ui, "ENTITY");
-                    ui.label(RichText::new("Name").color(MUTED));
-                    changed |= ui.text_edit_singleline(&mut entity.name).changed();
+                    changed |= ui
+                        .add(
+                            egui::TextEdit::singleline(&mut entity.name)
+                                .desired_width(f32::INFINITY),
+                        )
+                        .changed();
                     section(ui, "TRANSFORM");
                     changed |= vector(ui, "Position", &mut entity.transform.translation);
                     changed |= vector(ui, "Rotation · quaternion", &mut entity.transform.rotation);
                     changed |= vector(ui, "Scale", &mut entity.transform.scale);
-                    ui.add_space(6.0);
-                    ui.separator();
                     section(ui, "MATERIAL");
                     changed |= color(ui, "Base color", &mut entity.material.base_color);
                     changed |= scalar(
@@ -528,6 +1218,7 @@ pub fn show(
                         0.0..=1.0,
                         0.01,
                     );
+                    changed |= components(ui, &tools.registry, &mut entity.components);
                     ui.add_space(14.0);
                     delete = ui.button("Delete entity").clicked();
                 }
@@ -535,14 +1226,46 @@ pub fn show(
                     let light = &mut scene.lights[index];
                     section(ui, &format!("POINT LIGHT {}", index + 1));
                     changed |= vector(ui, "Position", &mut light.position);
-                    ui.add_space(6.0);
-                    ui.separator();
                     section(ui, "LIGHT");
                     changed |= color(ui, "Color", &mut light.color);
                     changed |= scalar(ui, "Intensity", &mut light.intensity, 0.0..=f32::MAX, 0.1);
                     changed |= scalar(ui, "Radius", &mut light.radius, 0.0..=f32::MAX, 0.1);
                     ui.add_space(14.0);
                     delete = ui.button("Delete light").clicked();
+                }
+                Selection::Camera(index) => {
+                    let camera = &mut scene.cameras[index];
+                    section(ui, "CAMERA");
+                    changed |= ui
+                        .add(
+                            egui::TextEdit::singleline(&mut camera.name)
+                                .desired_width(f32::INFINITY),
+                        )
+                        .changed();
+                    section(ui, "VIEW");
+                    changed |= vector(ui, "Position", &mut camera.position);
+                    changed |= vector(ui, "Target", &mut camera.target);
+                    changed |= scalar(ui, "Vertical FOV °", &mut camera.vertical_fov, 1.0..=170.0, 0.5);
+                    ui.add_space(8.0);
+                    ui.horizontal(|ui| {
+                        if ui
+                            .button("View through")
+                            .on_hover_text("Move the viewport to this camera")
+                            .clicked()
+                        {
+                            look_through(tools, camera);
+                        }
+                        if ui
+                            .button("Set from view")
+                            .on_hover_text("Move this camera to the viewport")
+                            .clicked()
+                        {
+                            *camera = camera_from_view(camera.name.clone(), &tools.camera);
+                            changed = true;
+                        }
+                    });
+                    ui.add_space(14.0);
+                    delete = ui.button("Delete camera").clicked();
                 }
                 Selection::Sun => {
                     section(ui, "SUN · DIRECTIONAL LIGHT");
@@ -553,53 +1276,69 @@ pub fn show(
                     }
                     if let Some(sun) = &mut scene.sun {
                         changed |= vector(ui, "Direction light travels", &mut sun.direction);
-                        ui.label(RichText::new("Zero direction uses straight down").color(MUTED));
+                        ui.label(
+                            RichText::new("Zero direction points straight down (−Z)")
+                                .size(11.0)
+                                .color(MUTED),
+                        );
                         changed |= color(ui, "Color", &mut sun.color);
                         changed |= scalar(ui, "Intensity", &mut sun.intensity, 0.0..=f32::MAX, 0.1);
                     }
                 }
                 Selection::Lighting => {
                     section(ui, "SCENE LIGHTING");
-                    ui.label(RichText::new("Method").color(MUTED));
                     let previous = scene.lighting.method;
-                    egui::ComboBox::from_id_salt("lighting_method")
-                        .selected_text(match scene.lighting.method {
-                            LightingMethod::DirectOnly => "Direct only",
-                            LightingMethod::DirectAndHemisphere => "Direct + Hemisphere ambient",
-                        })
-                        .show_ui(ui, |ui| {
-                            ui.selectable_value(
-                                &mut scene.lighting.method,
-                                LightingMethod::DirectOnly,
-                                "Direct only",
-                            );
-                            ui.selectable_value(
-                                &mut scene.lighting.method,
-                                LightingMethod::DirectAndHemisphere,
-                                "Direct + Hemisphere ambient",
-                            );
-                        });
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new("Method").size(11.5).color(MUTED));
+                        egui::ComboBox::from_id_salt("lighting_method")
+                            .width(ui.available_width())
+                            .selected_text(match scene.lighting.method {
+                                LightingMethod::DirectOnly => "Direct only",
+                                LightingMethod::DirectAndHemisphere => "Direct + hemisphere",
+                                LightingMethod::SplitRadianceCascades => "Split radiance cascades GI",
+                            })
+                            .show_ui(ui, |ui| {
+                                ui.selectable_value(
+                                    &mut scene.lighting.method,
+                                    LightingMethod::DirectOnly,
+                                    "Direct only",
+                                );
+                                ui.selectable_value(
+                                    &mut scene.lighting.method,
+                                    LightingMethod::DirectAndHemisphere,
+                                    "Direct + hemisphere",
+                                );
+                                ui.selectable_value(
+                                    &mut scene.lighting.method,
+                                    LightingMethod::SplitRadianceCascades,
+                                    "Split radiance cascades GI",
+                                );
+                            });
+                    });
                     changed |= previous != scene.lighting.method;
-                    ui.add_space(6.0);
-                    ui.separator();
+                    if let Some(status) = &tools.gi_status {
+                        ui.label(RichText::new(status).size(11.0).color(MUTED));
+                    }
                     section(ui, "HEMISPHERE AMBIENT");
-                    ui.label(RichText::new("Linear sky and ground radiance").color(MUTED));
                     changed |= color(ui, "Sky", &mut scene.lighting.sky);
                     changed |= color(ui, "Ground", &mut scene.lighting.ground);
                 }
                 Selection::None => {
-                    ui.add_space(20.0);
-                    ui.label(RichText::new("Nothing selected").strong());
-                    ui.label(
-                        RichText::new(
-                            "Select an entity or light in the hierarchy to edit its properties.",
-                        )
-                        .color(MUTED),
-                    );
+                    ui.add_space(24.0);
+                    ui.vertical_centered(|ui| {
+                        ui.label(RichText::new("Nothing selected").strong());
+                        ui.label(
+                            RichText::new(
+                                "Select something in the hierarchy\nto edit its properties.",
+                            )
+                            .size(11.5)
+                            .color(MUTED),
+                        );
+                    });
                 }
             });
             if delete {
-                gizmo.cancel_drag();
+                tools.gizmo.cancel_drag();
                 *selected = match *selected {
                     Selection::Entity(index) => {
                         scene.entities.remove(index);
@@ -617,9 +1356,15 @@ pub fn show(
                             Selection::Light(index.min(scene.lights.len() - 1))
                         }
                     }
-                    Selection::Sun => Selection::Sun,
-                    Selection::Lighting => Selection::Lighting,
-                    Selection::None => Selection::None,
+                    Selection::Camera(index) => {
+                        scene.cameras.remove(index);
+                        if scene.cameras.is_empty() {
+                            Selection::None
+                        } else {
+                            Selection::Camera(index.min(scene.cameras.len() - 1))
+                        }
+                    }
+                    other => other,
                 };
                 changed = true;
             }
@@ -627,76 +1372,98 @@ pub fn show(
 
     egui::Panel::bottom("editor_assets")
         .resizable(true)
-        .default_size(220.0)
-        .min_size(130.0)
+        .default_size(200.0)
+        .min_size(110.0)
         .frame(panel_frame(PANEL))
         .show(ui, |ui| {
-            ui.horizontal(|ui| {
-                ui.label(RichText::new("Assets").size(14.0).strong().color(TEXT));
-                ui.label(
-                    RichText::new("PROJECT LIBRARY")
-                        .size(10.0)
-                        .strong()
-                        .color(MUTED),
-                );
-                if ui.available_width() > 220.0 {
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        ui.label(
-                            RichText::new("Double-click to open or import")
-                                .size(10.5)
-                                .color(MUTED),
-                        );
-                    });
-                }
-            });
-            ui.add_space(4.0);
-            asset_action = browser.show(ui);
+            panel_heading(ui, "Assets", "Double-click to open or import");
+            asset_action = tools.browser.show(ui);
         });
 
     if *selected != previous_selection {
-        gizmo.cancel_drag();
+        tools.gizmo.cancel_drag();
     }
 
     let mut viewport = egui::Rect::NOTHING;
     egui::CentralPanel::default()
-        .frame(Frame::new().fill(Color32::TRANSPARENT))
+        .frame(Frame::new().fill(Color32::TRANSPARENT).inner_margin(4))
         .show(ui, |ui| {
-            Frame::new()
-                .fill(BAR)
-                .stroke(Stroke::new(1.0, BORDER))
-                .inner_margin(Margin::symmetric(12, 6))
-                .show(ui, |ui| {
-                    ui.set_width(ui.available_width());
-                    ui.horizontal(|ui| {
-                        ui.label(RichText::new("VIEWPORT").size(10.0).strong().color(ACCENT));
-                        ui.separator();
-                        gizmo.toolbar(ui);
-                        if ui.available_width() > 150.0 {
-                            ui.with_layout(
-                                egui::Layout::right_to_left(egui::Align::Center),
-                                |ui| {
-                                    ui.label(
-                                        RichText::new("PERSPECTIVE  ·  VULKAN")
-                                            .size(10.0)
-                                            .color(MUTED),
-                                    );
-                                },
-                            );
-                        }
-                    });
-                });
             viewport = ui.available_rect_before_wrap();
-            if let Selection::Entity(index) = *selected {
-                changed |= gizmo.show(ui, viewport, &mut scene.entities[index].transform, camera);
+            round_corners(&ui.painter_at(viewport), viewport, RADIUS as f32);
+            navigate(ui, viewport, tools);
+            orientation(ui, viewport, &tools.fly);
+            if let Selection::Entity(index) = *selected
+                && tools.play == PlayState::Editing
+            {
+                changed |= tools.gizmo.show(
+                    ui,
+                    viewport,
+                    &mut scene.entities[index].transform,
+                    &tools.camera,
+                );
             }
         });
     UiResponse {
         action,
         asset_action,
         asset_remove,
+        window,
         changed,
         viewport,
     }
+}
+
+fn add_cube(scene: &mut Scene, selected: &mut Selection) {
+    scene.entities.push(Entity {
+        name: format!("Cube {}", scene.entities.len() + 1),
+        transform: Transform {
+            translation: [0.0, 0.0, 0.5],
+            ..Transform::default()
+        },
+        material: Material::default(),
+        ..Entity::default()
+    });
+    *selected = Selection::Entity(scene.entities.len() - 1);
+}
+
+fn camera_from_view(name: String, view: &hyperon_render::Camera) -> hyperon_core::Camera {
+    hyperon_core::Camera {
+        name,
+        position: view.eye.to_array(),
+        target: view.target.to_array(),
+        vertical_fov: view.vertical_fov.to_degrees(),
+    }
+}
+
+fn add_camera(scene: &mut Scene, selected: &mut Selection, view: &hyperon_render::Camera) {
+    let name = format!("Camera {}", scene.cameras.len() + 1);
+    scene.cameras.push(camera_from_view(name, view));
+    *selected = Selection::Camera(scene.cameras.len() - 1);
+}
+
+/// Point the viewport, and the fly controls that drive it, along a scene camera.
+pub fn look_through(tools: &mut Tools, camera: &hyperon_core::Camera) {
+    let eye = Vec3::from_array(camera.position);
+    let Some(direction) = (Vec3::from_array(camera.target) - eye).try_normalize() else {
+        return;
+    };
+    tools.fly.yaw = direction.y.atan2(direction.x);
+    tools.fly.pitch = direction.z.clamp(-1.0, 1.0).asin();
+    tools.camera = hyperon_render::Camera {
+        eye,
+        target: eye + tools.fly.forward(),
+        vertical_fov: camera.vertical_fov.clamp(1.0, 170.0).to_radians(),
+    };
+}
+
+fn add_light(scene: &mut Scene, selected: &mut Selection) {
+    scene.lights.push(PointLight {
+        position: [0.0, 0.0, 3.0],
+        color: [1.0, 1.0, 1.0],
+        intensity: 30.0,
+        radius: 15.0,
+    });
+    *selected = Selection::Light(scene.lights.len() - 1);
 }
 
 #[cfg(test)]
@@ -729,5 +1496,70 @@ mod tests {
             viewport.right() <= 800.0 && viewport.bottom() <= 520.0,
             "{viewport:?}"
         );
+    }
+
+    #[test]
+    fn inspector_shows_components_without_rewriting_them() {
+        let mut scene = Scene::default();
+        let body = serde_json::json!({ "body_type": "Static", "shape": "Sphere", "radius": 2.0 });
+        scene.entities[0].components = [
+            ("Rigid Body".to_owned(), body),
+            ("Mana".to_owned(), serde_json::json!({ "points": 3 })),
+        ]
+        .into();
+        let before = scene.clone();
+        let (mut selected, mut tools) = (Selection::Entity(0), Tools::default());
+        let context = egui::Context::default();
+        for _ in 0..2 {
+            let mut output = context.run_ui(egui::RawInput::default(), |ui| {
+                assert!(!show(ui, &mut scene, &mut selected, None, false, &mut tools).changed);
+            });
+            output.textures_delta.clear();
+        }
+        assert_eq!(scene, before);
+    }
+
+    #[test]
+    fn edges_resize_and_the_inside_does_not() {
+        let screen = Rect::from_min_size(Pos2::ZERO, egui::vec2(800.0, 600.0));
+        assert_eq!(
+            resize_edge(screen, Pos2::new(2.0, 300.0)),
+            Some(ResizeDirection::West)
+        );
+        assert_eq!(
+            resize_edge(screen, Pos2::new(798.0, 598.0)),
+            Some(ResizeDirection::SouthEast)
+        );
+        assert_eq!(
+            resize_edge(screen, Pos2::new(400.0, 1.0)),
+            Some(ResizeDirection::North)
+        );
+        assert_eq!(resize_edge(screen, Pos2::new(400.0, 300.0)), None);
+    }
+
+    #[test]
+    fn look_through_matches_scene_camera() {
+        let mut tools = Tools::default();
+        let camera = hyperon_core::Camera {
+            name: "Nave".into(),
+            position: [8.0, -4.0, 3.0],
+            target: [-4.0, -4.0, 5.0],
+            vertical_fov: 60.0,
+        };
+        look_through(&mut tools, &camera);
+        let saved = camera_from_view(camera.name.clone(), &tools.camera);
+        let direction = |c: &hyperon_core::Camera| {
+            (Vec3::from_array(c.target) - Vec3::from_array(c.position)).normalize()
+        };
+        assert_eq!(saved.position, camera.position);
+        assert!(direction(&saved).abs_diff_eq(direction(&camera), 1e-5));
+        assert!((saved.vertical_fov - 60.0).abs() < 1e-3);
+    }
+
+    #[test]
+    fn default_fly_camera_looks_where_the_camera_does() {
+        let tools = Tools::default();
+        let direction = (tools.camera.target - tools.camera.eye).normalize();
+        assert!(tools.fly.forward().distance(direction) < 1e-4);
     }
 }

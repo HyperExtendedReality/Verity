@@ -1,4 +1,4 @@
-use crate::ui::{ACCENT, ACCENT_DARK, AQUA, BORDER, MUTED, SURFACE, TEXT};
+use crate::ui::{ACCENT, ACCENT_DARK, BORDER, CYAN, MUTED, PINK, SURFACE, TEXT};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -21,12 +21,12 @@ fn entry_row(ui: &mut egui::Ui, entry: &Entry, selected: bool) -> egui::Response
     let response = response.on_hover_text(&entry.name);
     if selected || response.hovered() {
         ui.painter()
-            .rect_filled(rect, 5, if selected { ACCENT_DARK } else { SURFACE });
+            .rect_filled(rect, 7, if selected { ACCENT_DARK } else { SURFACE });
     }
     if selected {
         ui.painter().rect_stroke(
             rect,
-            5,
+            7,
             egui::Stroke::new(1.0, BORDER),
             egui::StrokeKind::Inside,
         );
@@ -42,9 +42,9 @@ fn entry_row(ui: &mut egui::Ui, entry: &Entry, selected: bool) -> egui::Response
         .and_then(|e| e.to_str())
         .unwrap_or("");
     let (kind, color) = if entry.is_dir {
-        ("DIR", AQUA)
+        ("DIR", CYAN)
     } else if ext.eq_ignore_ascii_case("glb") {
-        ("3D", ACCENT)
+        ("3D", PINK)
     } else {
         ("FILE", MUTED)
     };

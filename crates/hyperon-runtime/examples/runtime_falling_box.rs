@@ -14,6 +14,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             ..Transform::default()
         },
         material: Material::default(),
+        ..Entity::default()
     });
     let cube = runtime.world.spawn(Entity {
         name: "Cube".into(),
@@ -22,6 +23,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             ..Transform::default()
         },
         material: Material::default(),
+        ..Entity::default()
     });
     runtime.physics.insert(
         &runtime.world,

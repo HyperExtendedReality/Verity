@@ -15,6 +15,7 @@ fn spawn(
             ..Default::default()
         },
         material: Material::default(),
+        ..Entity::default()
     });
     physics.insert(world, entity, body).unwrap();
     entity
@@ -132,6 +133,7 @@ fn friction_holds_box_on_slope() {
             ..Default::default()
         },
         material: Material::default(),
+        ..Entity::default()
     });
     let plank = Collider::Cuboid {
         half_extents: Vec3::new(10.0, 0.5, 10.0),
@@ -148,6 +150,7 @@ fn friction_holds_box_on_slope() {
             ..Default::default()
         },
         material: Material::default(),
+        ..Entity::default()
     });
     physics.insert(&world, entity, cube(0.5)).unwrap();
     run(&mut world, &mut physics, 240);
