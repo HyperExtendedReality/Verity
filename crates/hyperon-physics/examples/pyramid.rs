@@ -24,11 +24,11 @@ fn main() {
         physics.insert(world, entity, body).unwrap();
     };
     let floor = Collider::Cuboid {
-        half_extents: Vec3::new(100.0, 0.5, 100.0),
+        half_extents: Vec3::new(100.0, 100.0, 0.5),
     };
     add(
         &mut world,
-        Vec3::new(0.0, -0.5, 0.0),
+        Vec3::new(0.0, 0.0, -0.5),
         PhysicsBody::new(RigidBody::Static, floor),
     );
     let cube = Collider::Cuboid {
@@ -39,7 +39,7 @@ fn main() {
             let x = i as f32 - (rows - row) as f32 * 0.5;
             add(
                 &mut world,
-                Vec3::new(x * 1.01, 0.5 + row as f32, 0.0),
+                Vec3::new(x * 1.01, 0.0, 0.5 + row as f32),
                 PhysicsBody::new(RigidBody::Dynamic, cube),
             );
         }
@@ -54,7 +54,7 @@ fn main() {
     let elapsed = start.elapsed().as_secs_f64() * 1000.0 / steps as f64;
     let top = world
         .iter()
-        .map(|e| e.transform.translation[1])
+        .map(|e| e.transform.translation[2])
         .fold(0.0, f32::max);
     println!(
         "{} bodies, {} contacts: {elapsed:.2} ms/step, top at {top:.2} (built {:.2})",

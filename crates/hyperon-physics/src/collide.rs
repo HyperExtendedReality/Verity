@@ -5,7 +5,9 @@ use crate::Collider;
 use crate::solver::{Body, Contact};
 use glam::{Mat3, Vec3};
 
-pub(crate) const MAX_CONTACTS: usize = 8;
+/// A face manifold keeps four points spanning the largest area, enough for a
+/// stable support polygon at half the solver work of the full clip.
+pub(crate) const MAX_CONTACTS: usize = 4;
 const MAX_POLY: usize = 16;
 const AXIS_EPSILON: f32 = 1.0e-6;
 const PLANE_EPSILON: f32 = 1.0e-5;
@@ -29,7 +31,7 @@ pub(crate) fn collide(a: &Body, b: &Body) -> Option<([Vec3; 3], [Contact; MAX_CO
             let n = if distance > AXIS_EPSILON {
                 d / distance
             } else {
-                Vec3::Y
+                Vec3::Z
             };
             points.push(a.position - n * ra, b.position + n * rb, 0);
             n
@@ -300,19 +302,59 @@ fn face_contacts(
 
     let kind = if reference_is_a { FACE_A } else { FACE_B };
     let prefix = (kind << 24) | ((axis as u32) << 16) | ((incident_axis as u32) << 8);
+    // Penetrating points: polygon index and depth below the reference face.
+    let mut found = [(0usize, 0.0f32); MAX_POLY];
+    let mut n = 0;
     for (i, &p) in polygon[..count].iter().enumerate() {
         let distance = (p - center).dot(normal);
-        if distance > PLANE_EPSILON {
-            continue;
+        if distance <= PLANE_EPSILON {
+            found[n] = (i, distance);
+            n += 1;
         }
+    }
+    let (picked, len) = reduce(&polygon, &found[..n], normal);
+    for &i in &picked[..len] {
+        let (index, distance) = found[i];
+        let p = polygon[index];
         let on_reference = p - normal * distance;
         let (xa, xb) = if reference_is_a {
             (on_reference, p)
         } else {
             (p, on_reference)
         };
-        points.push(xa, xb, prefix | (i as u32 & 0xFF));
+        points.push(xa, xb, prefix | (index as u32 & 0xFF));
     }
+}
+
+/// Up to four of `found` (indices into `polygon`): the deepest, the farthest
+/// from it, then the two spanning the most area on either side of that line.
+fn reduce(
+    polygon: &[Vec3; MAX_POLY],
+    found: &[(usize, f32)],
+    normal: Vec3,
+) -> ([usize; MAX_CONTACTS], usize) {
+    if found.len() <= MAX_CONTACTS {
+        return (std::array::from_fn(|i| i), found.len());
+    }
+    let at = |i: usize| polygon[found[i].0];
+    let first = (0..found.len())
+        .min_by(|&i, &j| found[i].1.total_cmp(&found[j].1))
+        .unwrap();
+    let second = (0..found.len())
+        .max_by(|&i, &j| at(i).distance_squared(at(first)).total_cmp(&at(j).distance_squared(at(first))))
+        .unwrap();
+    let area = |i: usize| (at(second) - at(first)).cross(at(i) - at(first)).dot(normal);
+    let third = (0..found.len()).max_by(|&i, &j| area(i).total_cmp(&area(j))).unwrap();
+    let fourth = (0..found.len()).min_by(|&i, &j| area(i).total_cmp(&area(j))).unwrap();
+    let mut picked = [first, second, 0, 0];
+    let mut len = 2;
+    for i in [third, fourth] {
+        if !picked[..len].contains(&i) {
+            picked[len] = i;
+            len += 1;
+        }
+    }
+    (picked, len)
 }
 
 /// Sutherland-Hodgman: keep the part of the polygon with `n·p <= offset`.

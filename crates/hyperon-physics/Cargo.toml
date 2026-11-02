@@ -10,3 +10,6 @@ publish = false
 hyperon-core = { path = "../hyperon-core" }
 glam = "0.29"
 rayon = "1"
+
+[dev-dependencies]
+hyperon-box3d = { path = "../hyperon-box3d" }

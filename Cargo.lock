@@ -1268,6 +1268,7 @@ name = "hyperon-physics"
 version = "0.1.0"
 dependencies = [
  "glam",
+ "hyperon-box3d",
  "hyperon-core",
  "rayon",
 ]
