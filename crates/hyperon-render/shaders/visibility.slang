@@ -1,7 +1,7 @@
-// Visibility pass: rasterize depth plus (instance, triangle) IDs only. One
-// draw per instance; vertices are pulled through its index range. Draws are
-// non-indexed so the triangle ID is VertexID / 3 without needing PrimitiveID
-// (a geometry-shader capability many mobile GPUs lack).
+// Visibility pass: rasterize depth plus (instance, triangle) IDs only.
+// Non-indexed draws use primitive-local firstVertex for meshlet ranges, so
+// VertexID / 3 remains the original triangle ID without PrimitiveID (which
+// requires a geometry-shader capability many mobile GPUs lack).
 
 #include "lib/common.slang"
 
@@ -29,8 +29,7 @@ VertexOutput vertexMain(uint vertex: SV_VertexID) {
     return output;
 }
 
-[shader("fragment")]
-uint2 fragmentMain(VertexOutput input): SV_Target0 {
+void alphaTest(VertexOutput input) {
     Material material = materials[instances[draw.instance].draw.z];
     if ((material.textures.w & ALPHA_MASK) != 0) {
         float alpha = material.base_color.a * input.alpha;
@@ -39,5 +38,18 @@ uint2 fragmentMain(VertexOutput input): SV_Target0 {
         if (alpha < material.params.w)
             discard;
     }
+}
+
+// The depth prepass has no color attachment but must use the same alpha test.
+#if defined(DEPTH_ONLY)
+[shader("fragment")]
+void fragmentMain(VertexOutput input) {
+    alphaTest(input);
+}
+#else
+[shader("fragment")]
+uint2 fragmentMain(VertexOutput input): SV_Target0 {
+    alphaTest(input);
     return input.id;
 }
+#endif

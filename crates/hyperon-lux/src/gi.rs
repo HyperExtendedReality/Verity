@@ -55,6 +55,8 @@ const PASSES: &[(&str, &[u8])] = &[
     ("packProbes", spirv!("cascades", "packProbes")),
     ("temporal", spirv!("cascades", "temporal")),
     ("denoise", spirv!("cascades", "denoise")),
+    ("commitCache", spirv!("cascades", "commitCache")),
+    ("remapProbeHeads", spirv!("cascades", "remapProbeHeads")),
     ("worldResolve", spirv!("cascades", "worldResolve")),
     ("traceDeferred", spirv!("cascades", "traceDeferred")),
     ("traceRecord", spirv!("cascades", "traceRecord")),
@@ -1182,6 +1184,11 @@ impl Lux {
             device.cmd_dispatch(cmd, x.max(1), y.max(1), 1);
             compute_barrier();
         }
+        // Publish the world cache once composition is done reading it: without
+        // this, next frame's history heads point at stale working entries and
+        // every interval restarts from a single noisy sample.
+        dispatch("commitCache", compute[0], bucket_groups, 1);
+        dispatch("remapProbeHeads", compute[0], directory_groups, 1);
 
         self.history_valid = true;
         self.scene_changed = false;

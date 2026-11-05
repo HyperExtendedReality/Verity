@@ -13,6 +13,7 @@ glam = "0.29"
 egui = "0.36"
 egui-ash-renderer = "0.13"
 hyperon-core = { path = "../hyperon-core" }
+hyperon-strata = { path = "../hyperon-strata" }
 gpu-allocator = { version = "0.28", default-features = false, features = ["std", "vulkan"] }
 bytemuck = { version = "1.25.2", features = ["derive"] }
 gltf = { version = "1.4.1", default-features = false, features = ["KHR_lights_punctual", "allow_empty_texture", "extensions", "utils", "names"] }
@@ -27,3 +28,4 @@ hyperon-slang = { path = "../hyperon-slang" }
 [dev-dependencies]
 hyperon-runtime = { path = "../hyperon-runtime" }
 hyperon-box3d = { path = "../hyperon-box3d" }
+hyperon-ocean = { path = "../hyperon-ocean" }

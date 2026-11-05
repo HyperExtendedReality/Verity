@@ -1,5 +1,5 @@
-//! Moving loaded scenes onto the GPU: geometry appended to the shared
-//! device-local vertex and index buffers, and textures with full mip chains.
+//! Moving loaded scenes onto the GPU: vertices in a shared device-local
+//! buffer, per-frame indices, and textures with full mip chains.
 
 use crate::{
     asset::{self, AlphaMode, LoadOptions, TextureData, TextureFormat},
@@ -45,6 +45,11 @@ impl Renderer {
                 gpu::destroy_image(&self.device, allocator, image);
             }
             self.primitives.truncate(1);
+            self.primitive_meshlets.truncate(1);
+            self.virtual_geometry.truncate(1);
+            self.source_indices.clear();
+            self.source_indices.extend_from_slice(&indices);
+            self.frame_indices.clear();
             self.model_draws.clear();
             self.materials.clear();
             self.scene_lights.clear();
@@ -78,11 +83,45 @@ impl Renderer {
                 scene::MAX_TEXTURES
             )));
         }
+        let positions: Vec<_> = loaded
+            .vertices
+            .iter()
+            .map(|v| [v.position[0], v.position[1], v.position[2]])
+            .collect();
+        let virtual_geometry: Vec<_> = loaded
+            .primitives
+            .iter()
+            .enumerate()
+            .map(|(primitive_index, p)| {
+                let start = p.first_index as usize;
+                let end = start + p.index_count as usize;
+                let indices = &loaded.indices[start..end];
+                let budget = indices.len().saturating_mul(8).max(12);
+                let vertex_start = p.base_vertex as usize;
+                let vertex_end = loaded
+                    .primitives
+                    .get(primitive_index + 1)
+                    .map_or(positions.len(), |next| next.base_vertex as usize);
+                hyperon_strata::virtual_geometry::VirtualGeometry::cook(
+                    &positions[vertex_start..vertex_end],
+                    indices,
+                    hyperon_strata::lod::LodOptions {
+                        max_levels: 5,
+                        triangle_ratio: 0.5,
+                        max_step_error: 0.02,
+                    },
+                    12 * 1024,
+                    budget,
+                )
+                .ok()
+            })
+            .collect();
         let (material_base, draw_base) = unsafe {
             // Frames in flight read the buffers this replaces.
             self.device.device_wait_idle()?;
             let (base_vertex, first_index) =
                 self.append_geometry(&loaded.vertices, &loaded.indices)?;
+            self.source_indices.extend_from_slice(&loaded.indices);
             let texture_base = self.textures.len() as u32;
             for texture in &loaded.textures {
                 let image = self.upload_texture(texture)?;
@@ -120,6 +159,16 @@ impl Renderer {
                     base_vertex: base_vertex + p.base_vertex,
                     material: material_base + p.material,
                     ..*p
+                }));
+            self.virtual_geometry.extend(virtual_geometry);
+            self.primitive_meshlets
+                .extend(loaded.primitives.iter().map(|p| {
+                    let start = p.first_index as usize;
+                    let end = start + p.index_count as usize;
+                    crate::meshlets::build(
+                        &positions[p.base_vertex as usize..],
+                        &loaded.indices[start..end],
+                    )
                 }));
             let draw_base = self.model_draws.len() as u32;
             self.model_draws
@@ -180,110 +229,90 @@ impl Renderer {
         result
     }
 
-    /// Grow the shared vertex and index buffers by `vertices` and `indices`,
-    /// returning where the new data starts. The GPU must be idle.
+    /// Grow the shared vertex buffer and reserve source index offsets.
+    /// The GPU must be idle.
     pub(crate) unsafe fn append_geometry(
         &mut self,
         vertices: &[Vertex],
         indices: &[u32],
     ) -> Result<(u32, u32)> {
+        let new_vertex_count = self
+            .vertex_count
+            .checked_add(u32::try_from(vertices.len()).map_err(|_| failure("too many vertices"))?)
+            .ok_or_else(|| failure("too many vertices"))?;
+        let new_index_total = self
+            .index_total
+            .checked_add(u32::try_from(indices.len()).map_err(|_| failure("too many indices"))?)
+            .ok_or_else(|| failure("too many indices"))?;
         let vertex_bytes: &[u8] = bytemuck::cast_slice(vertices);
-        let index_bytes: &[u8] = bytemuck::cast_slice(indices);
         let old_vertex_bytes = self.vertex_count as u64 * mem::size_of::<Vertex>() as u64;
-        let old_index_bytes = self.index_total as u64 * 4;
         let device = &self.device;
         let allocator = self.allocator.as_mut().unwrap();
         use vk::BufferUsageFlags as U;
-        let usage = U::STORAGE_BUFFER | U::TRANSFER_SRC | U::TRANSFER_DST;
         let mut staging = gpu::create_buffer(
             device,
             allocator,
-            "geometry staging",
-            (vertex_bytes.len() + index_bytes.len()) as u64,
+            "vertex staging",
+            vertex_bytes.len() as u64,
             U::TRANSFER_SRC,
             MemoryLocation::CpuToGpu,
         )?;
-        staging.write(&[vertex_bytes, index_bytes].concat());
-        let created = (|| -> Result<_> {
-            let v = gpu::create_buffer(
-                device,
-                allocator,
-                "vertices",
-                old_vertex_bytes + vertex_bytes.len() as u64,
-                usage,
-                MemoryLocation::GpuOnly,
-            )?;
-            match gpu::create_buffer(
-                device,
-                allocator,
-                "indices",
-                old_index_bytes + index_bytes.len() as u64,
-                usage,
-                MemoryLocation::GpuOnly,
-            ) {
-                Ok(i) => Ok((v, i)),
-                Err(e) => {
-                    gpu::destroy_buffer(device, allocator, v);
-                    Err(e)
-                }
-            }
-        })();
-        let (new_vertices, new_indices) = match created {
-            Ok(buffers) => buffers,
-            Err(e) => {
+        staging.write(vertex_bytes);
+        let new_vertices = match gpu::create_buffer(
+            device,
+            allocator,
+            "vertices",
+            old_vertex_bytes + vertex_bytes.len() as u64,
+            U::STORAGE_BUFFER | U::TRANSFER_SRC | U::TRANSFER_DST,
+            MemoryLocation::GpuOnly,
+        ) {
+            Ok(buffer) => buffer,
+            Err(error) => {
                 gpu::destroy_buffer(device, allocator, staging);
-                return Err(e);
+                return Err(error);
             }
         };
-        let (old_vertices, old_indices) = (self.vertices.buffer, self.indices.buffer);
+        let old_vertices = self.vertices.buffer;
         let result = self.submit_once(|cmd| {
-            let copy = |src, dst, src_offset, dst_offset, size| {
-                if size > 0 {
-                    let region = vk::BufferCopy {
-                        src_offset,
-                        dst_offset,
-                        size,
-                    };
-                    device.cmd_copy_buffer(cmd, src, dst, &[region]);
-                }
-            };
-            copy(old_vertices, new_vertices.buffer, 0, 0, old_vertex_bytes);
-            copy(old_indices, new_indices.buffer, 0, 0, old_index_bytes);
-            copy(
-                staging.buffer,
-                new_vertices.buffer,
-                0,
-                old_vertex_bytes,
-                vertex_bytes.len() as u64,
-            );
-            copy(
-                staging.buffer,
-                new_indices.buffer,
-                vertex_bytes.len() as u64,
-                old_index_bytes,
-                index_bytes.len() as u64,
-            );
+            if old_vertex_bytes > 0 {
+                device.cmd_copy_buffer(
+                    cmd,
+                    old_vertices,
+                    new_vertices.buffer,
+                    &[vk::BufferCopy {
+                        src_offset: 0,
+                        dst_offset: 0,
+                        size: old_vertex_bytes,
+                    }],
+                );
+            }
+            if !vertex_bytes.is_empty() {
+                device.cmd_copy_buffer(
+                    cmd,
+                    staging.buffer,
+                    new_vertices.buffer,
+                    &[vk::BufferCopy {
+                        src_offset: 0,
+                        dst_offset: old_vertex_bytes,
+                        size: vertex_bytes.len() as u64,
+                    }],
+                );
+            }
         });
         let allocator = self.allocator.as_mut().unwrap();
         gpu::destroy_buffer(device, allocator, staging);
-        if let Err(e) = result {
+        if let Err(error) = result {
             gpu::destroy_buffer(device, allocator, new_vertices);
-            gpu::destroy_buffer(device, allocator, new_indices);
-            return Err(e);
+            return Err(error);
         }
         gpu::destroy_buffer(
             device,
             allocator,
             mem::replace(&mut self.vertices, new_vertices),
         );
-        gpu::destroy_buffer(
-            device,
-            allocator,
-            mem::replace(&mut self.indices, new_indices),
-        );
         let start = (self.vertex_count, self.index_total);
-        self.vertex_count += vertices.len() as u32;
-        self.index_total += indices.len() as u32;
+        self.vertex_count = new_vertex_count;
+        self.index_total = new_index_total;
         for frame in 0..self.frames.len() {
             self.write_buffer_descriptors(frame);
         }

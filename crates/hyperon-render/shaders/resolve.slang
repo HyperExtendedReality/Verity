@@ -229,5 +229,14 @@ void resolveMain(uint3 id: SV_DispatchThreadID) {
                 * point_shadow(i, light, s.position, face);
         }
     }
+    if (globals.counts.w != 0) {
+        uint level = uint(instance.normal_columns[0].w);
+        float3 colors[5] = {
+            float3(0.1, 0.8, 0.2), float3(0.1, 0.5, 1.0),
+            float3(1.0, 0.8, 0.1), float3(1.0, 0.3, 0.1),
+            float3(0.8, 0.1, 0.9)
+        };
+        result = colors[min(level, 4)];
+    }
     hdr_output[pixel] = float4(result, 1.0);
 }

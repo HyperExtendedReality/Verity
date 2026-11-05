@@ -15,6 +15,8 @@
 pub mod asset;
 pub mod extension;
 pub mod gpu;
+mod gpu_culling;
+mod meshlets;
 mod scene;
 mod upload;
 
@@ -58,6 +60,8 @@ macro_rules! spirv {
         include_bytes!(concat!(env!("OUT_DIR"), "/", $name, ".spv"))
     };
 }
+
+pub mod breaker;
 
 /// Tessellated UI and the physical-pixel scene viewport within the swapchain.
 pub struct UiFrame {
@@ -106,6 +110,23 @@ fn failure(message: impl Into<String>) -> Box<dyn Error> {
     Box::new(io::Error::other(message.into()))
 }
 
+fn append_lod_range(
+    arena: &mut Vec<u32>,
+    ranges: &mut std::collections::HashMap<(usize, usize), (u32, u32)>,
+    key: (usize, usize),
+    indices: &[u32],
+) -> Option<(u32, u32)> {
+    if let Some(&range) = ranges.get(&key) {
+        return Some(range);
+    }
+    let first = u32::try_from(arena.len()).ok()?;
+    let count = u32::try_from(indices.len()).ok()?;
+    first.checked_add(count)?;
+    arena.extend_from_slice(indices);
+    ranges.insert(key, (first, count));
+    Some((first, count))
+}
+
 /// Per-frame CPU-written data and the commands that read it.
 #[derive(Default)]
 struct Frame {
@@ -115,6 +136,7 @@ struct Frame {
     set: vk::DescriptorSet,
     globals: Buffer,
     instances: Buffer,
+    indices: Buffer,
     lights: Buffer,
     materials: Buffer,
     /// egui textures to free once this frame's fence signals.
@@ -180,6 +202,8 @@ pub struct Renderer {
     visibility_pipeline: vk::Pipeline,
     /// Same as `visibility_pipeline` without back-face culling.
     visibility_two_sided: vk::Pipeline,
+    depth_prepass: vk::Pipeline,
+    depth_prepass_two_sided: vk::Pipeline,
     resolve_pipeline: vk::Pipeline,
     /// Built for the swapchain format, so rebuilt when that changes.
     composite_pipeline: vk::Pipeline,
@@ -189,7 +213,6 @@ pub struct Renderer {
     frame: usize,
     clusters: Buffer,
     vertices: Buffer,
-    indices: Buffer,
     brdf_lut: Buffer,
     vertex_count: u32,
     index_total: u32,
@@ -207,6 +230,14 @@ pub struct Renderer {
     textures: Vec<Image>,
     /// Index ranges; primitive 0 is the unit cube world entities draw with.
     primitives: Vec<asset::Primitive>,
+    /// Meshlets in primitive order; missing metadata means draw the whole primitive.
+    primitive_meshlets: Vec<Option<Vec<meshlets::Meshlet>>>,
+    virtual_geometry: Vec<Option<hyperon_strata::virtual_geometry::VirtualGeometry>>,
+    /// Original indices remain available for exact fallback.
+    source_indices: Vec<u32>,
+    frame_indices: Vec<u32>,
+    strata_enabled: bool,
+    strata_debug: bool,
     model_draws: Vec<asset::Draw>,
     materials: Vec<LoadedMaterial>,
     scene_lights: Vec<PointLight>,
@@ -221,6 +252,7 @@ pub struct Renderer {
     frame_lights: Vec<PointLight>,
     frame_number: u64,
     extension: Option<Box<dyn RenderExtension>>,
+    breakers: breaker::BreakerPass,
     requested_size: (u32, u32),
     recreate: bool,
     ui_renderer:
@@ -230,8 +262,14 @@ pub struct Renderer {
     instance_data: Vec<scene::Instance>,
     light_data: Vec<scene::Light>,
     material_data: Vec<scene::GpuMaterial>,
-    /// Index count and two-sidedness of each instance this frame.
-    draw_calls: Vec<(u32, bool)>,
+    /// Index count, two-sidedness, and primitive index for each instance.
+    draw_calls: Vec<(u32, bool, usize)>,
+    shadow_calls: Vec<(u32, u32)>,
+    culler: Option<gpu_culling::Culler>,
+    culling_ranges: Vec<Option<(usize, usize)>>,
+    culling_active: bool,
+    hiz_active: bool,
+    depth_sampled: bool,
 }
 
 impl Renderer {
@@ -326,6 +364,8 @@ impl Renderer {
                 descriptor_pool: vk::DescriptorPool::null(),
                 cluster_pipeline: vk::Pipeline::null(),
                 visibility_pipeline: vk::Pipeline::null(),
+                depth_prepass: vk::Pipeline::null(),
+                depth_prepass_two_sided: vk::Pipeline::null(),
                 visibility_two_sided: vk::Pipeline::null(),
                 resolve_pipeline: vk::Pipeline::null(),
                 composite_pipeline: vk::Pipeline::null(),
@@ -335,7 +375,6 @@ impl Renderer {
                 frame: 0,
                 clusters: Buffer::default(),
                 vertices: Buffer::default(),
-                indices: Buffer::default(),
                 brdf_lut: Buffer::default(),
                 vertex_count: 0,
                 index_total: 0,
@@ -351,6 +390,12 @@ impl Renderer {
                 anisotropy,
                 textures: Vec::new(),
                 primitives: Vec::new(),
+                primitive_meshlets: Vec::new(),
+                virtual_geometry: Vec::new(),
+                source_indices: Vec::new(),
+                frame_indices: Vec::new(),
+                strata_enabled: false,
+                strata_debug: false,
                 model_draws: Vec::new(),
                 materials: Vec::new(),
                 scene_lights: Vec::new(),
@@ -363,6 +408,7 @@ impl Renderer {
                 frame_lights: Vec::new(),
                 frame_number: 0,
                 extension: None,
+                breakers: breaker::BreakerPass::default(),
                 requested_size: (size.width, size.height),
                 recreate: true,
                 ui_renderer: None,
@@ -372,9 +418,25 @@ impl Renderer {
                 light_data: Vec::new(),
                 material_data: Vec::new(),
                 draw_calls: Vec::new(),
+                shadow_calls: Vec::new(),
+                culler: None,
+                culling_ranges: Vec::new(),
+                hiz_active: false,
+                depth_sampled: false,
+                culling_active: false,
             };
             // Drop releases whatever a failed step leaves behind.
             renderer.init_resources()?;
+            let limits = renderer
+                .instance
+                .get_physical_device_properties(physical)
+                .limits;
+            renderer.culler = gpu_culling::Culler::new(&renderer.device, limits).ok();
+            renderer.depth_sampled = renderer
+                .instance
+                .get_physical_device_format_properties(physical, renderer.depth_format)
+                .optimal_tiling_features
+                .contains(vk::FormatFeatureFlags::SAMPLED_IMAGE);
             if size.width > 0 && size.height > 0 {
                 renderer.rebuild_swapchain()?;
             }
@@ -520,6 +582,23 @@ impl Renderer {
                 },
             )?;
         }
+        for (pipeline, cull) in [
+            (&mut self.depth_prepass, vk::CullModeFlags::BACK),
+            (&mut self.depth_prepass_two_sided, vk::CullModeFlags::NONE),
+        ] {
+            *pipeline = gpu::graphics_pipeline(
+                device,
+                layout,
+                &gpu::Raster {
+                    vertex: spirv!("visibility.vertexMain"),
+                    fragment: spirv!("depth_prepass.fragmentMain"),
+                    color: None,
+                    depth: Some((self.depth_format, vk::CompareOp::GREATER)),
+                    cull,
+                    depth_bias: None,
+                },
+            )?;
+        }
         let mut sampler = vk::SamplerCreateInfo::default()
             .mag_filter(vk::Filter::LINEAR)
             .min_filter(vk::Filter::LINEAR)
@@ -653,6 +732,14 @@ impl Renderer {
                 storage,
                 MemoryLocation::CpuToGpu,
             )?;
+            frame.indices = gpu::create_buffer(
+                device,
+                allocator,
+                "frame indices",
+                16,
+                storage,
+                MemoryLocation::CpuToGpu,
+            )?;
             frame.lights = gpu::create_buffer(
                 device,
                 allocator,
@@ -679,6 +766,14 @@ impl Renderer {
             base_vertex: 0,
             material: 0,
         });
+        let positions: Vec<_> = vertices
+            .iter()
+            .map(|v| [v.position[0], v.position[1], v.position[2]])
+            .collect();
+        self.primitive_meshlets
+            .push(meshlets::build(&positions, &indices));
+        self.virtual_geometry.push(None);
+        self.source_indices.extend_from_slice(&indices);
         self.write_texture_descriptors();
         Ok(())
     }
@@ -774,6 +869,27 @@ impl Renderer {
         self.sun_is_imported = false;
     }
 
+    /// Install or replace the shore surface without replacing render extensions.
+    /// Grid arrays are copied once and uploaded independently to each in-flight
+    /// frame. Update only the time with [`Self::set_breaker_time`] thereafter.
+    pub fn set_breakers(
+        &mut self,
+        grid: breaker::BreakerGrid<'_>,
+        profile: breaker::BreakerProfile,
+    ) -> Result<()> {
+        self.breakers.set(grid, profile)
+    }
+
+    /// Set the shore-wave time in seconds without re-uploading its grid.
+    pub fn set_breaker_time(&mut self, time: f32) {
+        self.breakers.set_time(time);
+    }
+
+    /// Stop rendering the shore-wave surface.
+    pub fn clear_breakers(&mut self) {
+        self.breakers.clear();
+    }
+
     /// Install an extension such as GI, replacing any current one. Install it
     /// before loading scenes: it only learns about scenes loaded afterwards.
     pub fn set_extension(&mut self, mut extension: Box<dyn RenderExtension>) -> Result<()> {
@@ -846,6 +962,16 @@ impl Renderer {
         self.texture_format
     }
 
+    /// Enable demand-resolved, per-frame virtual geometry for imported meshes.
+    pub fn set_strata_enabled(&mut self, enabled: bool) {
+        self.strata_enabled = enabled;
+    }
+
+    /// Color visible surfaces by the LOD actually selected for that frame.
+    pub fn set_strata_debug(&mut self, enabled: bool) {
+        self.strata_debug = enabled;
+    }
+
     /// Point a frame's descriptor set at its buffers and the shared ones.
     unsafe fn write_buffer_descriptors(&self, index: usize) {
         let frame = &self.frames[index];
@@ -855,7 +981,7 @@ impl Renderer {
             &frame.lights,
             &self.clusters,
             &self.vertices,
-            &self.indices,
+            &frame.indices,
             &self.brdf_lut,
         ];
         let mut infos: Vec<(u32, [vk::DescriptorBufferInfo; 1])> = buffers
@@ -1123,7 +1249,7 @@ impl Renderer {
             HDR_FORMAT,
             extent,
             1,
-            U::STORAGE | U::SAMPLED,
+            U::STORAGE | U::SAMPLED | U::COLOR_ATTACHMENT,
             vk::ImageAspectFlags::COLOR,
         )?);
         for (target, name, format) in [
@@ -1301,6 +1427,17 @@ impl Renderer {
             )?;
             self.record_scene(command, set, viewport)?;
             self.record_extension(command, set, viewport)?;
+            self.breakers.record(
+                &self.device,
+                self.allocator.as_mut().unwrap(),
+                self.depth_format,
+                frame_index,
+                command,
+                viewport,
+                self.frame_view_proj.0,
+                self.swap.hdr.as_ref().unwrap(),
+                self.swap.depth.as_ref().unwrap(),
+            )?;
             self.record_present(command, set, image as usize, viewport, ui.as_ref())?;
             self.frame_number += 1;
             let device = &self.device;
@@ -1383,6 +1520,10 @@ impl Renderer {
     unsafe fn upload_frame(&mut self, scene: &RenderInput<'_>, viewport: [u32; 4]) -> Result<()> {
         self.instance_data.clear();
         self.draw_calls.clear();
+        self.shadow_calls.clear();
+        self.frame_indices.clear();
+        let mut ranges = std::collections::HashMap::<(usize, usize), (u32, u32)>::new();
+        let mut selected_indices = Vec::new();
         self.material_data.clear();
         self.material_data
             .extend(self.materials.iter().map(|m| m.gpu));
@@ -1398,11 +1539,39 @@ impl Renderer {
                 primitive.base_vertex,
                 primitive.material,
             );
+            let primitive_index = draw.primitive as usize;
+            let mut level = 0;
+            if self.strata_enabled {
+                if let Some(geometry) = self.virtual_geometry[primitive_index].as_mut() {
+                    let scale = geometry.bounds().map_or(f64::INFINITY, |bounds| {
+                        scene::lod_projection_scale(&self.camera, viewport, draw.transform, bounds)
+                    });
+                    level = geometry
+                        .resolve(scale, 1.0, &mut selected_indices)
+                        .unwrap_or(0);
+                }
+            }
+            let original_start = primitive.first_index as usize;
+            let original_end = original_start + primitive.index_count as usize;
+            let indices = if level == 0 {
+                &self.source_indices[original_start..original_end]
+            } else {
+                &selected_indices
+            };
+            let (first, index_count) = append_lod_range(
+                &mut self.frame_indices,
+                &mut ranges,
+                (primitive_index, level),
+                indices,
+            )
+            .ok_or_else(|| failure("too many frame geometry indices"))?;
+            instance.draw[0] = first;
+            instance.normal_columns[0][3] = level as f32;
             // The stable draw index extensions know from `scene_loaded`.
             instance.draw[3] = index as u32;
             self.instance_data.push(instance);
             self.draw_calls
-                .push((primitive.index_count, material.double_sided));
+                .push((index_count, material.double_sided, draw.primitive as usize));
         }
         // World entities are unit cubes, each with its own plain material.
         let cube = self.primitives[0];
@@ -1413,11 +1582,27 @@ impl Renderer {
             };
             let index = self.material_data.len() as u32;
             self.material_data.push(scene::GpuMaterial::plain(material));
-            let mut instance = scene::instance(model, cube.first_index, cube.base_vertex, index);
+            let start = cube.first_index as usize;
+            let end = start + cube.index_count as usize;
+            let (first, _) = append_lod_range(
+                &mut self.frame_indices,
+                &mut ranges,
+                (0, 0),
+                &self.source_indices[start..end],
+            )
+            .ok_or_else(|| failure("too many frame geometry indices"))?;
+            let mut instance = scene::instance(model, first, cube.base_vertex, index);
             instance.draw[3] = model_draws + entity as u32;
             self.instance_data.push(instance);
-            self.draw_calls.push((cube.index_count, false));
+            self.draw_calls.push((cube.index_count, false, 0));
         }
+        // All casters are retained, including those outside the camera.
+        self.shadow_calls.extend(
+            self.draw_calls
+                .iter()
+                .enumerate()
+                .map(|(index, &(count, _, _))| (index as u32, count)),
+        );
         self.frame_lights.clear();
         self.frame_lights
             .extend(self.scene_lights.iter().chain(scene.lights()).cloned());
@@ -1456,6 +1641,7 @@ impl Renderer {
             self.previous_view_proj,
             self.swap.srgb,
         );
+        globals.counts[3] = u32::from(self.strata_debug);
         for (slot, light) in self.frame_lights.iter().take(MAX_POINT_SHADOWS).enumerate() {
             if light.radius.is_finite()
                 && light.radius > 0.0
@@ -1470,6 +1656,66 @@ impl Renderer {
         let view_proj = glam::Mat4::from_cols_array_2d(&globals.view_proj);
         self.frame_view_proj = (view_proj, self.previous_view_proj.unwrap_or(view_proj));
         self.previous_view_proj = Some(view_proj);
+        self.culling_ranges.clear();
+        let mut jobs = Vec::new();
+        let use_culling = self.strata_enabled && self.culler.is_some();
+        for (instance, &(count, _, primitive)) in
+            self.draw_calls.iter().enumerate().filter(|_| use_culling)
+        {
+            let record = &self.instance_data[instance];
+            let model = glam::Mat4::from_cols_array_2d(&record.model);
+            let start = jobs.len();
+            if record.normal_columns[0][3] == 0.0 {
+                if let Some(meshlets) = &self.primitive_meshlets[primitive] {
+                    for meshlet in meshlets {
+                        jobs.push(gpu_culling::Job::new(
+                            view_proj,
+                            model,
+                            meshlet.bounds.min,
+                            meshlet.bounds.max,
+                            meshlet.first_triangle * 3,
+                            meshlet.triangle_count * 3,
+                        ));
+                    }
+                }
+            } else if let Some(bounds) = self.virtual_geometry[primitive]
+                .as_ref()
+                .and_then(|geometry| geometry.bounds())
+            {
+                jobs.push(gpu_culling::Job::new(
+                    view_proj, model, bounds.min, bounds.max, 0, count,
+                ));
+            }
+            self.culling_ranges
+                .push((jobs.len() > start).then_some((start, jobs.len())));
+        }
+        self.culling_active = self.strata_enabled
+            && self.culler.as_mut().is_some_and(|culler| {
+                culler
+                    .prepare(
+                        &self.device,
+                        self.allocator.as_mut().unwrap(),
+                        self.frame,
+                        &jobs,
+                    )
+                    .unwrap_or(false)
+            });
+        self.hiz_active = self.culling_active
+            && self.depth_sampled
+            && !jobs.is_empty()
+            && viewport[2] > 0
+            && viewport[3] > 0
+            && self.culler.as_mut().is_some_and(|culler| {
+                culler
+                    .prepare_hiz(
+                        &self.device,
+                        self.allocator.as_mut().unwrap(),
+                        self.frame,
+                        self.swap.depth.as_ref().unwrap().view,
+                        self.swap.extent,
+                    )
+                    .unwrap_or(false)
+            });
 
         let device = &self.device;
         let allocator = self.allocator.as_mut().unwrap();
@@ -1481,6 +1727,11 @@ impl Renderer {
                 &mut frame.instances,
                 "instances",
                 bytemuck::cast_slice::<_, u8>(&self.instance_data),
+            ),
+            (
+                &mut frame.indices,
+                "frame indices",
+                bytemuck::cast_slice::<_, u8>(&self.frame_indices),
             ),
             (
                 &mut frame.lights,
@@ -1586,6 +1837,20 @@ impl Renderer {
             1,
             1,
         );
+        if self.culling_active {
+            self.culler
+                .as_ref()
+                .unwrap()
+                .record(device, cmd, self.frame);
+            device.cmd_bind_descriptor_sets(
+                cmd,
+                vk::PipelineBindPoint::COMPUTE,
+                self.pipeline_layout,
+                0,
+                &[set],
+                &[],
+            );
+        }
 
         // Both images are shared across frames. The queue dependency protects the
         // prior resolve's sampled reads before discarding and rewriting the maps.
@@ -1673,9 +1938,9 @@ impl Renderer {
                         vk::PipelineBindPoint::GRAPHICS,
                         self.shadow_pipeline,
                     );
-                    for (instance, &(index_count, _)) in self.draw_calls.iter().enumerate() {
+                    for &(instance, index_count) in &self.shadow_calls {
                         let matrix = index + if point { scene::CASCADES } else { 0 };
-                        let push = [instance as u32, matrix as u32];
+                        let push = [instance, matrix as u32];
                         device.cmd_push_constants(
                             cmd,
                             self.pipeline_layout,
@@ -1700,6 +1965,105 @@ impl Renderer {
                 &[],
             );
         }
+        if self.hiz_active {
+            barrier(
+                &[gpu::image_barrier(
+                    depth.image,
+                    vk::ImageAspectFlags::DEPTH,
+                    S::ALL_COMMANDS,
+                    A::NONE,
+                    S::EARLY_FRAGMENT_TESTS | S::LATE_FRAGMENT_TESTS,
+                    A::DEPTH_STENCIL_ATTACHMENT_WRITE,
+                    L::UNDEFINED,
+                    L::DEPTH_ATTACHMENT_OPTIMAL,
+                )],
+                &[],
+            );
+            let depth_attachment = vk::RenderingAttachmentInfo::default()
+                .image_view(depth.view)
+                .image_layout(L::DEPTH_ATTACHMENT_OPTIMAL)
+                .load_op(vk::AttachmentLoadOp::CLEAR)
+                .store_op(vk::AttachmentStoreOp::STORE)
+                .clear_value(vk::ClearValue {
+                    depth_stencil: vk::ClearDepthStencilValue {
+                        depth: 0.0,
+                        stencil: 0,
+                    },
+                });
+            device.cmd_begin_rendering(
+                cmd,
+                &vk::RenderingInfo::default()
+                    .render_area(vk::Rect2D {
+                        offset: vk::Offset2D::default(),
+                        extent,
+                    })
+                    .layer_count(1)
+                    .depth_attachment(&depth_attachment),
+            );
+            set_viewport(device, cmd, area);
+            let mut bound = None;
+            for (instance, &(count, two_sided, _)) in self.draw_calls.iter().enumerate() {
+                if bound != Some(two_sided) {
+                    device.cmd_bind_pipeline(
+                        cmd,
+                        vk::PipelineBindPoint::GRAPHICS,
+                        if two_sided {
+                            self.depth_prepass_two_sided
+                        } else {
+                            self.depth_prepass
+                        },
+                    );
+                    bound = Some(two_sided);
+                }
+                device.cmd_push_constants(
+                    cmd,
+                    self.pipeline_layout,
+                    vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT,
+                    0,
+                    &(instance as u32).to_ne_bytes(),
+                );
+                device.cmd_draw(cmd, count, 1, 0, 0);
+            }
+            device.cmd_end_rendering(cmd);
+            barrier(
+                &[gpu::image_barrier(
+                    depth.image,
+                    vk::ImageAspectFlags::DEPTH,
+                    S::EARLY_FRAGMENT_TESTS | S::LATE_FRAGMENT_TESTS,
+                    A::DEPTH_STENCIL_ATTACHMENT_WRITE,
+                    S::COMPUTE_SHADER,
+                    A::SHADER_SAMPLED_READ,
+                    L::DEPTH_ATTACHMENT_OPTIMAL,
+                    L::DEPTH_READ_ONLY_OPTIMAL,
+                )],
+                &[],
+            );
+            self.culler
+                .as_ref()
+                .unwrap()
+                .record_occlusion(device, cmd, self.frame, extent, viewport);
+            device.cmd_bind_descriptor_sets(
+                cmd,
+                vk::PipelineBindPoint::COMPUTE,
+                self.pipeline_layout,
+                0,
+                &[set],
+                &[],
+            );
+            barrier(
+                &[gpu::image_barrier(
+                    depth.image,
+                    vk::ImageAspectFlags::DEPTH,
+                    S::COMPUTE_SHADER,
+                    A::SHADER_SAMPLED_READ,
+                    S::EARLY_FRAGMENT_TESTS | S::LATE_FRAGMENT_TESTS,
+                    A::DEPTH_STENCIL_ATTACHMENT_READ | A::DEPTH_STENCIL_ATTACHMENT_WRITE,
+                    L::DEPTH_READ_ONLY_OPTIMAL,
+                    L::DEPTH_ATTACHMENT_OPTIMAL,
+                )],
+                &[],
+            );
+        }
 
         // Visibility: depth plus (instance, triangle) IDs.
         barrier(
@@ -1720,8 +2084,12 @@ impl Renderer {
                     S::LATE_FRAGMENT_TESTS,
                     A::NONE,
                     S::EARLY_FRAGMENT_TESTS | S::LATE_FRAGMENT_TESTS,
-                    A::DEPTH_STENCIL_ATTACHMENT_WRITE,
-                    L::UNDEFINED,
+                    A::DEPTH_STENCIL_ATTACHMENT_READ | A::DEPTH_STENCIL_ATTACHMENT_WRITE,
+                    if self.hiz_active {
+                        L::DEPTH_ATTACHMENT_OPTIMAL
+                    } else {
+                        L::UNDEFINED
+                    },
                     L::DEPTH_ATTACHMENT_OPTIMAL,
                 ),
             ],
@@ -1745,7 +2113,7 @@ impl Renderer {
             .image_view(depth.view)
             .image_layout(L::DEPTH_ATTACHMENT_OPTIMAL)
             .load_op(vk::AttachmentLoadOp::CLEAR)
-            .store_op(vk::AttachmentStoreOp::DONT_CARE)
+            .store_op(vk::AttachmentStoreOp::STORE)
             .clear_value(vk::ClearValue {
                 depth_stencil: vk::ClearDepthStencilValue {
                     depth: 0.0,
@@ -1763,7 +2131,9 @@ impl Renderer {
         if visible {
             set_viewport(device, cmd, area);
             let mut bound = None;
-            for (instance, &(index_count, two_sided)) in self.draw_calls.iter().enumerate() {
+            for (instance, &(index_count, two_sided, primitive)) in
+                self.draw_calls.iter().enumerate()
+            {
                 if bound != Some(two_sided) {
                     let pipeline = if two_sided {
                         self.visibility_two_sided
@@ -1780,7 +2150,28 @@ impl Renderer {
                     0,
                     &(instance as u32).to_ne_bytes(),
                 );
-                device.cmd_draw(cmd, index_count, 1, 0, 0);
+                if self.culling_active && self.culling_ranges[instance].is_some() {
+                    let (start, end) = self.culling_ranges[instance].unwrap();
+                    let culler = self.culler.as_ref().unwrap();
+                    for job in start..end {
+                        culler.draw(device, cmd, self.frame, job);
+                    }
+                } else if let Some(meshlets) = self.primitive_meshlets[primitive]
+                    .as_ref()
+                    .filter(|_| self.instance_data[instance].normal_columns[0][3] == 0.0)
+                {
+                    let model = glam::Mat4::from_cols_array_2d(&self.instance_data[instance].model);
+                    meshlets::visible_runs(
+                        meshlets,
+                        self.frame_view_proj.0,
+                        model,
+                        |first, count| {
+                            device.cmd_draw(cmd, count, 1, first, 0);
+                        },
+                    );
+                } else {
+                    device.cmd_draw(cmd, index_count, 1, 0, 0);
+                }
             }
         }
         device.cmd_end_rendering(cmd);
@@ -2122,9 +2513,17 @@ unsafe fn pick_device(
         let visibility = instance
             .get_physical_device_format_properties(physical, VISIBILITY_FORMAT)
             .optimal_tiling_features;
+        let hdr = instance
+            .get_physical_device_format_properties(physical, HDR_FORMAT)
+            .optimal_tiling_features;
         if !has(ash::khr::swapchain::NAME)
             || !visibility.contains(
                 vk::FormatFeatureFlags::COLOR_ATTACHMENT | vk::FormatFeatureFlags::SAMPLED_IMAGE,
+            )
+            || !hdr.contains(
+                vk::FormatFeatureFlags::COLOR_ATTACHMENT
+                    | vk::FormatFeatureFlags::SAMPLED_IMAGE
+                    | vk::FormatFeatureFlags::STORAGE_IMAGE,
             )
         {
             continue;
@@ -2210,6 +2609,12 @@ impl Drop for Renderer {
                     extension.destroy(&mut self.gpu());
                 }
             }
+            if let Some(allocator) = self.allocator.as_mut() {
+                if let Some(culler) = self.culler.take() {
+                    culler.destroy(&self.device, allocator);
+                }
+                self.breakers.destroy(&self.device, allocator);
+            }
             if self.allocator.is_some() {
                 self.clear_swapchain();
             }
@@ -2228,6 +2633,7 @@ impl Drop for Renderer {
                     for buffer in [
                         frame.globals,
                         frame.instances,
+                        frame.indices,
                         frame.lights,
                         frame.materials,
                     ] {
@@ -2237,7 +2643,6 @@ impl Drop for Renderer {
                 for buffer in [
                     mem::take(&mut self.clusters),
                     mem::take(&mut self.vertices),
-                    mem::take(&mut self.indices),
                     mem::take(&mut self.brdf_lut),
                 ] {
                     gpu::destroy_buffer(device, allocator, buffer);
@@ -2257,6 +2662,8 @@ impl Drop for Renderer {
                 self.cluster_pipeline,
                 self.visibility_pipeline,
                 self.visibility_two_sided,
+                self.depth_prepass,
+                self.depth_prepass_two_sided,
                 self.resolve_pipeline,
                 self.composite_pipeline,
             ] {
@@ -2273,5 +2680,31 @@ impl Drop for Renderer {
             self.surface_loader.destroy_surface(self.surface, None);
             self.instance.destroy_instance(None);
         }
+    }
+}
+
+#[cfg(test)]
+mod virtual_geometry_tests {
+    use super::*;
+
+    #[test]
+    fn selected_ranges_keep_source_and_deduplicate_by_primitive_and_level() {
+        let mut arena = vec![0, 1, 2, 2, 3, 0];
+        let mut ranges = std::collections::HashMap::new();
+        let range = append_lod_range(&mut arena, &mut ranges, (4, 1), &[2, 3, 1]).unwrap();
+        assert_eq!(range, (6, 3));
+        assert_eq!(
+            &arena[range.0 as usize..(range.0 + range.1) as usize],
+            &[2, 3, 1]
+        );
+        assert_eq!(
+            append_lod_range(&mut arena, &mut ranges, (4, 1), &[9]),
+            Some(range)
+        );
+        assert_eq!(&arena[..6], &[0, 1, 2, 2, 3, 0]);
+        assert_eq!(
+            append_lod_range(&mut arena, &mut ranges, (5, 1), &[7, 8, 9]),
+            Some((9, 3))
+        );
     }
 }

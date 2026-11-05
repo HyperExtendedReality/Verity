@@ -8,6 +8,7 @@ license.workspace = true
 hyperon-core = { path = "../hyperon-core" }
 hyperon-box3d = { path = "../hyperon-box3d" }
 glam = "0.29"
+hyperon-physics = { version = "0.1.0", path = "../hyperon-physics" }
 
 [dev-dependencies]
 serde_json = "1"

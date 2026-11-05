@@ -5,7 +5,8 @@ use egui::{
 };
 use glam::Vec3;
 use hyperon_core::{
-    ComponentRegistry, Entity, FieldMut, LightingMethod, Material, PointLight, Scene, Transform,
+    ComponentRegistry, Entity, FieldMut, LightingMethod, Material, PhysicsEngine, PointLight,
+    Scene, Transform,
 };
 use hyperon_render::UP;
 use winit::window::ResizeDirection;
@@ -85,6 +86,7 @@ impl Fly {
 
 pub struct Tools {
     pub browser: crate::asset_browser::AssetBrowser,
+    pub profiler: crate::profiler::Profiler,
     pub gizmo: crate::gizmo::Gizmo,
     pub camera: hyperon_render::Camera,
     pub fly: Fly,
@@ -92,6 +94,10 @@ pub struct Tools {
     pub flying: bool,
     pub maximized: bool,
     pub light_limit: usize,
+    /// Enable Strata geometry selection for the current editor session.
+    pub strata_enabled: bool,
+    /// Display the renderer's Strata geometry diagnostics.
+    pub strata_debug: bool,
     /// GI readiness, shown while the scene uses Split Radiance Cascades.
     pub gi_status: Option<String>,
     /// Component types the inspector can add and edit.
@@ -109,6 +115,7 @@ impl Default for Tools {
         let direction = (camera.target - camera.eye).normalize();
         Self {
             browser: Default::default(),
+            profiler: Default::default(),
             gizmo: Default::default(),
             fly: Fly {
                 yaw: direction.y.atan2(direction.x),
@@ -119,6 +126,8 @@ impl Default for Tools {
             flying: false,
             maximized: false,
             light_limit: hyperon_render::MAX_LIGHTS,
+            strata_enabled: false,
+            strata_debug: false,
             gi_status: None,
             registry: hyperon_runtime::registry(),
             play: PlayState::Editing,
@@ -141,7 +150,7 @@ pub(crate) const ACCENT: Color32 = Color32::from_rgb(57, 255, 136);
 pub(crate) const ACCENT_DARK: Color32 = Color32::from_rgb(22, 56, 38);
 pub(crate) const PINK: Color32 = Color32::from_rgb(255, 61, 172);
 pub(crate) const CYAN: Color32 = Color32::from_rgb(38, 214, 255);
-const AMBER: Color32 = Color32::from_rgb(255, 196, 64);
+pub(crate) const AMBER: Color32 = Color32::from_rgb(255, 196, 64);
 const RADIUS: u8 = 10;
 const CLOSE_HOVER: Color32 = Color32::from_rgb(214, 38, 90);
 const TITLE_HEIGHT: f32 = 36.0;
@@ -368,9 +377,18 @@ fn components(
         ui.push_id(name.as_str(), |ui| {
             ui.add_space(10.0);
             ui.horizontal(|ui| {
-                ui.label(RichText::new(name.to_uppercase()).size(10.0).strong().color(MUTED));
+                ui.label(
+                    RichText::new(name.to_uppercase())
+                        .size(10.0)
+                        .strong()
+                        .color(MUTED),
+                );
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui.small_button("✕").on_hover_text("Remove component").clicked() {
+                    if ui
+                        .small_button("✕")
+                        .on_hover_text("Remove component")
+                        .clicked()
+                    {
                         remove = Some(name.clone());
                     }
                 });
@@ -387,6 +405,15 @@ fn components(
                     }
                 },
             }
+            if name == "Rigid Body" {
+                ui.label(
+                    RichText::new(
+                        "Collider size is separate from visual scale. Spheres are shown as cubes.",
+                    )
+                    .size(11.0)
+                    .color(MUTED),
+                );
+            }
         });
     }
     if let Some(name) = remove {
@@ -395,7 +422,7 @@ fn components(
     }
     let missing: Vec<_> = registry
         .iter()
-        .filter(|info| !components.contains_key(info.name))
+        .filter(|info| info.name != "Rigid Body" && !components.contains_key(info.name))
         .collect();
     if !missing.is_empty() {
         ui.add_space(10.0);
@@ -893,6 +920,14 @@ pub fn show(
                         }
                     });
                 }
+                ui.menu_button(RichText::new("View").size(12.5), |ui| {
+                    ui.checkbox(&mut tools.strata_enabled, "Enable Strata")
+                        .on_hover_text("Use Strata virtualized geometry");
+                    ui.add_enabled_ui(tools.strata_enabled, |ui| {
+                        ui.checkbox(&mut tools.strata_debug, "Strata LOD debug view")
+                            .on_hover_text("Color geometry by the LOD selected for rendering");
+                    });
+                });
                 // The rest of the bar drags the window; double-click maximizes.
                 let buttons = 46.0 * 3.0;
                 let free = Rect::from_min_max(
@@ -957,7 +992,10 @@ pub fn show(
                     action = Some(Action::Step);
                 }
                 if ui
-                    .add_enabled(tools.play != PlayState::Editing, egui::Button::new("⏹ Stop"))
+                    .add_enabled(
+                        tools.play != PlayState::Editing,
+                        egui::Button::new("⏹ Stop"),
+                    )
                     .on_hover_text("Stop and restore the scene")
                     .clicked()
                 {
@@ -1156,8 +1194,13 @@ pub fn show(
                         *selected = Selection::Camera(index);
                     }
                 }
-                section(ui, "LIGHTING");
-                if hierarchy_row(ui, "Environment", *selected == Selection::Lighting, true) {
+                section(ui, "SCENE & LIGHTING");
+                if hierarchy_row(
+                    ui,
+                    "Environment & Physics",
+                    *selected == Selection::Lighting,
+                    true,
+                ) {
                     *selected = Selection::Lighting;
                 }
                 if hierarchy_row(ui, "Sun", *selected == Selection::Sun, true) {
@@ -1198,10 +1241,18 @@ pub fn show(
                                 .desired_width(f32::INFINITY),
                         )
                         .changed();
+                    if !entity.components.contains_key("Rigid Body")
+                        && let Some(info) = tools.registry.get("Rigid Body")
+                        && ui.button("＋ Add rigid body").clicked()
+                    {
+                        entity.components.insert(info.name.to_owned(), (info.default)());
+                        changed = true;
+                    }
                     section(ui, "TRANSFORM");
                     changed |= vector(ui, "Position", &mut entity.transform.translation);
                     changed |= vector(ui, "Rotation · quaternion", &mut entity.transform.rotation);
                     changed |= vector(ui, "Scale", &mut entity.transform.scale);
+                    changed |= components(ui, &tools.registry, &mut entity.components);
                     section(ui, "MATERIAL");
                     changed |= color(ui, "Base color", &mut entity.material.base_color);
                     changed |= scalar(
@@ -1218,7 +1269,6 @@ pub fn show(
                         0.0..=1.0,
                         0.01,
                     );
-                    changed |= components(ui, &tools.registry, &mut entity.components);
                     ui.add_space(14.0);
                     delete = ui.button("Delete entity").clicked();
                 }
@@ -1245,7 +1295,13 @@ pub fn show(
                     section(ui, "VIEW");
                     changed |= vector(ui, "Position", &mut camera.position);
                     changed |= vector(ui, "Target", &mut camera.target);
-                    changed |= scalar(ui, "Vertical FOV °", &mut camera.vertical_fov, 1.0..=170.0, 0.5);
+                    changed |= scalar(
+                        ui,
+                        "Vertical FOV °",
+                        &mut camera.vertical_fov,
+                        1.0..=170.0,
+                        0.5,
+                    );
                     ui.add_space(8.0);
                     ui.horizontal(|ui| {
                         if ui
@@ -1286,6 +1342,43 @@ pub fn show(
                     }
                 }
                 Selection::Lighting => {
+                    section(ui, "SCENE PHYSICS");
+                    let previous = scene.physics.engine;
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new("Engine").size(11.5).color(MUTED));
+                        egui::ComboBox::from_id_salt("physics_engine")
+                            .width(ui.available_width())
+                            .selected_text(match scene.physics.engine {
+                                PhysicsEngine::Box3d => "Box3D",
+                                PhysicsEngine::Hyperon => "Hyperon",
+                            })
+                            .show_ui(ui, |ui| {
+                                ui.selectable_value(&mut scene.physics.engine, PhysicsEngine::Box3d, "Box3D");
+                                ui.selectable_value(&mut scene.physics.engine, PhysicsEngine::Hyperon, "Hyperon");
+                            });
+                    });
+                    changed |= previous != scene.physics.engine;
+                    changed |= vector(ui, "Gravity", &mut scene.physics.gravity);
+                    let (label, value, max) = match scene.physics.engine {
+                        PhysicsEngine::Box3d => ("Substeps", &mut scene.physics.substeps, i32::MAX as u32),
+                        PhysicsEngine::Hyperon => ("Iterations", &mut scene.physics.iterations, u32::MAX),
+                    };
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new(label).size(11.5).color(MUTED));
+                        changed |= ui.add(DragValue::new(value).range(1..=max)).changed();
+                    });
+                    ui.label(
+                        RichText::new("Play uses these settings until Stop.")
+                            .size(11.0)
+                            .color(MUTED),
+                    );
+                    if scene.physics.engine == PhysicsEngine::Hyperon {
+                        ui.label(
+                            RichText::new("Hyperon supports cuboids and spheres; capsules and bounce are unavailable.")
+                                .size(11.0)
+                                .color(MUTED),
+                        );
+                    }
                     section(ui, "SCENE LIGHTING");
                     let previous = scene.lighting.method;
                     ui.horizontal(|ui| {
@@ -1295,7 +1388,9 @@ pub fn show(
                             .selected_text(match scene.lighting.method {
                                 LightingMethod::DirectOnly => "Direct only",
                                 LightingMethod::DirectAndHemisphere => "Direct + hemisphere",
-                                LightingMethod::SplitRadianceCascades => "Split radiance cascades GI",
+                                LightingMethod::SplitRadianceCascades => {
+                                    "Split radiance cascades GI"
+                                }
                             })
                             .show_ui(ui, |ui| {
                                 ui.selectable_value(
@@ -1372,11 +1467,11 @@ pub fn show(
 
     egui::Panel::bottom("editor_assets")
         .resizable(true)
-        .default_size(200.0)
-        .min_size(110.0)
+        .default_size(260.0)
+        .min_size(150.0)
         .frame(panel_frame(PANEL))
         .show(ui, |ui| {
-            panel_heading(ui, "Assets", "Double-click to open or import");
+            panel_heading(ui, "Content Browser", "Double-click to open or import");
             asset_action = tools.browser.show(ui);
         });
 
@@ -1392,6 +1487,7 @@ pub fn show(
             round_corners(&ui.painter_at(viewport), viewport, RADIUS as f32);
             navigate(ui, viewport, tools);
             orientation(ui, viewport, &tools.fly);
+            tools.profiler.badge(ui, viewport);
             if let Selection::Entity(index) = *selected
                 && tools.play == PlayState::Editing
             {
@@ -1403,6 +1499,28 @@ pub fn show(
                 );
             }
         });
+    let scale = ui.ctx().pixels_per_point();
+    let details = [
+        (
+            "Viewport",
+            format!(
+                "{:.0} × {:.0} px",
+                viewport.width() * scale,
+                viewport.height() * scale
+            ),
+        ),
+        ("Entities", scene.entities.len().to_string()),
+        (
+            "Lights",
+            format!("{} / {}", scene.lights.len(), tools.light_limit),
+        ),
+        ("Cameras", scene.cameras.len().to_string()),
+        (
+            "Lighting",
+            tools.gi_status.clone().unwrap_or_else(|| "No GI".into()),
+        ),
+    ];
+    tools.profiler.window(ui.ctx(), &details);
     UiResponse {
         action,
         asset_action,
@@ -1470,6 +1588,16 @@ fn add_light(scene: &mut Scene, selected: &mut Selection) {
 mod tests {
     use super::*;
 
+    fn text_position(shape: &egui::Shape, label: &str) -> Option<Pos2> {
+        match shape {
+            egui::Shape::Text(text) if text.galley.job.text == label => {
+                Some(text.pos + text.galley.size() * 0.5)
+            }
+            egui::Shape::Vec(shapes) => shapes.iter().find_map(|s| text_position(s, label)),
+            _ => None,
+        }
+    }
+
     #[test]
     fn viewport_remains_usable_at_minimum_window_size() {
         let context = egui::Context::default();
@@ -1517,6 +1645,132 @@ mod tests {
             output.textures_delta.clear();
         }
         assert_eq!(scene, before);
+    }
+
+    #[test]
+    fn inspector_adds_and_removes_a_rigid_body() {
+        let context = egui::Context::default();
+        let mut scene = Scene::default();
+        let (mut selected, mut tools) = (Selection::Entity(0), Tools::default());
+        let input = |events| egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(Pos2::ZERO, egui::vec2(1600.0, 1200.0))),
+            events,
+            ..Default::default()
+        };
+        let mut output = context.run_ui(input(vec![]), |ui| {
+            show(ui, &mut scene, &mut selected, None, false, &mut tools);
+        });
+        let pos = output
+            .shapes
+            .iter()
+            .find_map(|s| text_position(&s.shape, "＋ Add rigid body"))
+            .expect("add button is visible");
+        output.textures_delta.clear();
+        for pressed in [true, false] {
+            let events = vec![
+                egui::Event::PointerMoved(pos),
+                egui::Event::PointerButton {
+                    pos,
+                    button: egui::PointerButton::Primary,
+                    pressed,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ];
+            let mut output = context.run_ui(input(events), |ui| {
+                show(ui, &mut scene, &mut selected, None, false, &mut tools);
+            });
+            output.textures_delta.clear();
+        }
+        assert!(scene.entities[0].components.contains_key("Rigid Body"));
+
+        let mut output = context.run_ui(input(vec![]), |ui| {
+            show(ui, &mut scene, &mut selected, None, false, &mut tools);
+        });
+        let header = output
+            .shapes
+            .iter()
+            .find_map(|s| text_position(&s.shape, "RIGID BODY"))
+            .expect("rigid body is visible");
+        let pos = output
+            .shapes
+            .iter()
+            .filter_map(|s| text_position(&s.shape, "✕"))
+            .find(|p| (p.y - header.y).abs() < 12.0)
+            .expect("remove button is visible");
+        output.textures_delta.clear();
+        for pressed in [true, false] {
+            let events = vec![
+                egui::Event::PointerMoved(pos),
+                egui::Event::PointerButton {
+                    pos,
+                    button: egui::PointerButton::Primary,
+                    pressed,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ];
+            let mut output = context.run_ui(input(events), |ui| {
+                show(ui, &mut scene, &mut selected, None, false, &mut tools);
+            });
+            output.textures_delta.clear();
+        }
+        assert!(!scene.entities[0].components.contains_key("Rigid Body"));
+    }
+
+    #[test]
+    fn scene_physics_inspector_does_not_change_settings_when_idle() {
+        let context = egui::Context::default();
+        for engine in [PhysicsEngine::Box3d, PhysicsEngine::Hyperon] {
+            let mut scene = Scene::default();
+            scene.physics.engine = engine;
+            let before = scene.clone();
+            let (mut selected, mut tools) = (Selection::Lighting, Tools::default());
+            let mut output = context.run_ui(egui::RawInput::default(), |ui| {
+                assert!(!show(ui, &mut scene, &mut selected, None, false, &mut tools).changed);
+            });
+            output.textures_delta.clear();
+            assert_eq!(scene, before);
+        }
+    }
+
+    #[test]
+    fn scene_physics_engine_can_be_changed() {
+        let context = egui::Context::default();
+        let mut scene = Scene::default();
+        let (mut selected, mut tools) = (Selection::Lighting, Tools::default());
+        let mut changed = false;
+        let input = |events| egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(Pos2::ZERO, egui::vec2(1600.0, 1200.0))),
+            events,
+            ..Default::default()
+        };
+        for label in ["Box3D", "Hyperon"] {
+            let mut output = context.run_ui(input(vec![]), |ui| {
+                show(ui, &mut scene, &mut selected, None, false, &mut tools);
+            });
+            let pos = output
+                .shapes
+                .iter()
+                .find_map(|s| text_position(&s.shape, label))
+                .expect("engine option is visible");
+            output.textures_delta.clear();
+            for pressed in [true, false] {
+                let events = vec![
+                    egui::Event::PointerMoved(pos),
+                    egui::Event::PointerButton {
+                        pos,
+                        button: egui::PointerButton::Primary,
+                        pressed,
+                        modifiers: egui::Modifiers::NONE,
+                    },
+                ];
+                let mut output = context.run_ui(input(events), |ui| {
+                    changed |= show(ui, &mut scene, &mut selected, None, false, &mut tools).changed;
+                });
+                output.textures_delta.clear();
+            }
+        }
+        assert_eq!(scene.physics.engine, PhysicsEngine::Hyperon);
+        assert!(changed);
     }
 
     #[test]

@@ -162,6 +162,67 @@ fn friction_holds_box_on_slope() {
 }
 
 #[test]
+fn frictionless_ground_preserves_tangential_velocity() {
+    let (mut world, mut physics) = (World::new(), PhysicsWorld::default());
+    let floor = ground(&mut world, &mut physics);
+    let floor_material = &mut physics.get_mut(floor).unwrap().material;
+    floor_material.friction = 0.0;
+    floor_material.static_friction = 0.0;
+    let mut body = cube(0.5);
+    body.material.friction = 0.0;
+    body.material.static_friction = 0.0;
+    body.velocity.linear = Vec3::new(2.0, 0.0, 0.0);
+    let entity = spawn(&mut world, &mut physics, Vec3::new(0.0, 0.0, 0.5), body);
+    run(&mut world, &mut physics, 60);
+    let velocity = physics.get(entity).unwrap().velocity.linear;
+    assert!(velocity.x > 1.8, "frictionless speed fell to {velocity}");
+    assert!(position(&world, entity).x > 1.8);
+}
+
+#[test]
+fn contact_does_not_restrain_separating_body() {
+    let (mut world, mut physics) = (World::new(), PhysicsWorld::default());
+    ground(&mut world, &mut physics);
+    let entity = spawn(
+        &mut world,
+        &mut physics,
+        Vec3::new(0.0, 0.0, 0.5),
+        cube(0.5),
+    );
+    run(&mut world, &mut physics, 120);
+    physics.get_mut(entity).unwrap().velocity.linear = Vec3::new(0.0, 0.0, 5.0);
+    run(&mut world, &mut physics, 1);
+    let speed = physics.get(entity).unwrap().velocity.linear.z;
+    assert!(speed > 4.5, "separation was impeded: {speed}");
+}
+
+#[test]
+fn releasing_loaded_friction_does_not_keep_a_box_stuck() {
+    let (mut world, mut physics) = (World::new(), PhysicsWorld::default());
+    let floor = ground(&mut world, &mut physics);
+    let entity = spawn(
+        &mut world,
+        &mut physics,
+        Vec3::new(0.0, 0.0, 0.5),
+        cube(0.5),
+    );
+    run(&mut world, &mut physics, 120);
+    physics.get_mut(entity).unwrap().force.force = Vec3::new(3_000.0, 0.0, 0.0);
+    run(&mut world, &mut physics, 120);
+    let floor_material = &mut physics.get_mut(floor).unwrap().material;
+    floor_material.friction = 0.0;
+    floor_material.static_friction = 0.0;
+    let body = physics.get_mut(entity).unwrap();
+    body.material.friction = 0.0;
+    body.material.static_friction = 0.0;
+    body.force.force = Vec3::ZERO;
+    body.velocity.linear = Vec3::new(2.0, 0.0, 0.0);
+    run(&mut world, &mut physics, 30);
+    let velocity = physics.get(entity).unwrap().velocity.linear;
+    assert!(velocity.x > 1.8, "released box slowed to {velocity}");
+}
+
+#[test]
 fn despawned_and_removed_bodies_leave() {
     let (mut world, mut physics) = (World::new(), PhysicsWorld::default());
     let floor = ground(&mut world, &mut physics);
@@ -211,8 +272,43 @@ fn impulse_and_kinematic_motion() {
 }
 
 #[test]
+fn changing_density_shape_and_rotation_updates_impulse_response() {
+    let (mut world, mut physics) = (World::new(), PhysicsWorld::default());
+    let entity = spawn(&mut world, &mut physics, Vec3::ZERO, cube(0.5));
+    let settings = PhysicsSettings {
+        gravity: Vec3::ZERO,
+        ..Default::default()
+    };
+    physics.step(&mut world, &settings, 1.0 / 60.0);
+
+    let body = physics.get_mut(entity).unwrap();
+    body.collider = Collider::Sphere { radius: 0.5 };
+    body.material.density = 500.0;
+    body.impulse.linear = Vec3::X * 1000.0;
+    physics.step(&mut world, &settings, 1.0 / 60.0);
+    let mass = (4.0 / 3.0) * std::f32::consts::PI * 0.5_f32.powi(3) * 500.0;
+    assert!((physics.get(entity).unwrap().velocity.linear.x - 1000.0 / mass).abs() < 1e-4);
+
+    let body = physics.get_mut(entity).unwrap();
+    body.collider = Collider::Cuboid {
+        half_extents: Vec3::new(1.0, 0.5, 0.5),
+    };
+    body.material.density = 1000.0;
+    body.velocity = Velocity::default();
+    body.impulse.angular = Vec3::X * (2500.0 / 3.0);
+    world.get_mut(entity).unwrap().transform.rotation =
+        Quat::from_rotation_z(std::f32::consts::FRAC_PI_2).to_array();
+    physics.step(&mut world, &settings, 1.0 / 60.0);
+    let omega = physics.get(entity).unwrap().velocity.angular;
+    assert!((omega - Vec3::X).length() < 1e-3, "{omega:?}");
+}
+
+#[test]
 fn default_gravity_points_down_z() {
-    assert_eq!(PhysicsSettings::default().gravity, Vec3::new(0.0, 0.0, -9.81));
+    assert_eq!(
+        PhysicsSettings::default().gravity,
+        Vec3::new(0.0, 0.0, -9.81)
+    );
 }
 
 #[test]
@@ -245,10 +341,20 @@ fn resting_stack_sleeps_and_stays_put() {
     let (mut world, mut physics) = (World::new(), PhysicsWorld::default());
     ground(&mut world, &mut physics);
     let stack: Vec<_> = (0..5)
-        .map(|i| spawn(&mut world, &mut physics, Vec3::new(0.0, 0.0, 0.5 + i as f32), cube(0.5)))
+        .map(|i| {
+            spawn(
+                &mut world,
+                &mut physics,
+                Vec3::new(0.0, 0.0, 0.5 + i as f32),
+                cube(0.5),
+            )
+        })
         .collect();
     run(&mut world, &mut physics, 120);
-    assert!(stack.iter().all(|&e| physics.is_sleeping(e)), "stack still awake");
+    assert!(
+        stack.iter().all(|&e| physics.is_sleeping(e)),
+        "stack still awake"
+    );
     let before: Vec<_> = stack.iter().map(|&e| position(&world, e)).collect();
     run(&mut world, &mut physics, 60);
     let after: Vec<_> = stack.iter().map(|&e| position(&world, e)).collect();
@@ -257,11 +363,105 @@ fn resting_stack_sleeps_and_stays_put() {
 }
 
 #[test]
+fn sleeping_world_consumes_impulses_and_responds_to_force() {
+    let (mut world, mut physics) = (World::new(), PhysicsWorld::default());
+    ground(&mut world, &mut physics);
+    let entity = spawn(
+        &mut world,
+        &mut physics,
+        Vec3::new(0.0, 0.0, 0.5),
+        cube(0.5),
+    );
+    run(&mut world, &mut physics, 120);
+    assert!(physics.is_sleeping(entity));
+
+    physics.get_mut(entity).unwrap().impulse.linear.x = -0.0;
+    run(&mut world, &mut physics, 1);
+    assert_eq!(physics.get(entity).unwrap().impulse.linear.x.to_bits(), 0);
+    assert!(physics.is_sleeping(entity));
+
+    physics.get_mut(entity).unwrap().force.force = Vec3::new(200_000.0, 0.0, 0.0);
+    run(&mut world, &mut physics, 1);
+    assert!(!physics.is_sleeping(entity), "force must wake the body");
+}
+
+#[test]
+#[should_panic(expected = "friction coefficients must be finite and nonnegative")]
+fn sleeping_world_rejects_invalid_material() {
+    let (mut world, mut physics) = (World::new(), PhysicsWorld::default());
+    ground(&mut world, &mut physics);
+    let entity = spawn(
+        &mut world,
+        &mut physics,
+        Vec3::new(0.0, 0.0, 0.5),
+        cube(0.5),
+    );
+    run(&mut world, &mut physics, 120);
+    assert!(physics.is_sleeping(entity));
+    physics.get_mut(entity).unwrap().material.static_friction = f32::NAN;
+    run(&mut world, &mut physics, 1);
+}
+
+#[test]
+fn changing_a_quiet_static_body_to_kinematic_updates_its_pose() {
+    let (mut world, mut physics) = (World::new(), PhysicsWorld::default());
+    let entity = spawn(
+        &mut world,
+        &mut physics,
+        Vec3::ZERO,
+        PhysicsBody::new(RigidBody::Static, Collider::Sphere { radius: 0.5 }),
+    );
+    world.get_mut(entity).unwrap().transform.rotation = [0.0, 0.0, 0.0, 0.9999];
+    run(&mut world, &mut physics, 1);
+    physics.get_mut(entity).unwrap().body_type = RigidBody::Kinematic;
+    run(&mut world, &mut physics, 1);
+    assert_eq!(
+        world.get(entity).unwrap().transform.rotation,
+        Quat::IDENTITY.to_array()
+    );
+}
+
+#[test]
+fn penetration_blocks_sleep_even_with_strong_regularization() {
+    let (mut world, mut physics) = (World::new(), PhysicsWorld::default());
+    ground(&mut world, &mut physics);
+    let body = spawn(
+        &mut world,
+        &mut physics,
+        Vec3::new(0.0, 0.0, 0.4),
+        cube(0.5),
+    );
+    let settings = PhysicsSettings {
+        gravity: Vec3::ZERO,
+        alpha: 0.9999,
+        ..Default::default()
+    };
+    for _ in 0..90 {
+        physics.step(&mut world, &settings, 1.0 / 60.0);
+    }
+    assert!(
+        position(&world, body).z < 0.48,
+        "fixture no longer penetrates"
+    );
+    assert!(
+        !physics.is_sleeping(body),
+        "regularized error hid the remaining penetration"
+    );
+}
+
+#[test]
 fn falling_ball_wakes_a_sleeping_stack() {
     let (mut world, mut physics) = (World::new(), PhysicsWorld::default());
     ground(&mut world, &mut physics);
     let stack: Vec<_> = (0..3)
-        .map(|i| spawn(&mut world, &mut physics, Vec3::new(0.0, 0.0, 0.5 + i as f32), cube(0.5)))
+        .map(|i| {
+            spawn(
+                &mut world,
+                &mut physics,
+                Vec3::new(0.0, 0.0, 0.5 + i as f32),
+                cube(0.5),
+            )
+        })
         .collect();
     run(&mut world, &mut physics, 120);
     assert!(physics.is_sleeping(stack[0]));
@@ -270,19 +470,92 @@ fn falling_ball_wakes_a_sleeping_stack() {
     let ball = spawn(&mut world, &mut physics, Vec3::new(0.3, 0.0, 6.0), heavy);
     for _ in 0..90 {
         run(&mut world, &mut physics, 1);
-        assert!(position(&world, ball).z > 2.6 || !physics.is_sleeping(stack[2]), "hit a sleeper");
+        assert!(
+            position(&world, ball).z > 2.6 || !physics.is_sleeping(stack[2]),
+            "hit a sleeper"
+        );
     }
     // The off-centre hit must have moved the stack, which was asleep.
     let top = position(&world, stack[2]);
-    assert!(top.distance(Vec3::new(0.0, 0.0, 2.5)) > 0.01, "top box never woke: {top}");
+    assert!(
+        top.distance(Vec3::new(0.0, 0.0, 2.5)) > 0.01,
+        "top box never woke: {top}"
+    );
+}
+
+#[test]
+fn collision_wake_preserves_other_islands_warm_start() {
+    fn advance(prewake: bool) -> (Vec3, Vec3) {
+        let (mut world, mut physics) = (World::new(), PhysicsWorld::default());
+        ground(&mut world, &mut physics);
+        let sleeper = spawn(
+            &mut world,
+            &mut physics,
+            Vec3::new(0.0, 0.0, 0.5),
+            cube(0.5),
+        );
+        let settings = PhysicsSettings {
+            gamma: 0.8,
+            ..Default::default()
+        };
+        for _ in 0..120 {
+            physics.step(&mut world, &settings, 1.0 / 60.0);
+        }
+        assert!(physics.is_sleeping(sleeper));
+
+        let mut sliding = cube(0.5);
+        sliding.material.friction = 0.0;
+        sliding.material.static_friction = 0.0;
+        sliding.velocity.linear = Vec3::new(2.0, 0.0, 0.0);
+        let observer = spawn(&mut world, &mut physics, Vec3::new(5.0, 0.0, 0.5), sliding);
+        for _ in 0..10 {
+            physics.step(&mut world, &settings, 1.0 / 60.0);
+        }
+        assert!(physics.is_sleeping(sleeper));
+        if prewake {
+            let x = &mut world.get_mut(sleeper).unwrap().transform.translation[0];
+            *x = if *x == 0.0 {
+                1.0e-20
+            } else {
+                f32::from_bits(x.to_bits() + 1)
+            };
+        }
+        let mut impact = PhysicsBody::new(RigidBody::Dynamic, Collider::Sphere { radius: 0.5 });
+        impact.velocity.linear.z = -1.0;
+        spawn(&mut world, &mut physics, Vec3::new(0.0, 0.0, 1.4), impact);
+        physics.step(&mut world, &settings, 1.0 / 60.0);
+        assert!(
+            !physics.is_sleeping(sleeper),
+            "impact failed to wake the island"
+        );
+        (
+            position(&world, observer),
+            physics.get(observer).unwrap().velocity.linear,
+        )
+    }
+
+    let (collision_position, collision_velocity) = advance(false);
+    let (requested_position, requested_velocity) = advance(true);
+    assert!(collision_position.distance(requested_position) < 1.0e-5);
+    assert!(collision_velocity.distance(requested_velocity) < 1.0e-5);
 }
 
 #[test]
 fn caller_changes_and_lost_support_wake_sleepers() {
     let (mut world, mut physics) = (World::new(), PhysicsWorld::default());
     let floor = ground(&mut world, &mut physics);
-    let a = spawn(&mut world, &mut physics, Vec3::new(0.0, 0.0, 0.5), cube(0.5));
-    let b = spawn(&mut world, &mut physics, Vec3::new(3.0, 0.0, 0.5), cube(0.5));
+    let a = spawn(
+        &mut world,
+        &mut physics,
+        Vec3::new(0.0, 0.0, 0.5),
+        cube(0.5),
+    );
+    let b = spawn(
+        &mut world,
+        &mut physics,
+        Vec3::new(3.0, 0.0, 0.5),
+        cube(0.5),
+    );
     run(&mut world, &mut physics, 120);
     assert!(physics.is_sleeping(a) && physics.is_sleeping(b));
 
@@ -295,6 +568,35 @@ fn caller_changes_and_lost_support_wake_sleepers() {
     assert!(position(&world, b).z < 0.0, "fell once the floor went");
 }
 
+#[test]
+fn despawn_does_not_hide_moved_support_from_sleepers() {
+    let (mut world, mut physics) = (World::new(), PhysicsWorld::default());
+    let removed = spawn(
+        &mut world,
+        &mut physics,
+        Vec3::new(5.0, 0.0, 0.5),
+        cube(0.5),
+    );
+    let floor = ground(&mut world, &mut physics);
+    let sleeper = spawn(
+        &mut world,
+        &mut physics,
+        Vec3::new(0.0, 0.0, 0.5),
+        cube(0.5),
+    );
+    run(&mut world, &mut physics, 120);
+    assert!(physics.is_sleeping(sleeper));
+
+    world.despawn(removed);
+    world.get_mut(floor).unwrap().transform.translation[2] -= 5.0;
+    run(&mut world, &mut physics, 30);
+    assert!(!physics.contains(removed));
+    assert!(
+        position(&world, sleeper).z < 0.0,
+        "sleeper did not lose its support"
+    );
+}
+
 /// A pile big enough that a step solves on several threads.
 fn pile() -> (World, PhysicsWorld, Vec<EntityHandle>) {
     let (mut world, mut physics) = (World::new(), PhysicsWorld::default());
@@ -302,7 +604,8 @@ fn pile() -> (World, PhysicsWorld, Vec<EntityHandle>) {
     let mut bodies = Vec::new();
     for i in 0..400 {
         let (x, y, z) = ((i % 10) as f32, (i / 10 % 10) as f32, (i / 100) as f32);
-        let p = Vec3::new(x * 1.1 - 5.0, y * 1.1 - 5.0, 0.6 + z * 1.2) + Vec3::splat(i as f32 * 1e-3);
+        let p =
+            Vec3::new(x * 1.1 - 5.0, y * 1.1 - 5.0, 0.6 + z * 1.2) + Vec3::splat(i as f32 * 1e-3);
         let body = if i % 2 == 0 {
             cube(0.5)
         } else {
@@ -315,7 +618,9 @@ fn pile() -> (World, PhysicsWorld, Vec<EntityHandle>) {
         let (a, b) = (bodies[i], bodies[i + 1]);
         let (right, left) = (Vec3::new(0.55, 0.0, 0.0), Vec3::new(-0.55, 0.0, 0.0));
         if i % 2 == 0 {
-            physics.add_joint(&world, Joint::new(Some(a), b, right, left)).unwrap();
+            physics
+                .add_joint(&world, Joint::new(Some(a), b, right, left))
+                .unwrap();
         } else {
             let spring = Spring {
                 body_a: Some(a),
@@ -385,12 +690,23 @@ fn hard_joint_chain_holds_without_gaining_energy() {
     let (mut world, mut physics) = (World::new(), PhysicsWorld::default());
     let top = Vec3::new(0.0, 0.0, 12.0);
     let links: Vec<_> = (0..10)
-        .map(|i| spawn(&mut world, &mut physics, top + Vec3::new(0.5 + i as f32, 0.0, 0.0), bar()))
+        .map(|i| {
+            spawn(
+                &mut world,
+                &mut physics,
+                top + Vec3::new(0.5 + i as f32, 0.0, 0.0),
+                bar(),
+            )
+        })
         .collect();
     let (left, right) = (Vec3::new(-0.5, 0.0, 0.0), Vec3::new(0.5, 0.0, 0.0));
-    physics.add_joint(&world, Joint::new(None, links[0], top, left)).unwrap();
+    physics
+        .add_joint(&world, Joint::new(None, links[0], top, left))
+        .unwrap();
     for pair in links.windows(2) {
-        physics.add_joint(&world, Joint::new(Some(pair[0]), pair[1], right, left)).unwrap();
+        physics
+            .add_joint(&world, Joint::new(Some(pair[0]), pair[1], right, left))
+            .unwrap();
     }
     let error = |world: &World| {
         let mut worst = point(world, links[0], left).distance(top);
@@ -402,7 +718,10 @@ fn hard_joint_chain_holds_without_gaining_energy() {
     // Per kilogram: every bar weighs the same.
     let energy = |world: &World, physics: &PhysicsWorld| -> f32 {
         (links.iter())
-            .map(|&e| 9.81 * position(world, e).z + 0.5 * physics.get(e).unwrap().velocity.linear.length_squared())
+            .map(|&e| {
+                9.81 * position(world, e).z
+                    + 0.5 * physics.get(e).unwrap().velocity.linear.length_squared()
+            })
             .sum()
     };
     let start = energy(&world, &physics);
@@ -414,7 +733,10 @@ fn hard_joint_chain_holds_without_gaining_energy() {
     }
     assert!(swing < 0.05, "joint error while swinging {swing}");
     assert!(error(&world) < 0.005, "joint error {}", error(&world));
-    assert!(highest <= start * 1.001, "gained energy: {highest} from {start}");
+    assert!(
+        highest <= start * 1.001,
+        "gained energy: {highest} from {start}"
+    );
     assert!(position(&world, links[9]).z < 11.0, "chain swung down");
 }
 
@@ -422,16 +744,37 @@ fn hard_joint_chain_holds_without_gaining_energy() {
 fn jointed_bodies_sleep_and_wake_as_one_island() {
     let (mut world, mut physics) = (World::new(), PhysicsWorld::default());
     let floor = ground(&mut world, &mut physics);
-    let a = spawn(&mut world, &mut physics, Vec3::new(0.0, 0.0, 0.5), cube(0.5));
-    let b = spawn(&mut world, &mut physics, Vec3::new(1.5, 0.0, 0.5), cube(0.5));
+    let a = spawn(
+        &mut world,
+        &mut physics,
+        Vec3::new(0.0, 0.0, 0.5),
+        cube(0.5),
+    );
+    let b = spawn(
+        &mut world,
+        &mut physics,
+        Vec3::new(1.5, 0.0, 0.5),
+        cube(0.5),
+    );
     physics
-        .add_joint(&world, Joint::new(Some(a), b, Vec3::new(0.75, 0.0, 0.0), Vec3::new(-0.75, 0.0, 0.0)))
+        .add_joint(
+            &world,
+            Joint::new(
+                Some(a),
+                b,
+                Vec3::new(0.75, 0.0, 0.0),
+                Vec3::new(-0.75, 0.0, 0.0),
+            ),
+        )
         .unwrap();
     run(&mut world, &mut physics, 180);
     assert!(physics.is_sleeping(a) && physics.is_sleeping(b));
     physics.remove(floor);
     run(&mut world, &mut physics, 30);
-    assert!(position(&world, a).z < 0.0 && position(&world, b).z < 0.0, "both fell");
+    assert!(
+        position(&world, a).z < 0.0 && position(&world, b).z < 0.0,
+        "both fell"
+    );
 }
 
 #[test]
@@ -440,9 +783,17 @@ fn welded_bodies_keep_their_relative_rotation() {
     let a = spawn(&mut world, &mut physics, Vec3::new(0.5, 0.0, 5.0), bar());
     let b = spawn(&mut world, &mut physics, Vec3::new(1.5, 0.0, 5.0), bar());
     physics
-        .add_joint(&world, Joint::new(None, a, Vec3::new(0.0, 0.0, 5.0), Vec3::new(-0.5, 0.0, 0.0)))
+        .add_joint(
+            &world,
+            Joint::new(None, a, Vec3::new(0.0, 0.0, 5.0), Vec3::new(-0.5, 0.0, 0.0)),
+        )
         .unwrap();
-    let mut weld = Joint::new(Some(a), b, Vec3::new(0.5, 0.0, 0.0), Vec3::new(-0.5, 0.0, 0.0));
+    let mut weld = Joint::new(
+        Some(a),
+        b,
+        Vec3::new(0.5, 0.0, 0.0),
+        Vec3::new(-0.5, 0.0, 0.0),
+    );
     weld.angular_stiffness = f32::INFINITY;
     physics.add_joint(&world, weld).unwrap();
     for _ in 0..120 {
@@ -450,15 +801,28 @@ fn welded_bodies_keep_their_relative_rotation() {
     }
     let rotation = |e| Quat::from_array(world.get(e).unwrap().transform.rotation);
     let relative = rotation(a).conjugate() * rotation(b);
-    assert!(relative.angle_between(Quat::IDENTITY) < 0.01, "bent by {relative}");
+    assert!(
+        relative.angle_between(Quat::IDENTITY) < 0.01,
+        "bent by {relative}"
+    );
     assert!(position(&world, b).z < 4.5, "swung as one bar");
 }
 
 #[test]
 fn soft_joint_stretches_by_weight_over_stiffness() {
     let (mut world, mut physics) = (World::new(), PhysicsWorld::default());
-    let body = spawn(&mut world, &mut physics, Vec3::new(0.0, 0.0, 5.0), cube(0.5));
-    let mut joint = Joint::new(None, body, Vec3::new(0.0, 0.0, 5.5), Vec3::new(0.0, 0.0, 0.5));
+    let body = spawn(
+        &mut world,
+        &mut physics,
+        Vec3::new(0.0, 0.0, 5.0),
+        cube(0.5),
+    );
+    let mut joint = Joint::new(
+        None,
+        body,
+        Vec3::new(0.0, 0.0, 5.5),
+        Vec3::new(0.0, 0.0, 0.5),
+    );
     joint.linear_stiffness = 1.0e6; // 1000 kg: 9.81 mm under gravity
     physics.add_joint(&world, joint).unwrap();
     run(&mut world, &mut physics, 600);
@@ -475,10 +839,25 @@ fn stiffness_ratio_springs_converge_in_five_iterations() {
         &mut world,
         &mut physics,
         Vec3::new(0.0, 0.0, 10.0),
-        PhysicsBody::new(RigidBody::Static, Collider::Cuboid { half_extents: Vec3::splat(0.5) }),
+        PhysicsBody::new(
+            RigidBody::Static,
+            Collider::Cuboid {
+                half_extents: Vec3::splat(0.5),
+            },
+        ),
     );
-    let middle = spawn(&mut world, &mut physics, Vec3::new(0.0, 0.0, 7.0), cube(0.5));
-    let bottom = spawn(&mut world, &mut physics, Vec3::new(0.0, 0.0, 4.0), cube(0.5));
+    let middle = spawn(
+        &mut world,
+        &mut physics,
+        Vec3::new(0.0, 0.0, 7.0),
+        cube(0.5),
+    );
+    let bottom = spawn(
+        &mut world,
+        &mut physics,
+        Vec3::new(0.0, 0.0, 4.0),
+        cube(0.5),
+    );
     let (down, up) = (Vec3::new(0.0, 0.0, -0.5), Vec3::new(0.0, 0.0, 0.5));
     let spring = |a, b, stiffness| Spring {
         body_a: Some(a),
@@ -489,8 +868,12 @@ fn stiffness_ratio_springs_converge_in_five_iterations() {
         rest_length: 2.0,
     };
     // Stiff on top (two blocks of weight), soft below (one block).
-    physics.add_spring(&world, spring(anchor, middle, 1.0e9)).unwrap();
-    physics.add_spring(&world, spring(middle, bottom, 1.0e5)).unwrap();
+    physics
+        .add_spring(&world, spring(anchor, middle, 1.0e9))
+        .unwrap();
+    physics
+        .add_spring(&world, spring(middle, bottom, 1.0e5))
+        .unwrap();
     let settings = PhysicsSettings {
         iterations: 5,
         ..Default::default()
@@ -501,7 +884,10 @@ fn stiffness_ratio_springs_converge_in_five_iterations() {
     let weight = 1000.0 * 9.81;
     let soft = position(&world, middle).z - 0.5 - (position(&world, bottom).z + 0.5) - 2.0;
     let stiff = 9.5 - (position(&world, middle).z + 0.5) - 2.0;
-    assert!((soft - weight / 1.0e5).abs() < 0.01, "soft spring stretched {soft}");
+    assert!(
+        (soft - weight / 1.0e5).abs() < 0.01,
+        "soft spring stretched {soft}"
+    );
     assert!(stiff.abs() < 0.01, "stiff spring stretched {stiff}");
 }
 
@@ -512,10 +898,25 @@ fn overloaded_joint_breaks() {
         &mut world,
         &mut physics,
         Vec3::new(0.0, 0.0, 5.0),
-        PhysicsBody::new(RigidBody::Static, Collider::Cuboid { half_extents: Vec3::splat(0.5) }),
+        PhysicsBody::new(
+            RigidBody::Static,
+            Collider::Cuboid {
+                half_extents: Vec3::splat(0.5),
+            },
+        ),
     );
-    let b = spawn(&mut world, &mut physics, Vec3::new(1.0, 0.0, 5.0), cube(0.5));
-    let mut weld = Joint::new(Some(a), b, Vec3::new(0.5, 0.0, 0.0), Vec3::new(-0.5, 0.0, 0.0));
+    let b = spawn(
+        &mut world,
+        &mut physics,
+        Vec3::new(1.0, 0.0, 5.0),
+        cube(0.5),
+    );
+    let mut weld = Joint::new(
+        Some(a),
+        b,
+        Vec3::new(0.5, 0.0, 0.0),
+        Vec3::new(-0.5, 0.0, 0.0),
+    );
     weld.angular_stiffness = f32::INFINITY;
     weld.fracture = 1000.0;
     let id = physics.add_joint(&world, weld).unwrap();
@@ -535,15 +936,28 @@ fn jointed_bodies_do_not_collide() {
     };
     // Overlapping halves of one rigid assembly.
     let a = spawn(&mut world, &mut physics, Vec3::ZERO, cube(0.5));
-    let b = spawn(&mut world, &mut physics, Vec3::new(0.6, 0.0, 0.0), cube(0.5));
-    let mut weld = Joint::new(Some(a), b, Vec3::new(0.3, 0.0, 0.0), Vec3::new(-0.3, 0.0, 0.0));
+    let b = spawn(
+        &mut world,
+        &mut physics,
+        Vec3::new(0.6, 0.0, 0.0),
+        cube(0.5),
+    );
+    let mut weld = Joint::new(
+        Some(a),
+        b,
+        Vec3::new(0.3, 0.0, 0.0),
+        Vec3::new(-0.3, 0.0, 0.0),
+    );
     weld.angular_stiffness = f32::INFINITY;
     physics.add_joint(&world, weld).unwrap();
     for _ in 0..60 {
         physics.step(&mut world, &settings, 1.0 / 60.0);
     }
     assert!(position(&world, a).length() < 1e-3, "pushed apart");
-    assert!(position(&world, b).distance(Vec3::new(0.6, 0.0, 0.0)) < 1e-3, "pushed apart");
+    assert!(
+        position(&world, b).distance(Vec3::new(0.6, 0.0, 0.0)) < 1e-3,
+        "pushed apart"
+    );
     assert_eq!(physics.contact_count(), 0);
 }
 
@@ -592,7 +1006,9 @@ fn dropped_pile_stays_on_the_ground() {
     // let impacts bounce bodies between iterations and sink through the floor.
     // The compare example's 512-body rain scene, where it first showed.
     let jitter = |seed: usize| {
-        let x = (seed as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15).rotate_left(17);
+        let x = (seed as u64)
+            .wrapping_mul(0x9E37_79B9_7F4A_7C15)
+            .rotate_left(17);
         (x.wrapping_mul(0xBF58_476D_1CE4_E5B9) >> 40) as f32 / (1u64 << 23) as f32 - 1.0
     };
     let (mut world, mut physics) = (World::new(), PhysicsWorld::default());
@@ -617,7 +1033,10 @@ fn dropped_pile_stays_on_the_ground() {
     let mut lowest = f32::MAX;
     for _ in 0..120 {
         run(&mut world, &mut physics, 1);
-        lowest = bodies.iter().map(|&e| position(&world, e).z).fold(lowest, f32::min);
+        lowest = bodies
+            .iter()
+            .map(|&e| position(&world, e).z)
+            .fold(lowest, f32::min);
     }
     assert!(lowest > 0.35, "a body sank to {lowest}");
 }

@@ -79,12 +79,24 @@ impl Component for RigidBodyComponent {
         vec![
             ("Body type", FieldMut::Choice(&mut self.body_type)),
             ("Shape", FieldMut::Choice(&mut self.shape)),
-            ("Half extents", FieldMut::Vec3(&mut self.half_extents, size.clone())),
+            (
+                "Half extents",
+                FieldMut::Vec3(&mut self.half_extents, size.clone()),
+            ),
             ("Radius", FieldMut::Float(&mut self.radius, size.clone())),
             ("Half height", FieldMut::Float(&mut self.half_height, size)),
-            ("Density", FieldMut::Float(&mut self.density, 0.001..=f32::MAX)),
-            ("Friction", FieldMut::Float(&mut self.friction, 0.0..=f32::MAX)),
-            ("Restitution", FieldMut::Float(&mut self.restitution, 0.0..=1.0)),
+            (
+                "Density",
+                FieldMut::Float(&mut self.density, 0.001..=f32::MAX),
+            ),
+            (
+                "Friction",
+                FieldMut::Float(&mut self.friction, 0.0..=f32::MAX),
+            ),
+            (
+                "Restitution",
+                FieldMut::Float(&mut self.restitution, 0.0..=1.0),
+            ),
         ]
     }
 }

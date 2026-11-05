@@ -1,0 +1,13 @@
+[package]
+name = "hyperon-ocean"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Ocean spectra, shore waves, dispersive shallow water and buoyancy for the Hyperon runtime"
+publish = false
+
+[dependencies]
+hyperon-core = { path = "../hyperon-core" }
+hyperon-physics = { path = "../hyperon-physics" }
+glam = "0.29"
+rayon = "1"

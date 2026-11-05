@@ -7,8 +7,9 @@
 //! ratios stable at a few iterations and no substeps.
 //!
 //! From the paper: hard constraints (Sec. 3.1), force bounds with stiffness
-//! rescaling (3.2, Eq. 14), frictional contacts with static and kinetic
-//! friction (3.3), finite stiffness ramped up to its value (3.4, Eq. 16),
+//! rescaling where needed (3.2, Eq. 14), frictional contacts with static and
+//! kinetic friction and a conservative tangential Hessian (3.3, 5), finite
+//! stiffness ramped up to its value (3.4, Eq. 16),
 //! diagonal geometric stiffness (3.5), stabilization (3.6), warm starting
 //! (3.7), bounded duals and step-start Taylor contacts (4). [`Joint`] and
 //! [`Spring`] follow the authors' 3D demo, with joint fracture as a torque.
@@ -24,7 +25,7 @@ mod collide;
 mod link;
 mod solver;
 
-use glam::{Mat3, Quat, Vec3};
+use glam::{Mat3, Quat, Vec3, Vec3A};
 use hyperon_core::{EntityHandle, Transform, World};
 use std::collections::HashMap;
 
@@ -251,6 +252,22 @@ impl std::fmt::Display for InvalidEntity {
 }
 impl std::error::Error for InvalidEntity {}
 
+#[derive(Clone, Copy)]
+struct CachedMass {
+    collider: Collider,
+    density: f32,
+    mass: f32,
+    moment: Vec3,
+}
+
+#[derive(Clone, Copy)]
+struct CachedPose {
+    rotation_bits: [u32; 4],
+    rotation: Quat,
+    basis: Mat3,
+    inertia: Mat3,
+}
+
 struct Slot {
     entity: EntityHandle,
     body: PhysicsBody,
@@ -261,6 +278,8 @@ struct Slot {
     sleep_time: f32,
     /// The transform the body fell asleep at; moving it wakes the body.
     rest: ([f32; 3], [f32; 4]),
+    mass_properties: Option<CachedMass>,
+    pose_properties: Option<CachedPose>,
 }
 
 impl Slot {
@@ -273,6 +292,8 @@ impl Slot {
             island: 0,
             sleep_time: 0.0,
             rest: ([0.0; 3], [0.0; 4]),
+            mass_properties: None,
+            pose_properties: None,
         }
     }
 }
@@ -329,7 +350,9 @@ impl PhysicsWorld {
     /// Whether the body rests asleep: it costs nothing until a moving body
     /// touches its island or its velocity, force, impulse or transform changes.
     pub fn is_sleeping(&self, entity: EntityHandle) -> bool {
-        self.index.get(&entity).is_some_and(|&i| self.slots[i].asleep)
+        self.index
+            .get(&entity)
+            .is_some_and(|&i| self.slots[i].asleep)
     }
 
     /// Wake the islands these slots sleep in or that rest on them: they are
@@ -396,7 +419,13 @@ impl PhysicsWorld {
             fracture: joint.fracture,
             rest,
         };
-        Ok(self.push_link(joint.body_a, joint.body_b, kind, joint.anchor_a, joint.anchor_b))
+        Ok(self.push_link(
+            joint.body_a,
+            joint.body_b,
+            kind,
+            joint.anchor_a,
+            joint.anchor_b,
+        ))
     }
 
     /// Add a spring between bodies of live entities with physics.
@@ -418,7 +447,8 @@ impl PhysicsWorld {
             None => anchor,
         };
         let rest_length = if spring.rest_length < 0.0 {
-            point(spring.body_a, spring.anchor_a).distance(point(Some(spring.body_b), spring.anchor_b))
+            point(spring.body_a, spring.anchor_a)
+                .distance(point(Some(spring.body_b), spring.anchor_b))
         } else {
             spring.rest_length
         };
@@ -426,7 +456,13 @@ impl PhysicsWorld {
             stiffness: spring.stiffness,
             rest_length,
         };
-        Ok(self.push_link(spring.body_a, spring.body_b, kind, spring.anchor_a, spring.anchor_b))
+        Ok(self.push_link(
+            spring.body_a,
+            spring.body_b,
+            kind,
+            spring.anchor_a,
+            spring.anchor_b,
+        ))
     }
 
     /// Remove a joint or spring; false if it is not in this world.
@@ -470,7 +506,9 @@ impl PhysicsWorld {
         let id = LinkId(self.next_link);
         self.next_link += 1;
         self.links.push((id, a, b));
-        self.solver.links.push(link::Link::new(kind, anchor_a, anchor_b));
+        self.solver
+            .links
+            .push(link::Link::new(kind, anchor_a, anchor_b));
         // A new constraint on sleeping bodies must be solved.
         self.wake_bodies(a.into_iter().chain([b]));
         id
@@ -537,7 +575,11 @@ impl PhysicsWorld {
                 .into_iter()
                 .partition(|slot| !world.contains(slot.entity));
             self.slots = kept;
-            self.wake_islands_of(gone.iter().map(|s| (s.asleep, s.island, key(s.entity))).collect());
+            self.wake_islands_of(
+                gone.iter()
+                    .map(|s| (s.asleep, s.island, key(s.entity)))
+                    .collect(),
+            );
             self.index = (self.slots.iter().enumerate())
                 .map(|(i, slot)| (slot.entity, i))
                 .collect();
@@ -545,23 +587,60 @@ impl PhysicsWorld {
         }
 
         // A static or kinematic body the caller moved wakes what rests on it.
-        let moved: Vec<usize> = (0..self.slots.len())
-            .filter(|&i| {
-                let slot = &self.slots[i];
+        let mut woken = Vec::new();
+        for slot in &mut self.slots {
+            if slot.body.body_type != RigidBody::Dynamic {
                 let t = &world.get(slot.entity).unwrap().transform;
-                slot.body.body_type != RigidBody::Dynamic
-                    && slot.rest != (t.translation, t.rotation)
-            })
-            .collect();
-        if !moved.is_empty() {
-            let mut woken = Vec::new();
-            for &i in &moved {
-                let slot = &mut self.slots[i];
-                let t = &world.get(slot.entity).unwrap().transform;
-                slot.rest = (t.translation, t.rotation);
-                woken.push((slot.asleep, slot.island, key(slot.entity)));
+                if slot.rest != (t.translation, t.rotation) {
+                    slot.rest = (t.translation, t.rotation);
+                    woken.push((slot.asleep, slot.island, key(slot.entity)));
+                }
             }
+        }
+        if !woken.is_empty() {
             self.wake_islands_of(woken);
+        }
+        // A fully sleeping world cannot advance until a body, its transform,
+        // or an input changes. Cached properties prove that shapes, densities
+        // and rotations have already passed validation; all other invalid or
+        // one-shot inputs fall through to the normal step.
+        let quiescent = self.solver.bodies.len() == self.slots.len()
+            && self
+                .solver
+                .bodies
+                .iter()
+                .zip(&self.slots)
+                .all(|(previous, slot)| {
+                    let body = &slot.body;
+                    let sleeping = match body.body_type {
+                        RigidBody::Dynamic => slot.asleep,
+                        RigidBody::Static | RigidBody::Kinematic => !slot.asleep,
+                    };
+                    if previous.key != key(slot.entity)
+                        || previous.kinematic != (body.body_type == RigidBody::Kinematic)
+                        || !sleeping
+                        || body.velocity != Velocity::default()
+                        || body.force != ExternalForce::default()
+                        || body.impulse.linear.to_array().map(f32::to_bits) != [0; 3]
+                        || body.impulse.angular.to_array().map(f32::to_bits) != [0; 3]
+                        || !body.material.friction.is_finite()
+                        || body.material.friction < 0.0
+                        || !body.material.static_friction.is_finite()
+                        || body.material.static_friction < 0.0
+                        || !slot.mass_properties.is_some_and(|m| {
+                            m.collider == body.collider && m.density == body.material.density
+                        })
+                    {
+                        return false;
+                    }
+                    let transform = world.get(slot.entity).unwrap().transform;
+                    slot.rest == (transform.translation, transform.rotation)
+                        && slot.pose_properties.is_some_and(|p| {
+                            p.rotation_bits == transform.rotation.map(f32::to_bits)
+                        })
+                });
+        if quiescent {
+            return;
         }
         // Bodies are solved in slot order: point links at their slots.
         for (&(_, a, b), link) in self.links.iter().zip(&mut self.solver.links) {
@@ -570,32 +649,39 @@ impl PhysicsWorld {
         }
         let bodies = &mut self.solver.bodies;
         bodies.clear();
+        let mut awake = 0;
         for slot in &mut self.slots {
             let transform = world.get(slot.entity).unwrap().transform;
             bodies.push(solver_body(slot, transform, dt));
+            awake += usize::from(slot.body.body_type == RigidBody::Dynamic && !slot.asleep);
             slot.body.impulse = ExternalImpulse::default();
         }
 
-        let awake = (self.slots.iter())
-            .filter(|s| s.body.body_type == RigidBody::Dynamic && !s.asleep)
-            .count();
         let threads = (awake / BODIES_PER_THREAD)
             .max(1)
             .next_power_of_two()
             .min(rayon::current_num_threads())
             .min(*PHYSICAL_CORES);
-        let size = threads.trailing_zeros() as usize;
-        if self.pools.len() <= size {
-            self.pools.resize_with(size + 1, || None);
-        }
-        if self.pools[size].is_none() {
-            // A pool that cannot be built leaves the step on the global pool.
-            self.pools[size] = rayon::ThreadPoolBuilder::new().num_threads(threads).build().ok();
-        }
         let solver = &mut self.solver;
-        match &self.pools[size] {
-            Some(pool) => pool.install(|| solver.step(settings, dt, true)),
-            None => solver.step(settings, dt, false),
+        if threads == 1 {
+            // Avoid dispatching the entire step to a one-worker pool.
+            solver.step(settings, dt, false, true);
+        } else {
+            let size = threads.trailing_zeros() as usize;
+            if self.pools.len() <= size {
+                self.pools.resize_with(size + 1, || None);
+            }
+            if self.pools[size].is_none() {
+                // A pool that cannot be built leaves the step on the global pool.
+                self.pools[size] = rayon::ThreadPoolBuilder::new()
+                    .num_threads(threads)
+                    .build()
+                    .ok();
+            }
+            match &self.pools[size] {
+                Some(pool) => pool.install(|| solver.step(settings, dt, true, false)),
+                None => solver.step(settings, dt, false, false),
+            }
         }
 
         for (slot, body) in self.slots.iter_mut().zip(&self.solver.bodies) {
@@ -628,7 +714,7 @@ fn key(entity: EntityHandle) -> u64 {
 
 /// Validated solver input for one slot, with this step's force and impulse
 /// folded into its velocity.
-fn solver_body(slot: &Slot, transform: &Transform, dt: f32) -> solver::Body {
+fn solver_body(slot: &mut Slot, transform: &Transform, dt: f32) -> solver::Body {
     let body = &slot.body;
     let position = Vec3::from_array(transform.translation);
     let rotation = Quat::from_array(transform.rotation);
@@ -668,10 +754,42 @@ fn solver_body(slot: &Slot, transform: &Transform, dt: f32) -> solver::Body {
         "impulses must be finite"
     );
 
-    let rotation = rotation.normalize();
-    let (mut mass, moment) = body.collider.mass_properties(density);
-    let basis = Mat3::from_quat(rotation);
-    let mut inertia = basis * Mat3::from_diagonal(moment) * basis.transpose();
+    let (mut mass, moment) = match slot.mass_properties {
+        Some(cached) if cached.collider == body.collider && cached.density == density => {
+            (cached.mass, cached.moment)
+        }
+        _ => {
+            let (mass, moment) = body.collider.mass_properties(density);
+            slot.mass_properties = Some(CachedMass {
+                collider: body.collider,
+                density,
+                mass,
+                moment,
+            });
+            slot.pose_properties = None;
+            (mass, moment)
+        }
+    };
+    // Compare the raw quaternion bits so even signed-zero changes are not
+    // hidden by float equality. A mass-property change invalidates the tensor.
+    let rotation_bits = transform.rotation.map(f32::to_bits);
+    let pose = match slot.pose_properties {
+        Some(cached) if cached.rotation_bits == rotation_bits => cached,
+        _ => {
+            let rotation = rotation.normalize();
+            let basis = Mat3::from_quat(rotation);
+            let inertia = basis * Mat3::from_diagonal(moment) * basis.transpose();
+            let cached = CachedPose {
+                rotation_bits,
+                rotation,
+                basis,
+                inertia,
+            };
+            slot.pose_properties = Some(cached);
+            cached
+        }
+    };
+    let (rotation, basis, mut inertia) = (pose.rotation, pose.basis, pose.inertia);
     let (mut velocity, mut angular_velocity) = (v.linear, v.angular);
     match body.body_type {
         RigidBody::Dynamic => {
@@ -698,11 +816,12 @@ fn solver_body(slot: &Slot, transform: &Transform, dt: f32) -> solver::Body {
         initial_rotation: rotation,
         inertial_position: position,
         inertial_rotation: rotation,
+        initial_basis: basis,
         velocity,
         angular_velocity,
         previous: slot.previous,
-        moved: Vec3::ZERO,
-        turned: Vec3::ZERO,
+        moved: Vec3A::ZERO,
+        turned: Vec3A::ZERO,
         mass,
         inertia,
         friction,

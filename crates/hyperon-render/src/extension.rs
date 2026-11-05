@@ -62,7 +62,7 @@ pub struct FrameContext<'a> {
     pub lights: &'a [PointLight],
 }
 
-pub trait RenderExtension {
+pub trait RenderExtension: Send {
     /// A scene was loaded: its draws are numbered from `draw_base` in the
     /// receiver image's draw index and its materials from `material_base` in
     /// the material buffer. The GPU is idle.

@@ -4,13 +4,13 @@
 
 use crate::link::Link;
 use crate::{Collider, PhysicsSettings, collide};
-use glam::{Mat3, Mat3A, Mat4, Quat, Vec3, Vec3A, Vec4};
+use glam::{BVec4A, Mat3, Mat3A, Mat4, Quat, Vec3, Vec3A, Vec4};
 use rayon::prelude::*;
 use std::collections::HashMap;
 use std::hash::{BuildHasherDefault, Hasher};
 
-/// Body keys are already unique integers: a multiply mix is enough, and much
-/// cheaper than SipHash on the narrowphase's every-step lookups.
+/// Fast mixing for solver-owned entity pairs. Indices occupy the upper 32
+/// bits, so fold the product's high bits into HashMap's low bucket bits.
 #[derive(Default)]
 struct KeyHasher(u64);
 
@@ -24,7 +24,7 @@ impl Hasher for KeyHasher {
         self.0 = (self.0.rotate_left(5) ^ n).wrapping_mul(0x517c_c1b7_2722_0a95);
     }
     fn finish(&self) -> u64 {
-        self.0
+        self.0 ^ (self.0 >> 32)
     }
 }
 
@@ -32,6 +32,8 @@ type PairMap = HashMap<(u64, u64), usize, BuildHasherDefault<KeyHasher>>;
 
 /// Point speed (m/s) below which a body counts as resting.
 const SLEEP_SPEED: f32 = 0.05;
+/// Cache lines of each manifold to prefetch.
+const PREFETCH_LINES: usize = 2;
 /// Seconds an island must rest before it sleeps.
 const TIME_TO_SLEEP: f32 = 0.5;
 /// Marks an adjacency entry as a link, not a manifold.
@@ -81,13 +83,15 @@ pub(crate) struct Body {
     pub initial_rotation: Quat,
     pub inertial_position: Vec3,
     pub inertial_rotation: Quat,
+    /// Step-start orientation, shared by broadphase and narrowphase pairs.
+    pub initial_basis: Mat3,
     pub velocity: Vec3,
     pub angular_velocity: Vec3,
     pub previous: Vec3,
     /// Linear and angular displacement since the step began, kept with the
     /// pose so contacts need no quaternion math per visit.
-    pub moved: Vec3,
-    pub turned: Vec3,
+    pub moved: Vec3A,
+    pub turned: Vec3A,
     /// Zero for static and kinematic bodies.
     pub mass: f32,
     /// World-space inertia tensor at the start of the step.
@@ -109,8 +113,8 @@ impl Body {
     fn place(&mut self, position: Vec3, rotation: Quat) {
         self.position = position;
         self.rotation = rotation;
-        self.moved = position - self.initial_position;
-        self.turned = quat_sub(rotation, self.initial_rotation);
+        self.moved = (position - self.initial_position).into();
+        self.turned = quat_sub(rotation, self.initial_rotation).into();
     }
     fn dynamic(&self) -> bool {
         self.mass > 0.0 && !self.asleep
@@ -154,44 +158,25 @@ pub(crate) struct Contact {
     /// Anchors in each body's local frame.
     pub ra: Vec3,
     pub rb: Vec3,
-    penalty: Vec3A,
-    lambda: Vec3A,
-    stick: bool,
-    /// Whether the last dual update's friction fit the static bound: static
-    /// friction then applies next step (Sec. 3.3).
-    held: bool,
 }
 
 impl Contact {
     pub fn new(feature: u32, ra: Vec3, rb: Vec3) -> Self {
-        Self {
-            feature,
-            ra,
-            rb,
-            // A new contact starts static and turns kinetic once it must slide.
-            held: true,
-            ..Default::default()
-        }
+        Self { feature, ra, rb }
     }
 }
 
 pub(crate) struct Manifold {
     a: usize,
     b: usize,
-    key: (u64, u64),
     /// Normal (B to A) then two tangents as matrix rows: the shared linear
     /// Jacobian.
     rows: Mat3A,
-    /// The basis in A's frame, and B's pose relative to A, when the contacts
-    /// were generated: the manifold is reused while B stays near that pose.
-    local_basis: [Vec3; 3],
-    relative: (Vec3, Quat),
-    contacts: [Contact; collide::MAX_CONTACTS],
+    /// Keep collision metadata out of the repeatedly visited solver array.
+    cold: Box<CollisionData>,
     /// Whether A is solved before B each iteration, and so applies the
     /// previous iteration's dual update (see `Solver::step`).
     first_is_a: bool,
-    /// The narrowphase pass that last matched this manifold to a pair.
-    seen: u32,
     len: usize,
     /// Kinetic and static friction coefficients.
     friction: f32,
@@ -202,6 +187,21 @@ pub(crate) struct Manifold {
     lanes: Lanes,
 }
 
+struct CollisionData {
+    key: (u64, u64),
+    /// Basis and relative pose when the contacts were generated.
+    local_basis: [Vec3; 3],
+    relative: (Vec3, Quat),
+    contacts: [Contact; collide::MAX_CONTACTS],
+    /// The contacts' anchors in SIMD lanes: each step's `prepare` needs them,
+    /// but contacts change far less often.
+    anchors: [[Vec4; 3]; 2],
+    /// Unregularized step-start penetration exceeds the sleep tolerance.
+    deep: bool,
+    /// The narrowphase pass that last matched this manifold to a pair.
+    seen: u32,
+}
+
 /// A manifold's contacts in structure-of-arrays form for the solver: each
 /// `Vec4` holds one quantity for all four contacts, so a manifold is
 /// evaluated and stamped four contacts per instruction. `[r]` indexes the
@@ -209,29 +209,80 @@ pub(crate) struct Manifold {
 /// Unused lanes are inactive and contribute exactly zero.
 #[derive(Clone, Copy, Default)]
 struct Lanes {
+    /// Step-start constraint error with Eq. 18 already applied.
     c0: [Vec4; 3],
-    /// Angular Jacobians at the start of the step (Sec. 4): linearized once,
-    /// since re-evaluating at the current rotation double counts rotation.
-    ja: [[Vec4; 3]; 3],
-    jb: [[Vec4; 3]; 3],
+    /// World anchors at the start of the step, giving the angular Jacobians
+    /// (Sec. 4): linearized once, since re-evaluating at the current rotation
+    /// double counts rotation. Storing the Jacobians instead costs more in
+    /// cache misses, once a scene outgrows the cache, than crossing them does.
+    ra: [Vec4; 3],
+    rb: [Vec4; 3],
     penalty: [Vec4; 3],
     lambda: [Vec4; 3],
     /// 1 or 0 per lane: a real contact; static friction applies this step;
-    /// the normal row may be stiffness-rescaled; and the dual update's
-    /// stick and held results, copied back to the contacts after the step.
+    /// the normal row may be stiffness-rescaled.
     active: Vec4,
     sticking: Vec4,
     rescale_normal: Vec4,
-    stick: Vec4,
-    held: Vec4,
+    /// One bit per lane: the dual update's stick and held results, retained
+    /// for the next step. Bits, because the solver array must fit in cache.
+    stick: u8,
+    held: u8,
+}
+
+/// 1 or 0 in each lane for the bits of the index.
+const LANE_BITS: [Vec4; 16] = {
+    let mut table = [Vec4::ZERO; 16];
+    let mut bits = 0;
+    while bits < 16 {
+        table[bits] = Vec4::new(
+            (bits & 1) as f32,
+            (bits >> 1 & 1) as f32,
+            (bits >> 2 & 1) as f32,
+            (bits >> 3 & 1) as f32,
+        );
+        bits += 1;
+    }
+    table
+};
+
+#[derive(Default)]
+struct Warm {
+    penalty: [Vec4; 3],
+    lambda: [Vec4; 3],
+    stick: u8,
+    held: u8,
+}
+
+impl Lanes {
+    fn set_warm(&mut self, warm: Warm) {
+        self.penalty = warm.penalty;
+        self.lambda = warm.lambda;
+        self.stick = warm.stick;
+        self.held = warm.held;
+    }
+}
+
+/// Each contact's anchors as lanes, for `CollisionData::anchors`.
+fn anchor_lanes(contacts: &[Contact]) -> [[Vec4; 3]; 2] {
+    let (mut ra, mut rb) = ([Vec4::ZERO; 3], [Vec4::ZERO; 3]);
+    for (i, c) in contacts.iter().enumerate() {
+        for k in 0..3 {
+            ra[k][i] = c.ra[k];
+            rb[k][i] = c.rb[k];
+        }
+    }
+    [ra, rb]
 }
 
 /// Lane-wise angular Hessian (upper triangle: 00 01 02 11 12 22) and
-/// gradient summed over a body's manifolds, reduced once per body.
+/// gradient summed over a body's manifolds, reduced once per body. Each sum
+/// has two halves, one per manifold of a pair, adjacent so that a 256-bit
+/// register loads both: paired stamps match unpaired ones bit for bit.
 #[derive(Default)]
 struct LaneSums {
-    ang: [Vec4; 6],
-    rhs: [Vec4; 3],
+    ang: [[Vec4; 2]; 6],
+    rhs: [[Vec4; 2]; 3],
 }
 
 /// The sums of four vectors' lanes, as one vector.
@@ -253,23 +304,17 @@ fn sqrt4(v: Vec4) -> Vec4 {
     }
 }
 
-/// Four vectors, one per lane, rotated by `q`.
-fn rotate4(q: Quat, v: [Vec4; 3]) -> [Vec4; 3] {
-    let (x, y, z, w) = (q.x, q.y, q.z, q.w);
-    // v + w t + q × t, with t = 2 q × v.
-    let t = [
-        (v[2] * y - v[1] * z) * 2.0,
-        (v[0] * z - v[2] * x) * 2.0,
-        (v[1] * x - v[0] * y) * 2.0,
-    ];
+/// Rotate four vectors with the orientation already cached for this step.
+fn rotate4(m: Mat3, v: [Vec4; 3]) -> [Vec4; 3] {
     [
-        v[0] + t[0] * w + (t[2] * y - t[1] * z),
-        v[1] + t[1] * w + (t[0] * z - t[2] * x),
-        v[2] + t[2] * w + (t[1] * x - t[0] * y),
+        v[0] * m.x_axis.x + v[1] * m.y_axis.x + v[2] * m.z_axis.x,
+        v[0] * m.x_axis.y + v[1] * m.y_axis.y + v[2] * m.z_axis.y,
+        v[0] * m.x_axis.z + v[1] * m.y_axis.z + v[2] * m.z_axis.z,
     ]
 }
 
 /// Four vectors, one per lane, crossed with `n`.
+#[inline(always)]
 fn cross4(a: [Vec4; 3], n: Vec3) -> [Vec4; 3] {
     [
         a[1] * n.z - a[2] * n.y,
@@ -278,19 +323,15 @@ fn cross4(a: [Vec4; 3], n: Vec3) -> [Vec4; 3] {
     ]
 }
 
-fn mask(b: bool) -> f32 {
-    if b { 1.0 } else { 0.0 }
-}
-
 /// Four contacts' linearized constraints (Sec. 4) and clamped forces.
 struct Eval {
     c: [Vec4; 3],
     /// The force before its bounds were applied (λ⁺, Eq. 13).
     raw: [Vec4; 3],
     force: [Vec4; 3],
-    normal: Vec4,
-    tangent: Vec4,
-    bound: Vec4,
+    /// Lane masks; persistent friction state is materialized only on update.
+    held: BVec4A,
+    inside: BVec4A,
 }
 
 /// Both bodies' displacement since the step began, shared by a manifold's contacts.
@@ -301,11 +342,12 @@ struct Motion {
 }
 
 impl Motion {
+    #[inline(always)]
     fn new(a: &Body, b: &Body) -> Self {
         Self {
-            linear: (a.moved - b.moved).into(),
-            angular_a: a.turned.into(),
-            angular_b: b.turned.into(),
+            linear: a.moved - b.moved,
+            angular_a: a.turned,
+            angular_b: b.turned,
         }
     }
 }
@@ -316,86 +358,147 @@ fn scale_rows(m: Mat3A, s: Vec3A) -> Mat3A {
 }
 
 impl Manifold {
-    fn eval(&self, m: &Motion, alpha: f32) -> Eval {
+    #[inline(always)]
+    fn constraint(&self, m: &Motion) -> [Vec4; 3] {
         let l = &self.lanes;
         // The linear rows are the shared basis: one value per row for all lanes.
         let linear = self.rows * m.linear;
         let (ta, tb) = (m.angular_a, m.angular_b);
-        let c: [Vec4; 3] = std::array::from_fn(|r| {
-            let (ja, jb) = (&l.ja[r], &l.jb[r]);
-            (l.c0[r] * (1.0 - alpha)
+        // J θ is n · (θ × r): one cross per endpoint serves all three rows.
+        let (ra, rb) = (&l.ra, &l.rb);
+        let w = [
+            (ra[2] * ta.y - ra[1] * ta.z) - (rb[2] * tb.y - rb[1] * tb.z),
+            (ra[0] * ta.z - ra[2] * ta.x) - (rb[0] * tb.z - rb[2] * tb.x),
+            (ra[1] * ta.x - ra[0] * ta.y) - (rb[1] * tb.x - rb[0] * tb.y),
+        ];
+        let rows = &self.rows;
+        let c = std::array::from_fn(|r| {
+            l.c0[r]
                 + Vec4::splat(linear[r])
-                + ja[0] * ta.x
-                + ja[1] * ta.y
-                + ja[2] * ta.z
-                + jb[0] * tb.x
-                + jb[1] * tb.y
-                + jb[2] * tb.z)
-                * l.active
+                + (w[0] * rows.x_axis[r] + w[1] * rows.y_axis[r] + w[2] * rows.z_axis[r])
         });
+        // Every lane contributes when the manifold has four contacts.
+        if self.len == 4 {
+            c
+        } else {
+            c.map(|v| v * l.active)
+        }
+    }
+
+    #[inline(always)]
+    fn eval_constraint(&self, c: [Vec4; 3]) -> Eval {
+        let l = &self.lanes;
         let raw: [Vec4; 3] = std::array::from_fn(|r| l.penalty[r] * c[r] + l.lambda[r]);
         let fx = raw[0].min(Vec4::ZERO);
         let normal = -fx;
-        let tangent = sqrt4(raw[1] * raw[1] + raw[2] * raw[2]);
-        // Static friction while the contact stuck last frame; kinetic as soon
-        // as holding it would take more than the static bound (Sec. 3.3).
+        let tangent_squared = raw[1] * raw[1] + raw[2] * raw[2];
+        // Test the cone before taking a norm: sticking contacts need neither
+        // a square root nor a division. Keep the original overflow behavior
+        // when the squared tangential force is infinite.
+        let infinity = Vec4::splat(f32::INFINITY);
+        let within = |bound: Vec4, squared: Vec4| {
+            tangent_squared.cmple(squared)
+                & (tangent_squared.cmpne(infinity) | bound.cmpeq(infinity))
+        };
         let static_bound = normal * self.static_friction;
-        let use_static = l.sticking.cmpgt(Vec4::ZERO) & tangent.cmple(static_bound);
-        let bound = Vec4::select(use_static, static_bound, normal * self.friction);
-        let over = tangent.cmpgt(bound) & tangent.cmpgt(Vec4::ZERO);
-        let scale = Vec4::select(over, bound / tangent.max(Vec4::splat(f32::MIN_POSITIVE)), Vec4::ONE);
+        let static_squared = static_bound * static_bound;
+        let held = within(static_bound, static_squared);
+        // Equal coefficients have the same cone regardless of sticking. Reuse
+        // its test and squared bound, including for zero and infinite bounds.
+        // Compare bits so differently signed zero coefficients stay distinct.
+        let (bound, bound_squared, inside) =
+            if self.static_friction.to_bits() == self.friction.to_bits() {
+                (static_bound, static_squared, held)
+            } else {
+                let use_static = l.sticking.cmpgt(Vec4::ZERO) & held;
+                let bound = Vec4::select(use_static, static_bound, normal * self.friction);
+                let squared = bound * bound;
+                (bound, squared, within(bound, squared))
+            };
+        let over = (tangent_squared.cmpgt(bound_squared)
+            | (tangent_squared.cmpeq(infinity) & bound.cmplt(infinity)))
+            & tangent_squared.cmpgt(Vec4::ZERO);
+        let scale = if over.any() {
+            let tangent = sqrt4(tangent_squared);
+            Vec4::select(
+                over,
+                bound / tangent.max(Vec4::splat(f32::MIN_POSITIVE)),
+                Vec4::ONE,
+            )
+        } else {
+            Vec4::ONE
+        };
         Eval {
             c,
             raw,
             force: [fx, raw[1] * scale, raw[2] * scale],
-            normal,
-            tangent,
-            bound,
+            held,
+            inside,
         }
+    }
+
+    #[inline(always)]
+    fn eval(&self, m: &Motion) -> Eval {
+        self.eval_constraint(self.constraint(m))
     }
 
     /// Accumulate this manifold's force and Hessian approximation for `body`
     /// (Eqs. 5, 6), four contacts at a time. The angular terms stay lane-wise
     /// in `sums` until the body's solve; the linear rows are the shared basis,
     /// so the linear block, coupling and gradient sum once per manifold.
+    /// `half` selects which of `sums`' halves this manifold adds to.
     #[allow(clippy::too_many_arguments)]
+    #[inline(always)]
     fn stamp(
         &self,
         a: &Body,
         b: &Body,
         is_a: bool,
-        alpha: f32,
+        c: Option<[Vec4; 3]>,
         damping: f32,
         system: &mut System,
         sums: &mut LaneSums,
+        half: usize,
     ) {
-        let e = self.eval(&Motion::new(a, b), alpha);
+        let c = c.unwrap_or_else(|| self.constraint(&Motion::new(a, b)));
+        let e = self.eval_constraint(c);
         let mut force = e.force;
         let l = &self.lanes;
-        // Stiffness rescaling (Eq. 14): a clamped row contributes the slope
-        // that reaches its bound, not the full penalty. Not for the normal
-        // row of a contact that began the step penetrating: an iteration that
-        // overshoots it apart would leave it no stiffness or force in the
-        // next, so the body falls back, and an even iteration count leaves it
-        // sinking through.
+        // The paper's friction experiments use the full tangential penalty
+        // as a conservative Hessian even when the force is cone-clamped.
+        // Rescale only the normal row, except for a contact that began the
+        // step penetrating: rescaling there can make even iteration counts
+        // alternate between separation and falling back through the contact.
         let mut k = l.penalty;
-        let clamped: [_; 3] = std::array::from_fn(|r| {
-            let row = if r == 0 { l.rescale_normal.cmpgt(Vec4::ZERO) } else { l.active.cmpgt(Vec4::ZERO) };
-            e.force[r].cmpne(e.raw[r]) & e.c[r].cmpne(Vec4::ZERO) & row
-        });
-        if (clamped[0] | clamped[1] | clamped[2]).any() {
-            for r in 0..3 {
-                let rescaled = ((e.force[r] - l.lambda[r]) / e.c[r]).clamp(Vec4::ZERO, l.penalty[r]);
-                k[r] = Vec4::select(clamped[r], rescaled, k[r]);
-            }
+        let clamped = e.force[0].cmpne(e.raw[0])
+            & e.c[0].cmpne(Vec4::ZERO)
+            & l.rescale_normal.cmpgt(Vec4::ZERO);
+        if clamped.any() {
+            let rescaled = ((e.force[0] - l.lambda[0]) / e.c[0]).clamp(Vec4::ZERO, l.penalty[0]);
+            k[0] = Vec4::select(clamped, rescaled, k[0]);
         }
-        let j = if is_a { &l.ja } else { &l.jb };
+        // rb × (−n) = n × rb, so B's Jacobians cross with the negated basis.
+        let (anchor, basis) = if is_a {
+            (l.ra, self.rows.transpose())
+        } else {
+            (l.rb, self.rows.transpose() * -1.0)
+        };
+        let j = [
+            cross4(anchor, basis.x_axis.into()),
+            cross4(anchor, basis.y_axis.into()),
+            cross4(anchor, basis.z_axis.into()),
+        ];
         // Contact damping, VBD's Rayleigh term (Chen et al. 2024): a pushing
         // normal row resists this body's own motion along it this step, with
         // stiffness (k_d / h) k. Corrections otherwise bounce stacks.
         if damping > 0.0 {
             let (body, sign) = if is_a { (a, 1.0) } else { (b, -1.0) };
-            let along = (self.rows * Vec3A::from(body.moved)).x * sign;
+            // Damping only needs the normal projection, not all three rows.
+            let moved = body.moved;
+            let along = (self.rows.x_axis.x * moved.x
+                + self.rows.y_axis.x * moved.y
+                + self.rows.z_axis.x * moved.z)
+                * sign;
             let t = body.turned;
             let motion = Vec4::splat(along) + j[0][0] * t.x + j[0][1] * t.y + j[0][2] * t.z;
             let pushing = force[0].cmplt(Vec4::ZERO);
@@ -404,60 +507,475 @@ impl Manifold {
             force[0] = (force[0] + kd * motion).min(Vec4::ZERO);
             k[0] += kd;
         }
+        if self.len == 1 {
+            // A sphere or edge contact occupies only one contact lane. Use
+            // spatial SIMD for its block instead of four mostly empty lanes.
+            let stiffness = Vec3A::new(k[0].x, k[1].x, k[2].x);
+            let force = Vec3A::new(force[0].x, force[1].x, force[2].x);
+            let angular = Mat3A::from_cols(
+                Vec3A::new(j[0][0].x, j[1][0].x, j[2][0].x),
+                Vec3A::new(j[0][1].x, j[1][1].x, j[2][1].x),
+                Vec3A::new(j[0][2].x, j[1][2].x, j[2][2].x),
+            );
+            let weighted = scale_rows(angular, stiffness);
+            let sign = if is_a { 1.0 } else { -1.0 };
+            system.lin += self.rows.transpose() * scale_rows(self.rows, stiffness);
+            system.ang += angular.transpose() * weighted;
+            system.cross += weighted.transpose() * self.rows * sign;
+            system.rhs_lin += self.rows.transpose() * force * sign;
+            system.rhs_ang += angular.transpose() * force;
+            return;
+        }
         // Stiffness-weighted angular rows K J, per row and component.
         let mut kj = [[Vec4::ZERO; 3]; 3];
         for r in 0..3 {
             let (jr, f) = (&j[r], force[r]);
             kj[r] = [k[r] * jr[0], k[r] * jr[1], k[r] * jr[2]];
             let w = &kj[r];
-            sums.ang[0] += w[0] * jr[0];
-            sums.ang[1] += w[0] * jr[1];
-            sums.ang[2] += w[0] * jr[2];
-            sums.ang[3] += w[1] * jr[1];
-            sums.ang[4] += w[1] * jr[2];
-            sums.ang[5] += w[2] * jr[2];
-            sums.rhs[0] += jr[0] * f;
-            sums.rhs[1] += jr[1] * f;
-            sums.rhs[2] += jr[2] * f;
+            sums.ang[0][half] += w[0] * jr[0];
+            sums.ang[1][half] += w[0] * jr[1];
+            sums.ang[2][half] += w[0] * jr[2];
+            sums.ang[3][half] += w[1] * jr[1];
+            sums.ang[4][half] += w[1] * jr[2];
+            sums.ang[5][half] += w[2] * jr[2];
+            sums.rhs[0][half] += jr[0] * f;
+            sums.rhs[1][half] += jr[1] * f;
+            sums.rhs[2][half] += jr[2] * f;
         }
-        let s1 = sum4(k[0], k[1], k[2], force[0]);
-        let s2 = sum4(force[1], force[2], kj[0][0], kj[0][1]);
-        let s3 = sum4(kj[0][2], kj[1][0], kj[1][1], kj[1][2]);
-        let s4 = sum4(kj[2][0], kj[2][1], kj[2][2], Vec4::ZERO);
+        self.add_block(
+            is_a,
+            [
+                sum4(k[0], k[1], k[2], force[0]),
+                sum4(force[1], force[2], kj[0][0], kj[0][1]),
+                sum4(kj[0][2], kj[1][0], kj[1][1], kj[1][2]),
+                sum4(kj[2][0], kj[2][1], kj[2][2], Vec4::ZERO),
+            ],
+            system,
+        );
+    }
+
+    /// The linear block, coupling and gradient from a manifold's reduced
+    /// stiffness `k`, force and K J, packed in that order.
+    #[inline(always)]
+    fn add_block(&self, is_a: bool, [s1, s2, s3, s4]: [Vec4; 4], system: &mut System) {
         let stiffness = Vec3A::new(s1.x, s1.y, s1.z);
         let force = Vec3A::new(s1.w, s2.x, s2.y);
-        // Rows are K J per basis row.
-        let weighted = Mat3A::from_cols(
-            Vec3A::new(s2.z, s3.y, s4.x),
-            Vec3A::new(s2.w, s3.z, s4.y),
-            Vec3A::new(s3.x, s3.w, s4.z),
+        // Columns are the contact-basis rows of K J.
+        let weighted_transpose = Mat3A::from_cols(
+            Vec3A::new(s2.z, s2.w, s3.x),
+            Vec3A::new(s3.y, s3.z, s3.w),
+            Vec3A::new(s4.x, s4.y, s4.z),
         );
         let sign = if is_a { 1.0 } else { -1.0 };
         let bt = self.rows.transpose();
         system.lin += bt * scale_rows(self.rows, stiffness);
-        system.cross += weighted.transpose() * self.rows * sign;
+        system.cross += weighted_transpose * self.rows * sign;
         system.rhs_lin += bt * force * sign;
     }
 
+    /// `dual`, where its flag is set, then `stamp`, for two multi-contact
+    /// manifolds of body `i`, one per 256-bit half. Every lane repeats those
+    /// functions' operations in the same order, so results match them bit for
+    /// bit; do not contract them into FMAs.
+    ///
+    /// # Safety
+    /// The CPU must support AVX2.
+    #[cfg(target_arch = "x86_64")]
+    #[target_feature(enable = "avx2")]
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn stamp_pair_avx2(
+        p: &mut Self,
+        q: &mut Self,
+        [pa, pb]: [&Body; 2],
+        [qa, qb]: [&Body; 2],
+        i: usize,
+        [dual_p, dual_q]: [bool; 2],
+        beta: f32,
+        damping: f32,
+        system: &mut System,
+        sums: &mut LaneSums,
+    ) {
+        use std::arch::x86_64::*;
+        let join = |a: Vec4, b: Vec4| _mm256_set_m128(b.into(), a.into());
+        let splat2 = |a: f32, b: f32| _mm256_set_m128(_mm_set1_ps(b), _mm_set1_ps(a));
+        let mul = |a, b| _mm256_mul_ps(a, b);
+        let add = |a, b| _mm256_add_ps(a, b);
+        let and = |a, b| _mm256_and_ps(a, b);
+        let or = |a, b| _mm256_or_ps(a, b);
+        let le = |a, b| _mm256_cmp_ps::<_CMP_LE_OS>(a, b);
+        let lt = |a, b| _mm256_cmp_ps::<_CMP_LT_OS>(a, b);
+        let gt = |a, b| _mm256_cmp_ps::<_CMP_GT_OS>(a, b);
+        let eq = |a, b| _mm256_cmp_ps::<_CMP_EQ_OQ>(a, b);
+        let ne = |a, b| _mm256_cmp_ps::<_CMP_NEQ_UQ>(a, b);
+        let zero = _mm256_setzero_ps();
+        let one = _mm256_set1_ps(1.0);
+        let infinity = _mm256_set1_ps(f32::INFINITY);
+
+        let (mp, mq) = (Motion::new(pa, pb), Motion::new(qa, qb));
+        let wide = |a: Vec3A, b: Vec3A| _mm256_set_m128(b.into(), a.into());
+        // A matrix times `v` in each half, summing as glam does.
+        let times = |m: &[__m256; 3], v| {
+            let x = mul(m[0], _mm256_permute_ps::<0x00>(v));
+            let y = mul(m[1], _mm256_permute_ps::<0x55>(v));
+            add(add(x, y), mul(m[2], _mm256_permute_ps::<0xAA>(v)))
+        };
+        let rows = [
+            wide(p.rows.x_axis, q.rows.x_axis),
+            wide(p.rows.y_axis, q.rows.y_axis),
+            wide(p.rows.z_axis, q.rows.z_axis),
+        ];
+        let sign = splat2(
+            if i == p.a { 1.0 } else { -1.0 },
+            if i == q.a { 1.0 } else { -1.0 },
+        );
+        let linear = times(&rows, wide(mp.linear, mq.linear));
+        let linear = [
+            _mm256_permute_ps::<0x00>(linear),
+            _mm256_permute_ps::<0x55>(linear),
+            _mm256_permute_ps::<0xAA>(linear),
+        ];
+        let (ta, tb) = (
+            wide(mp.angular_a, mq.angular_a),
+            wide(mp.angular_b, mq.angular_b),
+        );
+        let (ax, ay, az) = (
+            _mm256_permute_ps::<0x00>(ta),
+            _mm256_permute_ps::<0x55>(ta),
+            _mm256_permute_ps::<0xAA>(ta),
+        );
+        let (bx, by, bz) = (
+            _mm256_permute_ps::<0x00>(tb),
+            _mm256_permute_ps::<0x55>(tb),
+            _mm256_permute_ps::<0xAA>(tb),
+        );
+        let (lp, lq) = (&p.lanes, &q.lanes);
+        let active = join(lp.active, lq.active);
+        let sub = |a, b| _mm256_sub_ps(a, b);
+        let ra = [
+            join(lp.ra[0], lq.ra[0]),
+            join(lp.ra[1], lq.ra[1]),
+            join(lp.ra[2], lq.ra[2]),
+        ];
+        let rb = [
+            join(lp.rb[0], lq.rb[0]),
+            join(lp.rb[1], lq.rb[1]),
+            join(lp.rb[2], lq.rb[2]),
+        ];
+        let w = [
+            sub(
+                sub(mul(ra[2], ay), mul(ra[1], az)),
+                sub(mul(rb[2], by), mul(rb[1], bz)),
+            ),
+            sub(
+                sub(mul(ra[0], az), mul(ra[2], ax)),
+                sub(mul(rb[0], bz), mul(rb[2], bx)),
+            ),
+            sub(
+                sub(mul(ra[1], ax), mul(ra[0], ay)),
+                sub(mul(rb[1], bx), mul(rb[0], by)),
+            ),
+        ];
+        // The basis vectors' components, one per half: `n[k][r]` is row r's k.
+        let n = [
+            [
+                _mm256_permute_ps::<0x00>(rows[0]),
+                _mm256_permute_ps::<0x55>(rows[0]),
+                _mm256_permute_ps::<0xAA>(rows[0]),
+            ],
+            [
+                _mm256_permute_ps::<0x00>(rows[1]),
+                _mm256_permute_ps::<0x55>(rows[1]),
+                _mm256_permute_ps::<0xAA>(rows[1]),
+            ],
+            [
+                _mm256_permute_ps::<0x00>(rows[2]),
+                _mm256_permute_ps::<0x55>(rows[2]),
+                _mm256_permute_ps::<0xAA>(rows[2]),
+            ],
+        ];
+        // Plain loops: closures passed to `from_fn` or `map` would leave this
+        // function's target features and pass every vector through memory.
+        let mut c = [zero; 3];
+        let mut penalty = [zero; 3];
+        let mut lambda = [zero; 3];
+        for r in 0..3 {
+            let angular = add(
+                add(mul(w[0], n[0][r]), mul(w[1], n[1][r])),
+                mul(w[2], n[2][r]),
+            );
+            let v = add(add(join(lp.c0[r], lq.c0[r]), linear[r]), angular);
+            c[r] = mul(v, active);
+            penalty[r] = join(lp.penalty[r], lq.penalty[r]);
+            lambda[r] = join(lp.lambda[r], lq.lambda[r]);
+        }
+        let static_friction = splat2(p.static_friction, q.static_friction);
+        let friction = splat2(p.friction, q.friction);
+        let sticking = join(lp.sticking, lq.sticking);
+        let same = |m: &Self| m.static_friction.to_bits() == m.friction.to_bits();
+        let same = same(p) && same(q);
+        // `eval_constraint`: raw normal, forces, and the held and inside masks.
+        let eval = |penalty: &[__m256; 3], lambda: &[__m256; 3]| {
+            let raw = [
+                add(mul(penalty[0], c[0]), lambda[0]),
+                add(mul(penalty[1], c[1]), lambda[1]),
+                add(mul(penalty[2], c[2]), lambda[2]),
+            ];
+            let fx = _mm256_min_ps(raw[0], zero);
+            let normal = _mm256_xor_ps(fx, _mm256_set1_ps(-0.0));
+            let tangent_squared = add(mul(raw[1], raw[1]), mul(raw[2], raw[2]));
+            let within = |bound, squared| {
+                and(
+                    le(tangent_squared, squared),
+                    or(ne(tangent_squared, infinity), eq(bound, infinity)),
+                )
+            };
+            let static_bound = mul(normal, static_friction);
+            let static_squared = mul(static_bound, static_bound);
+            let held = within(static_bound, static_squared);
+            let (bound, bound_squared, inside) = if same {
+                (static_bound, static_squared, held)
+            } else {
+                let use_static = and(gt(sticking, zero), held);
+                let bound = _mm256_blendv_ps(mul(normal, friction), static_bound, use_static);
+                let squared = mul(bound, bound);
+                (bound, squared, within(bound, squared))
+            };
+            let over = and(
+                or(
+                    gt(tangent_squared, bound_squared),
+                    and(eq(tangent_squared, infinity), lt(bound, infinity)),
+                ),
+                gt(tangent_squared, zero),
+            );
+            let scale = if _mm256_movemask_ps(over) != 0 {
+                let tangent = _mm256_sqrt_ps(tangent_squared);
+                let limit = _mm256_max_ps(tangent, _mm256_set1_ps(f32::MIN_POSITIVE));
+                _mm256_blendv_ps(one, _mm256_div_ps(bound, limit), over)
+            } else {
+                one
+            };
+            (
+                raw[0],
+                [fx, mul(raw[1], scale), mul(raw[2], scale)],
+                held,
+                inside,
+            )
+        };
+        let (mut raw0, mut force, held, inside) = eval(&penalty, &lambda);
+        if dual_p || dual_q {
+            let beta = splat2(beta * p.scale, beta * q.scale);
+            let max = splat2(PENALTY_MAX * p.scale, PENALTY_MAX * q.scale);
+            let bound = splat2(LAMBDA_MAX * p.scale, LAMBDA_MAX * q.scale);
+            let minimum = _mm256_xor_ps(bound, _mm256_set1_ps(-0.0));
+            let abs = |v| _mm256_andnot_ps(_mm256_set1_ps(-0.0), v);
+            let ramp = |r: usize| {
+                let v: __m256 = c[r];
+                _mm256_min_ps(add(penalty[r], mul(abs(v), beta)), max)
+            };
+            let pushing = lt(force[0], zero);
+            let slip_squared = add(mul(c[1], c[1]), mul(c[2], c[2]));
+            let threshold = _mm256_set1_ps(STICK_THRESHOLD * STICK_THRESHOLD);
+            let stuck = _mm256_movemask_ps(lt(slip_squared, threshold)) as u8;
+            let (held, inside_bits) = (
+                _mm256_movemask_ps(held) as u8,
+                _mm256_movemask_ps(inside) as u8,
+            );
+            // Each flag selects a half: the other manifold's dual waits for
+            // its own first visitor.
+            let update = _mm256_set_m128(
+                _mm_castsi128_ps(_mm_set1_epi32(-i32::from(dual_q))),
+                _mm_castsi128_ps(_mm_set1_epi32(-i32::from(dual_p))),
+            );
+            let mut new_penalty = [zero; 3];
+            let mut new_lambda = [zero; 3];
+            new_penalty[0] = _mm256_blendv_ps(penalty[0], ramp(0), pushing);
+            new_penalty[1] = _mm256_blendv_ps(penalty[1], ramp(1), inside);
+            new_penalty[2] = _mm256_blendv_ps(penalty[2], ramp(2), inside);
+            for r in 0..3 {
+                new_lambda[r] = _mm256_min_ps(_mm256_max_ps(force[r], minimum), bound);
+                new_penalty[r] = _mm256_blendv_ps(penalty[r], new_penalty[r], update);
+                new_lambda[r] = _mm256_blendv_ps(lambda[r], new_lambda[r], update);
+            }
+            (penalty, lambda) = (new_penalty, new_lambda);
+            let low = |v| Vec4::from(_mm256_castps256_ps128(v));
+            let high = |v| Vec4::from(_mm256_extractf128_ps::<1>(v));
+            if dual_p {
+                let l = &mut p.lanes;
+                for r in 0..3 {
+                    (l.penalty[r], l.lambda[r]) = (low(penalty[r]), low(lambda[r]));
+                }
+                let (inside, stuck) = (inside_bits & 15, stuck & 15);
+                (l.stick, l.held) = (l.stick & !inside | stuck & inside, held & 15);
+            }
+            if dual_q {
+                let l = &mut q.lanes;
+                for r in 0..3 {
+                    (l.penalty[r], l.lambda[r]) = (high(penalty[r]), high(lambda[r]));
+                }
+                let (inside, stuck) = (inside_bits >> 4, stuck >> 4);
+                (l.stick, l.held) = (l.stick & !inside | stuck & inside, held >> 4);
+            }
+            let evaluated = eval(&penalty, &lambda);
+            (raw0, force) = (evaluated.0, evaluated.1);
+        }
+        let (lp, lq) = (&p.lanes, &q.lanes);
+        let mut fx = force[0];
+
+        let mut k = penalty;
+        let clamped = and(
+            and(ne(fx, raw0), ne(c[0], zero)),
+            gt(join(lp.rescale_normal, lq.rescale_normal), zero),
+        );
+        if _mm256_movemask_ps(clamped) != 0 {
+            let rescaled = _mm256_div_ps(_mm256_sub_ps(fx, lambda[0]), c[0]);
+            let rescaled = _mm256_min_ps(_mm256_max_ps(rescaled, zero), penalty[0]);
+            k[0] = _mm256_blendv_ps(k[0], rescaled, clamped);
+        }
+        // `cross4` of this body's anchors with its signed basis, each half.
+        let anchor = {
+            let (ap, aq) = (
+                if i == p.a { &lp.ra } else { &lp.rb },
+                if i == q.a { &lq.ra } else { &lq.rb },
+            );
+            [join(ap[0], aq[0]), join(ap[1], aq[1]), join(ap[2], aq[2])]
+        };
+        let mut j = [[zero; 3]; 3];
+        for r in 0..3 {
+            let (x, y, z) = (mul(n[0][r], sign), mul(n[1][r], sign), mul(n[2][r], sign));
+            j[r] = [
+                sub(mul(anchor[1], z), mul(anchor[2], y)),
+                sub(mul(anchor[2], x), mul(anchor[0], z)),
+                sub(mul(anchor[0], y), mul(anchor[1], x)),
+            ];
+        }
+        if damping > 0.0 {
+            let body = if i == p.a { pa } else { pb };
+            let along = times(&rows, wide(body.moved, body.moved));
+            let along = mul(_mm256_permute_ps::<0x00>(along), sign);
+            let t = body.turned;
+            let mut motion = add(along, mul(j[0][0], _mm256_set1_ps(t.x)));
+            motion = add(motion, mul(j[0][1], _mm256_set1_ps(t.y)));
+            motion = add(motion, mul(j[0][2], _mm256_set1_ps(t.z)));
+            let pushing = lt(fx, zero);
+            let kd = _mm256_blendv_ps(zero, mul(k[0], _mm256_set1_ps(damping)), pushing);
+            fx = _mm256_min_ps(add(fx, mul(kd, motion)), zero);
+            k[0] = add(k[0], kd);
+        }
+        let force = [fx, force[1], force[2]];
+
+        // SAFETY: each sum's two halves are 32 contiguous bytes.
+        let load = |v: &[Vec4; 2]| unsafe { _mm256_loadu_ps(v.as_ptr().cast()) };
+        let mut ang = [zero; 6];
+        for (v, sum) in ang.iter_mut().zip(&sums.ang) {
+            *v = load(sum);
+        }
+        let mut rhs = [zero; 3];
+        for (v, sum) in rhs.iter_mut().zip(&sums.rhs) {
+            *v = load(sum);
+        }
+        let mut kj = [[zero; 3]; 3];
+        for r in 0..3 {
+            let (jr, f) = (&j[r], force[r]);
+            kj[r] = [mul(k[r], jr[0]), mul(k[r], jr[1]), mul(k[r], jr[2])];
+            let w = &kj[r];
+            ang[0] = add(ang[0], mul(w[0], jr[0]));
+            ang[1] = add(ang[1], mul(w[0], jr[1]));
+            ang[2] = add(ang[2], mul(w[0], jr[2]));
+            ang[3] = add(ang[3], mul(w[1], jr[1]));
+            ang[4] = add(ang[4], mul(w[1], jr[2]));
+            ang[5] = add(ang[5], mul(w[2], jr[2]));
+            rhs[0] = add(rhs[0], mul(jr[0], f));
+            rhs[1] = add(rhs[1], mul(jr[1], f));
+            rhs[2] = add(rhs[2], mul(jr[2], f));
+        }
+        // SAFETY: as for `load`.
+        let store = |to: &mut [Vec4; 2], v| unsafe { _mm256_storeu_ps(to.as_mut_ptr().cast(), v) };
+        for (sum, v) in sums.ang.iter_mut().zip(ang) {
+            store(sum, v);
+        }
+        for (sum, v) in sums.rhs.iter_mut().zip(rhs) {
+            store(sum, v);
+        }
+
+        // `sum4` in each half.
+        let sum4 = |a, b, c, d| {
+            let t0 = _mm256_shuffle_ps::<0b01_00_01_00>(a, b);
+            let t1 = _mm256_shuffle_ps::<0b11_10_11_10>(a, b);
+            let t2 = _mm256_shuffle_ps::<0b01_00_01_00>(c, d);
+            let t3 = _mm256_shuffle_ps::<0b11_10_11_10>(c, d);
+            let x = _mm256_shuffle_ps::<0b10_00_10_00>(t0, t2);
+            let y = _mm256_shuffle_ps::<0b11_01_11_01>(t0, t2);
+            let z = _mm256_shuffle_ps::<0b10_00_10_00>(t1, t3);
+            let w = _mm256_shuffle_ps::<0b11_01_11_01>(t1, t3);
+            add(add(add(x, y), z), w)
+        };
+        let stiffness = sum4(k[0], k[1], k[2], zero);
+        let force = sum4(force[0], force[1], force[2], zero);
+        // Columns are the contact-basis rows of K J.
+        let weighted = [
+            sum4(kj[0][0], kj[0][1], kj[0][2], zero),
+            sum4(kj[1][0], kj[1][1], kj[1][2], zero),
+            sum4(kj[2][0], kj[2][1], kj[2][2], zero),
+        ];
+
+        // `add_block` in each half.
+        let (t0, t1) = (
+            _mm256_unpacklo_ps(rows[0], rows[1]),
+            _mm256_unpackhi_ps(rows[0], rows[1]),
+        );
+        let transposed = [
+            _mm256_shuffle_ps::<0b00_00_01_00>(t0, rows[2]),
+            _mm256_shuffle_ps::<0b01_01_11_10>(t0, rows[2]),
+            _mm256_shuffle_ps::<0b10_10_01_00>(t1, rows[2]),
+        ];
+        let mut block = [zero; 7];
+        for n in 0..3 {
+            block[n] = times(&transposed, mul(rows[n], stiffness));
+            block[n + 3] = mul(times(&weighted, rows[n]), sign);
+        }
+        block[6] = mul(times(&transposed, force), sign);
+        let low = |v| Vec3A::from(_mm256_castps256_ps128(v));
+        let high = |v| Vec3A::from(_mm256_extractf128_ps::<1>(v));
+        let both = |to: &mut Vec3A, v| *to = *to + low(v) + high(v);
+        both(&mut system.lin.x_axis, block[0]);
+        both(&mut system.lin.y_axis, block[1]);
+        both(&mut system.lin.z_axis, block[2]);
+        both(&mut system.cross.x_axis, block[3]);
+        both(&mut system.cross.y_axis, block[4]);
+        both(&mut system.cross.z_axis, block[5]);
+        both(&mut system.rhs_lin, block[6]);
+    }
+
     /// Store forces and ramp penalties (Eqs. 11, 12), four contacts at a time.
-    fn dual(&mut self, a: &Body, b: &Body, alpha: f32, beta: f32) {
-        let e = self.eval(&Motion::new(a, b), alpha);
+    #[inline(always)]
+    fn dual(&mut self, a: &Body, b: &Body, beta: f32) -> [Vec4; 3] {
+        let e = self.eval(&Motion::new(a, b));
         let (beta, max) = (beta * self.scale, Vec4::splat(PENALTY_MAX * self.scale));
         let bound = Vec4::splat(LAMBDA_MAX * self.scale);
-        let (friction, l) = (self.static_friction, &mut self.lanes);
+        let l = &mut self.lanes;
         for r in 0..3 {
             l.lambda[r] = e.force[r].clamp(-bound, bound);
         }
-        l.held = Vec4::select(e.tangent.cmple(e.normal * friction), Vec4::ONE, Vec4::ZERO);
+        l.held = e.held.bitmask() as u8;
         let pushing = e.force[0].cmplt(Vec4::ZERO);
-        l.penalty[0] = Vec4::select(pushing, (l.penalty[0] + e.c[0].abs() * beta).min(max), l.penalty[0]);
-        let inside = e.tangent.cmple(e.bound);
+        l.penalty[0] = Vec4::select(
+            pushing,
+            (l.penalty[0] + e.c[0].abs() * beta).min(max),
+            l.penalty[0],
+        );
+        let inside = e.inside;
         for r in 1..3 {
-            l.penalty[r] = Vec4::select(inside, (l.penalty[r] + e.c[r].abs() * beta).min(max), l.penalty[r]);
+            l.penalty[r] = Vec4::select(
+                inside,
+                (l.penalty[r] + e.c[r].abs() * beta).min(max),
+                l.penalty[r],
+            );
         }
-        let slip = sqrt4(e.c[1] * e.c[1] + e.c[2] * e.c[2]);
-        let stuck = Vec4::select(slip.cmplt(Vec4::splat(STICK_THRESHOLD)), Vec4::ONE, Vec4::ZERO);
-        l.stick = Vec4::select(inside, stuck, l.stick);
+        let slip_squared = e.c[1] * e.c[1] + e.c[2] * e.c[2];
+        let stuck = slip_squared.cmplt(Vec4::splat(STICK_THRESHOLD * STICK_THRESHOLD));
+        let inside = inside.bitmask() as u8;
+        l.stick = l.stick & !inside | stuck.bitmask() as u8 & inside;
+        e.c
     }
 
     /// A manifold for a new pair, warm started from `previous` (a sleeping
@@ -467,134 +985,175 @@ impl Manifold {
         a: usize,
         b: usize,
         previous: Option<&Manifold>,
-        settings: &PhysicsSettings,
+        prepare: Option<&PhysicsSettings>,
     ) -> Option<Self> {
         let (ba, bb) = (&bodies[a], &bodies[b]);
         let (basis, mut contacts, len) = collide::collide(ba, bb)?;
-        if let Some(previous) = previous {
-            previous.warm(ba, bb, &mut contacts[..len]);
-        }
+        let warm = if let Some(previous) = previous {
+            previous.warm(ba, bb, &mut contacts[..len])
+        } else {
+            Warm {
+                held: (1 << len) - 1,
+                ..Warm::default()
+            }
+        };
+        let mut lanes = Lanes::default();
+        lanes.set_warm(warm);
         let inverse = ba.rotation.conjugate();
         let mut m = Manifold {
             a,
             b,
-            key: (ba.key, bb.key),
-            rows: Mat3A::IDENTITY,
-            local_basis: basis.map(|v| inverse * v),
-            relative: (inverse * (bb.position - ba.position), inverse * bb.rotation),
-            contacts,
+            rows: Mat3A::from_cols(basis[0].into(), basis[1].into(), basis[2].into()).transpose(),
+            cold: Box::new(CollisionData {
+                key: (ba.key, bb.key),
+                local_basis: basis.map(|v| inverse * v),
+                relative: (inverse * (bb.position - ba.position), inverse * bb.rotation),
+                contacts,
+                anchors: anchor_lanes(&contacts[..len]),
+                deep: false,
+                seen: 0,
+            }),
             first_is_a: true,
-            seen: 0,
             len,
             friction: 0.0,
             static_friction: 0.0,
             scale: 0.0,
-            lanes: Lanes::default(),
+            lanes,
         };
-        m.prepare(ba, bb, basis, settings);
+        if let Some(settings) = prepare {
+            m.prepare(ba, bb, basis, settings);
+        }
         Some(m)
     }
 
     /// Bring a kept manifold up to this step: reuse its contacts while B
     /// stays near the pose they were made at, else collide again, warm
     /// starting from the old contacts. False once the shapes separate.
-    fn refresh(&mut self, bodies: &[Body], settings: &PhysicsSettings) -> bool {
+    fn refresh(&mut self, bodies: &[Body], prepare: Option<&PhysicsSettings>) -> bool {
         let (ba, bb) = (&bodies[self.a], &bodies[self.b]);
         let inverse = ba.rotation.conjugate();
         let relative = (inverse * (bb.position - ba.position), inverse * bb.rotation);
-        let reusable = self.relative.0.distance_squared(relative.0) < REUSE_DISTANCE * REUSE_DISTANCE
-            && quat_sub(relative.1, self.relative.1).length_squared() < REUSE_ANGLE * REUSE_ANGLE;
+        let reusable = self.cold.relative.0.distance_squared(relative.0)
+            < REUSE_DISTANCE * REUSE_DISTANCE
+            && quat_sub(relative.1, self.cold.relative.1).length_squared()
+                < REUSE_ANGLE * REUSE_ANGLE;
         let basis = if reusable {
-            self.local_basis.map(|v| ba.rotation * v)
+            self.cold.local_basis.map(|v| ba.rotation * v)
         } else {
             let Some((basis, mut contacts, len)) = collide::collide(ba, bb) else {
                 return false;
             };
-            self.warm(ba, bb, &mut contacts[..len]);
-            (self.contacts, self.len) = (contacts, len);
-            self.local_basis = basis.map(|v| inverse * v);
-            self.relative = relative;
+            if len == self.len
+                && contacts[..len]
+                    .iter()
+                    .zip(&self.cold.contacts[..len])
+                    .all(|(new, old)| new.feature == old.feature)
+            {
+                // Identical feature order already has the correct solver lanes.
+                // Keep sticking anchors, except for rolling spheres.
+                if !matches!(ba.shape, Collider::Sphere { .. })
+                    && !matches!(bb.shape, Collider::Sphere { .. })
+                {
+                    for (i, (new, old)) in contacts[..len]
+                        .iter_mut()
+                        .zip(&self.cold.contacts[..len])
+                        .enumerate()
+                    {
+                        if self.lanes.stick >> i & 1 != 0 {
+                            (new.ra, new.rb) = (old.ra, old.rb);
+                        }
+                    }
+                }
+            } else {
+                let warm = self.warm(ba, bb, &mut contacts[..len]);
+                self.lanes.set_warm(warm);
+            }
+            (self.cold.contacts, self.len) = (contacts, len);
+            self.cold.anchors = anchor_lanes(&contacts[..len]);
+            self.cold.local_basis = basis.map(|v| inverse * v);
+            self.cold.relative = relative;
             basis
         };
-        self.prepare(ba, bb, basis, settings);
+        self.rows = Mat3A::from_cols(basis[0].into(), basis[1].into(), basis[2].into()).transpose();
+        if let Some(settings) = prepare {
+            self.prepare(ba, bb, basis, settings);
+        }
         true
     }
 
     /// Carry matching contacts' forces, penalties and friction state (and,
     /// while static friction held, their anchors) to freshly collided ones.
-    fn warm(&self, ba: &Body, bb: &Body, contacts: &mut [Contact]) {
+    fn warm(&self, ba: &Body, bb: &Body, contacts: &mut [Contact]) -> Warm {
         // A rolling sphere's contact point moves over its surface: its
         // anchors never stick, only its forces warm start.
         let rolls = matches!(ba.shape, Collider::Sphere { .. })
             || matches!(bb.shape, Collider::Sphere { .. });
-        for contact in contacts {
-            let matched = self.contacts[..self.len]
+        let mut warm = Warm::default();
+        for (i, contact) in contacts.iter_mut().enumerate() {
+            // A new contact starts static and turns kinetic once it slides.
+            warm.held |= 1 << i;
+            let matched = self.cold.contacts[..self.len]
                 .iter()
-                .find(|p| p.feature == contact.feature);
-            if let Some(p) = matched {
-                let (ra, rb) = (contact.ra, contact.rb);
-                *contact = *p;
-                if !p.stick || rolls {
-                    (contact.ra, contact.rb) = (ra, rb);
+                .enumerate()
+                .find(|(_, p)| p.feature == contact.feature);
+            if let Some((j, previous)) = matched {
+                let stick = self.lanes.stick >> j & 1;
+                if stick != 0 && !rolls {
+                    (contact.ra, contact.rb) = (previous.ra, previous.rb);
                 }
+                for k in 0..3 {
+                    warm.penalty[k][i] = self.lanes.penalty[k][j];
+                    warm.lambda[k][i] = self.lanes.lambda[k][j];
+                }
+                warm.stick |= stick << i;
+                warm.held = warm.held & !(1 << i) | (self.lanes.held >> j & 1) << i;
             }
         }
+        warm
     }
 
     /// The step's constraint errors, Jacobians, materials and warm-started
     /// penalties and duals (Eq. 19), four contacts at a time in the lanes.
-    /// The contacts keep last step's state until `store`.
     fn prepare(&mut self, ba: &Body, bb: &Body, basis: [Vec3; 3], settings: &PhysicsSettings) {
         let (alpha, gamma) = (settings.alpha, settings.gamma);
         let scale = ba.mass.max(bb.mass);
-        let mut l = Lanes::default();
-        let (mut ra, mut rb) = ([Vec4::ZERO; 3], [Vec4::ZERO; 3]);
-        for (i, c) in self.contacts[..self.len].iter().enumerate() {
-            for k in 0..3 {
-                ra[k][i] = c.ra[k];
-                rb[k][i] = c.rb[k];
-                l.penalty[k][i] = c.penalty[k];
-                l.lambda[k][i] = c.lambda[k];
-            }
-            l.active[i] = 1.0;
-            // Static friction while the contact held at the last step's end.
-            l.sticking[i] = mask(c.held);
-            l.stick[i] = mask(c.stick);
-            l.held[i] = mask(c.held);
-        }
-        let (ra, rb) = (rotate4(ba.rotation, ra), rotate4(bb.rotation, rb));
+        let l = &mut self.lanes;
+        let live = (1u8 << self.len) - 1;
+        l.active = LANE_BITS[live as usize];
+        let [ra, rb] = self.cold.anchors;
+        // Dual state already lives in SIMD lanes. Clear unused contacts so
+        // their previous values cannot contaminate this step's arithmetic.
+        let active = l.active.cmpgt(Vec4::ZERO);
+        l.penalty = l.penalty.map(|v| Vec4::select(active, v, Vec4::ZERO));
+        l.lambda = l.lambda.map(|v| Vec4::select(active, v, Vec4::ZERO));
+        l.stick &= live;
+        l.held &= live;
+        l.sticking = LANE_BITS[l.held as usize];
+        let (ra, rb) = (rotate4(ba.initial_basis, ra), rotate4(bb.initial_basis, rb));
         let gap = ba.position - bb.position;
-        let d: [Vec4; 3] = std::array::from_fn(|k| (Vec4::splat(gap[k]) + ra[k] - rb[k]) * l.active);
+        let d: [Vec4; 3] =
+            std::array::from_fn(|k| (Vec4::splat(gap[k]) + ra[k] - rb[k]) * l.active);
+        (l.ra, l.rb) = (ra, rb);
         for (r, n) in basis.iter().enumerate() {
-            l.ja[r] = cross4(ra, *n);
-            // rb × (−n) = n × rb.
-            l.jb[r] = cross4(rb, *n).map(|v| -v);
             let margin = if r == 0 { COLLISION_MARGIN } else { 0.0 };
             l.c0[r] = (d[0] * n.x + d[1] * n.y + d[2] * n.z + Vec4::splat(margin)) * l.active;
         }
-        let (min, max) = (Vec4::splat(PENALTY_MIN * scale), Vec4::splat(PENALTY_MAX * scale));
+        let (min, max) = (
+            Vec4::splat(PENALTY_MIN * scale),
+            Vec4::splat(PENALTY_MAX * scale),
+        );
         for k in 0..3 {
             l.lambda[k] *= alpha * gamma;
             l.penalty[k] = (l.penalty[k] * gamma).clamp(min, max) * l.active;
         }
         l.rescale_normal = Vec4::select(l.c0[0].cmpge(Vec4::ZERO), l.active, Vec4::ZERO);
-        self.lanes = l;
-        self.rows = Mat3A::from_cols(basis[0].into(), basis[1].into(), basis[2].into()).transpose();
+        self.cold.deep = l.c0[0].cmplt(Vec4::splat(-SLEEP_PENETRATION)).any();
+        for c in &mut l.c0 {
+            *c *= 1.0 - alpha;
+        }
         self.friction = (ba.friction * bb.friction).sqrt();
         self.static_friction = (ba.static_friction * bb.static_friction).sqrt();
         self.scale = scale;
-    }
-
-    /// Copy the lanes' warm-start state back to the contacts, for matching
-    /// them to next step's contacts.
-    fn store(&mut self) {
-        let l = &self.lanes;
-        for (i, contact) in self.contacts[..self.len].iter_mut().enumerate() {
-            contact.penalty = Vec3A::new(l.penalty[0][i], l.penalty[1][i], l.penalty[2][i]);
-            contact.lambda = Vec3A::new(l.lambda[0][i], l.lambda[1][i], l.lambda[2][i]);
-            contact.stick = l.stick[i] > 0.5;
-            contact.held = l.held[i] > 0.5;
-        }
     }
 }
 
@@ -609,6 +1168,122 @@ pub(crate) struct System {
 }
 
 impl System {
+    const IDENTITY: Self = Self {
+        lin: Mat3A::IDENTITY,
+        ang: Mat3A::IDENTITY,
+        cross: Mat3A::ZERO,
+        rhs_lin: Vec3A::ZERO,
+        rhs_ang: Vec3A::ZERO,
+    };
+
+    /// Transpose whole spatial columns, avoiding scalar gathers for each
+    /// coefficient of the six-by-six block.
+    #[inline(always)]
+    fn pack_four(s: &[Self]) -> ([[Vec4; 6]; 6], [Vec4; 6]) {
+        macro_rules! transpose {
+            ($($field:ident).+) => {
+                Mat4::from_cols(
+                    s[0].$($field).+.extend(0.0),
+                    s[1].$($field).+.extend(0.0),
+                    s[2].$($field).+.extend(0.0),
+                    s[3].$($field).+.extend(0.0),
+                ).transpose()
+            };
+        }
+        let (a0, a1, a2) = (
+            transpose!(lin.x_axis),
+            transpose!(lin.y_axis),
+            transpose!(lin.z_axis),
+        );
+        let (b0, b1, b2) = (
+            transpose!(cross.x_axis),
+            transpose!(cross.y_axis),
+            transpose!(cross.z_axis),
+        );
+        let (c0, c1, c2) = (
+            transpose!(ang.x_axis),
+            transpose!(ang.y_axis),
+            transpose!(ang.z_axis),
+        );
+        let (linear, angular) = (transpose!(rhs_lin), transpose!(rhs_ang));
+        let z = Vec4::ZERO;
+        (
+            [
+                [a0.x_axis, z, z, z, z, z],
+                [a0.y_axis, a1.y_axis, z, z, z, z],
+                [a0.z_axis, a1.z_axis, a2.z_axis, z, z, z],
+                [b0.x_axis, b1.x_axis, b2.x_axis, c0.x_axis, z, z],
+                [b0.y_axis, b1.y_axis, b2.y_axis, c0.y_axis, c1.y_axis, z],
+                [
+                    b0.z_axis, b1.z_axis, b2.z_axis, c0.z_axis, c1.z_axis, c2.z_axis,
+                ],
+            ],
+            [
+                -linear.x_axis,
+                -linear.y_axis,
+                -linear.z_axis,
+                -angular.x_axis,
+                -angular.y_axis,
+                -angular.z_axis,
+            ],
+        )
+    }
+
+    /// Shared fixed-size factorization, specialized to each SIMD width.
+    /// Inlining specializes arithmetic within the caller's instruction-set
+    /// boundary, avoiding out-of-line calls to the lane operations.
+    #[inline(always)]
+    fn ldlt<T: Copy>(
+        mut l: [[T; 6]; 6],
+        mut x: [T; 6],
+        zero: T,
+        reciprocal: impl Fn(T) -> T,
+        multiply: impl Fn(T, T) -> T,
+        subtract: impl Fn(T, T) -> T,
+    ) -> [T; 6] {
+        let mut inverse_d = [zero; 6];
+        macro_rules! eliminate {
+            ($j:literal; $($i:literal),*) => {
+                inverse_d[$j] = reciprocal(l[$j][$j]);
+                $(
+                    let v = multiply(l[$i][$j], inverse_d[$j]);
+                    x[$i] = subtract(x[$i], multiply(v, x[$j]));
+                    for k in $j + 1..=$i {
+                        l[$i][k] = subtract(l[$i][k], multiply(v, l[k][$j]));
+                    }
+                    l[$i][$j] = v;
+                )*
+            };
+        }
+        // Literal pivots keep this fixed-size elimination unrolled.
+        // Descending rows retain the unnormalized column until its last use.
+        eliminate!(0; 5, 4, 3, 2, 1);
+        eliminate!(1; 5, 4, 3, 2);
+        eliminate!(2; 5, 4, 3);
+        eliminate!(3; 5, 4);
+        eliminate!(4; 5);
+        eliminate!(5;);
+        macro_rules! substitute {
+            ($i:literal; $($j:literal),*) => {
+                x[$i] = multiply(x[$i], inverse_d[$i]);
+                $(x[$i] = subtract(x[$i], multiply(l[$j][$i], x[$j]));)*
+            };
+        }
+        substitute!(5;);
+        substitute!(4; 5);
+        substitute!(3; 4, 5);
+        substitute!(2; 3, 4, 5);
+        substitute!(1; 2, 3, 4, 5);
+        substitute!(0; 1, 2, 3, 4, 5);
+        x
+    }
+
+    /// Four independent body blocks, one per SIMD lane.
+    fn solve_four(s: &[Self; 4]) -> [Vec4; 6] {
+        let (l, x) = Self::pack_four(s);
+        Self::ldlt(l, x, Vec4::ZERO, |v| v.recip(), |a, b| a * b, |a, b| a - b)
+    }
+
     /// Solve `A x = -rhs` (Eq. 4) by block elimination of the SPD system
     /// `[lin, crossᵀ; cross, ang]`: the linear block, then its Schur
     /// complement, each a 3x3 SIMD inverse.
@@ -626,26 +1301,148 @@ impl System {
         let x = lin_inverse * (-self.rhs_lin - self.cross.transpose() * y);
         (x.into(), y.into())
     }
+
+    /// The same LDLᵀ arithmetic as `solve_four`, eight bodies per register.
+    ///
+    /// # Safety
+    /// The caller must detect AVX2 before entering this function.
+    #[cfg(target_arch = "x86_64")]
+    #[target_feature(enable = "avx2")]
+    unsafe fn solve_eight(s: &[Self; 8], rotations: &[Quat; 8]) -> [[f32; 8]; 7] {
+        use std::arch::x86_64::*;
+        unsafe {
+            // Lane `n` of each output comes from row `n` of the eight inputs.
+            macro_rules! transpose {
+                ($v:expr) => {{
+                    let v = $v;
+                    let pair =
+                        |a: usize| -> __m256 { _mm256_set_m128(v[a + 4].into(), v[a].into()) };
+                    let (v0, v1, v2, v3) = (pair(0), pair(1), pair(2), pair(3));
+                    let (t0, t1) = (_mm256_unpacklo_ps(v0, v1), _mm256_unpackhi_ps(v0, v1));
+                    let (t2, t3) = (_mm256_unpacklo_ps(v2, v3), _mm256_unpackhi_ps(v2, v3));
+                    [
+                        _mm256_shuffle_ps::<0b01_00_01_00>(t0, t2),
+                        _mm256_shuffle_ps::<0b11_10_11_10>(t0, t2),
+                        _mm256_shuffle_ps::<0b01_00_01_00>(t1, t3),
+                        _mm256_shuffle_ps::<0b11_10_11_10>(t1, t3),
+                    ]
+                }};
+            }
+            macro_rules! field {
+                ($($field:ident).+) => {
+                    transpose!([
+                        s[0].$($field).+, s[1].$($field).+, s[2].$($field).+, s[3].$($field).+,
+                        s[4].$($field).+, s[5].$($field).+, s[6].$($field).+, s[7].$($field).+,
+                    ])
+                };
+            }
+            let (a0, a1, a2) = (field!(lin.x_axis), field!(lin.y_axis), field!(lin.z_axis));
+            let (b0, b1, b2) = (
+                field!(cross.x_axis),
+                field!(cross.y_axis),
+                field!(cross.z_axis),
+            );
+            let (c0, c1, c2) = (field!(ang.x_axis), field!(ang.y_axis), field!(ang.z_axis));
+            let (linear, angular) = (field!(rhs_lin), field!(rhs_ang));
+            let z = _mm256_setzero_ps();
+            let l = [
+                [a0[0], z, z, z, z, z],
+                [a0[1], a1[1], z, z, z, z],
+                [a0[2], a1[2], a2[2], z, z, z],
+                [b0[0], b1[0], b2[0], c0[0], z, z],
+                [b0[1], b1[1], b2[1], c0[1], c1[1], z],
+                [b0[2], b1[2], b2[2], c0[2], c1[2], c2[2]],
+            ];
+            let negate = |v| _mm256_xor_ps(v, _mm256_set1_ps(-0.0));
+            let x = [
+                negate(linear[0]),
+                negate(linear[1]),
+                negate(linear[2]),
+                negate(angular[0]),
+                negate(angular[1]),
+                negate(angular[2]),
+            ];
+            let one = _mm256_set1_ps(1.0);
+            let x = Self::ldlt(
+                l,
+                x,
+                z,
+                |v| _mm256_div_ps(one, v),
+                |a, b| _mm256_mul_ps(a, b),
+                |a, b| _mm256_sub_ps(a, b),
+            );
+            // Apply and normalize all eight quaternion updates in SIMD.
+            // Match glam's quaternion multiplication and dot-product order.
+            let [qx, qy, qz, qw] = transpose!(rotations);
+            let (rx, ry, rz) = (x[3], x[4], x[5]);
+            let half = _mm256_set1_ps(0.5);
+            let mul = |a, b| _mm256_mul_ps(a, b);
+            let add = |a, b| _mm256_add_ps(a, b);
+            let sub = |a, b| _mm256_sub_ps(a, b);
+            let nx = add(
+                qx,
+                mul(half, add(mul(rx, qw), sub(mul(ry, qz), mul(rz, qy)))),
+            );
+            let ny = add(
+                qy,
+                mul(
+                    half,
+                    add(sub(z, mul(rx, qz)), add(mul(ry, qw), mul(rz, qx))),
+                ),
+            );
+            let nz = add(
+                qz,
+                mul(half, add(mul(rx, qy), sub(mul(rz, qw), mul(ry, qx)))),
+            );
+            let nw = add(
+                qw,
+                mul(
+                    half,
+                    sub(sub(z, mul(rx, qx)), add(mul(ry, qy), mul(rz, qz))),
+                ),
+            );
+            let length = _mm256_sqrt_ps(add(
+                add(mul(nx, nx), mul(nz, nz)),
+                add(mul(ny, ny), mul(nw, nw)),
+            ));
+            let normalized = [
+                _mm256_div_ps(nx, length),
+                _mm256_div_ps(ny, length),
+                _mm256_div_ps(nz, length),
+                _mm256_div_ps(nw, length),
+            ];
+            let mut output = [[0.0; 8]; 7];
+            for i in 0..3 {
+                _mm256_storeu_ps(output[i].as_mut_ptr(), x[i]);
+            }
+            for i in 0..4 {
+                _mm256_storeu_ps(output[i + 3].as_mut_ptr(), normalized[i]);
+            }
+            output
+        }
+    }
 }
 
-/// One body's block solve (Eqs. 4-6) against the manifolds and links
-/// `adjacency` lists for it; returns its new pose.
+/// Assemble one body's block against its incident manifolds and links.
 #[allow(clippy::too_many_arguments)]
-fn solve_body<'a>(
+#[inline(always)]
+fn assemble_body<'a>(
     body_at: impl Fn(usize) -> &'a Body,
-    manifold_at: impl Fn(usize) -> &'a Manifold,
+    manifolds: Shared<Manifold>,
     link_at: impl Fn(usize) -> &'a Link,
     adjacency: &[u32],
     i: usize,
-    alpha: f32,
+    dual: bool,
+    settings: &PhysicsSettings,
     damping: f32,
-    dt: f32,
-) -> (Vec3, Quat) {
+    scale: f32,
+    #[cfg_attr(not(target_arch = "x86_64"), allow(unused_variables))] wide: bool,
+    system: &mut System,
+) {
     let body = body_at(i);
-    let scale = 1.0 / (dt * dt);
     let mass = body.mass * scale;
     let inertia = Mat3A::from(body.inertia * scale);
-    let mut system = System {
+    *system = System {
         lin: Mat3A::from_diagonal(Vec3::splat(mass)),
         ang: inertia,
         cross: Mat3A::ZERO,
@@ -653,78 +1450,303 @@ fn solve_body<'a>(
         rhs_ang: inertia * Vec3A::from(quat_sub(body.rotation, body.inertial_rotation)),
     };
     let mut sums = LaneSums::default();
+    // SAFETY (all accesses below): per `solve_batch_with`, only this body
+    // uses its manifolds now, and each appears once in its adjacency.
+    macro_rules! stamp {
+        ($k:expr, $first:expr, $half:expr) => {{
+            let m = unsafe { &mut *manifolds.get().add($k) };
+            let (a, b) = (body_at(m.a), body_at(m.b));
+            // The first visitor applies the previous iteration's dual update:
+            // neither body has moved since, so the stamp can reuse the error,
+            // though not the force, which depends on the updated duals.
+            let c = if $first {
+                Some(m.dual(a, b, settings.beta))
+            } else {
+                None
+            };
+            m.stamp(a, b, i == m.a, c, damping, system, &mut sums, $half);
+        }};
+    }
+    // Multi-contact manifolds are stamped two at a time, one per sum half,
+    // whether or not the CPU can do so at once: every CPU sums in one order.
+    let mut pending = None;
     for &entry in adjacency {
         if entry & LINK != 0 {
             let link = link_at((entry & !LINK) as usize);
             let a = link.a.map(&body_at);
-            link.stamp(a, body_at(link.b), link.a == Some(i), alpha, &mut system);
+            link.stamp(
+                a,
+                body_at(link.b),
+                link.a == Some(i),
+                settings.alpha,
+                system,
+            );
         } else {
-            let m = manifold_at(entry as usize);
-            m.stamp(body_at(m.a), body_at(m.b), i == m.a, alpha, damping, &mut system, &mut sums);
+            let k = entry as usize;
+            let m = unsafe { &*manifolds.get().add(k) };
+            let first = dual && i == if m.first_is_a { m.a } else { m.b };
+            if m.len == 1 {
+                stamp!(k, first, 0);
+                continue;
+            }
+            let Some((other, other_first)) = pending.take() else {
+                pending = Some((k, first));
+                continue;
+            };
+            #[cfg(target_arch = "x86_64")]
+            if wide {
+                // SAFETY: `wide` is set only after detecting AVX2. `k` and
+                // `other` differ, each appearing once in the adjacency.
+                unsafe {
+                    let p = &mut *manifolds.get().add(other);
+                    let q = &mut *manifolds.get().add(k);
+                    let (pa, pb, qa, qb) = (body_at(p.a), body_at(p.b), body_at(q.a), body_at(q.b));
+                    Manifold::stamp_pair_avx2(
+                        p,
+                        q,
+                        [pa, pb],
+                        [qa, qb],
+                        i,
+                        [other_first, first],
+                        settings.beta,
+                        damping,
+                        system,
+                        &mut sums,
+                    );
+                }
+                continue;
+            }
+            stamp!(other, other_first, 0);
+            stamp!(k, first, 1);
         }
     }
-    let h = sum4(sums.ang[0], sums.ang[1], sums.ang[2], sums.ang[3]);
-    let g = sum4(sums.ang[4], sums.ang[5], sums.rhs[0], sums.rhs[1]);
+    if let Some((k, first)) = pending {
+        stamp!(k, first, 0);
+    }
+    let total = |v: [Vec4; 2]| v[0] + v[1];
+    let (ang, rhs) = (sums.ang.map(total), sums.rhs.map(total));
+    let h = sum4(ang[0], ang[1], ang[2], ang[3]);
+    let g = sum4(ang[4], ang[5], rhs[0], rhs[1]);
     system.ang += Mat3A::from_cols(
         Vec3A::new(h.x, h.y, h.z),
         Vec3A::new(h.y, h.w, g.x),
         Vec3A::new(h.z, g.x, g.y),
     );
-    system.rhs_ang += Vec3A::new(g.z, g.w, sums.rhs[2].element_sum());
-    let (dx, dr) = system.solve();
-    (body.position + dx, quat_add(body.rotation, dr))
+    system.rhs_ang += Vec3A::new(g.z, g.w, rhs[2].element_sum());
 }
 
-/// The previous iteration's dual update (Algorithm 1, lines 26-35) for one
-/// manifold or link, applied when its first-solved body reaches it in the
-/// next iteration. Neither body has moved since that iteration ended, so this
-/// equals a separate dual pass while saving a pass and a barrier.
-fn first_dual(
-    bodies: &[Body],
-    manifolds: &mut [Manifold],
-    links: &mut [Link],
-    entry: u32,
+/// Apply the previous iteration's dual update at a link's first visit.
+/// Neither endpoint has moved since the preceding iteration ended.
+///
+/// # Safety
+/// The caller is `i`'s thread in `i`'s color phase: only `i` may write the
+/// links it visits first, and no thread writes the bodies they read. No
+/// reference to the visited link may remain live across this call.
+#[inline(always)]
+unsafe fn first_link_dual<'a>(
+    body_at: impl Fn(usize) -> &'a Body,
+    links: Shared<Link>,
+    k: usize,
     i: usize,
     settings: &PhysicsSettings,
 ) {
-    if entry & LINK != 0 {
-        let link = &mut links[(entry & !LINK) as usize];
-        let first = if link.first_is_a { link.a } else { Some(link.b) };
-        if first == Some(i) {
-            link.dual(link.a.map(|j| &bodies[j]), &bodies[link.b], settings);
-        }
+    let link = unsafe { &mut *links.get().add(k) };
+    let first = if link.first_is_a {
+        link.a
     } else {
-        let m = &mut manifolds[entry as usize];
-        if i == if m.first_is_a { m.a } else { m.b } {
-            m.dual(&bodies[m.a], &bodies[m.b], settings.alpha, settings.beta);
+        Some(link.b)
+    };
+    if first == Some(i) {
+        link.dual(link.a.map(&body_at), body_at(link.b), settings);
+    }
+}
+
+/// Start loading the manifolds of a body about to be assembled: colors visit
+/// them out of memory order. The first lines are enough for the hardware
+/// prefetcher to stream the rest.
+#[cfg_attr(not(target_arch = "x86_64"), allow(unused_variables))]
+#[inline(always)]
+fn prefetch_manifolds(manifolds: Shared<Manifold>, adjacency: &[u32]) {
+    #[cfg(target_arch = "x86_64")]
+    for &entry in adjacency {
+        use std::arch::x86_64::{_MM_HINT_T0, _mm_prefetch};
+        if entry & LINK == 0 {
+            let m = manifolds.get().wrapping_add(entry as usize).cast::<i8>();
+            for line in 0..PREFETCH_LINES {
+                // SAFETY: prefetching has no effect on memory, valid or not.
+                unsafe { _mm_prefetch::<_MM_HINT_T0>(m.wrapping_add(line * 64)) };
+            }
         }
     }
 }
 
-/// `first_dual` through the parallel region's shared pointers.
+fn batch_width() -> usize {
+    #[cfg(target_arch = "x86_64")]
+    if std::is_x86_feature_detected!("avx2") {
+        return 8;
+    }
+    4
+}
+
+/// Solve up to eight bodies of one color, writing poses only after assembly.
 ///
 /// # Safety
-/// The caller is `i`'s thread in `i`'s color phase: only `i` may write the
-/// entries it visits first, and no thread writes the bodies they read.
-unsafe fn first_dual_raw<'a>(
-    body_at: impl Fn(usize) -> &'a Body,
+/// Each body in `indices` is unique and shares no constraint with another
+/// body in this color. The caller owns these bodies and their first-visited
+/// constraints for the current color phase; other colors cannot run yet.
+/// `WIDE` additionally requires AVX2 support.
+#[allow(clippy::too_many_arguments)]
+#[inline(always)]
+unsafe fn solve_batch_with<const WIDE: bool>(
+    bodies: Shared<Body>,
     manifolds: Shared<Manifold>,
     links: Shared<Link>,
-    entry: u32,
-    i: usize,
+    offsets: &[u32],
+    adjacency: &[u32],
+    indices: &[usize],
     settings: &PhysicsSettings,
+    scale: f32,
+    damping: f32,
+    iteration: u32,
 ) {
-    if entry & LINK != 0 {
-        let link = unsafe { &mut *links.get().add((entry & !LINK) as usize) };
-        let first = if link.first_is_a { link.a } else { Some(link.b) };
-        if first == Some(i) {
-            link.dual(link.a.map(&body_at), body_at(link.b), settings);
+    let body_at = |j| unsafe { &*bodies.get().add(j) };
+    // A macro, not a closure: closures would not inherit the caller's target
+    // features unless inlined, and only functions can force that.
+    macro_rules! assemble {
+        ($i:expr, $system:expr) => {{
+            let i = $i;
+            assemble_body(
+                body_at,
+                manifolds,
+                |k| unsafe {
+                    if iteration > 0 {
+                        first_link_dual(body_at, links, k, i, settings);
+                    }
+                    &*links.get().add(k)
+                },
+                &adjacency[offsets[i] as usize..offsets[i + 1] as usize],
+                i,
+                iteration > 0,
+                settings,
+                damping,
+                scale,
+                WIDE,
+                $system,
+            )
+        }};
+    }
+    #[cfg(target_arch = "x86_64")]
+    if WIDE && indices.len() == 8 {
+        let mut systems = std::array::from_fn(|_| System::IDENTITY);
+        for (n, system) in systems.iter_mut().enumerate() {
+            if let Some(&next) = indices.get(n + 1) {
+                prefetch_manifolds(
+                    manifolds,
+                    &adjacency[offsets[next] as usize..offsets[next + 1] as usize],
+                );
+            }
+            assemble!(indices[n], system);
         }
-    } else {
-        let m = unsafe { &mut *manifolds.get().add(entry as usize) };
-        if i == if m.first_is_a { m.a } else { m.b } {
-            m.dual(body_at(m.a), body_at(m.b), settings.alpha, settings.beta);
+        let rotations = std::array::from_fn(|lane| body_at(indices[lane]).rotation);
+        // SAFETY: the batch width is selected by runtime CPU detection.
+        let update = unsafe { System::solve_eight(&systems, &rotations) };
+        for (lane, &i) in indices.iter().enumerate() {
+            let dx = Vec3::new(update[0][lane], update[1][lane], update[2][lane]);
+            let rotation = Quat::from_xyzw(
+                update[3][lane],
+                update[4][lane],
+                update[5][lane],
+                update[6][lane],
+            );
+            let body = unsafe { &mut *bodies.get().add(i) };
+            body.place(body.position + dx, rotation);
         }
+        return;
+    }
+    // Partial batches take the four-body and singleton paths.
+    for chunk in indices.chunks(4) {
+        if let [i] = *chunk {
+            let mut system = System::IDENTITY;
+            assemble!(i, &mut system);
+            let (dx, dr) = system.solve();
+            // No references to these bodies escape assembly.
+            let body = unsafe { &mut *bodies.get().add(i) };
+            body.place(body.position + dx, quat_add(body.rotation, dr));
+            continue;
+        }
+        let mut systems = std::array::from_fn(|_| System::IDENTITY);
+        for (system, &i) in systems.iter_mut().zip(chunk) {
+            assemble!(i, system);
+        }
+        let update = System::solve_four(&systems);
+        for (lane, &i) in chunk.iter().enumerate() {
+            let dx = Vec3::new(update[0][lane], update[1][lane], update[2][lane]);
+            let dr = Vec3::new(update[3][lane], update[4][lane], update[5][lane]);
+            // All references used for assembly are dead before the first write.
+            let body = unsafe { &mut *bodies.get().add(i) };
+            body.place(body.position + dx, quat_add(body.rotation, dr));
+        }
+    }
+}
+
+/// `solve_batch_with` compiled for AVX2, so its inlined arithmetic is too.
+///
+/// # Safety
+/// As for `solve_batch_with::<true>`.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+#[allow(clippy::too_many_arguments)]
+unsafe fn solve_batch_avx2(
+    bodies: Shared<Body>,
+    manifolds: Shared<Manifold>,
+    links: Shared<Link>,
+    offsets: &[u32],
+    adjacency: &[u32],
+    indices: &[usize],
+    settings: &PhysicsSettings,
+    scale: f32,
+    damping: f32,
+    iteration: u32,
+) {
+    unsafe {
+        solve_batch_with::<true>(
+            bodies, manifolds, links, offsets, adjacency, indices, settings, scale, damping,
+            iteration,
+        );
+    }
+}
+
+/// `solve_batch_with` for this CPU; its contract applies except for AVX2,
+/// which this detects.
+#[allow(clippy::too_many_arguments)]
+unsafe fn solve_batch(
+    bodies: Shared<Body>,
+    manifolds: Shared<Manifold>,
+    links: Shared<Link>,
+    offsets: &[u32],
+    adjacency: &[u32],
+    indices: &[usize],
+    settings: &PhysicsSettings,
+    scale: f32,
+    damping: f32,
+    iteration: u32,
+) {
+    #[cfg(target_arch = "x86_64")]
+    if batch_width() == 8 {
+        // SAFETY: the batch width is selected by runtime CPU detection.
+        unsafe {
+            solve_batch_avx2(
+                bodies, manifolds, links, offsets, adjacency, indices, settings, scale, damping,
+                iteration,
+            );
+        }
+        return;
+    }
+    unsafe {
+        solve_batch_with::<false>(
+            bodies, manifolds, links, offsets, adjacency, indices, settings, scale, damping,
+            iteration,
+        );
     }
 }
 
@@ -798,6 +1820,46 @@ struct Aabb {
     flags: u32,
 }
 
+/// Four sorted sweep boxes. The candidate loop tests four complete AABBs
+/// per SIMD instruction, then visits only the overlapping lanes in order.
+struct SweepBlock {
+    min: [Vec4; 3],
+    max: [Vec4; 3],
+    index: [u32; 4],
+    flags: [u32; 4],
+    valid: u32,
+}
+
+impl SweepBlock {
+    fn new(boxes: &[Aabb]) -> Self {
+        Self {
+            min: std::array::from_fn(|axis| {
+                Vec4::from_array(std::array::from_fn(|lane| {
+                    boxes.get(lane).map_or(f32::INFINITY, |b| b.min[axis])
+                }))
+            }),
+            max: std::array::from_fn(|axis| {
+                Vec4::from_array(std::array::from_fn(|lane| {
+                    boxes.get(lane).map_or(f32::NEG_INFINITY, |b| b.max[axis])
+                }))
+            }),
+            index: std::array::from_fn(|lane| boxes.get(lane).map_or(0, |b| b.index)),
+            flags: std::array::from_fn(|lane| boxes.get(lane).map_or(0, |b| b.flags)),
+            valid: (1 << boxes.len()) - 1,
+        }
+    }
+
+    fn overlaps(&self, min: &[Vec4; 3], max: &[Vec4; 3]) -> u32 {
+        let mask = self.min[0].cmple(max[0])
+            & self.max[0].cmpge(min[0])
+            & self.min[1].cmple(max[1])
+            & self.max[1].cmpge(min[1])
+            & self.min[2].cmple(max[2])
+            & self.max[2].cmpge(min[2]);
+        mask.bitmask() & self.valid
+    }
+}
+
 #[derive(Default)]
 pub(crate) struct Solver {
     /// The bodies (key, solved) and links (ends, solved) the coloring was
@@ -821,15 +1883,16 @@ pub(crate) struct Solver {
     stash: Vec<(u32, Manifold)>,
     stash_index: PairMap,
     next_island: u32,
-    /// The sleep pass's union-find, rest times and island ids, reused.
-    parent: Vec<usize>,
+    /// Shared temporary storage for coloring and sleeping islands.
+    scratch_usize: Vec<usize>,
     rest: Vec<f32>,
-    island_of: Vec<u32>,
+    scratch_u32: Vec<u32>,
     /// Joints and springs, kept in step by the physics world.
     pub links: Vec<Link>,
     /// Body-key pairs a link joins: they do not collide.
     linked: PairMap,
     boxes: Vec<Aabb>,
+    sweep_blocks: Vec<SweepBlock>,
     swept: Vec<Vec<(usize, usize)>>,
     pairs: Vec<(usize, usize)>,
     /// Manifolds touching each body, as CSR offsets into `adjacency`.
@@ -854,10 +1917,15 @@ impl Solver {
     /// `exclusive`: the step runs alone on its own thread pool, so the
     /// iterations may hold every pool thread at a barrier. On a shared pool
     /// two worlds' barriers could wait on each other's threads forever.
-    pub fn step(&mut self, settings: &PhysicsSettings, dt: f32, exclusive: bool) {
-        let requested: Vec<u32> = (self.bodies.iter())
-            .filter(|b| b.asleep && b.wake)
-            .map(|b| b.island)
+    pub fn step(&mut self, settings: &PhysicsSettings, dt: f32, exclusive: bool, serial: bool) {
+        let mut has_sleepers = false;
+        let requested: Vec<u32> = self
+            .bodies
+            .iter()
+            .filter_map(|b| {
+                has_sleepers |= b.asleep;
+                (b.asleep && b.wake).then_some(b.island)
+            })
             .collect();
         let mut woken = self.wake_islands(&requested);
         self.linked.clear();
@@ -874,12 +1942,17 @@ impl Solver {
             self.recolor = true;
             return;
         }
-        self.broadphase();
-        self.narrowphase(settings);
+        self.broadphase(serial);
+        // If no island is asleep, collision detection cannot require a second
+        // pass, so warm starting can be prepared during the first pass. With
+        // sleepers, retain unscaled lanes until both passes finish: preparing
+        // during each pass would decay the same warm start more than once.
+        let prepare_now = !has_sleepers;
+        self.narrowphase(serial, prepare_now.then_some(settings));
         // Real contact with a moving body wakes an asleep island; collide
         // again so the island's own contacts join this step.
-        let linked_pairs = (self.links.iter().filter(|l| !l.broken))
-            .filter_map(|l| l.a.map(|a| (a, l.b)));
+        let linked_pairs =
+            (self.links.iter().filter(|l| !l.broken)).filter_map(|l| l.a.map(|a| (a, l.b)));
         let touched: Vec<u32> = (self.manifolds.iter().map(|m| (m.a, m.b)))
             .chain(linked_pairs)
             .flat_map(|(a, b)| [(a, b), (b, a)])
@@ -889,12 +1962,32 @@ impl Solver {
         let also = self.wake_islands(&touched);
         if !also.is_empty() {
             woken.extend(also);
-            self.broadphase();
-            self.narrowphase(settings);
+            self.broadphase(serial);
+            self.narrowphase(serial, None);
         }
         if !woken.is_empty() {
             self.stash.retain(|(island, _)| !woken.contains(island));
             self.index_stash();
+        }
+        if !prepare_now {
+            let bodies = &self.bodies;
+            let prepare = |m: &mut Manifold| {
+                let basis = m.rows.transpose();
+                let basis = [
+                    basis.x_axis.into(),
+                    basis.y_axis.into(),
+                    basis.z_axis.into(),
+                ];
+                m.prepare(&bodies[m.a], &bodies[m.b], basis, settings);
+            };
+            if serial {
+                self.manifolds.iter_mut().for_each(prepare);
+            } else {
+                self.manifolds
+                    .par_iter_mut()
+                    .with_min_len(PAIR_BATCH)
+                    .for_each(prepare);
+            }
         }
         for link in &mut self.links {
             if link.solved(&self.bodies) {
@@ -904,85 +1997,98 @@ impl Solver {
         self.color();
 
         let gravity = settings.gravity;
-        self.bodies
-            .par_iter_mut()
-            .with_min_len(BODY_BATCH)
-            .for_each(|body| {
-                body.initial_position = body.position;
-                body.initial_rotation = body.rotation;
-                (body.moved, body.turned) = (Vec3::ZERO, Vec3::ZERO);
-                if body.dynamic() {
-                    // Inertial target (Eq. 2) and adaptive warm start (VBD).
-                    body.inertial_position =
-                        body.position + body.velocity * dt + gravity * (dt * dt);
-                    body.inertial_rotation = quat_add(body.rotation, body.angular_velocity * dt);
-                    let accel = (body.velocity - body.previous) / dt;
-                    let weight = (accel.dot(gravity) / gravity.length_squared()).clamp(0.0, 1.0);
-                    let weight = if weight.is_finite() { weight } else { 0.0 };
-                    let start = body.position + body.velocity * dt + gravity * (weight * dt * dt);
-                    body.place(start, body.inertial_rotation);
-                } else if body.kinematic {
-                    let rotation = quat_add(body.rotation, body.angular_velocity * dt);
-                    body.place(body.position + body.velocity * dt, rotation);
-                }
-            });
+        let initialize = |body: &mut Body| {
+            body.initial_position = body.position;
+            body.initial_rotation = body.rotation;
+            (body.moved, body.turned) = (Vec3A::ZERO, Vec3A::ZERO);
+            if body.dynamic() {
+                // Inertial target (Eq. 2) and adaptive warm start (VBD).
+                body.inertial_position = body.position + body.velocity * dt + gravity * (dt * dt);
+                body.inertial_rotation = quat_add(body.rotation, body.angular_velocity * dt);
+                let accel = (body.velocity - body.previous) / dt;
+                let weight = (accel.dot(gravity) / gravity.length_squared()).clamp(0.0, 1.0);
+                let weight = if weight.is_finite() { weight } else { 0.0 };
+                let start = body.position + body.velocity * dt + gravity * (weight * dt * dt);
+                body.place(start, body.inertial_rotation);
+            } else if body.kinematic {
+                let rotation = quat_add(body.rotation, body.angular_velocity * dt);
+                body.place(body.position + body.velocity * dt, rotation);
+            }
+        };
+        if serial {
+            self.bodies.iter_mut().for_each(initialize);
+        } else {
+            self.bodies
+                .par_iter_mut()
+                .with_min_len(BODY_BATCH)
+                .for_each(initialize);
+        }
 
         for &i in &self.free {
             let body = &mut self.bodies[i];
             body.place(body.inertial_position, body.inertial_rotation);
         }
-        let threads = rayon::current_num_threads();
+        let scale = 1.0 / (dt * dt);
+        let damping = settings.contact_damping / dt;
+        let threads = if serial {
+            1
+        } else {
+            rayon::current_num_threads()
+        };
         if threads == 1 || !exclusive {
-            let (alpha, beta) = (settings.alpha, settings.beta);
+            let batch_width = batch_width();
+            let beta = settings.beta;
+            let manifolds = Shared(self.manifolds.as_mut_ptr());
+            let links = Shared(self.links.as_mut_ptr());
+            let bodies = Shared(self.bodies.as_mut_ptr());
             for iteration in 0..settings.iterations {
                 for color in &self.colors {
-                    for &i in color {
-                        let range = self.offsets[i] as usize..self.offsets[i + 1] as usize;
-                        if iteration > 0 {
-                            let (manifolds, links) = (&mut self.manifolds, &mut self.links);
-                            for &entry in &self.adjacency[range.clone()] {
-                                first_dual(&self.bodies, manifolds, links, entry, i, settings);
-                            }
+                    for indices in color.chunks(batch_width) {
+                        // SAFETY: this thread owns the complete color phase.
+                        unsafe {
+                            solve_batch(
+                                bodies,
+                                manifolds,
+                                links,
+                                &self.offsets,
+                                &self.adjacency,
+                                indices,
+                                settings,
+                                scale,
+                                damping,
+                                iteration,
+                            );
                         }
-                        let (bodies, adjacency) = (&self.bodies, &self.adjacency[range]);
-                        let (manifolds, links) = (&self.manifolds, &self.links);
-                        let pose = solve_body(
-                            |j| &bodies[j],
-                            |k| &manifolds[k],
-                            |k| &links[k],
-                            adjacency,
-                            i,
-                            alpha,
-                            settings.contact_damping / dt,
-                            dt,
-                        );
-                        self.bodies[i].place(pose.0, pose.1);
                     }
                 }
             }
             // The last iteration's dual update, for warm starting the next step.
             let bodies = &self.bodies;
             for m in &mut self.manifolds {
-                m.dual(&bodies[m.a], &bodies[m.b], alpha, beta);
-                m.store();
+                m.dual(&bodies[m.a], &bodies[m.b], beta);
             }
             for link in self.links.iter_mut().filter(|l| l.solved(bodies)) {
                 link.dual(link.a.map(|j| &bodies[j]), &bodies[link.b], settings);
             }
         } else {
-            self.iterate_parallel(settings, dt, threads);
+            self.iterate_parallel(settings, scale, damping, threads);
         }
 
-        self.bodies
-            .par_iter_mut()
-            .with_min_len(BODY_BATCH)
-            .for_each(|body| {
-                body.previous = body.velocity;
-                if body.dynamic() {
-                    body.velocity = body.moved / dt;
-                    body.angular_velocity = body.turned / dt;
-                }
-            });
+        let finalize = |body: &mut Body| {
+            body.previous = body.velocity;
+            if body.dynamic() {
+                body.velocity = (body.moved / dt).into();
+                body.angular_velocity = (body.turned / dt).into();
+            }
+        };
+        if serial {
+            self.bodies.iter_mut().for_each(finalize);
+        } else {
+            self.bodies
+                .par_iter_mut()
+                .with_min_len(BODY_BATCH)
+                .for_each(finalize);
+        }
         self.sleep(dt);
     }
 
@@ -990,7 +2096,7 @@ impl Solver {
     /// going away or were moved by the caller.
     pub fn islands_touching(&self, keys: &[u64]) -> Vec<u32> {
         (self.stash.iter())
-            .filter(|(_, m)| keys.contains(&m.key.0) || keys.contains(&m.key.1))
+            .filter(|(_, m)| keys.contains(&m.cold.key.0) || keys.contains(&m.cold.key.1))
             .map(|&(island, _)| island)
             .collect()
     }
@@ -999,14 +2105,21 @@ impl Solver {
     /// takes its share of every color, then of the manifolds, meeting at a
     /// barrier between phases. Forking once per color instead cost more than
     /// the work in small and medium scenes. Results match the serial path.
-    fn iterate_parallel(&mut self, settings: &PhysicsSettings, dt: f32, threads: usize) {
-        let (alpha, beta) = (settings.alpha, settings.beta);
+    fn iterate_parallel(
+        &mut self,
+        settings: &PhysicsSettings,
+        scale: f32,
+        damping: f32,
+        threads: usize,
+    ) {
+        let beta = settings.beta;
         let bodies = Shared(self.bodies.as_mut_ptr());
         let manifolds = Shared(self.manifolds.as_mut_ptr());
         let manifold_count = self.manifolds.len();
         let links = Shared(self.links.as_mut_ptr());
         let link_count = self.links.len();
         let (colors, offsets, adjacency) = (&self.colors, &self.offsets, &self.adjacency);
+        let batch_width = batch_width();
         let barrier = SpinBarrier::new(threads);
         rayon::broadcast(|ctx| {
             let (t, n) = (ctx.index(), ctx.num_threads());
@@ -1023,26 +2136,17 @@ impl Solver {
             let body_at = |j: usize| unsafe { &*bodies.get().add(j) };
             for iteration in 0..settings.iterations {
                 for color in colors {
-                    for &i in &color[share(color.len())] {
-                        let range = offsets[i] as usize..offsets[i + 1] as usize;
-                        if iteration > 0 {
-                            for &entry in &adjacency[range.clone()] {
-                                // SAFETY: only a manifold's first visitor writes
-                                // it, in its own color phase.
-                                unsafe { first_dual_raw(body_at, manifolds, links, entry, i, settings) };
-                            }
+                    for group in share(color.len().div_ceil(batch_width)) {
+                        let start = group * batch_width;
+                        let indices = &color[start..(start + batch_width).min(color.len())];
+                        // SAFETY: groups partition the current color; the
+                        // barrier excludes all other colors until completion.
+                        unsafe {
+                            solve_batch(
+                                bodies, manifolds, links, offsets, adjacency, indices, settings,
+                                scale, damping, iteration,
+                            );
                         }
-                        let pose = solve_body(
-                            body_at,
-                            |k| unsafe { &*manifolds.get().add(k) },
-                            |k| unsafe { &*links.get().add(k) },
-                            &adjacency[range],
-                            i,
-                            alpha,
-                            settings.contact_damping / dt,
-                            dt,
-                        );
-                        unsafe { (*bodies.get().add(i)).place(pose.0, pose.1) };
                     }
                     barrier.wait();
                 }
@@ -1051,8 +2155,7 @@ impl Solver {
             for k in share(manifold_count + link_count) {
                 if k < manifold_count {
                     let m = unsafe { &mut *manifolds.get().add(k) };
-                    m.dual(body_at(m.a), body_at(m.b), alpha, beta);
-                    m.store();
+                    m.dual(body_at(m.a), body_at(m.b), beta);
                 } else {
                     let link = unsafe { &mut *links.get().add(k - manifold_count) };
                     // `solved` reads only flags no phase writes.
@@ -1087,7 +2190,12 @@ impl Solver {
 
     fn index_stash(&mut self) {
         self.stash_index.clear();
-        (self.stash_index).extend(self.stash.iter().enumerate().map(|(i, (_, m))| (m.key, i)));
+        (self.stash_index).extend(
+            self.stash
+                .iter()
+                .enumerate()
+                .map(|(i, (_, m))| (m.cold.key, i)),
+        );
     }
 
     /// Put to sleep each island (dynamic bodies joined by contacts) whose
@@ -1096,14 +2204,21 @@ impl Solver {
         let n = self.bodies.len();
         for body in self.bodies.iter_mut().filter(|b| b.dynamic()) {
             let speed = body.velocity.length() + body.angular_velocity.length() * body.bound();
-            body.sleep_time = if speed < SLEEP_SPEED { body.sleep_time + dt } else { 0.0 };
+            body.sleep_time = if speed < SLEEP_SPEED {
+                body.sleep_time + dt
+            } else {
+                0.0
+            };
         }
         // Islands sleep only once every body in them has rested this long.
-        let resting = self.bodies.iter().any(|b| b.dynamic() && b.sleep_time >= TIME_TO_SLEEP);
+        let resting = self
+            .bodies
+            .iter()
+            .any(|b| b.dynamic() && b.sleep_time >= TIME_TO_SLEEP);
         if !resting {
             return;
         }
-        let mut parent = std::mem::take(&mut self.parent);
+        let mut parent = std::mem::take(&mut self.scratch_usize);
         parent.clear();
         parent.extend(0..n);
         fn find(parent: &mut [usize], mut i: usize) -> usize {
@@ -1113,8 +2228,12 @@ impl Solver {
             }
             i
         }
-        let joined = (self.manifolds.iter().map(|m| (m.a, m.b)))
-            .chain(self.links.iter().filter(|l| !l.broken).filter_map(|l| l.a.map(|a| (a, l.b))));
+        let joined = (self.manifolds.iter().map(|m| (m.a, m.b))).chain(
+            self.links
+                .iter()
+                .filter(|l| !l.broken)
+                .filter_map(|l| l.a.map(|a| (a, l.b))),
+        );
         for (a, b) in joined.clone() {
             if self.bodies[a].dynamic() && self.bodies[b].dynamic() {
                 let (ra, rb) = (find(&mut parent, a), find(&mut parent, b));
@@ -1130,10 +2249,9 @@ impl Solver {
             rest[root] = rest[root].min(self.bodies[i].sleep_time);
         }
         for m in &self.manifolds {
-            let deep = m.lanes.c0[0].cmplt(Vec4::splat(-SLEEP_PENETRATION)).any();
             for (x, y) in [(m.a, m.b), (m.b, m.a)] {
                 let (bx, by) = (&self.bodies[x], &self.bodies[y]);
-                if bx.dynamic() && (deep || (by.active() && !by.dynamic())) {
+                if bx.dynamic() && (m.cold.deep || (by.active() && !by.dynamic())) {
                     let root = find(&mut parent, x);
                     rest[root] = -1.0;
                 }
@@ -1148,7 +2266,7 @@ impl Solver {
                 }
             }
         }
-        let mut island = std::mem::take(&mut self.island_of);
+        let mut island = std::mem::take(&mut self.scratch_u32);
         island.clear();
         island.resize(n, u32::MAX);
         for i in 0..n {
@@ -1170,7 +2288,7 @@ impl Solver {
             body.angular_velocity = Vec3::ZERO;
             body.previous = Vec3::ZERO;
         }
-        (self.parent, self.rest, self.island_of) = (parent, rest, island);
+        (self.scratch_usize, self.rest, self.scratch_u32) = (parent, rest, island);
         let bodies = &self.bodies;
         let asleep = |i: usize| bodies[i].asleep;
         if !self.manifolds.iter().any(|m| asleep(m.a) || asleep(m.b)) {
@@ -1190,13 +2308,18 @@ impl Solver {
         self.stash.extend(slept);
         self.index_stash();
         self.cache.clear();
-        (self.cache).extend(self.manifolds.iter().enumerate().map(|(i, m)| (m.key, i)));
+        (self.cache).extend(
+            self.manifolds
+                .iter()
+                .enumerate()
+                .map(|(i, m)| (m.cold.key, i)),
+        );
     }
 
     /// Sweep and prune oriented-box AABBs along the axis where body centers
     /// vary most. The boxes live in one compact array: the sweep's inner loop
     /// then streams through cache instead of chasing whole bodies.
-    fn broadphase(&mut self) {
+    fn broadphase(&mut self, serial: bool) {
         let bodies = &self.bodies;
         if bodies.len() < 2 {
             self.pairs.clear();
@@ -1206,15 +2329,14 @@ impl Solver {
         let bounds = |(i, b): (usize, &Body)| {
             let extent = match b.shape {
                 Collider::Cuboid { half_extents } => {
-                    let m = Mat3::from_quat(b.rotation);
+                    let m = b.initial_basis;
                     let abs = |row: Vec3| row.abs().dot(half_extents);
                     Vec3::new(abs(m.row(0)), abs(m.row(1)), abs(m.row(2)))
                 }
                 Collider::Sphere { radius } => Vec3::splat(radius),
             } + COLLISION_MARGIN;
-            let flags = u32::from(b.dynamic())
-                | u32::from(b.active()) << 1
-                | u32::from(b.asleep) << 2;
+            let flags =
+                u32::from(b.dynamic()) | u32::from(b.active()) << 1 | u32::from(b.asleep) << 2;
             Aabb {
                 min: b.position - extent,
                 max: b.position + extent,
@@ -1222,8 +2344,17 @@ impl Solver {
                 flags,
             }
         };
-        (bodies.par_iter().enumerate().with_min_len(BODY_BATCH).map(bounds))
+        if serial {
+            self.tight.clear();
+            self.tight.extend(bodies.iter().enumerate().map(bounds));
+        } else {
+            (bodies
+                .par_iter()
+                .enumerate()
+                .with_min_len(BODY_BATCH)
+                .map(bounds))
             .collect_into_vec(&mut self.tight);
+        }
         // Last step's pairs hold while every body stays inside its enlarged
         // box and no body changed: settling bodies skip the sweep entirely.
         let kept = |fat: &[Aabb], keys: &[u64], i: usize, t: &Aabb| {
@@ -1232,8 +2363,9 @@ impl Solver {
                 && t.max.cmple(fat[i].max).all()
         };
         let fits = self.fat.len() == bodies.len()
-            && (self.tight.iter().enumerate())
-                .all(|(i, t)| t.flags == self.fat[i].flags && kept(&self.fat, &self.fat_keys, i, t));
+            && (self.tight.iter().enumerate()).all(|(i, t)| {
+                t.flags == self.fat[i].flags && kept(&self.fat, &self.fat_keys, i, t)
+            });
         if fits {
             return;
         }
@@ -1243,7 +2375,11 @@ impl Solver {
             if !kept(&self.fat, &self.fat_keys, i, t) {
                 // Only moving bodies get room to move.
                 let margin = if t.flags & 2 != 0 { FAT_MARGIN } else { 0.0 };
-                self.fat[i] = Aabb { min: t.min - margin, max: t.max + margin, ..*t };
+                self.fat[i] = Aabb {
+                    min: t.min - margin,
+                    max: t.max + margin,
+                    ..*t
+                };
                 self.fat_keys[i] = bodies[i].key;
             }
             self.fat[i].flags = t.flags;
@@ -1254,7 +2390,10 @@ impl Solver {
         self.pairs.clear();
         let n = bodies.len() as f32;
         let mean = bodies.iter().map(|b| b.position).sum::<Vec3>() / n;
-        let variance = bodies.iter().map(|b| (b.position - mean) * (b.position - mean)).sum::<Vec3>();
+        let variance = bodies
+            .iter()
+            .map(|b| (b.position - mean) * (b.position - mean))
+            .sum::<Vec3>();
         let axis = if variance.x >= variance.y && variance.x >= variance.z {
             0
         } else if variance.y >= variance.z {
@@ -1265,49 +2404,81 @@ impl Solver {
         self.boxes.clear();
         self.boxes.extend_from_slice(&self.fat);
         let order = |a: &Aabb, b: &Aabb| a.min[axis].total_cmp(&b.min[axis]);
-        if self.boxes.len() < SERIAL_SORT {
+        if serial || self.boxes.len() < SERIAL_SORT {
             self.boxes.sort_unstable_by(order);
         } else {
             self.boxes.par_sort_unstable_by(order);
         }
+        self.sweep_blocks.clear();
+        self.sweep_blocks
+            .extend(self.boxes.chunks(4).map(SweepBlock::new));
         const DYNAMIC: u32 = 1;
         const ACTIVE: u32 = 2;
         const ASLEEP: u32 = 4;
         let boxes = &self.boxes;
+        let blocks = &self.sweep_blocks;
         // Each chunk sweeps forward from its own boxes; joining the chunks'
         // pairs in order keeps the result independent of thread count.
-        let sweep = |(c, chunk): (usize, &[Aabb])| {
-            let mut pairs = Vec::new();
+        let sweep = |(c, chunk): (usize, &[Aabb]), pairs: &mut Vec<(usize, usize)>| {
             for (k, a) in chunk.iter().enumerate() {
-                for b in &boxes[c * SWEEP_CHUNK + k + 1..] {
-                    if b.min[axis] > a.max[axis] {
+                let first = c * SWEEP_CHUNK + k + 1;
+                let min = a.min.to_array().map(Vec4::splat);
+                let max = a.max.to_array().map(Vec4::splat);
+                for (offset, b) in blocks[first / 4..].iter().enumerate() {
+                    if b.min[axis].x > a.max[axis] {
                         break;
                     }
-                    // Pairs an asleep body forms with a moving one only wake it.
-                    let relevant = (a.flags | b.flags) & DYNAMIC != 0
-                        || (a.flags & ASLEEP != 0 && b.flags & ACTIVE != 0)
-                        || (b.flags & ASLEEP != 0 && a.flags & ACTIVE != 0);
-                    if relevant && a.min.cmple(b.max).all() && b.min.cmple(a.max).all() {
-                        let (i, j) = (a.index as usize, b.index as usize);
-                        let first = bodies[i].key < bodies[j].key;
-                        pairs.push(if first { (i, j) } else { (j, i) });
+                    let mut mask = b.overlaps(&min, &max);
+                    if offset == 0 {
+                        mask &= 0xf << (first % 4);
+                    }
+                    while mask != 0 {
+                        let lane = mask.trailing_zeros() as usize;
+                        mask &= mask - 1;
+                        // Pairs an asleep body forms with a moving one only wake it.
+                        let flags = b.flags[lane];
+                        let relevant = (a.flags | flags) & DYNAMIC != 0
+                            || (a.flags & ASLEEP != 0 && flags & ACTIVE != 0)
+                            || (flags & ASLEEP != 0 && a.flags & ACTIVE != 0);
+                        if relevant {
+                            let (i, j) = (a.index as usize, b.index[lane] as usize);
+                            let first = bodies[i].key < bodies[j].key;
+                            pairs.push(if first { (i, j) } else { (j, i) });
+                        }
                     }
                 }
             }
-            pairs
         };
         // Below SERIAL_SWEEP boxes one task sweeps them all.
-        let min = if boxes.len() < SERIAL_SWEEP { usize::MAX } else { 1 };
-        (boxes.par_chunks(SWEEP_CHUNK).enumerate().with_min_len(min).map(sweep))
+        let min = if boxes.len() < SERIAL_SWEEP {
+            usize::MAX
+        } else {
+            1
+        };
+        if serial {
+            for chunk in boxes.chunks(SWEEP_CHUNK).enumerate() {
+                sweep(chunk, &mut self.pairs);
+            }
+        } else {
+            (boxes
+                .par_chunks(SWEEP_CHUNK)
+                .enumerate()
+                .with_min_len(min)
+                .map(|chunk| {
+                    let mut pairs = Vec::new();
+                    sweep(chunk, &mut pairs);
+                    pairs
+                }))
             .collect_into_vec(&mut self.swept);
-        self.pairs.extend(self.swept.drain(..).flatten());
+            self.pairs.extend(self.swept.drain(..).flatten());
+        }
     }
 
     /// Update the persistent manifolds from this step's pairs: kept pairs
     /// are refreshed in place, new ones collided, and dropped or separated
     /// ones removed. Contacts merge with the previous step's to warm start
     /// their forces and penalties (Eq. 19).
-    fn narrowphase(&mut self, settings: &PhysicsSettings) {
+    fn narrowphase(&mut self, serial: bool, prepare: Option<&PhysicsSettings>) {
         self.pass = self.pass.wrapping_add(1);
         let pass = self.pass;
         self.fresh.clear();
@@ -1319,38 +2490,67 @@ impl Solver {
             match self.cache.get(&key) {
                 Some(&i) => {
                     let m = &mut self.manifolds[i];
-                    (m.a, m.b, m.seen) = (a, b, pass);
+                    (m.a, m.b, m.cold.seen) = (a, b, pass);
                 }
                 None => self.fresh.push((a, b)),
             }
         }
         let bodies = &self.bodies;
-        self.manifolds
-            .par_iter_mut()
-            .with_min_len(PAIR_BATCH)
-            .for_each(|m| {
-                if m.seen != pass || !m.refresh(bodies, settings) {
-                    m.len = 0;
-                }
-            });
-        let (stash, stash_index) = (&self.stash, &self.stash_index);
-        self.fresh
-            .par_iter()
-            .with_min_len(PAIR_BATCH)
-            .map(|&(a, b)| {
-                let key = (bodies[a].key, bodies[b].key);
-                let previous = stash_index.get(&key).map(|&i| &stash[i].1);
-                Manifold::create(bodies, a, b, previous, settings)
-            })
-            .collect_into_vec(&mut self.found);
+        let refresh = |m: &mut Manifold| {
+            if m.cold.seen != pass || !m.refresh(bodies, prepare) {
+                m.len = 0;
+            }
+        };
+        if serial {
+            self.manifolds.iter_mut().for_each(refresh);
+        } else {
+            self.manifolds
+                .par_iter_mut()
+                .with_min_len(PAIR_BATCH)
+                .for_each(refresh);
+        }
         let before = self.manifolds.len();
         self.manifolds.retain(|m| m.len > 0);
-        let changed = self.manifolds.len() != before || self.found.iter().any(Option::is_some);
-        self.manifolds.extend(self.found.drain(..).flatten());
+        let mut changed = self.manifolds.len() != before;
+        let (stash, stash_index) = (&self.stash, &self.stash_index);
+        let tight = &self.tight;
+        let create = |&(a, b): &(usize, usize)| {
+            // Enlarged boxes pair near neighbours that are not touching.
+            let (ta, tb) = (&tight[a], &tight[b]);
+            if !(ta.min.cmple(tb.max).all() && tb.min.cmple(ta.max).all()) {
+                return None;
+            }
+            let key = (bodies[a].key, bodies[b].key);
+            let previous = stash_index.get(&key).map(|&i| &stash[i].1);
+            Manifold::create(bodies, a, b, previous, prepare)
+        };
+        if serial || rayon::current_num_threads() == 1 || self.fresh.len() < PAIR_BATCH {
+            // A failed narrowphase needs no manifold-sized output slot.
+            // Append hits directly when there is no parallel work to merge.
+            for pair in &self.fresh {
+                if let Some(manifold) = create(pair) {
+                    self.manifolds.push(manifold);
+                    changed = true;
+                }
+            }
+        } else {
+            self.fresh
+                .par_iter()
+                .with_min_len(PAIR_BATCH)
+                .map(create)
+                .collect_into_vec(&mut self.found);
+            changed |= self.found.iter().any(Option::is_some);
+            self.manifolds.extend(self.found.drain(..).flatten());
+        }
         if changed {
             self.recolor = true;
             self.cache.clear();
-            (self.cache).extend(self.manifolds.iter().enumerate().map(|(i, m)| (m.key, i)));
+            (self.cache).extend(
+                self.manifolds
+                    .iter()
+                    .enumerate()
+                    .map(|(i, m)| (m.cold.key, i)),
+            );
         }
     }
 
@@ -1370,7 +2570,8 @@ impl Solver {
         }
         self.recolor = false;
         self.colored.clear();
-        self.colored.extend(bodies.iter().map(|b| (b.key, b.dynamic())));
+        self.colored
+            .extend(bodies.iter().map(|b| (b.key, b.dynamic())));
         self.colored_links.clear();
         (self.colored_links).extend(self.links.iter().map(|l| (l.a, l.b, l.solved(bodies))));
         let n = self.bodies.len();
@@ -1392,7 +2593,9 @@ impl Solver {
         }
         self.adjacency.clear();
         self.adjacency.resize(self.offsets[n] as usize, 0);
-        let mut fill: Vec<u32> = self.offsets[..n].to_vec();
+        self.scratch_u32.clear();
+        self.scratch_u32.extend_from_slice(&self.offsets[..n]);
+        let fill = &mut self.scratch_u32;
         for (index, m) in self.manifolds.iter().enumerate() {
             for body in [m.a, m.b] {
                 self.adjacency[fill[body] as usize] = index as u32;
@@ -1413,9 +2616,11 @@ impl Solver {
             color.clear();
         }
         self.free.clear();
-        let mut color_of = vec![u32::MAX; n];
+        fill.fill(u32::MAX);
+        let color_of = fill;
         // stamp[c] == i marks color c as taken by a neighbor of body i.
-        let mut stamp: Vec<usize> = Vec::new();
+        self.scratch_usize.clear();
+        let stamp = &mut self.scratch_usize;
         for i in (0..n).filter(|&i| self.bodies[i].dynamic()) {
             if self.offsets[i] == self.offsets[i + 1] {
                 self.free.push(i);
@@ -1424,7 +2629,11 @@ impl Solver {
             for &entry in &self.adjacency[self.offsets[i] as usize..self.offsets[i + 1] as usize] {
                 let other = if entry & LINK != 0 {
                     let link = &self.links[(entry & !LINK) as usize];
-                    if link.a == Some(i) { Some(link.b) } else { link.a }
+                    if link.a == Some(i) {
+                        Some(link.b)
+                    } else {
+                        link.a
+                    }
                 } else {
                     let m = &self.manifolds[entry as usize];
                     Some(if m.a == i { m.b } else { m.a })
@@ -1487,12 +2696,384 @@ mod tests {
     }
 
     #[test]
+    fn batched_solves_keep_lanes_independent_across_mass_scales_and_partial_batches() {
+        let scales = [1.0e-12, 1.0e-3, 1.0e9, 1.0e24];
+        for width in 1..=4 {
+            let expected: [(Vec3A, Vec3A); 4] = std::array::from_fn(|lane| {
+                let v = lane as f32 + 1.0;
+                (Vec3A::new(v, -0.3 * v, 0.2), Vec3A::new(-0.1, v * 0.2, -v))
+            });
+            let systems = std::array::from_fn(|lane| {
+                if lane >= width {
+                    return System::IDENTITY;
+                }
+                let v = lane as f32;
+                let lin = Mat3A::from_cols(
+                    Vec3A::new(4.0 + v, 0.4, -0.2),
+                    Vec3A::new(0.4, 3.0 + v, 0.3),
+                    Vec3A::new(-0.2, 0.3, 5.0 + v),
+                ) * scales[lane];
+                let ang = Mat3A::from_cols(
+                    Vec3A::new(6.0 + v, -0.5, 0.1),
+                    Vec3A::new(-0.5, 7.0 + v, -0.4),
+                    Vec3A::new(0.1, -0.4, 8.0 + v),
+                ) * scales[lane];
+                let cross = Mat3A::from_cols(
+                    Vec3A::new(0.1, 0.2, -0.3),
+                    Vec3A::new(-0.4, 0.1, 0.2),
+                    Vec3A::new(0.3, -0.2, 0.4),
+                ) * scales[lane];
+                let (x, y) = expected[lane];
+                System {
+                    lin,
+                    ang,
+                    cross,
+                    rhs_lin: -(lin * x + cross.transpose() * y),
+                    rhs_ang: -(cross * x + ang * y),
+                }
+            });
+            let update = System::solve_four(&systems);
+            for lane in 0..4 {
+                let x = Vec3A::new(update[0][lane], update[1][lane], update[2][lane]);
+                let y = Vec3A::new(update[3][lane], update[4][lane], update[5][lane]);
+                if lane >= width {
+                    assert_eq!((x, y), (Vec3A::ZERO, Vec3A::ZERO));
+                    continue;
+                }
+                let s = &systems[lane];
+                assert!(
+                    (x - expected[lane].0).length() < 1.0e-4,
+                    "width {width}, lane {lane}"
+                );
+                assert!(
+                    (y - expected[lane].1).length() < 1.0e-4,
+                    "width {width}, lane {lane}"
+                );
+                let linear = (s.lin * x + s.cross.transpose() * y + s.rhs_lin) / scales[lane];
+                let angular = (s.cross * x + s.ang * y + s.rhs_ang) / scales[lane];
+                assert!(
+                    linear.length() < 1.0e-4,
+                    "width {width}, lane {lane}: {linear}"
+                );
+                assert!(
+                    angular.length() < 1.0e-4,
+                    "width {width}, lane {lane}: {angular}"
+                );
+            }
+        }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn avx2_solves_keep_eight_body_systems_independent() {
+        if !std::is_x86_feature_detected!("avx2") {
+            return;
+        }
+        let scales = [1.0e-12, 1.0e-3, 1.0e9, 1.0e24];
+        let systems = std::array::from_fn(|lane| {
+            let v = lane as f32 + 1.0;
+            let scale = scales[lane % scales.len()];
+            System {
+                lin: Mat3A::from_cols(
+                    Vec3A::new(4.0 + v, 0.4, -0.2),
+                    Vec3A::new(0.4, 3.0 + v, 0.3),
+                    Vec3A::new(-0.2, 0.3, 5.0 + v),
+                ) * scale,
+                ang: Mat3A::from_cols(
+                    Vec3A::new(6.0 + v, -0.5, 0.1),
+                    Vec3A::new(-0.5, 7.0 + v, -0.4),
+                    Vec3A::new(0.1, -0.4, 8.0 + v),
+                ) * scale,
+                cross: Mat3A::from_cols(
+                    Vec3A::new(0.1, 0.2, -0.3),
+                    Vec3A::new(-0.4, 0.1, 0.2),
+                    Vec3A::new(0.3, -0.2, 0.4),
+                ) * scale,
+                rhs_lin: Vec3A::new(v, -2.0 * v, 3.0) * scale,
+                rhs_ang: Vec3A::new(-v, 0.5 * v, 2.0) * scale,
+            }
+        });
+        // SAFETY: CPU support was checked above.
+        let rotations = std::array::from_fn(|lane| {
+            Quat::from_euler(glam::EulerRot::XYZ, lane as f32 * 0.1, -0.3, 0.7)
+        });
+        let update = unsafe { System::solve_eight(&systems, &rotations) };
+        for (lane, s) in systems.iter().enumerate() {
+            let x = Vec3A::new(update[0][lane], update[1][lane], update[2][lane]);
+            let actual = Quat::from_xyzw(
+                update[3][lane],
+                update[4][lane],
+                update[5][lane],
+                update[6][lane],
+            );
+            let relative = actual * rotations[lane].conjugate();
+            let y = Vec3A::from(relative.xyz() * (2.0 / relative.w));
+            let scale = scales[lane % scales.len()];
+            let linear = (s.lin * x + s.cross.transpose() * y + s.rhs_lin) / scale;
+            let angular = (s.cross * x + s.ang * y + s.rhs_ang) / scale;
+            assert!(linear.length() < 1.0e-4, "lane {lane}: {linear}");
+            assert!(angular.length() < 1.0e-4, "lane {lane}: {angular}");
+        }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn batched_rotation_updates_match_scalar_at_varied_poses() {
+        if !std::is_x86_feature_detected!("avx2") {
+            return;
+        }
+        for sample in 0..256 {
+            let systems = std::array::from_fn(|lane| {
+                let t = (sample * 8 + lane) as f32;
+                System {
+                    rhs_ang: Vec3A::new((t * 0.19).sin(), (t * 0.37).cos(), (t * 0.11).sin())
+                        * 0.25,
+                    ..System::IDENTITY
+                }
+            });
+            let rotations = std::array::from_fn(|lane| {
+                let t = (sample * 8 + lane) as f32;
+                let q = Quat::from_euler(glam::EulerRot::XYZ, t * 0.017, t * -0.011, t * 0.031);
+                if lane % 2 == 0 { q } else { -q }
+            });
+            // SAFETY: CPU support was checked above.
+            let update = unsafe { System::solve_eight(&systems, &rotations) };
+            for lane in 0..8 {
+                let dr = -Vec3::from(systems[lane].rhs_ang);
+                let expected = quat_add(rotations[lane], dr);
+                let actual = Quat::from_xyzw(
+                    update[3][lane],
+                    update[4][lane],
+                    update[5][lane],
+                    update[6][lane],
+                );
+                assert_eq!(
+                    actual.to_array().map(f32::to_bits),
+                    expected.to_array().map(f32::to_bits),
+                    "sample {sample}, lane {lane}"
+                );
+            }
+        }
+    }
+
+    /// Pseudo-random value in [-1, 1).
+    #[cfg(target_arch = "x86_64")]
+    fn random(state: &mut u64) -> f32 {
+        *state ^= *state << 13;
+        *state ^= *state >> 7;
+        *state ^= *state << 17;
+        (*state >> 40) as f32 / (1u64 << 23) as f32 - 1.0
+    }
+
+    /// A body with an arbitrary displacement since the step began.
+    #[cfg(target_arch = "x86_64")]
+    fn moved_body(state: &mut u64) -> Body {
+        let mut vector = || Vec3A::new(random(state), random(state), random(state)) * 0.01;
+        Body {
+            key: 0,
+            shape: Collider::Sphere { radius: 1.0 },
+            position: Vec3::ZERO,
+            rotation: Quat::IDENTITY,
+            initial_position: Vec3::ZERO,
+            initial_rotation: Quat::IDENTITY,
+            inertial_position: Vec3::ZERO,
+            inertial_rotation: Quat::IDENTITY,
+            initial_basis: Mat3::IDENTITY,
+            velocity: Vec3::ZERO,
+            angular_velocity: Vec3::ZERO,
+            previous: Vec3::ZERO,
+            moved: vector(),
+            turned: vector(),
+            mass: 1.0,
+            inertia: Mat3::IDENTITY,
+            friction: 0.5,
+            static_friction: 0.5,
+            kinematic: false,
+            asleep: false,
+            wake: false,
+            island: 0,
+            sleep_time: 0.0,
+        }
+    }
+
+    /// Solver state varied enough to reach every clamp, in the lanes `len` uses.
+    #[cfg(target_arch = "x86_64")]
+    fn random_manifold(
+        mut state: u64,
+        (a, b): (usize, usize),
+        len: usize,
+        (friction, static_friction): (f32, f32),
+    ) -> Manifold {
+        let state = &mut state;
+        let live = (1u8 << len) - 1;
+        let active = LANE_BITS[live as usize];
+        let mut vector =
+            |scale: f32| Vec4::from_array(std::array::from_fn(|_| random(state))) * scale * active;
+        let mut bits = || (vector(8.0).x.abs() as u8) & live;
+        let (sticking, rescale_normal, stick, held) = (bits(), bits(), bits(), bits());
+        let mut vector =
+            |scale: f32| Vec4::from_array(std::array::from_fn(|_| random(state))) * scale * active;
+        let lanes = Lanes {
+            c0: [vector(0.01), vector(0.01), vector(0.01)],
+            ra: [vector(0.5), vector(0.5), vector(0.5)],
+            rb: [vector(0.5), vector(0.5), vector(0.5)],
+            penalty: [
+                vector(1.0e4).abs(),
+                vector(1.0e4).abs(),
+                vector(1.0e4).abs(),
+            ],
+            lambda: [-vector(50.0).abs(), vector(30.0), vector(30.0)],
+            active,
+            sticking: LANE_BITS[sticking as usize],
+            rescale_normal: LANE_BITS[rescale_normal as usize],
+            stick,
+            held,
+        };
+        let angle = vector(3.0);
+        Manifold {
+            a,
+            b,
+            rows: Mat3A::from_quat(Quat::from_euler(
+                glam::EulerRot::XYZ,
+                angle.x,
+                angle.x * 0.7,
+                angle.x * 0.3,
+            )),
+            cold: Box::new(CollisionData {
+                key: (0, 0),
+                local_basis: [Vec3::ZERO; 3],
+                relative: (Vec3::ZERO, Quat::IDENTITY),
+                contacts: [Contact::default(); collide::MAX_CONTACTS],
+                anchors: [[Vec4::ZERO; 3]; 2],
+                deep: false,
+                seen: 0,
+            }),
+            first_is_a: true,
+            len,
+            friction,
+            static_friction,
+            scale: 1.0,
+            lanes,
+        }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn avx2_pair_stamps_match_scalar_bit_for_bit() {
+        if !std::is_x86_feature_detected!("avx2") {
+            return;
+        }
+        let mut seed = 0x2545_F491_4F6C_DD1Du64;
+        let bits = |v: Vec4| v.to_array().map(f32::to_bits);
+        let bits3 = |v: Vec3A| v.to_array().map(f32::to_bits);
+        let (mut cone, mut clamped) = (0, 0);
+        for sample in 0..4096 {
+            let bodies: [Body; 3] = std::array::from_fn(|_| moved_body(&mut seed));
+            // Body 0 is A of the first manifold and, alternately, B of the second.
+            let (first, second) = ((0, 1), if sample % 2 == 0 { (2, 0) } else { (0, 2) });
+            let (len_p, len_q) = ([(4, 4), (2, 4), (4, 3), (2, 3)])[sample / 2 % 4];
+            let friction = if sample / 8 % 2 == 0 {
+                ((0.5, 0.5), (0.5, 0.5))
+            } else {
+                ((0.3, 0.6), (0.5, 0.5))
+            };
+            let flags = [sample / 16 % 2 == 0, sample / 32 % 2 == 0];
+            let damping = if sample / 64 % 2 == 0 { 0.042 } else { 0.0 };
+            // Each path gets its own copy of the same two manifolds.
+            let (seed_p, seed_q) = (seed.rotate_left(13), seed.rotate_left(29));
+            random(&mut seed);
+            let make_p = || random_manifold(seed_p, first, len_p, friction.0);
+            let make_q = || random_manifold(seed_q, second, len_q, friction.1);
+            let (mut p, mut q, mut wide_p, mut wide_q) = (make_p(), make_q(), make_p(), make_q());
+            let beta = 1.0e5;
+            // Nonzero, as assembly's inertial term is, so sum order shows.
+            let start = || System {
+                rhs_lin: Vec3A::new(0.1, -0.2, 0.3),
+                ..System::IDENTITY
+            };
+
+            let mut scalar = start();
+            let mut scalar_sums = LaneSums::default();
+            for (half, (m, first)) in [(&mut p, flags[0]), (&mut q, flags[1])]
+                .into_iter()
+                .enumerate()
+            {
+                let (a, b) = (&bodies[m.a], &bodies[m.b]);
+                let c = first.then(|| m.dual(a, b, beta));
+                let e = m.eval(&Motion::new(a, b));
+                cone += usize::from(e.force[1].cmpne(e.raw[1]).any());
+                clamped += usize::from(e.force[0].cmpne(e.raw[0]).any());
+                m.stamp(
+                    a,
+                    b,
+                    m.a == 0,
+                    c,
+                    damping,
+                    &mut scalar,
+                    &mut scalar_sums,
+                    half,
+                );
+            }
+            let mut wide = start();
+            let mut wide_sums = LaneSums::default();
+            let (pa, pb) = (&bodies[wide_p.a], &bodies[wide_p.b]);
+            let (qa, qb) = (&bodies[wide_q.a], &bodies[wide_q.b]);
+            // SAFETY: AVX2 support was checked above.
+            unsafe {
+                Manifold::stamp_pair_avx2(
+                    &mut wide_p,
+                    &mut wide_q,
+                    [pa, pb],
+                    [qa, qb],
+                    0,
+                    flags,
+                    beta,
+                    damping,
+                    &mut wide,
+                    &mut wide_sums,
+                );
+            }
+
+            for (s, w) in [
+                (scalar.lin.x_axis, wide.lin.x_axis),
+                (scalar.lin.y_axis, wide.lin.y_axis),
+                (scalar.lin.z_axis, wide.lin.z_axis),
+                (scalar.cross.x_axis, wide.cross.x_axis),
+                (scalar.cross.y_axis, wide.cross.y_axis),
+                (scalar.cross.z_axis, wide.cross.z_axis),
+                (scalar.rhs_lin, wide.rhs_lin),
+            ] {
+                assert_eq!(bits3(s), bits3(w), "sample {sample}");
+            }
+            let (s, w) = (&scalar_sums, &wide_sums);
+            for (s, w) in s.ang.iter().chain(&s.rhs).zip(w.ang.iter().chain(&w.rhs)) {
+                assert_eq!(s.map(bits), w.map(bits), "sample {sample}");
+            }
+            for (s, w) in [(&p, &wide_p), (&q, &wide_q)] {
+                assert_eq!(s.lanes.penalty.map(bits), w.lanes.penalty.map(bits));
+                assert_eq!(s.lanes.lambda.map(bits), w.lanes.lambda.map(bits));
+                assert_eq!((s.lanes.stick, s.lanes.held), (w.lanes.stick, w.lanes.held));
+            }
+        }
+        // The samples must reach the friction cone and the normal clamp.
+        assert!(
+            cone > 100 && clamped > 100,
+            "cone {cone}, clamped {clamped}"
+        );
+    }
+
+    #[test]
     fn lane_rotation_and_cross_match_scalar() {
         let q = Quat::from_euler(glam::EulerRot::XYZ, 0.3, -1.1, 2.0);
         let n = Vec3::new(0.2, -0.7, 0.4).normalize();
-        let points = [Vec3::new(1.0, 2.0, 3.0), Vec3::new(-0.5, 0.25, 4.0), Vec3::X, Vec3::new(0.0, -3.0, 0.5)];
+        let points = [
+            Vec3::new(1.0, 2.0, 3.0),
+            Vec3::new(-0.5, 0.25, 4.0),
+            Vec3::X,
+            Vec3::new(0.0, -3.0, 0.5),
+        ];
         let lanes: [Vec4; 3] = std::array::from_fn(|k| Vec4::from_array(points.map(|p| p[k])));
-        let (rotated, crossed) = (rotate4(q, lanes), cross4(lanes, n));
+        let (rotated, crossed) = (rotate4(Mat3::from_quat(q), lanes), cross4(lanes, n));
         for (i, p) in points.iter().enumerate() {
             let (r, c) = (q * *p, p.cross(n));
             for k in 0..3 {
@@ -1507,5 +3088,52 @@ mod tests {
         let q = Quat::from_rotation_y(0.7);
         let w = Vec3::new(0.01, -0.02, 0.015);
         assert!((quat_sub(quat_add(q, w), q) - w).length() < 1e-4);
+    }
+
+    #[test]
+    fn sweep_blocks_preserve_touching_bounds_and_exclude_unused_lanes() {
+        for len in 1..=4 {
+            let boxes: Vec<_> = (0..len)
+                .map(|i| {
+                    let center = Vec3::new(i as f32 * 1.5, i as f32 * -0.3, i as f32 * 0.4);
+                    Aabb {
+                        min: center - Vec3::new(0.5, 0.7, 0.9),
+                        max: center + Vec3::new(0.5, 0.7, 0.9),
+                        index: i as u32,
+                        flags: 1,
+                    }
+                })
+                .collect();
+            let block = SweepBlock::new(&boxes);
+            let mut queries: Vec<_> = boxes.iter().flat_map(|b| [b.min, b.max]).collect();
+            queries.extend((0..100).map(|i| {
+                Vec3::new(
+                    i as f32 * 0.1 - 2.0,
+                    (i % 7) as f32 * 0.4 - 2.0,
+                    (i % 11) as f32 * 0.3 - 2.0,
+                )
+            }));
+            for center in queries {
+                for half in [Vec3::ZERO, Vec3::splat(0.6), Vec3::splat(100.0)] {
+                    let min = center - half;
+                    let max = center + half;
+                    let expected = boxes.iter().enumerate().fold(0, |mask, (i, b)| {
+                        if b.min.cmple(max).all() && b.max.cmpge(min).all() {
+                            mask | (1 << i)
+                        } else {
+                            mask
+                        }
+                    });
+                    assert_eq!(
+                        block.overlaps(
+                            &min.to_array().map(Vec4::splat),
+                            &max.to_array().map(Vec4::splat)
+                        ),
+                        expected,
+                        "len {len}, center {center:?}, half {half:?}",
+                    );
+                }
+            }
+        }
     }
 }

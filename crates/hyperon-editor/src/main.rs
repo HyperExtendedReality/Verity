@@ -1,5 +1,6 @@
 mod asset_browser;
 mod gizmo;
+mod profiler;
 mod ui;
 
 use std::{
@@ -8,13 +9,13 @@ use std::{
     time::{Duration, Instant},
 };
 
+use hyperon_core::EntityHandle;
 use hyperon_core::{Entity, LightingMethod, Material, PointLight, Scene, Transform};
 use hyperon_lux::{
     gi::{GiStatus, Lux},
     settings::{Sampling, Settings},
 };
 use hyperon_render::{Renderer, UiFrame};
-use hyperon_core::EntityHandle;
 use hyperon_runtime::Runtime;
 use ui::{Action, PlayState, Selection, WindowCommand};
 use winit::{
@@ -55,6 +56,15 @@ struct Editor {
     close_requested: bool,
     play: Option<Play>,
     history: History,
+    loading: Option<Loading>,
+}
+
+/// Models loading on a worker thread that holds the renderer until it is done.
+struct Loading {
+    /// The renderer, the imported light count when the GPU holds a known
+    /// scene, and the outcome.
+    thread: std::thread::JoinHandle<(Renderer, Option<usize>, Result<(), String>)>,
+    done: Box<dyn FnOnce(&mut Editor, Result<(), String>)>,
 }
 
 /// Undo steps beyond this are forgotten.
@@ -98,6 +108,7 @@ impl Editor {
             close_requested: false,
             play: None,
             history: History::default(),
+            loading: None,
         }
     }
 
@@ -128,8 +139,13 @@ impl Editor {
                 .and_then(|s| s.to_str())
                 .unwrap_or("Untitled");
             window.set_title(&format!(
-                "Hyperon — {file}{}",
-                if self.dirty { "*" } else { "" }
+                "Hyperon — {file}{}{}",
+                if self.dirty { "*" } else { "" },
+                if self.loading.is_some() {
+                    " — loading models…"
+                } else {
+                    ""
+                }
             ));
         }
     }
@@ -216,36 +232,52 @@ impl Editor {
         Ok(count - scene_lights)
     }
 
+    /// Load models on a worker thread, which holds the renderer meanwhile, so
+    /// the window keeps responding: Sponza takes seconds, and Windows closes
+    /// windows that stop responding. `done` runs on the event loop afterwards.
     /// On failure restore the previous scene's imported geometry.
     fn replace_assets(
         &mut self,
-        assets: &[String],
+        assets: Vec<String>,
         scene_lights: usize,
         method: LightingMethod,
-    ) -> Result<(), String> {
-        let renderer = self.renderer.as_mut().ok_or("Renderer is not available")?;
-        match Self::load_assets(renderer, assets, scene_lights, method) {
-            Ok(imported) => {
-                self.tools.light_limit = hyperon_render::MAX_LIGHTS - imported;
-                Ok(())
-            }
-            Err(error) => {
-                match Self::load_assets(
-                    renderer,
-                    &self.scene.assets,
-                    self.scene.lights.len(),
-                    self.scene.lighting.method,
-                ) {
-                    Ok(imported) => self.tools.light_limit = hyperon_render::MAX_LIGHTS - imported,
-                    Err(restore) => {
-                        return Err(format!(
-                            "{error}\nCould not restore the previous models: {restore}"
-                        ));
-                    }
-                }
-                Err(error)
-            }
-        }
+        done: impl FnOnce(&mut Self, Result<(), String>) + 'static,
+    ) {
+        let Some(mut renderer) = self.renderer.take() else {
+            return done(self, Err("Renderer is not available".to_owned()));
+        };
+        let previous = self.scene.assets.clone();
+        let (previous_lights, previous_method) =
+            (self.scene.lights.len(), self.scene.lighting.method);
+        let context = self.context.clone();
+        let thread = std::thread::spawn(move || {
+            let (imported, result) =
+                match Self::load_assets(&mut renderer, &assets, scene_lights, method) {
+                    Ok(imported) => (Some(imported), Ok(())),
+                    Err(error) => match Self::load_assets(
+                        &mut renderer,
+                        &previous,
+                        previous_lights,
+                        previous_method,
+                    ) {
+                        Ok(imported) => (Some(imported), Err(error)),
+                        Err(restore) => (
+                            None,
+                            Err(format!(
+                                "{error}\nCould not restore the previous models: {restore}"
+                            )),
+                        ),
+                    },
+                };
+            // Wakes the event loop to finish in `frame`.
+            context.request_repaint();
+            (renderer, imported, result)
+        });
+        self.loading = Some(Loading {
+            thread,
+            done: Box::new(done),
+        });
+        self.title();
     }
 
     fn import_model(&mut self, path: PathBuf) {
@@ -258,13 +290,19 @@ impl Editor {
         }
         let mut assets = self.scene.assets.clone();
         assets.push(path);
-        match self.replace_assets(&assets, self.scene.lights.len(), self.scene.lighting.method) {
-            Ok(()) => {
-                self.scene.assets = assets;
-                self.changed();
-            }
-            Err(error) => Self::error(format!("Cannot import model: {error}")),
-        }
+        let (lights, method) = (self.scene.lights.len(), self.scene.lighting.method);
+        self.replace_assets(
+            assets.clone(),
+            lights,
+            method,
+            |editor, result| match result {
+                Ok(()) => {
+                    editor.scene.assets = assets;
+                    editor.changed();
+                }
+                Err(error) => Self::error(format!("Cannot import model: {error}")),
+            },
+        );
     }
 
     fn remove_model(&mut self, index: usize) {
@@ -273,30 +311,43 @@ impl Editor {
         }
         let mut assets = self.scene.assets.clone();
         assets.remove(index);
-        match self.replace_assets(&assets, self.scene.lights.len(), self.scene.lighting.method) {
-            Ok(()) => {
-                self.scene.assets = assets;
-                self.changed();
-            }
-            Err(error) => Self::error(format!("Cannot remove model: {error}")),
-        }
+        let (lights, method) = (self.scene.lights.len(), self.scene.lighting.method);
+        self.replace_assets(
+            assets.clone(),
+            lights,
+            method,
+            |editor, result| match result {
+                Ok(()) => {
+                    editor.scene.assets = assets;
+                    editor.changed();
+                }
+                Err(error) => Self::error(format!("Cannot remove model: {error}")),
+            },
+        );
     }
 
     fn new_scene(&mut self) {
         if self.can_discard() {
             // Also runs without models, to drop a GI extension the old scene installed.
-            if let Err(error) = self.replace_assets(&[], 0, LightingMethod::default()) {
-                Self::error(format!("Cannot create scene: {error}"));
-                return;
-            }
-            self.tools.gizmo.cancel_drag();
-            self.scene = Scene::default();
-            self.reset_history();
-            self.path = None;
-            self.selected = Selection::Entity(0);
-            self.dirty = false;
-            self.title();
-            self.redraw();
+            self.replace_assets(
+                Vec::new(),
+                0,
+                LightingMethod::default(),
+                |editor, result| {
+                    if let Err(error) = result {
+                        Self::error(format!("Cannot create scene: {error}"));
+                        return;
+                    }
+                    editor.tools.gizmo.cancel_drag();
+                    editor.scene = Scene::default();
+                    editor.reset_history();
+                    editor.path = None;
+                    editor.selected = Selection::Entity(0);
+                    editor.dirty = false;
+                    editor.title();
+                    editor.redraw();
+                },
+            );
         }
     }
 
@@ -326,27 +377,32 @@ impl Editor {
                 ));
             }
             Ok(scene) => {
-                if let Err(error) =
-                    self.replace_assets(&scene.assets, scene.lights.len(), scene.lighting.method)
-                {
-                    Self::error(format!("Cannot open {}: {error}", path.display()));
-                    return;
-                }
-                self.tools.gizmo.cancel_drag();
-                self.selected = if scene.entities.is_empty() {
-                    Selection::None
-                } else {
-                    Selection::Entity(0)
-                };
-                if let Some(camera) = scene.cameras.first() {
-                    ui::look_through(&mut self.tools, camera);
-                }
-                self.scene = scene;
-                self.reset_history();
-                self.path = Some(path);
-                self.dirty = false;
-                self.title();
-                self.redraw();
+                let (assets, lights, method) = (
+                    scene.assets.clone(),
+                    scene.lights.len(),
+                    scene.lighting.method,
+                );
+                self.replace_assets(assets, lights, method, |editor, result| {
+                    if let Err(error) = result {
+                        Self::error(format!("Cannot open {}: {error}", path.display()));
+                        return;
+                    }
+                    editor.tools.gizmo.cancel_drag();
+                    editor.selected = if scene.entities.is_empty() {
+                        Selection::None
+                    } else {
+                        Selection::Entity(0)
+                    };
+                    if let Some(camera) = scene.cameras.first() {
+                        ui::look_through(&mut editor.tools, camera);
+                    }
+                    editor.scene = scene;
+                    editor.reset_history();
+                    editor.path = Some(path);
+                    editor.dirty = false;
+                    editor.title();
+                    editor.redraw();
+                });
             }
             Err(error) => Self::error(format!("Cannot open {}: {error}", path.display())),
         }
@@ -410,20 +466,36 @@ impl Editor {
         };
         let Some(target) = stack.pop() else { return };
         // Models and GI live on the GPU: reload them when the step changes them.
-        if (target.assets != self.scene.assets
-            || target.lighting.method != self.scene.lighting.method)
-            && let Err(error) =
-                self.replace_assets(&target.assets, target.lights.len(), target.lighting.method)
+        if target.assets != self.scene.assets
+            || target.lighting.method != self.scene.lighting.method
         {
-            let stack = if forward {
-                &mut self.history.redo
-            } else {
-                &mut self.history.undo
-            };
-            stack.push(target);
-            Self::error(format!("Cannot {}: {error}", if forward { "redo" } else { "undo" }));
-            return;
+            let (assets, lights, method) = (
+                target.assets.clone(),
+                target.lights.len(),
+                target.lighting.method,
+            );
+            self.replace_assets(assets, lights, method, move |editor, result| match result {
+                Ok(()) => editor.arrive(target, forward),
+                Err(error) => {
+                    let stack = if forward {
+                        &mut editor.history.redo
+                    } else {
+                        &mut editor.history.undo
+                    };
+                    stack.push(target);
+                    Self::error(format!(
+                        "Cannot {}: {error}",
+                        if forward { "redo" } else { "undo" }
+                    ));
+                }
+            });
+        } else {
+            self.arrive(target, forward);
         }
+    }
+
+    /// Make an undo or redo step's scene current.
+    fn arrive(&mut self, target: Scene, forward: bool) {
         let previous = std::mem::replace(&mut self.history.committed, target.clone());
         if forward {
             self.history.undo.push(previous);
@@ -685,6 +757,25 @@ impl Editor {
         let Some(window) = self.window.clone() else {
             return Ok(());
         };
+        if let Some(loading) = self.loading.take_if(|loading| loading.thread.is_finished()) {
+            let (mut renderer, imported, result) = loading
+                .thread
+                .join()
+                .map_err(|_| "Loading models panicked")?;
+            if let Some(imported) = imported {
+                self.tools.light_limit = hyperon_render::MAX_LIGHTS - imported;
+            }
+            // Resizes during the load went unseen.
+            let size = window.inner_size();
+            renderer.resize(size.width, size.height);
+            self.renderer = Some(renderer);
+            (loading.done)(self, result);
+            self.title();
+        }
+        // The UI stays frozen until the models arrive, so no edit races the load.
+        if self.loading.is_some() {
+            return Ok(());
+        }
         self.tick(false);
         self.tools.can_undo = !self.history.undo.is_empty() || self.scene != self.history.committed;
         self.tools.can_redo = !self.history.redo.is_empty();
@@ -701,6 +792,7 @@ impl Editor {
         let context = self.context.clone();
         let mut response = None;
         let method = self.scene.lighting.method;
+        let ui_start = Instant::now();
         let output = context.run_ui(input, |root| {
             response = Some(ui::show(
                 root,
@@ -711,6 +803,7 @@ impl Editor {
                 &mut self.tools,
             ));
         });
+        let ui_time = ui_start.elapsed();
         let Some(response) = response else {
             return Ok(());
         };
@@ -740,9 +833,14 @@ impl Editor {
         if let Some(renderer) = &mut self.renderer {
             let camera = &self.tools.camera;
             renderer.set_camera(camera.eye, camera.target, camera.vertical_fov);
+            renderer.set_strata_enabled(self.tools.strata_enabled);
+            renderer.set_strata_debug(self.tools.strata_enabled && self.tools.strata_debug);
+            let render_start = Instant::now();
             renderer.draw_ui(&self.scene, frame)?;
-            self.tools.gi_status = renderer.extension_mut::<Lux>().map(|lux| {
-                match lux.status() {
+            self.tools.profiler.record(ui_time, render_start.elapsed());
+            self.tools.gi_status = renderer
+                .extension_mut::<Lux>()
+                .map(|lux| match lux.status() {
                     GiStatus::Compiling { since } => format!(
                         "GI compiling pipelines… {}s (hemisphere until ready)",
                         since.elapsed().as_secs()
@@ -751,11 +849,13 @@ impl Editor {
                         format!("GI active (compiled in {:.1}s)", compile_time.as_secs_f32())
                     }
                     GiStatus::Failed(error) => format!("GI failed: {error}"),
-                }
-            });
+                });
             // GI polls its compile and converges over frames, and play mode
-            // simulates, so keep drawing.
-            if self.tools.gi_status.is_some() || self.tools.play == PlayState::Playing {
+            // simulates, so keep drawing; an open profiler measures continuous frames.
+            if self.tools.gi_status.is_some()
+                || self.tools.play == PlayState::Playing
+                || self.tools.profiler.open
+            {
                 window.request_redraw();
             }
         }
@@ -778,11 +878,11 @@ impl Editor {
         if self.scene.lighting.method != method {
             // replace_assets restores from the scene on failure, so it must hold the old method.
             let new = std::mem::replace(&mut self.scene.lighting.method, method);
-            let assets = self.scene.assets.clone();
-            match self.replace_assets(&assets, self.scene.lights.len(), new) {
-                Ok(()) => self.scene.lighting.method = new,
+            let (assets, lights) = (self.scene.assets.clone(), self.scene.lights.len());
+            self.replace_assets(assets, lights, new, move |editor, result| match result {
+                Ok(()) => editor.scene.lighting.method = new,
                 Err(error) => Self::error(format!("Cannot change the lighting method: {error}")),
-            }
+            });
         }
         // File and model actions apply to the authoring scene.
         if matches!(
@@ -936,6 +1036,7 @@ impl ApplicationHandler<Instant> for Editor {
                         ["n", "o", "s", "p"].iter().any(|s| c.eq_ignore_ascii_case(s))
                             || (!self.context.text_edit_focused() && ["c", "v", "z", "y"].iter().any(|s| c.eq_ignore_ascii_case(s))));
                 if !self.tools.flying
+                    && self.loading.is_none()
                     && (!event.repeat || movement)
                     && (shortcut || (!consumed && !self.context.egui_wants_keyboard_input()))
                 {
@@ -971,6 +1072,44 @@ impl ApplicationHandler<Instant> for Editor {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn playground_runs_hyperon_physics_and_stop_restores_the_scene() {
+        let scene: Scene = serde_json::from_str(include_str!(
+            "../../../assets/scenes/physics-playground.hyperon"
+        ))
+        .unwrap();
+        assert_eq!(scene.physics.engine, hyperon_core::PhysicsEngine::Hyperon);
+        assert_eq!(scene.entities.len(), 427);
+        let falling = scene
+            .entities
+            .iter()
+            .position(|entity| entity.name == "Falling cube 001")
+            .unwrap();
+        let start_z = scene.entities[falling].transform.translation[2];
+        let mut editor = Editor::new(egui::Context::default());
+        editor.scene = scene.clone();
+
+        // Validate before invoking play, which reports errors in a dialog.
+        Runtime::from_scene(&scene).unwrap();
+        editor.play();
+        assert!(
+            editor
+                .play
+                .as_ref()
+                .unwrap()
+                .runtime
+                .hyperon_physics
+                .is_some()
+        );
+        editor.play.as_mut().unwrap().paused = true;
+        for _ in 0..10 {
+            editor.tick(true);
+        }
+        assert!(editor.scene.entities[falling].transform.translation[2] < start_z);
+        editor.stop();
+        assert_eq!(editor.scene, scene);
+    }
 
     #[test]
     fn play_simulates_locks_edits_and_stop_restores() {

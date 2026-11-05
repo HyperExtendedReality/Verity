@@ -310,6 +310,61 @@ pub fn entity_matrix(transform: &Transform) -> Option<Mat4> {
     ))
 }
 
+/// Conservative perspective magnification for an entire transformed bound.
+/// Uncertain or near-plane-crossing inputs force the original level.
+pub fn lod_projection_scale(
+    camera: &Camera,
+    viewport: [u32; 4],
+    model: Mat4,
+    bounds: hyperon_strata::Bounds,
+) -> f64 {
+    if viewport[2] == 0
+        || viewport[3] == 0
+        || !model.is_finite()
+        || !camera.eye.is_finite()
+        || !camera.target.is_finite()
+        || !camera.vertical_fov.is_finite()
+        || !(0.0..std::f32::consts::PI).contains(&camera.vertical_fov)
+        || (0..3).any(|i| {
+            !bounds.min[i].is_finite()
+                || !bounds.max[i].is_finite()
+                || bounds.min[i] > bounds.max[i]
+        })
+    {
+        return f64::INFINITY;
+    }
+    let forward = (camera.target - camera.eye).normalize_or_zero();
+    if forward == Vec3::ZERO {
+        return f64::INFINITY;
+    }
+    let min = Vec3::from_array(bounds.min);
+    let max = Vec3::from_array(bounds.max);
+    let center = model.transform_point3((min + max) * 0.5);
+    let linear = Mat3::from_mat4(model);
+    // Frobenius norm bounds the largest singular value, including shear.
+    let stretch = (linear.x_axis.length_squared()
+        + linear.y_axis.length_squared()
+        + linear.z_axis.length_squared())
+    .sqrt();
+    let radius = (max - min).length() * 0.5 * stretch;
+    let delta = center - camera.eye;
+    let nearest = forward.dot(delta) - radius;
+    if !nearest.is_finite() || nearest <= NEAR || !stretch.is_finite() {
+        return f64::INFINITY;
+    }
+    let focal = viewport[3] as f64 / (2.0 * (camera.vertical_fov as f64 * 0.5).tan());
+    let nearest = nearest as f64;
+    // Both projection coordinates have the same pixel focal length. The
+    // off-axis term bounds the perspective derivative in either direction.
+    let scale =
+        2.0 * focal * stretch as f64 / nearest * (1.0 + (delta.length() + radius) as f64 / nearest);
+    if scale.is_finite() {
+        scale
+    } else {
+        f64::INFINITY
+    }
+}
+
 /// GPU draw record for a model matrix, index range and material.
 pub fn instance(model: Mat4, first_index: u32, base_vertex: u32, material: u32) -> Instance {
     let normal = Mat3::from_mat4(model).inverse().transpose();
@@ -402,6 +457,33 @@ pub fn brdf_lut() -> Vec<[f32; 2]> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn lod_scale_falls_back_at_near_plane_and_for_invalid_bounds() {
+        let camera = Camera {
+            eye: Vec3::ZERO,
+            target: Vec3::Y,
+            vertical_fov: 1.0,
+        };
+        let bounds = hyperon_strata::Bounds {
+            min: [-1.0; 3],
+            max: [1.0; 3],
+        };
+        let viewport = [0, 0, 1280, 720];
+        assert!(lod_projection_scale(&camera, viewport, Mat4::IDENTITY, bounds).is_infinite());
+        let far = Mat4::from_translation(Vec3::Y * 100.0);
+        let near = Mat4::from_translation(Vec3::Y * 10.0);
+        assert!(
+            lod_projection_scale(&camera, viewport, far, bounds)
+                < lod_projection_scale(&camera, viewport, near, bounds)
+        );
+        let invalid = hyperon_strata::Bounds {
+            min: [f32::NAN; 3],
+            max: [1.0; 3],
+        };
+        assert!(lod_projection_scale(&camera, viewport, far, invalid).is_infinite());
+        assert!(lod_projection_scale(&camera, [0; 4], far, bounds).is_infinite());
+    }
 
     #[test]
     fn point_shadow_faces_cover_axes_and_light_range() {

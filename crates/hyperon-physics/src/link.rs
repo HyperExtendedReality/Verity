@@ -5,7 +5,7 @@
 //! following the AVBD 3D demo; contacts instead use the step-start Taylor
 //! expansion (Sec. 4).
 
-use crate::solver::{quat_sub, Body, System};
+use crate::solver::{Body, System, quat_sub};
 use crate::{Collider, PhysicsSettings};
 use glam::{Mat3A, Quat, Vec3, Vec3A};
 
@@ -158,9 +158,18 @@ impl Link {
         let e = self.ends(a, b);
         let (alpha, gamma) = (settings.alpha, settings.gamma);
         let (min, max) = (PENALTY_MIN * self.scale, PENALTY_MAX * self.scale);
-        let warm = |p: Vec3, limit: f32| (p * gamma).clamp(Vec3::splat(min), Vec3::splat(max)).min(Vec3::splat(limit));
+        let warm = |p: Vec3, limit: f32| {
+            (p * gamma)
+                .clamp(Vec3::splat(min), Vec3::splat(max))
+                .min(Vec3::splat(limit))
+        };
         match self.kind {
-            Kind::Joint { linear, angular, rest, .. } => {
+            Kind::Joint {
+                linear,
+                angular,
+                rest,
+                ..
+            } => {
                 self.c0_linear = e.point_a - e.point_b;
                 self.c0_angular = self.angle(&e, rest);
                 self.lambda_linear *= alpha * gamma;
@@ -190,7 +199,12 @@ impl Link {
         let e = self.ends(a, b);
         let sign = if is_a { 1.0 } else { -1.0 };
         match self.kind {
-            Kind::Joint { linear, angular, rest, .. } => {
+            Kind::Joint {
+                linear,
+                angular,
+                rest,
+                ..
+            } => {
                 if self.penalty_linear != Vec3::ZERO {
                     let k = Vec3A::from(self.penalty_linear);
                     let c = self.linear_error(&e, linear.is_infinite(), alpha);
@@ -205,7 +219,8 @@ impl Link {
                     system.rhs_ang += jt * f;
                     // Diagonal geometric stiffness (Sec. 3.5, Eq. 17).
                     let r = if is_a { e.arm_a } else { -e.arm_b };
-                    let g = ball_socket(0, r) * f.x + ball_socket(1, r) * f.y + ball_socket(2, r) * f.z;
+                    let g =
+                        ball_socket(0, r) * f.x + ball_socket(1, r) * f.y + ball_socket(2, r) * f.z;
                     system.ang += diagonalize(g);
                 }
                 if self.penalty_angular != Vec3::ZERO {
@@ -250,7 +265,12 @@ impl Link {
             (p + c.abs() * (beta * self.scale)).min(Vec3::splat(limit.min(max)))
         };
         match self.kind {
-            Kind::Joint { linear, angular, fracture, rest } => {
+            Kind::Joint {
+                linear,
+                angular,
+                fracture,
+                rest,
+            } => {
                 if self.penalty_linear != Vec3::ZERO {
                     let c = self.linear_error(&e, linear.is_infinite(), alpha);
                     if linear.is_infinite() {
@@ -277,9 +297,17 @@ impl Link {
                     self.lambda_angular = Vec3::ZERO;
                 }
             }
-            Kind::Spring { stiffness, rest_length } => {
+            Kind::Spring {
+                stiffness,
+                rest_length,
+            } => {
                 let c = (e.point_a - e.point_b).length() - rest_length;
-                self.penalty_linear = ramp(self.penalty_linear, Vec3::splat(c), settings.beta, stiffness);
+                self.penalty_linear = ramp(
+                    self.penalty_linear,
+                    Vec3::splat(c),
+                    settings.beta,
+                    stiffness,
+                );
             }
         }
     }

@@ -4,13 +4,19 @@ use std::{env, fs, path::PathBuf};
 /// Every pipeline entry point, written to `OUT_DIR/{file}.{entry}.spv`.
 const ENTRY_POINTS: &[(&str, &str, SlangStage)] = &[
     ("clusters", "clusterMain", SlangStage::Compute),
+    ("gpu_culling", "cullMain", SlangStage::Compute),
+    ("gpu_culling", "pyramidMain", SlangStage::Compute),
+    ("gpu_culling", "occlusionMain", SlangStage::Compute),
     ("visibility", "vertexMain", SlangStage::Vertex),
     ("visibility", "fragmentMain", SlangStage::Fragment),
+    ("depth_prepass", "fragmentMain", SlangStage::Fragment),
     ("resolve", "resolveMain", SlangStage::Compute),
     ("composite", "vertexMain", SlangStage::Vertex),
     ("composite", "fragmentMain", SlangStage::Fragment),
     ("shadow", "vertexMain", SlangStage::Vertex),
     ("shadow", "fragmentMain", SlangStage::Fragment),
+    ("breaker", "vertexMain", SlangStage::Vertex),
+    ("breaker", "fragmentMain", SlangStage::Fragment),
 ];
 
 fn main() {
