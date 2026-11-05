@@ -629,3 +629,245 @@ median unless stated.
   unaligned at 368 bytes. Padding to 448 bytes measured 0.873 ms.
 - **Storing inertia as `Mat3A`:** 0.856 and 0.862 ms.
 - **Prefetching cold data during refresh:** 0.825 and 0.838 ms.
+
+## Accuracy against closed-form references (adopted)
+
+Collected on 2026-11-05 on the same CPU and toolchain, with one Rayon thread.
+`examples/quality.rs` compares both engines with analytic results: Coulomb
+stopping distances, sliding down a slope (gravity is tilted), a ball rolling
+and going from sliding to rolling at 5/7 of its speed, stacks, impacts, and a
+tumbling slab against RK4 integration of Euler's equations. Cubes and spheres
+have no gyroscopic term, so the slab is needed.
+
+A literature check found no published successor to AVBD for this use: other
+2026 work targets GPU affine bodies, robotics-grade contact, or offline
+simulation. The search did not cover a complete SIGGRAPH 2026 program. The
+fixes below come from the authors' reference solver and from NVIDIA Newton's
+later AVBD implementation, plus this log's measurements.
+
+| Measure | Reference | Before | After | Box3D |
+| --- | --- | --- | --- | --- |
+| Slide stop, 2 m/s | 0.3398 m | +27.5% | -5.9% | -1.2% |
+| Slide stop, 5 m/s | 2.1237 m | +82.8% | -2.5% | -0.5% |
+| Slide stop, 10 m/s | 8.4947 m | +118.7% | -1.2% | -0.2% |
+| Cube on 35 degree slope | 1.6105 m | +2.8% | +3.9% | +1.5% |
+| Cube held at 30 degrees | 0 m | 0.0011 m | 0.0025 m | 0.0008 m |
+| Ball slide to roll | 5 m/s | -11.9% | +0.1% | -0.1% |
+| Ball rolls down 20 degrees | 4.7932 m | -0.2% | +0.9% | +0.2% |
+| Stack of 20, top | 19.5 m | 19.4151 | 19.4312 | 19.3944 |
+| 100x cube on 2, top | 2.5 m | 2.4820 | 2.4888 | 2.4098 |
+| Drop 5 m, late penetration | 0 m | 0.0064 m | 0.0010 m | 0.0001 m |
+| Drop 5 m, late speed | 0 m/s | 0.0836 | 0.0000 | 0.0000 |
+| Tumble, momentum drift | 0 | not measured | 0.0000 | 0.0089 |
+| Tumble, energy ratio | 1 | not measured | 1.0000 | 0.9830 |
+| Tumble, final body spin | -3.8727 r/s | not measured | -0.1% | -0.8% |
+
+The "before" drop penetration is a final snapshot; "after" is the mean of the
+last 60 steps. The ball's -0.2% on the slope was partly the spin damping below
+cancelling backward Euler's bias of n(n+1)/n², +0.8% at 120 steps. Over eight
+jitter seeds, mean rain floor penetration fell from 0.0410 to 0.0159 m at 512
+bodies and from 0.0563 to 0.0262 m at 2,744, with RMS speed essentially
+unchanged. Box3D measured 0.0062 and 0.0140 m, so it remains better here. Peak
+penetration on impact is also unchanged (0.1531 m versus Box3D's 0.0906 m): at
+9.9 m/s a body moves 16 cm per step and contacts exist only once shapes overlap.
+
+Single-thread timing against the previous commit, 11 alternating rounds, was
+within noise: 820-body active 0.880 and 0.898 ms with Box3D at 0.869 and
+0.889 ms (0.99x both); full run 0.208 and 0.201 ms; rain, 2,744 bodies, 2.266
+and 2.310 ms active. The machine ran slower than in the previous section.
+
+Adopted:
+
+- **Secant tangential stiffness.** A cone-limited contact kept its full penalty,
+  so each Newton step applied about k/(k + m/h²) of the capped force, and the
+  error grew with speed. Tangential stiffness now takes the cone's scale factor.
+  Two multiplies. An earlier comment cited the paper for the full penalty; the
+  authors' demo uses it too, at 10 iterations.
+- **Exact inverse rotation map.** `quat_add` is a Cayley map but velocities came
+  from 2 sin(φ/2), multiplying spin by 1/√(1 + w²/4) each step: 0.35% per step
+  at 10 rad/s. `quat_step` is the exact inverse. Joints keep the bounded
+  `quat_sub`.
+- **Post-stabilization, from the reference solver.** The main sweeps use α = 1,
+  velocities are taken, and a last sweep at the `alpha` setting corrects
+  step-start error without adding velocity. `iterations` still counts all sweeps,
+  so the default is five plus one at the same cost. The default `alpha` is now 0.
+- **Contact forces carry over whole,** as in the reference. Applying γ to λ left
+  the 820-body pyramid unable to settle or sleep with five main sweeps: its top
+  sank to 39.16 m and the full run cost 0.848 ms. Joints keep the decay; removing
+  it failed `hard_joint_chain_holds_without_gaining_energy` (error 0.0060 m).
+- **`COLLISION_MARGIN` of 1 mm instead of 3 mm.** Less sink at equal cost. At
+  0.5 mm, 820-body active rose to 0.973 ms from about 0.87 ms.
+- **Gyroscopic term.** Non-cubic bodies now conserve angular momentum. The next
+  rotation is predicted by explicit midpoint, and the step's average velocity is
+  converted back through the same mid-step inertia, which makes free flight exact
+  by construction. Only non-cubic boxes pay for it.
+
+Checks: five new integration tests each fail with the matching fix undone. Final
+transforms stayed bit-identical between AVX2 and the fallback, and across 1, 4
+and 8 Rayon threads.
+
+## Rejected during that work
+
+- **Gyroscopic update using the end-of-step inertia alone:** momentum exact, but
+  tumble energy rose 8%.
+- **The same with energy capped:** energy held, but momentum drifted 3.7% and the
+  flip missed by 3.7%.
+- **Pairing average velocities with mid-step inertias, without a prediction
+  step:** energy rose 16%.
+- **Midpoint prediction with `finish` rebuilding the inertia from the actual turn:**
+  the two inertias differed, and energy rose 7.5%.
+- **Larger `alpha` (0.3, 0.6):** no benefit to stacks, and heavy-stack overlap
+  rose from 0.0105 to 0.0126 m at 0.6.
+
+## Speculative contacts and momentum (adopted)
+
+Collected on 2026-11-05 on the same CPU and toolchain, with one Rayon thread.
+Compared with the previous section's build, and with Box3D, using
+`examples/quality.rs`, which gained drops from 5, 20 and 40 m, free-body
+collisions, and body-to-body overlap. Depths are metres. Box3D's single-run pile
+figures vary by roughly 30% between runs.
+
+| Measure | Before | After | Box3D |
+| --- | --- | --- | --- |
+| Cube dropped 5 m, peak depth | 0.1531 | 0.0000 | 0.0906 |
+| Cube dropped 20 m, peak depth | not measured | 0.0001 | 0.0004 |
+| Cube dropped 40 m, peak depth | not measured | 0.0004 | 0.0004 |
+| Ball dropped 20 m, peak depth | not measured | 0.0011 | 0.0001 |
+| Ball dropped 40 m, peak depth | not measured | 0.0011 | 0.0069 |
+| Head-on at 20 m/s each, peak overlap | not measured | 0.0000 | 0.3333 |
+| Pile, peak floor depth | 0.1679 | 0.0219 | 0.1395 |
+| Pile, late floor depth | 0.0252 | 0.0012 | 0.0138 |
+| Pile, peak body overlap | not measured | 0.0521 | 0.1068 |
+| Pile, late body overlap | not measured | 0.0033 | 0.0455 |
+| Rain, 512, floor (8-seed mean) | 0.0410 | 0.0010 | 0.0044 |
+| Rain, 2,744, floor (8-seed mean) | 0.0563 | 0.0022 | 0.0201 |
+| Stack of 20, top (19.5 m) | 19.4312 | 19.4670 | 19.3944 |
+
+The rain "before" figures are from the commit before the accuracy work; the
+section above reached 0.0159 and 0.0262 m. Box3D's depth at 5 m reflects where a
+step happens to fall, not its usual result.
+
+A cube moving 20 to 150 m/s into a 10 cm wall no longer passes through it in
+any of seven phases; the previous build passed through in 3 to 6 of 7. A ball
+passing a cube's corner with 5 cm to spare keeps its velocity.
+
+Momentum was not conserved in collisions before this work. A cube striking a
+resting cube at 5 m/s left 2.18 of 5 units of momentum; it now leaves 4.55.
+Equal cubes meeting head-on at 5 m/s stop dead, and at 20 m/s retain 0.64 m/s of
+total. Box3D is exact, because impulses are equal and opposite by construction.
+
+Timing, median of alternating rounds, against the previous commit:
+
+| Scene | Active before | Active after | Box3D | Full before | Full after | Box3D |
+| --- | --- | --- | --- | --- | --- | --- |
+| Pyramid, 210 | 0.163 | 0.158 | 0.191 | 0.035 | 0.034 | 0.053 |
+| Pyramid, 820 | 0.846 | 0.781 | 0.837 | 0.200 | 0.165 | 0.308 |
+| Rain, 512 | 0.303 | 0.378 | 0.474 | 0.641 | 0.785 | 0.661 |
+| Rain, 2,744 | 1.628 | 2.138 | 2.700 | 4.596 | 5.637 | 4.633 |
+
+**Rain's full run regressed from about 1.02x to 0.82x of Box3D's speed.** Its
+active phase stays ahead. In one multi-threaded run the 820-body pyramid improved
+(0.438 to 0.338 ms active) and 2,744-body rain slowed (0.862 to 1.039 ms).
+
+Adopted:
+
+- **Speculative contacts.** Contacts exist before shapes touch; the gap stays in
+  the constraint in the main sweeps, and only overlap waits for stabilization.
+  Bodies now rest at zero overlap: `COLLISION_MARGIN` became a detection range,
+  `CONTACT_DISTANCE`, kept under the 1 cm gaps of neighbouring boxes.
+- **Contacts built at the predicted first touch.** A contact plane from the start
+  pose took 26% to 52% of the velocity of a ball missing a corner.
+- **Penalty limit between free bodies,** at half the heavier body's m/h². Much
+  stiffer, block descent locks the pair: whichever moves first satisfies the
+  contact alone. Between 0.5 and 4 times that, 1 was the best balance: 0.5 raised
+  pile body overlap to 0.187 m, and 2 lost more momentum (-15.8%).
+- **Dual update at every visit,** so the second body feels the force the first
+  used. Alone this added momentum (11.2 of 5) and made piles explode. With the
+  limit it conserves momentum, and the 820-body pyramid's top rose to 39.44 m.
+- **Rescaling only touching contacts.** A contact far from its surface alternated
+  between overshooting and springing back, which let cubes through walls.
+- **Edge axes must beat `0.95 * face + 0.01`, not `0.95 * edge > face + 0.01`.**
+  With negative separations the old form, inherited from the demo, favoured edges
+  past about 0.2 m of depth, giving flat cubes one contact point. This caused
+  18 cm dives on hard landings and most of the head-on overlap.
+
+Checks: final transforms stayed bit-identical between AVX2 and the fallback, and
+across 1, 4 and 8 Rayon threads. Six deliberate reversions of these changes each
+failed a regression test. Tolerances for ball depth (2 mm) and head-on momentum
+(5% of speed) were set from these measurements.
+
+## Open problems
+
+- A box sliding over floor tiles stops too soon: 1.06 m instead of 2.12 m at
+  5 m/s. This predates speculative contacts and is not understood. Preferring
+  the nearest touching axis made it worse (0.98 m) and was rejected.
+- Free collisions still lose 9% of a strike's momentum at five sweeps.
+- Rain's cost. Narrowphase and manifold counts rose; much of this may be
+  speculative contacts in rolling piles.
+
+## Rejected during that work
+
+- **Scoping swept boxes by relative motion alone:** the exact reject stayed in,
+  but it did not explain rain's cost. Spheres padding contact range by their spin
+  did; they no longer pad at all.
+- **Testing overlap at the start pose as well as along the path:** one more SAT per
+  moving pair, for pairs that are separating anyway.
+- **FMA, reversal and the other ideas above** were not retried.
+
+## Rain speed, tile seams and momentum (adopted)
+
+Collected on 2026-11-05 with one Rayon thread. The machine ran about 40% slower
+than earlier in the day for the larger scenes, so compare ratios between sessions,
+not milliseconds. This section closes most of the open problems listed above.
+
+Timing, alternating rounds, ratios to Box3D (higher is better):
+
+| Scene | Active, last commit | Active, now | Full, last commit | Full, now |
+| --- | --- | --- | --- | --- |
+| Pyramid, 210 | 1.02x | 1.30x | 1.33x | 1.67x |
+| Pyramid, 820 | 0.95x | 1.14x | 1.46x | 1.99x |
+| Rain, 512 | 1.61x | 1.39x | 1.07x | 1.01x |
+| Rain, 2,744 | 1.71x | 1.43x | 1.00x | 0.96x |
+
+Rain's full run recovered from 0.82x to about parity. It is still slightly slower
+than the last commit: its active phase pays for speculative contacts. In one
+multi-threaded run, 820 pyramid bodies took 0.340 ms active against 0.460, and
+2,744 rain bodies 1.448 against 1.275.
+
+Adopted:
+
+- **All manifolds stamp in pairs,** including single contacts, whose scalar branch
+  is gone. A profile put 46% of rain in that batch code. With the next change this
+  took 512-body rain from 0.799 to 0.667 ms in one A/B.
+- **No separate overlap test when one sample covers the path:** the contact
+  generator rejects the pair itself.
+- **Velocities from contact forces in impacts.** Bodies in a manifold between free
+  bodies closing above 1 m/s take velocity from the multipliers, which are equal
+  and opposite before the solve converges. A strike keeps 4.93 of 5 units of
+  momentum, up from 4.55, and 19.73 of 20. Using this everywhere gave exact
+  momentum but made stacks unstable: a pyramid went non-finite and 100x-on-2 fell
+  to 2.37 m, because motion-based velocity supplies the damping resting contacts
+  need. A 0.25 m/s gate also broke the 100x stack; 0.5 m/s did not improve
+  momentum. The remaining 1.4% was not traced.
+- **Penalties start at a quarter of m/h²,** not PENALTY_MIN. Peak depth of a ball
+  dropped 20 m fell from 1.1 to 0.6 mm, and a cube on a 30 degree slope no longer
+  creeps (0.0000 m in 5 s; it was 1.6 mm, and Box3D 0.6 mm).
+
+The tile problem listed above had already gone: it was the edge-axis bug. Tiled
+slides are now within 5% of theory. Box3D, measured for the first time, catches on
+seams: it stopped within 1 cm of its start at 2 and 5 m/s and lost 51% to 98% of the
+distance at 10 and 20 m/s, varying between runs.
+
+Over eight seeds, pile means are 0.0202 m peak floor depth (Box3D 0.1113), 0.0016 m
+late floor depth (0.0124), 0.0447 m peak body overlap (0.1012), and 0.0048 m late
+body overlap (0.0327).
+
+Two remaining error sources are the integrator, not bugs. Slide stops fall short by
+v·h/2, backward Euler's bias: -4.9% at 2 m/s and -1% at 10 m/s. Box3D's is the same
+formula at its four substeps. A pendulum keeps its period to -0.11% and its rod to
+1.3 mm, but its amplitude falls to 31% in 30 s, matching backward Euler's
+exp(-ω²ht/2) = 0.29. No joint comparison exists: the Box3D bridge has no joints.
+
+Checks: 43 integration and 11 unit tests pass; each change above fails a test when
+reverted; results are bit-identical between AVX2 and the fallback and across 1, 4
+and 8 Rayon threads.

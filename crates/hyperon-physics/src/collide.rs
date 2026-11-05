@@ -2,7 +2,7 @@
 //! axis test with reference-face clipping, ported from the AVBD 3D demo.
 
 use crate::Collider;
-use crate::solver::{Body, Contact};
+use crate::solver::{Body, CONTACT_DISTANCE, Contact};
 use glam::Vec3;
 
 /// A face manifold keeps four points spanning the largest area, enough for a
@@ -12,20 +12,88 @@ const MAX_POLY: usize = 16;
 const AXIS_EPSILON: f32 = 1.0e-6;
 const PLANE_EPSILON: f32 = 1.0e-5;
 const MERGE_DISTANCE_SQ: f32 = 1.0e-6;
+/// Most poses tested along a body's path in one step.
+const MAX_SAMPLES: usize = 16;
+/// Bisections of a hit found between two of those poses.
+const REFINEMENTS: usize = 3;
 
 const FACE_A: u32 = 0;
 const FACE_B: u32 = 1;
 const EDGE: u32 = 2;
 
+/// Whether A, moved by `shift`, comes within `margin` of B.
+fn touches(a: &Body, b: &Body, shift: Vec3, margin: f32) -> bool {
+    let center = a.position + shift;
+    match (a.shape, b.shape) {
+        (Collider::Sphere { radius: ra }, Collider::Sphere { radius: rb }) => {
+            let reach = ra + rb + margin;
+            center.distance_squared(b.position) <= reach * reach
+        }
+        (Collider::Sphere { radius }, Collider::Cuboid { half_extents }) => {
+            sphere_box(center, radius, &obb(b, half_extents), margin).is_some()
+        }
+        (Collider::Cuboid { half_extents }, Collider::Sphere { radius }) => {
+            let box_a = moved_obb(a, half_extents, shift);
+            sphere_box(b.position, radius, &box_a, margin).is_some()
+        }
+        (Collider::Cuboid { half_extents: ha }, Collider::Cuboid { half_extents: hb }) => {
+            box_axes(&moved_obb(a, ha, shift), &obb(b, hb), margin).is_some()
+        }
+    }
+}
+
+/// A's first pose this step that touches B, as a shift from now; `None` if it
+/// passes clear. Contacts come from that pose, not this one: a contact plane
+/// from here would stop a body flying past a corner, and catch a box sliding
+/// over a seam on the far tile's side.
+fn predicted_hit(a: &Body, b: &Body, margin: f32) -> Option<Vec3> {
+    let travel = a.travel - b.travel;
+    if travel.length_squared() < CONTACT_DISTANCE * CONTACT_DISTANCE * 0.01 {
+        return Some(Vec3::ZERO);
+    }
+    let thickness = |shape| match shape {
+        Collider::Cuboid { half_extents } => half_extents.min_element(),
+        Collider::Sphere { radius } => radius,
+    };
+    let spacing = 0.5 * (thickness(a.shape) + thickness(b.shape));
+    let samples = ((travel.length() / spacing).ceil() as usize).clamp(1, MAX_SAMPLES);
+    if samples == 1 {
+        // The contact generator makes this one test itself.
+        return Some(travel);
+    }
+    let hit =
+        (1..=samples).find(|&i| touches(a, b, travel * (i as f32 / samples as f32), margin))?;
+    // A deep first sample could lie past a thin wall's middle, which would
+    // push the body through, so find first touch more closely.
+    let (mut low, mut high) = (
+        (hit - 1) as f32 / samples as f32,
+        hit as f32 / samples as f32,
+    );
+    for _ in 0..REFINEMENTS {
+        let middle = 0.5 * (low + high);
+        if touches(a, b, travel * middle, margin) {
+            high = middle;
+        } else {
+            low = middle;
+        }
+    }
+    Some(travel * high)
+}
+
 /// Contact basis (normal from B to A, then tangents) and contacts with anchors
-/// in each body's frame; `None` when the shapes don't touch.
+/// in each body's frame; `None` when the shapes do not meet this step. Shapes
+/// about to meet get speculative contacts, whose gap stays in the constraint,
+/// so a fast body stops at the surface, not inside it.
 pub(crate) fn collide(a: &Body, b: &Body) -> Option<([Vec3; 3], [Contact; MAX_CONTACTS], usize)> {
     let mut points = Points::default();
+    let margin = CONTACT_DISTANCE + a.reach + b.reach;
+    let shift = predicted_hit(a, b, margin)?;
+    let center = a.position + shift;
     let normal = match (a.shape, b.shape) {
         (Collider::Sphere { radius: ra }, Collider::Sphere { radius: rb }) => {
-            let d = a.position - b.position;
+            let d = center - b.position;
             let distance_squared = d.length_squared();
-            let reach = ra + rb;
+            let reach = ra + rb + margin;
             if distance_squared > reach * reach
                 || (distance_squared == f32::INFINITY && reach.is_finite())
             {
@@ -37,28 +105,37 @@ pub(crate) fn collide(a: &Body, b: &Body) -> Option<([Vec3; 3], [Contact; MAX_CO
             } else {
                 Vec3::Z
             };
-            points.push(a.position - n * ra, b.position + n * rb, 0);
+            points.push(center - n * ra, b.position + n * rb, 0);
             n
         }
         (Collider::Sphere { radius }, Collider::Cuboid { half_extents }) => {
-            let (n, xa, xb) = sphere_box(a.position, radius, &obb(b, half_extents))?;
+            let (n, xa, xb) = sphere_box(center, radius, &obb(b, half_extents), margin)?;
             points.push(xa, xb, 0);
             n
         }
         (Collider::Cuboid { half_extents }, Collider::Sphere { radius }) => {
-            let (n, xb, xa) = sphere_box(b.position, radius, &obb(a, half_extents))?;
+            let box_a = moved_obb(a, half_extents, shift);
+            let (n, xb, xa) = sphere_box(b.position, radius, &box_a, margin)?;
             points.push(xa, xb, 0);
             -n
         }
         (Collider::Cuboid { half_extents: ha }, Collider::Cuboid { half_extents: hb }) => {
-            -box_box(&obb(a, ha), &obb(b, hb), &mut points)?
+            -box_box(&moved_obb(a, ha, shift), &obb(b, hb), margin, &mut points)?
         }
     };
     let (t1, t2) = normal.any_orthonormal_pair();
     let (ia, ib) = (a.rotation.conjugate(), b.rotation.conjugate());
     let mut contacts = [Contact::default(); MAX_CONTACTS];
+    // Back to the real poses, leaving only the gap along the normal: sideways
+    // would read as friction error. The lighter body's anchors move less, so
+    // a rolling ball's stay under it and the floor's take the difference.
+    let slide = shift - normal * normal.dot(shift);
+    let total = a.mass + b.mass;
+    let share = if total > 0.0 { b.mass / total } else { 0.5 };
+    let (slide_a, slide_b) = (slide * share, slide * (1.0 - share));
     for (contact, &(xa, xb, feature)) in contacts.iter_mut().zip(&points.p[..points.len]) {
-        *contact = Contact::new(feature, ia * (xa - a.position), ib * (xb - b.position));
+        let (ra, rb) = (xa - center + slide_a, xb - b.position - slide_b);
+        *contact = Contact::new(feature, ia * ra, ib * rb);
     }
     Some(([normal, t1, t2], contacts, points.len))
 }
@@ -92,9 +169,13 @@ struct Obb {
 }
 
 fn obb(body: &Body, half: Vec3) -> Obb {
+    moved_obb(body, half, Vec3::ZERO)
+}
+
+fn moved_obb(body: &Body, half: Vec3, shift: Vec3) -> Obb {
     let m = body.initial_basis;
     Obb {
-        center: body.position,
+        center: body.position + shift,
         half,
         axis: [m.x_axis, m.y_axis, m.z_axis],
     }
@@ -123,14 +204,15 @@ impl Obb {
 }
 
 /// Normal from box to sphere, the sphere's deepest point, and the box surface point.
-fn sphere_box(center: Vec3, radius: f32, b: &Obb) -> Option<(Vec3, Vec3, Vec3)> {
+fn sphere_box(center: Vec3, radius: f32, b: &Obb, margin: f32) -> Option<(Vec3, Vec3, Vec3)> {
     let d = center - b.center;
     let local = Vec3::new(d.dot(b.axis[0]), d.dot(b.axis[1]), d.dot(b.axis[2]));
     let clamped = local.clamp(-b.half, b.half);
     let (n_local, surface) = if clamped != local {
         let offset = local - clamped;
         let distance_squared = offset.length_squared();
-        if distance_squared > radius * radius
+        let reach = radius + margin;
+        if distance_squared > reach * reach
             || (distance_squared == f32::INFINITY && radius.is_finite())
         {
             return None;
@@ -177,18 +259,21 @@ fn test_axis(
     kind: u32,
     ia: usize,
     ib: usize,
+    margin: f32,
     best: &mut Option<Axis>,
 ) -> bool {
     let length_sq = axis.length_squared();
     if length_sq < AXIS_EPSILON {
         return true;
     }
-    if separation > 0.0 {
+    if separation > 0.0 && separation * separation > margin * margin * length_sq {
         return false;
     }
+    // The largest separation, compared without normalizing: squares keep sign.
+    let squared = |s: f32| s * s.abs();
     if best
         .as_ref()
-        .is_none_or(|best| separation * separation < best.separation * best.separation * length_sq)
+        .is_none_or(|best| squared(separation) > squared(best.separation) * length_sq)
     {
         let inverse_length = length_sq.sqrt().recip();
         let n = axis * inverse_length;
@@ -203,8 +288,8 @@ fn test_axis(
     true
 }
 
-/// Fill `points` and return the normal from A to B.
-fn box_box(a: &Obb, b: &Obb, points: &mut Points) -> Option<Vec3> {
+/// The best face and edge axes, or `None` if an axis separates by over `margin`.
+fn box_axes(a: &Obb, b: &Obb, margin: f32) -> Option<(Option<Axis>, Option<Axis>)> {
     let delta = b.center - a.center;
     // Project the relative orientation once. The 15 box SAT tests can then
     // share these nine dot products instead of projecting six axes per test.
@@ -224,6 +309,7 @@ fn box_box(a: &Obb, b: &Obb, points: &mut Points) -> Option<Vec3> {
             FACE_A,
             i,
             0,
+            margin,
             &mut face,
         ) || !test_axis(
             delta,
@@ -232,6 +318,7 @@ fn box_box(a: &Obb, b: &Obb, points: &mut Points) -> Option<Vec3> {
             FACE_B,
             0,
             i,
+            margin,
             &mut face,
         ) {
             return None;
@@ -251,22 +338,29 @@ fn box_box(a: &Obb, b: &Obb, points: &mut Points) -> Option<Vec3> {
                 EDGE,
                 i,
                 j,
+                margin,
                 &mut edge,
             ) {
                 return None;
             }
         }
     }
+    Some((face, edge))
+}
+
+/// Fill `points` and return the normal from A to B.
+fn box_box(a: &Obb, b: &Obb, margin: f32, points: &mut Points) -> Option<Vec3> {
+    let (face, edge) = box_axes(a, b, margin)?;
     let face = face?;
     // Prefer faces unless an edge axis is clearly better: face manifolds are stable.
     let best = match edge {
-        Some(edge) if 0.95 * edge.separation > face.separation + 0.01 => edge,
+        Some(edge) if edge.separation > 0.95 * face.separation + 0.01 => edge,
         _ => face,
     };
     match best.kind {
         EDGE => edge_contact(a, b, &best, points),
-        FACE_A => face_contacts(a, b, true, best.a, best.normal, points),
-        _ => face_contacts(a, b, false, best.b, best.normal, points),
+        FACE_A => face_contacts(a, b, true, best.a, best.normal, margin, points),
+        _ => face_contacts(a, b, false, best.b, best.normal, margin, points),
     }
     if points.len == 0 {
         points.push(
@@ -285,6 +379,7 @@ fn face_contacts(
     reference_is_a: bool,
     axis: usize,
     normal_ab: Vec3,
+    margin: f32,
     points: &mut Points,
 ) {
     let (reference, incident) = if reference_is_a { (a, b) } else { (b, a) };
@@ -331,12 +426,12 @@ fn face_contacts(
 
     let kind = if reference_is_a { FACE_A } else { FACE_B };
     let prefix = (kind << 24) | ((axis as u32) << 16) | ((incident_axis as u32) << 8);
-    // Penetrating points: polygon index and depth below the reference face.
+    // Points within reach: polygon index and depth below the reference face.
     let mut found = [(0usize, 0.0f32); MAX_POLY];
     let mut n = 0;
     for (i, &p) in input[..count].iter().enumerate() {
         let distance = (p - center).dot(normal);
-        if distance <= PLANE_EPSILON {
+        if distance <= PLANE_EPSILON + margin {
             found[n] = (i, distance);
             n += 1;
         }
@@ -608,7 +703,7 @@ mod tests {
             }
             let separation = corner_separation(&a, &b);
             let mut points = Points::default();
-            let normal = box_box(&a, &b, &mut points);
+            let normal = box_box(&a, &b, 0.0, &mut points);
             // Both formulas use f32; do not pin classifications at roundoff.
             if separation.abs() > 1.0e-4 {
                 assert_eq!(

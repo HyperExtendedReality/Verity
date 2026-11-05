@@ -53,6 +53,294 @@ fn run(world: &mut World, physics: &mut PhysicsWorld, steps: usize) {
     }
 }
 
+/// A body on a floor wide enough for any of these runs.
+fn on_long_floor(body: PhysicsBody, spin: Vec3, speed: f32) -> (World, PhysicsWorld, EntityHandle) {
+    let (mut world, mut physics) = (World::new(), PhysicsWorld::default());
+    spawn(
+        &mut world,
+        &mut physics,
+        Vec3::new(0.0, 0.0, -0.5),
+        PhysicsBody::new(
+            RigidBody::Static,
+            Collider::Cuboid {
+                half_extents: Vec3::new(200.0, 200.0, 0.5),
+            },
+        ),
+    );
+    let mut body = body;
+    body.velocity = Velocity {
+        linear: Vec3::new(speed, 0.0, 0.0),
+        angular: spin,
+    };
+    let entity = spawn(&mut world, &mut physics, Vec3::new(0.0, 0.0, 0.5), body);
+    (world, physics, entity)
+}
+
+#[test]
+fn sliding_friction_stops_a_box_at_the_coulomb_distance() {
+    for speed in [5.0f32, 10.0] {
+        let (mut world, mut physics, entity) = on_long_floor(cube(0.5), Vec3::ZERO, speed);
+        run(&mut world, &mut physics, 300);
+        let expected = speed * speed / (2.0 * 0.6 * 9.81);
+        let x = position(&world, entity).x;
+        assert!((x - expected).abs() < expected * 0.05, "{x} for {expected}");
+    }
+}
+
+#[test]
+fn sliding_ball_ends_rolling_at_five_sevenths_of_its_speed() {
+    let ball = PhysicsBody::new(RigidBody::Dynamic, Collider::Sphere { radius: 0.5 });
+    let (mut world, mut physics, entity) = on_long_floor(ball, Vec3::ZERO, 7.0);
+    run(&mut world, &mut physics, 180);
+    let velocity = physics.get(entity).unwrap().velocity;
+    assert!((velocity.linear.x - 5.0).abs() < 0.05, "{:?}", velocity);
+    assert!(
+        (velocity.angular.y * 0.5 - 5.0).abs() < 0.05,
+        "{:?}",
+        velocity
+    );
+}
+
+#[test]
+fn free_spin_is_not_damped() {
+    let (mut world, mut physics) = (World::new(), PhysicsWorld::default());
+    let mut ball = PhysicsBody::new(RigidBody::Dynamic, Collider::Sphere { radius: 0.5 });
+    ball.velocity.angular = Vec3::new(0.0, 0.0, 30.0);
+    let entity = spawn(&mut world, &mut physics, Vec3::new(0.0, 0.0, 50.0), ball);
+    let settings = PhysicsSettings {
+        gravity: Vec3::ZERO,
+        ..Default::default()
+    };
+    for _ in 0..300 {
+        physics.step(&mut world, &settings, 1.0 / 60.0);
+    }
+    let spin = physics.get(entity).unwrap().velocity.angular.z;
+    assert!((spin - 30.0).abs() < 1.0e-3, "{spin}");
+}
+
+#[test]
+fn tumbling_slab_conserves_momentum_and_energy_and_flips() {
+    let (mut world, mut physics) = (World::new(), PhysicsWorld::default());
+    let half = Vec3::new(0.5, 0.3, 0.15);
+    let mut slab = PhysicsBody::new(RigidBody::Dynamic, Collider::Cuboid { half_extents: half });
+    // Nearly about the intermediate axis, which is unstable.
+    let spin = Vec3::new(0.02, 4.0, 0.02);
+    slab.velocity.angular = spin;
+    let entity = spawn(&mut world, &mut physics, Vec3::new(0.0, 0.0, 50.0), slab);
+    let settings = PhysicsSettings {
+        gravity: Vec3::ZERO,
+        ..Default::default()
+    };
+    for _ in 0..300 {
+        physics.step(&mut world, &settings, 1.0 / 60.0);
+    }
+    let square = half * half;
+    let moments = Vec3::new(
+        square.y + square.z,
+        square.x + square.z,
+        square.x + square.y,
+    );
+    let rotation = Quat::from_array(world.get(entity).unwrap().transform.rotation);
+    let local = rotation.inverse() * physics.get(entity).unwrap().velocity.angular;
+    let momentum = rotation * (moments * local);
+    assert!((momentum - moments * spin).length() < 1.0e-3 * (moments * spin).length());
+    let energy = (moments * local).dot(local) / (moments * spin).dot(spin);
+    assert!((energy - 1.0).abs() < 1.0e-3, "energy ratio {energy}");
+    assert!(local.y < -3.5, "spin must have flipped: {local}");
+}
+
+#[test]
+fn impact_stops_at_the_surface_and_rests_there() {
+    let ball = PhysicsBody::new(RigidBody::Dynamic, Collider::Sphere { radius: 0.5 });
+    for body in [cube(0.5), ball] {
+        let (mut world, mut physics) = (World::new(), PhysicsWorld::default());
+        ground(&mut world, &mut physics);
+        let entity = spawn(&mut world, &mut physics, Vec3::new(0.0, 0.0, 20.5), body);
+        for _ in 0..240 {
+            run(&mut world, &mut physics, 1);
+            assert!(position(&world, entity).z > 0.498, "sank into the floor");
+        }
+        // Neither inside the floor nor hovering above it.
+        assert!((position(&world, entity).z - 0.5).abs() < 1.0e-3);
+        assert_eq!(physics.get(entity).unwrap().velocity.linear, Vec3::ZERO);
+    }
+}
+
+#[test]
+fn a_gap_is_closed_in_the_step_that_reaches_it() {
+    let (mut world, mut physics) = (World::new(), PhysicsWorld::default());
+    ground(&mut world, &mut physics);
+    let mut body = cube(0.5);
+    body.velocity.linear = Vec3::new(0.0, 0.0, -30.0);
+    let entity = spawn(&mut world, &mut physics, Vec3::new(0.0, 0.0, 0.7), body);
+    run(&mut world, &mut physics, 1);
+    let z = position(&world, entity).z;
+    assert!((z - 0.5).abs() < 0.01, "stopped short at {z}");
+}
+
+/// A world without gravity and with `fixed` as its only static body.
+fn weightless(fixed: Vec3) -> (World, PhysicsWorld) {
+    let (mut world, mut physics) = (World::new(), PhysicsWorld::default());
+    let collider = Collider::Cuboid {
+        half_extents: fixed,
+    };
+    let body = PhysicsBody::new(RigidBody::Static, collider);
+    spawn(&mut world, &mut physics, Vec3::ZERO, body);
+    (world, physics)
+}
+
+fn run_weightless(world: &mut World, physics: &mut PhysicsWorld, steps: usize) {
+    let settings = PhysicsSettings {
+        gravity: Vec3::ZERO,
+        ..Default::default()
+    };
+    for _ in 0..steps {
+        physics.step(world, &settings, 1.0 / 60.0);
+    }
+}
+
+#[test]
+fn a_box_slides_over_floor_tile_seams() {
+    let (mut world, mut physics) = (World::new(), PhysicsWorld::default());
+    for i in -5..30 {
+        let collider = Collider::Cuboid {
+            half_extents: Vec3::new(0.5, 10.0, 0.5),
+        };
+        let tile = PhysicsBody::new(RigidBody::Static, collider);
+        spawn(
+            &mut world,
+            &mut physics,
+            Vec3::new(i as f32, 0.0, -0.5),
+            tile,
+        );
+    }
+    let mut body = cube(0.5);
+    body.velocity.linear = Vec3::new(10.0, 0.0, 0.0);
+    let entity = spawn(&mut world, &mut physics, Vec3::new(0.0, 0.0, 0.5), body);
+    run(&mut world, &mut physics, 240);
+    let expected = 10.0 * 10.0 / (2.0 * 0.6 * 9.81);
+    let x = position(&world, entity).x;
+    assert!((x - expected).abs() < expected * 0.05, "{x} for {expected}");
+}
+
+#[test]
+fn static_friction_does_not_creep_down_a_slope() {
+    // tan(30 degrees) is below the default friction of 0.6.
+    let (mut world, mut physics) = (World::new(), PhysicsWorld::default());
+    let collider = Collider::Cuboid {
+        half_extents: Vec3::new(50.0, 50.0, 0.5),
+    };
+    let floor = PhysicsBody::new(RigidBody::Static, collider);
+    spawn(&mut world, &mut physics, Vec3::new(0.0, 0.0, -0.5), floor);
+    let entity = spawn(
+        &mut world,
+        &mut physics,
+        Vec3::new(0.0, 0.0, 0.5),
+        cube(0.5),
+    );
+    let angle = 30.0f32.to_radians();
+    let settings = PhysicsSettings {
+        gravity: Vec3::new(angle.sin(), 0.0, -angle.cos()) * 9.81,
+        ..Default::default()
+    };
+    for _ in 0..300 {
+        physics.step(&mut world, &settings, 1.0 / 60.0);
+    }
+    let x = position(&world, entity).x;
+    assert!(x.abs() < 5.0e-4, "crept {x} m");
+}
+
+#[test]
+fn fast_bodies_do_not_tunnel_through_a_thin_wall() {
+    let ball = PhysicsBody::new(RigidBody::Dynamic, Collider::Sphere { radius: 0.5 });
+    for shape in [cube(0.5), ball] {
+        for speed in [20.0, 60.0, 150.0] {
+            // Offsets vary where in a step the body meets the wall.
+            for phase in 0..7 {
+                let mut body = shape.clone();
+                body.velocity.linear = Vec3::new(speed, 0.0, 0.0);
+                let (mut world, mut physics) = weightless(Vec3::new(0.05, 20.0, 20.0));
+                let start = Vec3::new(-8.0 - phase as f32 * 0.13, 0.0, 0.0);
+                let entity = spawn(&mut world, &mut physics, start, body);
+                run_weightless(&mut world, &mut physics, 120);
+                let x = position(&world, entity).x;
+                assert!(x < 0.0, "through at {speed} m/s, phase {phase}: {x}");
+            }
+        }
+    }
+}
+
+#[test]
+fn passing_a_corner_is_not_a_collision() {
+    let (along, across) = (
+        Vec3::new(1.0, 1.0, 0.0).normalize(),
+        Vec3::new(1.0, -1.0, 0.0).normalize(),
+    );
+    for speed in [30.0, 80.0] {
+        for phase in 0..7 {
+            let (mut world, mut physics) = weightless(Vec3::splat(0.5));
+            let mut ball = PhysicsBody::new(RigidBody::Dynamic, Collider::Sphere { radius: 0.5 });
+            ball.velocity.linear = along * speed;
+            // The cube's far corner, the ball's radius, and 5 cm to spare.
+            let line = across * (0.7072 + 0.5 + 0.05);
+            let start = line - along * (6.0 + phase as f32 * 0.037 * speed / 10.0);
+            let entity = spawn(&mut world, &mut physics, start, ball);
+            run_weightless(&mut world, &mut physics, (14.0 / speed * 60.0) as usize);
+            let velocity = physics.get(entity).unwrap().velocity.linear;
+            assert!((velocity - along * speed).length() < 1.0e-3 * speed);
+        }
+    }
+}
+
+#[test]
+fn collisions_between_free_bodies_keep_their_momentum() {
+    for speed in [5.0f32, 20.0] {
+        let (mut world, mut physics) = (World::new(), PhysicsWorld::default());
+        let moving = |x: f32| {
+            let mut body = cube(0.5);
+            body.velocity.linear = Vec3::new(x, 0.0, 0.0);
+            body
+        };
+        let a = spawn(
+            &mut world,
+            &mut physics,
+            Vec3::new(-3.0, 0.0, 0.0),
+            moving(speed),
+        );
+        let b = spawn(
+            &mut world,
+            &mut physics,
+            Vec3::new(3.0, 0.0, 0.0),
+            moving(-speed),
+        );
+        run_weightless(&mut world, &mut physics, 120);
+        let x = |e| physics.get(e).unwrap().velocity.linear.x;
+        assert!((x(a) + x(b)).abs() < 0.05 * speed, "{} {}", x(a), x(b));
+
+        let (mut world, mut physics) = (World::new(), PhysicsWorld::default());
+        let a = spawn(
+            &mut world,
+            &mut physics,
+            Vec3::new(-3.0, 0.0, 0.0),
+            moving(speed),
+        );
+        let b = spawn(
+            &mut world,
+            &mut physics,
+            Vec3::new(3.0, 0.0, 0.0),
+            moving(0.0),
+        );
+        run_weightless(&mut world, &mut physics, 120);
+        let x = |e| physics.get(e).unwrap().velocity.linear.x;
+        assert!(
+            (x(a) + x(b) - speed).abs() < 0.02 * speed,
+            "{} {}",
+            x(a),
+            x(b)
+        );
+    }
+}
+
 #[test]
 fn shapes_fall_and_rest_on_ground() {
     let (mut world, mut physics) = (World::new(), PhysicsWorld::default());

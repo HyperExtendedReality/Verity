@@ -8,13 +8,26 @@
 //!
 //! From the paper: hard constraints (Sec. 3.1), force bounds with stiffness
 //! rescaling where needed (3.2, Eq. 14), frictional contacts with static and
-//! kinetic friction and a conservative tangential Hessian (3.3, 5), finite
-//! stiffness ramped up to its value (3.4, Eq. 16),
-//! diagonal geometric stiffness (3.5), stabilization (3.6), warm starting
-//! (3.7), bounded duals and step-start Taylor contacts (4). [`Joint`] and
-//! [`Spring`] follow the authors' 3D demo, with joint fracture as a torque.
+//! kinetic friction (3.3, 5), finite stiffness ramped up to its value (3.4,
+//! Eq. 16), diagonal geometric stiffness (3.5), warm starting (3.7), bounded
+//! duals and step-start Taylor contacts (4). [`Joint`] and [`Spring`] follow
+//! the authors' 3D demo, with joint fracture as a torque.
+//!
+//! From the authors' reference solver rather than the paper: post-stabilization
+//! in place of Eq. 18's regularization. The last of the iterations corrects
+//! step-start error after velocities are taken, so it adds no energy.
+//!
 //! Deliberate departures: penalties and β are per kilogram so tuning is
-//! unit-free, and bodies sleep in islands.
+//! unit-free, a cone-limited contact uses the secant of its capped force as
+//! its tangential stiffness (as NVIDIA Newton's AVBD does), rotations conserve
+//! angular momentum by an explicit midpoint step, and bodies sleep in islands.
+//! Contacts are speculative, generated at the pose where a body's predicted path
+//! first meets another, so fast bodies stop at surfaces and pass what they miss.
+//! Between two free bodies the penalty is limited to their inertial stiffness
+//! and the dual updates at every visit, without which momentum is lost; in an
+//! impact their velocities come from the contact forces, which are equal and
+//! opposite even before the solve converges.
+//! `examples/quality.rs` measures these against closed-form results.
 //!
 //! Bodies sharing a contact are graph-colored; every body of one color is
 //! updated in parallel, which is the same structure a GPU port dispatches.
@@ -34,10 +47,12 @@ use std::collections::HashMap;
 pub struct PhysicsSettings {
     /// Z is up, as in Hyperon scenes.
     pub gravity: Vec3,
-    /// Block descent sweeps per step.
+    /// Block descent sweeps per step. All but the last solve the step, and
+    /// the last is the stabilization sweep, so at least two are needed for it.
     pub iterations: u32,
     /// Fraction of the starting contact error left uncorrected each step, in
-    /// [0, 1). Higher is smoother, lower is snappier.
+    /// [0, 1). Correction moves positions without adding velocity, so zero
+    /// is the default. Higher is smoother.
     pub alpha: f32,
     /// Penalty growth per metre of contact or joint error, per kilogram.
     pub beta: f32,
@@ -56,11 +71,12 @@ impl Default for PhysicsSettings {
     fn default() -> Self {
         Self {
             gravity: Vec3::new(0.0, 0.0, -9.81),
-            // The paper's α and γ (Table 2). β is per kilogram here, so its
+            // The paper's γ (Table 2), and the reference solver's post-stabilized
+            // α, which removes all error from positions. β is per kilogram here, so its
             // value differs from the paper's 10; it and the iteration count
             // were tuned on box pyramids, the slowest case for local solvers.
             iterations: 6,
-            alpha: 0.95,
+            alpha: 0.0,
             beta: 100_000.0,
             beta_angular: 100.0,
             gamma: 0.99,
@@ -822,8 +838,11 @@ fn solver_body(slot: &mut Slot, transform: &Transform, dt: f32) -> solver::Body 
         previous: slot.previous,
         moved: Vec3A::ZERO,
         turned: Vec3A::ZERO,
+        travel: Vec3::ZERO,
+        reach: 0.0,
+        stiffness: 0.0,
         mass,
-        inertia,
+        inertia: inertia.into(),
         friction,
         static_friction,
         kinematic: body.body_type == RigidBody::Kinematic,

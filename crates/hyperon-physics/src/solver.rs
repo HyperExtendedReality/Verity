@@ -36,6 +36,10 @@ const SLEEP_SPEED: f32 = 0.05;
 const PREFETCH_LINES: usize = 2;
 /// Seconds an island must rest before it sleeps.
 const TIME_TO_SLEEP: f32 = 0.5;
+/// Closing speed (m/s) of free bodies above which forces set their velocities.
+const IMPACT_SPEED: f32 = 1.0;
+/// The `iteration` of a stabilization sweep, which updates no duals.
+const STABILIZE: u32 = u32::MAX;
 /// Marks an adjacency entry as a link, not a manifold.
 const LINK: u32 = 1 << 31;
 /// Penetration beyond the margin that keeps an island awake: AVBD pushes
@@ -46,11 +50,10 @@ const PENALTY_MIN: f32 = 1.0;
 /// the Dual Variables"): conflicting constraints cannot drive them to infinity.
 const LAMBDA_MAX: f32 = 1.0e10;
 const PENALTY_MAX: f32 = 1.0e10;
-/// Contacts hold this much overlap so they don't flicker between steps. Each
-/// layer of a stack sinks this far before its contacts push, so it is kept
-/// small (the demo's 1 cm sank a 20-box stack 20 cm, settling it slowly);
-/// Box3D keeps resting overlap near 5 mm.
-pub(crate) const COLLISION_MARGIN: f32 = 0.003;
+/// Shapes this close have contacts, whatever their motion, so contacts do not
+/// flicker while bodies rest at zero overlap. Stays below the 1 cm gaps of
+/// neighbouring boxes: each such pair would cost a manifold.
+pub(crate) const CONTACT_DISTANCE: f32 = 0.004;
 /// Relative motion since a manifold's contacts were generated below which it
 /// reuses them instead of colliding again: resting contacts barely move.
 const REUSE_DISTANCE: f32 = 0.005;
@@ -92,10 +95,16 @@ pub(crate) struct Body {
     /// pose so contacts need no quaternion math per visit.
     pub moved: Vec3A,
     pub turned: Vec3A,
+    /// How far this step's velocity should carry the body, and how far any
+    /// of its surface may swing: what speculative contacts cover.
+    pub travel: Vec3,
+    pub reach: f32,
+    /// The inertial term of the block system, mass / dt². Zero if unmoved by forces.
+    pub stiffness: f32,
     /// Zero for static and kinematic bodies.
     pub mass: f32,
     /// World-space inertia tensor at the start of the step.
-    pub inertia: Mat3,
+    pub inertia: Mat3A,
     pub friction: f32,
     pub static_friction: f32,
     pub kinematic: bool,
@@ -114,7 +123,83 @@ impl Body {
         self.position = position;
         self.rotation = rotation;
         self.moved = (position - self.initial_position).into();
-        self.turned = quat_sub(rotation, self.initial_rotation).into();
+        self.turned = quat_step(rotation, self.initial_rotation).into();
+    }
+    /// Where this step may carry the body, for speculative contacts.
+    fn predict(&mut self, dt: f32) {
+        self.stiffness = self.mass / (dt * dt);
+        (self.travel, self.reach) = if self.active() {
+            // Spinning moves only what sticks out past the inscribed sphere.
+            let swing = match self.shape {
+                Collider::Cuboid { half_extents } => self.bound() - half_extents.min_element(),
+                Collider::Sphere { .. } => 0.0,
+            };
+            (
+                self.velocity * dt,
+                self.angular_velocity.length() * swing * dt,
+            )
+        } else {
+            (Vec3::ZERO, 0.0)
+        };
+    }
+    /// Take velocities from the main sweeps. With `wrench`, the contact forces
+    /// on a body in an impact, they come from those forces rather than its
+    /// motion: each force acts equally on two bodies, so momentum survives a
+    /// solve that has not converged. Motion alone would show the stop of
+    /// whichever body moved first, without the push the other has yet to get.
+    /// Resting contacts must not use this: their numerical damping keeps
+    /// stacks stable, where unconverged forces would feed them energy.
+    fn finish(&mut self, dt: f32, wrench: Option<(Vec3A, Vec3A)>) {
+        self.previous = self.velocity;
+        if self.dynamic() {
+            let (moved, turned) = match wrench {
+                Some((force, torque)) => {
+                    let scale = dt * dt;
+                    let start = quat_step(self.inertial_rotation, self.initial_rotation);
+                    (
+                        Vec3A::from(self.inertial_position - self.initial_position)
+                            - force * (scale / self.mass),
+                        Vec3A::from(start) - self.inertia.inverse() * torque * scale,
+                    )
+                }
+                None => (self.moved, self.turned),
+            };
+            self.velocity = (moved / dt).into();
+            self.conserve_angular_momentum(turned, dt);
+        }
+    }
+    /// A turned body's world inertia has turned with it: keep its angular
+    /// momentum, not its angular velocity. This is the gyroscopic term. A
+    /// step's displacement is its average velocity, which pairs with the
+    /// inertia `midpoint_spin` used, so a free body's momentum is exact.
+    fn conserve_angular_momentum(&mut self, turned: Vec3A, dt: f32) {
+        let average = turned / dt;
+        self.angular_velocity = if self.gyroscopic() {
+            let start = Vec3A::from(self.angular_velocity);
+            let momentum = self.inertia_after(start * (0.5 * dt)) * average;
+            (self.inertia_after(turned).inverse() * momentum).into()
+        } else {
+            average.into()
+        };
+    }
+    /// The velocity to cross this step with: the explicit midpoint of a body
+    /// conserving momentum, as a whole step at the start velocity gains energy.
+    fn midpoint_spin(&self, dt: f32) -> Vec3 {
+        if !self.gyroscopic() {
+            return self.angular_velocity;
+        }
+        let spin = Vec3A::from(self.angular_velocity);
+        let inertia = self.inertia_after(spin * (0.5 * dt));
+        (inertia.inverse() * (self.inertia * spin)).into()
+    }
+    /// Equal principal moments have no gyroscopic term.
+    fn gyroscopic(&self) -> bool {
+        matches!(self.shape, Collider::Cuboid { half_extents: h } if h.x != h.y || h.y != h.z)
+    }
+    /// World inertia after the rotation `w` from the step start.
+    fn inertia_after(&self, w: Vec3A) -> Mat3A {
+        let turn = Mat3A::from_quat(quat_add(Quat::IDENTITY, w.into()));
+        turn * self.inertia * turn.transpose()
     }
     fn dynamic(&self) -> bool {
         self.mass > 0.0 && !self.asleep
@@ -140,6 +225,19 @@ impl Body {
 /// `q` rotated by the small rotation vector `w`.
 pub(crate) fn quat_add(q: Quat, w: Vec3) -> Quat {
     (q + Quat::from_xyzw(w.x, w.y, w.z, 0.0) * q * 0.5).normalize()
+}
+
+/// The `w` for which `quat_add(b, w)` is `a`. Velocities come from this, so it
+/// must be the exact inverse: anything else damps spin in proportion to ω².
+pub(crate) fn quat_step(a: Quat, b: Quat) -> Vec3 {
+    let d = a * b.conjugate();
+    // Near a half turn per step, `w` tends to infinity. Keep it finite.
+    let w = if d.w.abs() < 1.0e-3 {
+        1.0e-3f32.copysign(d.w)
+    } else {
+        d.w
+    };
+    d.xyz() * (2.0 / w)
 }
 
 /// Rotation vector taking `b` to `a`, valid for small differences.
@@ -183,6 +281,10 @@ pub(crate) struct Manifold {
     static_friction: f32,
     /// Heavier body's mass: penalties are per kilogram so tuning is unit-free.
     scale: f32,
+    /// The largest penalty that helps this pair converge.
+    limit: f32,
+    /// Two free bodies meeting fast: see `Body::finish`.
+    impact: bool,
     /// The contacts' solver state, one SIMD lane per contact.
     lanes: Lanes,
 }
@@ -196,6 +298,8 @@ struct CollisionData {
     /// The contacts' anchors in SIMD lanes: each step's `prepare` needs them,
     /// but contacts change far less often.
     anchors: [[Vec4; 3]; 2],
+    /// Step-start constraint error, which only stabilization corrects.
+    error: [Vec4; 3],
     /// Unregularized step-start penetration exceeds the sleep tolerance.
     deep: bool,
     /// The narrowphase pass that last matched this manifold to a pair.
@@ -261,6 +365,17 @@ impl Lanes {
         self.stick = warm.stick;
         self.held = warm.held;
     }
+}
+
+/// Eq. 18: step-start error with `alpha` of it left uncorrected. A gap is not
+/// an error: speculative contacts must keep it, or they would stop bodies early.
+fn regularize(c: [Vec4; 3], alpha: f32) -> [Vec4; 3] {
+    let keep = 1.0 - alpha;
+    [
+        c[0].max(Vec4::ZERO) + c[0].min(Vec4::ZERO) * keep,
+        c[1] * keep,
+        c[2] * keep,
+    ]
 }
 
 /// Each contact's anchors as lanes, for `CollisionData::anchors`.
@@ -329,6 +444,8 @@ struct Eval {
     /// The force before its bounds were applied (λ⁺, Eq. 13).
     raw: [Vec4; 3],
     force: [Vec4; 3],
+    /// What the Coulomb cone scaled the tangential force by: one inside it.
+    cone: Vec4,
     /// Lane masks; persistent friction state is materialized only on update.
     held: BVec4A,
     inside: BVec4A,
@@ -432,6 +549,7 @@ impl Manifold {
             c,
             raw,
             force: [fx, raw[1] * scale, raw[2] * scale],
+            cone: scale,
             held,
             inside,
         }
@@ -464,12 +582,13 @@ impl Manifold {
         let e = self.eval_constraint(c);
         let mut force = e.force;
         let l = &self.lanes;
-        // The paper's friction experiments use the full tangential penalty
-        // as a conservative Hessian even when the force is cone-clamped.
-        // Rescale only the normal row, except for a contact that began the
-        // step penetrating: rescaling there can make even iteration counts
+        // A sliding contact's force is capped by the cone, so its stiffness is
+        // too: the full penalty would make each Newton step apply only a
+        // fraction of the friction. This is the secant of the capped force, as
+        // in NVIDIA Newton's AVBD. Rescale the normal row too, except for a
+        // contact that began the step penetrating: rescaling there can make even iteration counts
         // alternate between separation and falling back through the contact.
-        let mut k = l.penalty;
+        let mut k = [l.penalty[0], l.penalty[1] * e.cone, l.penalty[2] * e.cone];
         let clamped = e.force[0].cmpne(e.raw[0])
             & e.c[0].cmpne(Vec4::ZERO)
             & l.rescale_normal.cmpgt(Vec4::ZERO);
@@ -506,25 +625,6 @@ impl Manifold {
             // Damping never pulls a contact closed.
             force[0] = (force[0] + kd * motion).min(Vec4::ZERO);
             k[0] += kd;
-        }
-        if self.len == 1 {
-            // A sphere or edge contact occupies only one contact lane. Use
-            // spatial SIMD for its block instead of four mostly empty lanes.
-            let stiffness = Vec3A::new(k[0].x, k[1].x, k[2].x);
-            let force = Vec3A::new(force[0].x, force[1].x, force[2].x);
-            let angular = Mat3A::from_cols(
-                Vec3A::new(j[0][0].x, j[1][0].x, j[2][0].x),
-                Vec3A::new(j[0][1].x, j[1][1].x, j[2][1].x),
-                Vec3A::new(j[0][2].x, j[1][2].x, j[2][2].x),
-            );
-            let weighted = scale_rows(angular, stiffness);
-            let sign = if is_a { 1.0 } else { -1.0 };
-            system.lin += self.rows.transpose() * scale_rows(self.rows, stiffness);
-            system.ang += angular.transpose() * weighted;
-            system.cross += weighted.transpose() * self.rows * sign;
-            system.rhs_lin += self.rows.transpose() * force * sign;
-            system.rhs_ang += angular.transpose() * force;
-            return;
         }
         // Stiffness-weighted angular rows K J, per row and component.
         let mut kj = [[Vec4::ZERO; 3]; 3];
@@ -573,8 +673,8 @@ impl Manifold {
         system.rhs_lin += bt * force * sign;
     }
 
-    /// `dual`, where its flag is set, then `stamp`, for two multi-contact
-    /// manifolds of body `i`, one per 256-bit half. Every lane repeats those
+    /// `dual`, where its flag is set, then `stamp`, for two manifolds of body
+    /// `i`, one per 256-bit half. Every lane repeats those
     /// functions' operations in the same order, so results match them bit for
     /// bit; do not contract them into FMAs.
     ///
@@ -759,12 +859,13 @@ impl Manifold {
                 [fx, mul(raw[1], scale), mul(raw[2], scale)],
                 held,
                 inside,
+                scale,
             )
         };
-        let (mut raw0, mut force, held, inside) = eval(&penalty, &lambda);
+        let (mut raw0, mut force, held, inside, mut cone) = eval(&penalty, &lambda);
         if dual_p || dual_q {
             let beta = splat2(beta * p.scale, beta * q.scale);
-            let max = splat2(PENALTY_MAX * p.scale, PENALTY_MAX * q.scale);
+            let max = splat2(p.limit, q.limit);
             let bound = splat2(LAMBDA_MAX * p.scale, LAMBDA_MAX * q.scale);
             let minimum = _mm256_xor_ps(bound, _mm256_set1_ps(-0.0));
             let abs = |v| _mm256_andnot_ps(_mm256_set1_ps(-0.0), v);
@@ -816,12 +917,12 @@ impl Manifold {
                 (l.stick, l.held) = (l.stick & !inside | stuck & inside, held >> 4);
             }
             let evaluated = eval(&penalty, &lambda);
-            (raw0, force) = (evaluated.0, evaluated.1);
+            (raw0, force, cone) = (evaluated.0, evaluated.1, evaluated.4);
         }
         let (lp, lq) = (&p.lanes, &q.lanes);
         let mut fx = force[0];
 
-        let mut k = penalty;
+        let mut k = [penalty[0], mul(penalty[1], cone), mul(penalty[2], cone)];
         let clamped = and(
             and(ne(fx, raw0), ne(c[0], zero)),
             gt(join(lp.rescale_normal, lq.rescale_normal), zero),
@@ -946,11 +1047,44 @@ impl Manifold {
         both(&mut system.rhs_lin, block[6]);
     }
 
+    /// The force and torque of this manifold's stored multipliers on body A
+    /// or B, in the convention of `System`'s gradient.
+    fn wrench(&self, is_a: bool) -> (Vec3A, Vec3A) {
+        let l = &self.lanes;
+        let (anchor, basis, sign) = if is_a {
+            (l.ra, self.rows.transpose(), 1.0)
+        } else {
+            (l.rb, self.rows.transpose() * -1.0, -1.0)
+        };
+        let total = Vec3A::new(
+            l.lambda[0].element_sum(),
+            l.lambda[1].element_sum(),
+            l.lambda[2].element_sum(),
+        );
+        let (mut x, mut y, mut z) = (0.0, 0.0, 0.0);
+        for (lambda, axis) in l
+            .lambda
+            .iter()
+            .zip([basis.x_axis, basis.y_axis, basis.z_axis])
+        {
+            let j = cross4(anchor, axis.into());
+            x += (j[0] * *lambda).element_sum();
+            y += (j[1] * *lambda).element_sum();
+            z += (j[2] * *lambda).element_sum();
+        }
+        (self.rows.transpose() * total * sign, Vec3A::new(x, y, z))
+    }
+
+    /// Show the stabilization sweep the error it should correct (Eq. 18).
+    fn restore_error(&mut self, alpha: f32) {
+        self.lanes.c0 = regularize(self.cold.error, alpha);
+    }
+
     /// Store forces and ramp penalties (Eqs. 11, 12), four contacts at a time.
     #[inline(always)]
     fn dual(&mut self, a: &Body, b: &Body, beta: f32) -> [Vec4; 3] {
         let e = self.eval(&Motion::new(a, b));
-        let (beta, max) = (beta * self.scale, Vec4::splat(PENALTY_MAX * self.scale));
+        let (beta, max) = (beta * self.scale, Vec4::splat(self.limit));
         let bound = Vec4::splat(LAMBDA_MAX * self.scale);
         let l = &mut self.lanes;
         for r in 0..3 {
@@ -1010,6 +1144,7 @@ impl Manifold {
                 relative: (inverse * (bb.position - ba.position), inverse * bb.rotation),
                 contacts,
                 anchors: anchor_lanes(&contacts[..len]),
+                error: [Vec4::ZERO; 3],
                 deep: false,
                 seen: 0,
             }),
@@ -1018,6 +1153,8 @@ impl Manifold {
             friction: 0.0,
             static_friction: 0.0,
             scale: 0.0,
+            limit: 0.0,
+            impact: false,
             lanes,
         };
         if let Some(settings) = prepare {
@@ -1135,22 +1272,40 @@ impl Manifold {
             std::array::from_fn(|k| (Vec4::splat(gap[k]) + ra[k] - rb[k]) * l.active);
         (l.ra, l.rb) = (ra, rb);
         for (r, n) in basis.iter().enumerate() {
-            let margin = if r == 0 { COLLISION_MARGIN } else { 0.0 };
-            l.c0[r] = (d[0] * n.x + d[1] * n.y + d[2] * n.z + Vec4::splat(margin)) * l.active;
+            l.c0[r] = (d[0] * n.x + d[1] * n.y + d[2] * n.z) * l.active;
         }
+        // Between two free bodies a much stiffer penalty only locks them: the
+        // first to move satisfies the contact alone, the other barely moves,
+        // and momentum is lost. Half the heavier body's inertial term is the
+        // reduced mass of equal bodies. A static partner has no such limit.
+        let (ka, kb) = (ba.stiffness, bb.stiffness);
+        let limit = if ka > 0.0 && kb > 0.0 {
+            (0.5 * ka.max(kb)).min(PENALTY_MAX * scale)
+        } else {
+            PENALTY_MAX * scale
+        };
+        self.limit = limit;
+        let closing = (bb.travel - ba.travel).dot(basis[0]);
+        self.impact = ka > 0.0 && kb > 0.0 && closing > IMPACT_SPEED * (ba.mass / ka).sqrt();
+        // A new contact starts near the body's own inertia: from PENALTY_MIN it
+        // spends sweeps ramping up, and slopes creep while it does.
+        let start = (0.25 * ka.max(kb)).min(limit);
         let (min, max) = (
-            Vec4::splat(PENALTY_MIN * scale),
-            Vec4::splat(PENALTY_MAX * scale),
+            Vec4::splat((PENALTY_MIN * scale).max(start)),
+            Vec4::splat(limit),
         );
         for k in 0..3 {
-            l.lambda[k] *= alpha * gamma;
+            // With post-stabilization a contact's force carries over whole. Any
+            // decay here must be rebuilt every step, and tall stacks cannot.
             l.penalty[k] = (l.penalty[k] * gamma).clamp(min, max) * l.active;
         }
-        l.rescale_normal = Vec4::select(l.c0[0].cmpge(Vec4::ZERO), l.active, Vec4::ZERO);
+        // Only a touching contact: one far from its surface, on either side,
+        // alternates between overshooting and springing back to its target.
+        let touching = l.c0[0].cmpge(Vec4::ZERO) & l.c0[0].cmple(Vec4::splat(CONTACT_DISTANCE));
+        l.rescale_normal = Vec4::select(touching, l.active, Vec4::ZERO);
         self.cold.deep = l.c0[0].cmplt(Vec4::splat(-SLEEP_PENETRATION)).any();
-        for c in &mut l.c0 {
-            *c *= 1.0 - alpha;
-        }
+        self.cold.error = l.c0;
+        l.c0 = regularize(l.c0, alpha);
         self.friction = (ba.friction * bb.friction).sqrt();
         self.static_friction = (ba.static_friction * bb.static_friction).sqrt();
         self.scale = scale;
@@ -1433,6 +1588,7 @@ fn assemble_body<'a>(
     adjacency: &[u32],
     i: usize,
     dual: bool,
+    visit: bool,
     settings: &PhysicsSettings,
     damping: f32,
     scale: f32,
@@ -1441,13 +1597,13 @@ fn assemble_body<'a>(
 ) {
     let body = body_at(i);
     let mass = body.mass * scale;
-    let inertia = Mat3A::from(body.inertia * scale);
+    let inertia = body.inertia * scale;
     *system = System {
         lin: Mat3A::from_diagonal(Vec3::splat(mass)),
         ang: inertia,
         cross: Mat3A::ZERO,
         rhs_lin: Vec3A::from(body.position - body.inertial_position) * mass,
-        rhs_ang: inertia * Vec3A::from(quat_sub(body.rotation, body.inertial_rotation)),
+        rhs_ang: inertia * Vec3A::from(quat_step(body.rotation, body.inertial_rotation)),
     };
     let mut sums = LaneSums::default();
     // SAFETY (all accesses below): per `solve_batch_with`, only this body
@@ -1467,7 +1623,7 @@ fn assemble_body<'a>(
             m.stamp(a, b, i == m.a, c, damping, system, &mut sums, $half);
         }};
     }
-    // Multi-contact manifolds are stamped two at a time, one per sum half,
+    // Manifolds are stamped two at a time, one per sum half,
     // whether or not the CPU can do so at once: every CPU sums in one order.
     let mut pending = None;
     for &entry in adjacency {
@@ -1484,11 +1640,11 @@ fn assemble_body<'a>(
         } else {
             let k = entry as usize;
             let m = unsafe { &*manifolds.get().add(k) };
-            let first = dual && i == if m.first_is_a { m.a } else { m.b };
-            if m.len == 1 {
-                stamp!(k, first, 0);
-                continue;
-            }
+            // Every visit updates the dual, not just each iteration's first:
+            // the second body must feel the force the first body just used,
+            // or a stiff contact stops one body and barely moves the other,
+            // and momentum is lost.
+            let first = dual || (visit && i != if m.first_is_a { m.a } else { m.b });
             let Some((other, other_first)) = pending.take() else {
                 pending = Some((k, first));
                 continue;
@@ -1533,6 +1689,27 @@ fn assemble_body<'a>(
         Vec3A::new(h.z, g.x, g.y),
     );
     system.rhs_ang += Vec3A::new(g.z, g.w, rhs[2].element_sum());
+}
+
+/// The sum of body `i`'s contact forces if it is in an impact; `None` if not,
+/// or if a joint or spring also acts on it, whose forces are not among them.
+fn contact_wrench(
+    manifolds: &[Manifold],
+    offsets: &[u32],
+    adjacency: &[u32],
+    i: usize,
+) -> Option<(Vec3A, Vec3A)> {
+    let (mut force, mut torque, mut impact) = (Vec3A::ZERO, Vec3A::ZERO, false);
+    for &entry in adjacency.get(offsets[i] as usize..offsets[i + 1] as usize)? {
+        if entry & LINK != 0 {
+            return None;
+        }
+        let m = &manifolds[entry as usize];
+        let (f, t) = m.wrench(i == m.a);
+        (force, torque) = (force + f, torque + t);
+        impact |= m.impact;
+    }
+    impact.then_some((force, torque))
 }
 
 /// Apply the previous iteration's dual update at a link's first visit.
@@ -1619,14 +1796,15 @@ unsafe fn solve_batch_with<const WIDE: bool>(
                 body_at,
                 manifolds,
                 |k| unsafe {
-                    if iteration > 0 {
+                    if iteration > 0 && iteration != STABILIZE {
                         first_link_dual(body_at, links, k, i, settings);
                     }
                     &*links.get().add(k)
                 },
                 &adjacency[offsets[i] as usize..offsets[i + 1] as usize],
                 i,
-                iteration > 0,
+                iteration > 0 && iteration != STABILIZE,
+                iteration != STABILIZE,
                 settings,
                 damping,
                 scale,
@@ -1918,6 +2096,16 @@ impl Solver {
     /// iterations may hold every pool thread at a barrier. On a shared pool
     /// two worlds' barriers could wait on each other's threads forever.
     pub fn step(&mut self, settings: &PhysicsSettings, dt: f32, exclusive: bool, serial: bool) {
+        // Post-stabilization, from the AVBD authors' reference solver: the main
+        // sweeps leave step-start error alone, velocities are taken from them,
+        // and a last sweep then removes the error from positions alone, so
+        // correcting penetration adds no energy.
+        let stabilize = settings.clone();
+        let settings = &PhysicsSettings {
+            alpha: 1.0,
+            ..settings.clone()
+        };
+        let sweeps = settings.iterations.saturating_sub(1).max(1);
         let mut has_sleepers = false;
         let requested: Vec<u32> = self
             .bodies
@@ -1941,6 +2129,9 @@ impl Solver {
             self.cache.clear();
             self.recolor = true;
             return;
+        }
+        for body in &mut self.bodies {
+            body.predict(dt);
         }
         self.broadphase(serial);
         // If no island is asleep, collision detection cannot require a second
@@ -2004,7 +2195,7 @@ impl Solver {
             if body.dynamic() {
                 // Inertial target (Eq. 2) and adaptive warm start (VBD).
                 body.inertial_position = body.position + body.velocity * dt + gravity * (dt * dt);
-                body.inertial_rotation = quat_add(body.rotation, body.angular_velocity * dt);
+                body.inertial_rotation = quat_add(body.rotation, body.midpoint_spin(dt) * dt);
                 let accel = (body.velocity - body.previous) / dt;
                 let weight = (accel.dot(gravity) / gravity.length_squared()).clamp(0.0, 1.0);
                 let weight = if weight.is_finite() { weight } else { 0.0 };
@@ -2041,8 +2232,8 @@ impl Solver {
             let manifolds = Shared(self.manifolds.as_mut_ptr());
             let links = Shared(self.links.as_mut_ptr());
             let bodies = Shared(self.bodies.as_mut_ptr());
-            for iteration in 0..settings.iterations {
-                for color in &self.colors {
+            let sweep = |settings: &PhysicsSettings, iteration: u32, colors: &[Vec<usize>]| {
+                for color in colors {
                     for indices in color.chunks(batch_width) {
                         // SAFETY: this thread owns the complete color phase.
                         unsafe {
@@ -2061,33 +2252,29 @@ impl Solver {
                         }
                     }
                 }
+            };
+            for iteration in 0..sweeps {
+                sweep(settings, iteration, &self.colors);
             }
             // The last iteration's dual update, for warm starting the next step.
-            let bodies = &self.bodies;
+            let solved = &self.bodies;
             for m in &mut self.manifolds {
-                m.dual(&bodies[m.a], &bodies[m.b], beta);
+                m.dual(&solved[m.a], &solved[m.b], beta);
+                m.restore_error(stabilize.alpha);
             }
-            for link in self.links.iter_mut().filter(|l| l.solved(bodies)) {
-                link.dual(link.a.map(|j| &bodies[j]), &bodies[link.b], settings);
+            for link in self.links.iter_mut().filter(|l| l.solved(solved)) {
+                link.dual(link.a.map(|j| &solved[j]), &solved[link.b], settings);
+            }
+            let (manifolds, offsets, adjacency) = (&self.manifolds, &self.offsets, &self.adjacency);
+            for (i, body) in self.bodies.iter_mut().enumerate() {
+                let wrench = contact_wrench(manifolds, offsets, adjacency, i);
+                body.finish(dt, wrench);
+            }
+            if settings.iterations > 1 {
+                sweep(&stabilize, STABILIZE, &self.colors);
             }
         } else {
-            self.iterate_parallel(settings, scale, damping, threads);
-        }
-
-        let finalize = |body: &mut Body| {
-            body.previous = body.velocity;
-            if body.dynamic() {
-                body.velocity = (body.moved / dt).into();
-                body.angular_velocity = (body.turned / dt).into();
-            }
-        };
-        if serial {
-            self.bodies.iter_mut().for_each(finalize);
-        } else {
-            self.bodies
-                .par_iter_mut()
-                .with_min_len(BODY_BATCH)
-                .for_each(finalize);
+            self.iterate_parallel(settings, &stabilize, sweeps, dt, scale, damping, threads);
         }
         self.sleep(dt);
     }
@@ -2105,9 +2292,13 @@ impl Solver {
     /// takes its share of every color, then of the manifolds, meeting at a
     /// barrier between phases. Forking once per color instead cost more than
     /// the work in small and medium scenes. Results match the serial path.
+    #[allow(clippy::too_many_arguments)]
     fn iterate_parallel(
         &mut self,
         settings: &PhysicsSettings,
+        stabilize: &PhysicsSettings,
+        sweeps: u32,
+        dt: f32,
         scale: f32,
         damping: f32,
         threads: usize,
@@ -2118,6 +2309,7 @@ impl Solver {
         let manifold_count = self.manifolds.len();
         let links = Shared(self.links.as_mut_ptr());
         let link_count = self.links.len();
+        let body_count = self.bodies.len();
         let (colors, offsets, adjacency) = (&self.colors, &self.offsets, &self.adjacency);
         let batch_width = batch_width();
         let barrier = SpinBarrier::new(threads);
@@ -2134,7 +2326,7 @@ impl Solver {
             // manifolds and links and only read bodies. The barrier orders
             // every phase after the previous one.
             let body_at = |j: usize| unsafe { &*bodies.get().add(j) };
-            for iteration in 0..settings.iterations {
+            let sweep = |settings: &PhysicsSettings, iteration: u32| {
                 for color in colors {
                     for group in share(color.len().div_ceil(batch_width)) {
                         let start = group * batch_width;
@@ -2150,12 +2342,16 @@ impl Solver {
                     }
                     barrier.wait();
                 }
+            };
+            for iteration in 0..sweeps {
+                sweep(settings, iteration);
             }
             // The last iteration's dual update, for warm starting the next step.
             for k in share(manifold_count + link_count) {
                 if k < manifold_count {
                     let m = unsafe { &mut *manifolds.get().add(k) };
                     m.dual(body_at(m.a), body_at(m.b), beta);
+                    m.restore_error(stabilize.alpha);
                 } else {
                     let link = unsafe { &mut *links.get().add(k - manifold_count) };
                     // `solved` reads only flags no phase writes.
@@ -2166,6 +2362,21 @@ impl Solver {
                         link.dual(link.a.map(body_at), body_at(link.b), settings);
                     }
                 }
+            }
+            // Duals read every body, so velocities wait for all of them.
+            barrier.wait();
+            for k in share(body_count) {
+                // SAFETY: duals are done, so manifolds are only read here, and
+                // threads write disjoint bodies and read no others.
+                let wrench = unsafe {
+                    let all = std::slice::from_raw_parts(manifolds.get(), manifold_count);
+                    contact_wrench(all, offsets, adjacency, k)
+                };
+                unsafe { &mut *bodies.get().add(k) }.finish(dt, wrench);
+            }
+            barrier.wait();
+            if settings.iterations > 1 {
+                sweep(stabilize, STABILIZE);
             }
         });
     }
@@ -2334,12 +2545,12 @@ impl Solver {
                     Vec3::new(abs(m.row(0)), abs(m.row(1)), abs(m.row(2)))
                 }
                 Collider::Sphere { radius } => Vec3::splat(radius),
-            } + COLLISION_MARGIN;
+            } + (0.5 * CONTACT_DISTANCE + b.reach);
             let flags =
                 u32::from(b.dynamic()) | u32::from(b.active()) << 1 | u32::from(b.asleep) << 2;
             Aabb {
-                min: b.position - extent,
-                max: b.position + extent,
+                min: b.position - extent + b.travel.min(Vec3::ZERO),
+                max: b.position + extent + b.travel.max(Vec3::ZERO),
                 index: i as u32,
                 flags,
             }
@@ -2515,9 +2726,19 @@ impl Solver {
         let (stash, stash_index) = (&self.stash, &self.stash_index);
         let tight = &self.tight;
         let create = |&(a, b): &(usize, usize)| {
-            // Enlarged boxes pair near neighbours that are not touching.
-            let (ta, tb) = (&tight[a], &tight[b]);
-            if !(ta.min.cmple(tb.max).all() && tb.min.cmple(ta.max).all()) {
+            // Enlarged boxes pair near neighbours that are not touching, and
+            // swept ones pair bodies that travel together without closing.
+            let (ta, tb, ba, bb) = (&tight[a], &tight[b], &bodies[a], &bodies[b]);
+            let relative = ba.travel - bb.travel;
+            let (min_a, max_a) = (
+                ta.min - ba.travel.min(Vec3::ZERO) + relative.min(Vec3::ZERO),
+                ta.max - ba.travel.max(Vec3::ZERO) + relative.max(Vec3::ZERO),
+            );
+            let (min_b, max_b) = (
+                tb.min - bb.travel.min(Vec3::ZERO),
+                tb.max - bb.travel.max(Vec3::ZERO),
+            );
+            if !(min_a.cmple(max_b).all() && min_b.cmple(max_a).all()) {
                 return None;
             }
             let key = (bodies[a].key, bodies[b].key);
@@ -2884,8 +3105,11 @@ mod tests {
             previous: Vec3::ZERO,
             moved: vector(),
             turned: vector(),
+            travel: Vec3::ZERO,
+            reach: 0.0,
+            stiffness: 3600.0,
             mass: 1.0,
-            inertia: Mat3::IDENTITY,
+            inertia: Mat3A::IDENTITY,
             friction: 0.5,
             static_friction: 0.5,
             kinematic: false,
@@ -2945,6 +3169,7 @@ mod tests {
                 relative: (Vec3::ZERO, Quat::IDENTITY),
                 contacts: [Contact::default(); collide::MAX_CONTACTS],
                 anchors: [[Vec4::ZERO; 3]; 2],
+                error: [Vec4::ZERO; 3],
                 deep: false,
                 seen: 0,
             }),
@@ -2953,6 +3178,8 @@ mod tests {
             friction,
             static_friction,
             scale: 1.0,
+            limit: PENALTY_MAX,
+            impact: false,
             lanes,
         }
     }
@@ -3088,6 +3315,12 @@ mod tests {
         let q = Quat::from_rotation_y(0.7);
         let w = Vec3::new(0.01, -0.02, 0.015);
         assert!((quat_sub(quat_add(q, w), q) - w).length() < 1e-4);
+        // Exactly, however fast: velocities must survive being integrated.
+        let fast = Vec3::new(0.9, -0.5, 0.7);
+        assert!((quat_step(quat_add(q, fast), q) - fast).length() < 1e-5);
+        assert!(quat_step(-quat_add(q, fast), q).distance(fast) < 1e-5);
+        let half_turn = Quat::from_rotation_z(std::f32::consts::PI);
+        assert!(quat_step(half_turn, Quat::IDENTITY).is_finite());
     }
 
     #[test]

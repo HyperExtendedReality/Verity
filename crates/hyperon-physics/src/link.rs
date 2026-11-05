@@ -156,7 +156,7 @@ impl Link {
         self.scale = a.map_or(0.0, |a| a.mass).max(b.mass).max(f32::MIN_POSITIVE);
         self.arm = (a.map_or(Vec3::ZERO, |a| size(a.shape)) + size(b.shape)).length_squared();
         let e = self.ends(a, b);
-        let (alpha, gamma) = (settings.alpha, settings.gamma);
+        let gamma = settings.gamma;
         let (min, max) = (PENALTY_MIN * self.scale, PENALTY_MAX * self.scale);
         let warm = |p: Vec3, limit: f32| {
             (p * gamma)
@@ -172,10 +172,12 @@ impl Link {
             } => {
                 self.c0_linear = e.point_a - e.point_b;
                 self.c0_angular = self.angle(&e, rest);
-                self.lambda_linear *= alpha * gamma;
-                self.lambda_angular *= alpha * gamma;
                 self.penalty_linear = warm(self.penalty_linear, linear);
                 self.penalty_angular = warm(self.penalty_angular, angular);
+                // Unlike contacts, joints keep the decay: without it a swinging
+                // chain holds forces from where it just was.
+                self.lambda_linear *= gamma;
+                self.lambda_angular *= gamma;
             }
             Kind::Spring { stiffness, .. } => {
                 self.penalty_linear = warm(self.penalty_linear, stiffness);

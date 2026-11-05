@@ -59,7 +59,12 @@ Design references: [meshoptimizer](https://meshoptimizer.org/) and
 `hyperon-physics` solves contact forces and body motion with AVBD. Its solver
 combines each deferred dual update with the next body visit and reuses the
 contact error for that body's solve; the last dual update still runs at the end
-of the step for warm starting.
+of the step for warm starting. Velocities are taken before a final stabilization
+sweep, so correcting penetration adds no energy. Speculative contacts, built where
+a body's predicted path meets another, stop fast bodies at surfaces, so they do
+not tunnel through thin walls. Run
+`cargo run --release -p hyperon-physics --example quality` to compare accuracy
+with closed-form results and Box3D.
 
 Within each graph color, independent body systems are assembled in place before
 writing poses, then solved together with SIMD LDLᵀ. Runtime AVX2 detection
