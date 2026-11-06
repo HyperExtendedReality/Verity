@@ -1725,6 +1725,13 @@ fn hill_muscle_torque_follows_size_activation_length_and_speed() {
 }
 
 #[test]
+fn the_elbow_preset_gives_its_stated_torque() {
+    let elbow = Muscle::elbow_flexors();
+    let peak = elbow.torque_limit(elbow.optimal_angle, 0.0);
+    assert!((peak - 13.3).abs() < 0.1, "{peak}");
+}
+
+#[test]
 fn a_tensed_arm_holds_what_breaks_a_limp_one() {
     // The bar's 785 N·m at level, held by a muscle or falling on a 400 N·m stop.
     let setup = |activation: f32| {

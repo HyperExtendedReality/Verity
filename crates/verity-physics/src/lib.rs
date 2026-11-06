@@ -274,6 +274,26 @@ pub struct Muscle {
 }
 
 impl Muscle {
+    /// The elbow's flexors together, around the Y axis: the areas of biceps,
+    /// brachialis and brachioradialis (3.6, 6.0 and 1.5 cm²) at about 30 N/cm²,
+    /// over a moment arm near 4 cm. That gives about 13 N·m, well under what a
+    /// person lifts: published specific tensions and areas vary widely, so scale
+    /// `section` to the character.
+    pub fn elbow_flexors() -> Self {
+        Self {
+            axis: Vec3::Y,
+            section: 11.1,
+            specific_tension: 30.0,
+            moment_arm: 0.04,
+            activation: 1.0,
+            target: 0.0,
+            optimal_angle: 1.4,
+            angle_width: 1.6,
+            max_speed: 15.0,
+            stiffness: 100.0,
+        }
+    }
+
     /// The torque limit at an angle, shortening at `speed` (negative when the
     /// joint is forced the other way, where muscle resists up to 1.5 times more).
     pub fn torque_limit(&self, angle: f32, speed: f32) -> f32 {
@@ -858,6 +878,7 @@ impl PhysicsWorld {
             let body = obstacles.get(i)?;
             Some((body.position + body.rotation * point, i as u32))
         };
+        soft::find_pairs(&mut self.soft, settings.gravity, dt);
         let mut reactions = Vec::new();
         for body in &mut self.soft {
             body.step(dt, settings.gravity, &obstacles, pin_target, &mut reactions);

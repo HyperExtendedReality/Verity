@@ -1094,3 +1094,119 @@ loop the tests could not. Removing each behaviour above fails a test, except whe
 noted in this section's history: a reset of multipliers at tears proved unnecessary
 once fragments used true stiffness, and a limit on the force through pins made no
 difference, so both were deleted.
+
+## Cloth elements, global solve, fracture and collision (adopted)
+
+Collected on 2026-11-05 on a Ryzen 7 8845HS. This replaces the section above's cloth
+solver, and closes most of its limits.
+
+### Beams were the wrong element
+
+`examples/cloth_accuracy.rs` hangs a 1 m sheet under its own weight, which stretches
+by exactly ρgL²/(2Et). At the same 20 kN/m stiffness:
+
+| Cells | Beams | Triangle elements |
+| --- | --- | --- |
+| 8 | -7.9% | +1.6% |
+| 16 | +5.6% | +2.2% |
+| 32 | +100% | +0.4% |
+| 64 | came apart | +1.7% |
+
+Edge beams have no shear or Poisson behaviour of their own, and depend on the mesh.
+Cloth is now StVK membrane triangles with Bergou's quadratic bending, whose Hessian
+is constant. A triangle keeps its rest data through mesh splits, so tearing no
+longer rebuilds elements. Tears follow the largest principal stress, cutting the
+edge most nearly across it, preferring edges that touch a cut: tears grow from their
+tips. Only one element in a hundred may tear per step, worst first, or a uniform
+load shreds a sheet in one step instead of relieving itself.
+
+### Sweeps could not solve it
+
+Element forces alone did not help: vertex block descent's error grew with resolution
+(+10%, +141%, +645% at 8, 16, 32 cells), as a stiff sheet's large motions barely move
+in a few sweeps. Chebyshev acceleration and adaptive starts changed the numbers
+without fixing them. A sheet now takes an implicit Newton step solved by conjugate
+gradients, matrix-free from the elements, in two passes that run in parallel and sum
+in one order.
+
+One Newton step needs a good start. Starting from last step's correction brought
+solve work down, but it must be limited: whole, it fed itself; along its own
+direction, it destabilized hanging; only the part opposing gravity, and only for
+particles not on a surface, both settles a hanging sheet and lets one slide.
+
+Mistakes worth keeping:
+
+- Softening stiffness when a triangle shortens on average made steps 20 times too
+  large: only a triangle with no tension at all is soft.
+- Damping on a particle's own displacement dragged the whole sheet. It now acts on
+  the stiffness applied to true strain rates.
+- Contact springs at 10 times the sheet's stiffness left local strain the solver
+  could not spread; the same stiffness allows millimetres of overlap.
+- Friction after the solve stuck particles to a ball and tore the sheet around it. It
+  is now a spring along the surface inside the solve, slipping at Coulomb's limit.
+- A cap on reaction by closing speed read zero for cloth, which moves with what
+  presses it. Cloth's cap is the body's own speed.
+- Pins as firm as the sheet rang against rigid bodies, which feel them a step late,
+  so their stiffness is bounded by the body's mass.
+
+Cost is about four times beams' for far better results, on one thread and eight:
+
+| Body | Particles | 1 thread | 8 threads |
+| --- | --- | --- | --- |
+| Cloth 20 × 20 | 441 | 1.4 ms | |
+| Cloth 40 × 40 | 1,681 | 8.3 ms | 6.7 ms |
+| Cloth 64 × 64 | 4,225 | 26 ms | 14 ms |
+
+Warm iterations are capped at `20 + √particles / 2`, which at the 50 kN/m preset
+leaves meshes above 16 cells about 4 mm long in the test: a real 0.4% strain error,
+twice the expected stretch, that more iterations remove. Its cause was not fully
+traced. Cloth this large is not a cheap per-frame effect.
+
+### Solids
+
+`SoftBody::voxels` builds any shape from an inside test. `embed` and `deformed` tie
+detailed mesh vertices to the lattice. Fracture needs no mesh surgery: particles
+are coupled only through regions, so a crack across a region's largest strain splits
+the regions it crosses, within a region's reach, and grows as new tips overload.
+Brittle materials crack at `break_load / stiffness`; ductile ones once plastic strain
+reaches `ductility`. Crack faces are not capped: the surface just opens.
+
+### Crushing
+
+Calibration against crash data showed crush did not depend on strength at all: 1.2 m
+at any yield, the distance to the rigid core reaching the wall. Position corrections
+on light particles cannot stop a heavy core, and limiting the force through pins did
+nothing. A carried body now feels crush strength × contact area, which is how a
+crushing structure behaves. `crumple_zone` is set to crush a 1500 kg car about 0.55 m
+at 56 km/h, within the 0.49 m NHTSA measured and the 0.65 m of a published barrier
+test, and `a_car_at_56_kmh_crushes_about_as_far_as_a_real_one` holds it there.
+
+### Collision
+
+Pairs of particles about to meet become contact planes before the solve, for a sheet
+and itself and between soft bodies, so the sheet carries the load: pushing them apart
+afterwards tore sheets and stopped nothing. Fast particles sweep exactly against
+obstacles. Bodies small enough to pass between particles press triangles along their
+path.
+
+### Elbow
+
+`Muscle::elbow_flexors` uses areas of 3.6, 6.0 and 1.5 cm² and about 30 N/cm², from a
+textbook-style source, not a primary study. It gives about 13 N·m, well under what
+people lift, so it needs scaling. Murray et al. 2000 and Kawakami et al. 1994 have
+the primary figures, which were not retrieved.
+
+Limits that remain:
+
+- Soft bodies are not in Lux's GI scene: it is a static structure built at load.
+- A solid's crack faces are not capped, and its contacts are per particle.
+- A rigid body feels a soft body a step late, so a 30 m/s ball passes through cloth,
+  slowed, rather than stopping in it.
+- A body has one Joint component.
+- Solids run on one thread (they are cheap). Their landing hits yield more than
+  real steel would: a steel ball dropped half a metre flattens by about 12%.
+- Editor entities are cubes, so `embed` has no authoring path yet.
+
+Checks: each behaviour here fails a test when removed, except two with no visible
+effect: preferring the deepest contact, as a later one overwrites it anyway, and
+keeping carried cloth awake, as it wakes next step.

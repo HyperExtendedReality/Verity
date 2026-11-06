@@ -381,17 +381,20 @@ pub enum SoftShape {
     #[default]
     Cloth,
     Solid,
+    Ball,
+    /// A body with a cabin: a low box with a raised middle.
+    CarBody,
 }
 
 impl Choice for SoftShape {
     fn options(&self) -> &'static [&'static str] {
-        &["Cloth", "Solid"]
+        &["Cloth", "Solid", "Ball", "Car body"]
     }
     fn index(&self) -> usize {
         *self as usize
     }
     fn select(&mut self, index: usize) {
-        *self = [Self::Cloth, Self::Solid][index.min(1)];
+        *self = [Self::Cloth, Self::Solid, Self::Ball, Self::CarBody][index.min(3)];
     }
 }
 
@@ -403,17 +406,24 @@ pub enum SoftPreset {
     Metal,
     CrumpleZone,
     Rubber,
+    Concrete,
 }
 
 impl Choice for SoftPreset {
     fn options(&self) -> &'static [&'static str] {
-        &["Cloth", "Metal", "Crumple zone", "Rubber"]
+        &["Cloth", "Metal", "Crumple zone", "Rubber", "Concrete"]
     }
     fn index(&self) -> usize {
         *self as usize
     }
     fn select(&mut self, index: usize) {
-        *self = [Self::Cloth, Self::Metal, Self::CrumpleZone, Self::Rubber][index.min(3)];
+        *self = [
+            Self::Cloth,
+            Self::Metal,
+            Self::CrumpleZone,
+            Self::Rubber,
+            Self::Concrete,
+        ][index.min(4)];
     }
 }
 
@@ -533,6 +543,7 @@ impl SoftBodyComponent {
             SoftPreset::Metal => SoftMaterial::sheet_metal(),
             SoftPreset::CrumpleZone => SoftMaterial::crumple_zone(),
             SoftPreset::Rubber => SoftMaterial::rubber(),
+            SoftPreset::Concrete => SoftMaterial::concrete(),
         };
         material.strength.yield_load *= self.strength;
         material.strength.break_load *= self.strength;
@@ -546,6 +557,16 @@ impl SoftBodyComponent {
                 material,
             ),
             SoftShape::Solid => SoftBody::lattice(position, rotation, size / 2.0, cells, material),
+            SoftShape::Ball => {
+                let half = size / 2.0;
+                let inside = |p: Vec3| (p / half).length() <= 1.0;
+                SoftBody::voxels(position, rotation, half, cells, material, inside)
+            }
+            SoftShape::CarBody => {
+                let half = size / 2.0;
+                let inside = |p: Vec3| p.z < 0.0 || p.x.abs() < half.x * 0.5;
+                SoftBody::voxels(position, rotation, half, cells, material, inside)
+            }
         })
     }
 

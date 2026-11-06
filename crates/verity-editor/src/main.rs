@@ -588,6 +588,19 @@ impl Editor {
                     status.stage, status.force, status.torque
                 );
                 self.tools.joint_status.insert(index, (text, status.share));
+                // Load shows in the viewport too: redder nearer breaking.
+                if let (Some(entity), Some(authored)) = (
+                    self.scene.entities.get_mut(index),
+                    play.snapshot.entities.get(index),
+                ) {
+                    let share = status.share.clamp(0.0, 1.0);
+                    let base = authored.material.base_color;
+                    entity.material.base_color = [
+                        base[0] + (0.95 - base[0]) * share,
+                        base[1] * (1.0 - share),
+                        base[2] * (1.0 - share),
+                    ];
+                }
             }
         }
     }
@@ -1196,7 +1209,7 @@ mod tests {
             editor.tick(true);
         }
         let meshes = soft_meshes(editor.play.as_ref());
-        assert_eq!(meshes.len(), 4);
+        assert_eq!(meshes.len(), 5);
         for mesh in &meshes {
             assert!(mesh.vertices.iter().all(|v| v.position.iter().all(|p| p.is_finite())));
         }

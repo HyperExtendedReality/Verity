@@ -79,8 +79,10 @@ playing. `assets/scenes/joints.verity` is a demonstration. A joint can also have
 Hill muscle: what it cannot hold falls on the limits, so a tensed arm survives what
 breaks a limp one.
 
-Soft Body components add cloth that tears, and solids that keep their shape and stay
-dented past yield. A shell pinned around a rigid core crumples like a car's body.
+Soft Body components add cloth, solved as finite elements and tearing where stress
+exceeds its strength, and solids of any shape that stay dented past yield or crack
+past their limit. A shell pinned around a rigid core crushes like a car's body,
+calibrated to crash tests. Soft bodies collide with themselves and each other.
 `assets/scenes/soft-bodies.verity` shows them;
 `cargo run --release -p verity-render --example soft_bodies` runs it.
 

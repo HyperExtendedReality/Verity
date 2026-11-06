@@ -1,8 +1,10 @@
 //! Deformable bodies: cloth and solids.
 //!
-//! Cloth is a triangle mesh whose edges are beams, solved by vertex block
-//! descent (Chen et al. 2024) with each beam's force carried as an AVBD
-//! multiplier. It tears along edges that exceed their strength.
+//! Cloth is a triangle mesh of StVK membrane elements with quadratic bending
+//! across its edges (Bergou et al. 2006), stepped implicitly by Newton's method
+//! and conjugate gradients. The mesh does not change what the material does. It
+//! tears where its largest principal stress passes its strength, across that
+//! stress.
 //!
 //! Solids are lattices solved by shape matching (Müller et al. 2005): each
 //! overlapping region of particles is pulled toward the best-fit rotation of its
@@ -16,7 +18,8 @@
 //! [`crate::ExternalImpulse`], one step late.
 
 use crate::{Collider, Strength};
-use glam::{Mat3, Quat, Vec3};
+use glam::{Mat3, Quat, Vec2, Vec3};
+use rayon::prelude::*;
 use std::collections::{HashMap, HashSet};
 use verity_core::EntityHandle;
 
@@ -28,16 +31,28 @@ const REGION_REACH: i32 = 2;
 const REGION_STRIDE: u32 = 2;
 /// Particles that resist a contact together: about one region.
 const CONTACT_SPREAD: f32 = 50.0;
-/// Beams meeting at a particle for their forces to balance while solving.
-const SUPPORTED_BEAMS: usize = 5;
 /// Share of an overlap with a rigid body resolved each step.
 const SEPARATION: f32 = 0.2;
-/// Share of the speed along a beam removed each step.
-const BEAM_DAMPING: f32 = 0.3;
-/// Share of a beam's force kept into the next step's warm start.
-const FORCE_MEMORY: f32 = 0.99;
-/// Seconds over which a beam's load is averaged, as for joints.
+/// Newton steps per time step, and the conjugate gradient work in each.
+const NEWTON_STEPS: usize = 1;
+const CG_ITERATIONS: usize = 20;
+const CG_TOLERANCE: f32 = 1.0e-2;
+/// A sheet's contact springs, as a multiple of its stiffness.
+const CONTACT_STIFFNESS: f32 = 1.0;
+/// One element in this many may tear in a step.
+const TEARS_PER_STEP: usize = 100;
+/// Least work worth a thread.
+const PARALLEL_CHUNK: usize = 512;
+/// Seconds of strain rate damped in a sheet's elements.
+const ELEMENT_DAMPING: f32 = 0.002;
+/// Seconds over which a sheet's stress is averaged, as for joints.
 const LOAD_TIME: f32 = 0.03;
+/// Most samples along a particle's path through a step.
+const MAX_SWEEP_SAMPLES: usize = 16;
+/// Particles closer than this many collision radii at rest never collide.
+const NEIGHBOUR_REACH: f32 = 1.5;
+/// A body this many collision radii across can pass between a sheet's particles.
+const SMALL_BODY: f32 = 3.0;
 /// A pin's stiffness, as a multiple of its particle's inertial term.
 const PIN_STIFFNESS: f32 = 50.0;
 /// Speed (m/s) below which a soft body may sleep, and for how long (s).
@@ -55,17 +70,20 @@ pub struct SoftMaterial {
     pub density: f32,
     /// Resistance to stretching: Young's modulus, times thickness for a sheet.
     pub stiffness: f32,
+    /// A sheet's lateral contraction when stretched: Poisson's ratio.
+    pub poisson: f32,
     /// Share of `stiffness` that resists shortening: little for cloth, which
     /// buckles instead.
     pub compression: f32,
-    /// Share of `stiffness` that resists folding a sheet.
+    /// A sheet's resistance to folding (N·m).
     pub bending: f32,
     /// How firmly a solid returns to its shape each sweep: 1 is as rigid as it
     /// can be, 0.1 is jelly.
     pub rigidity: f32,
     /// In the units of `stiffness`, with `ductility` as strain: 0.1 is 10%.
-    /// A solid yields at the strain `yield_load / stiffness`, and hardens no
-    /// further than `ductility`; only cloth breaks.
+    /// A sheet tears at the stress `break_load`. A solid yields at the strain
+    /// `yield_load / stiffness` and cracks after `ductility` of plastic strain,
+    /// or at `break_load / stiffness` if brittle.
     pub strength: Strength,
     /// Velocity lost per second.
     pub damping: f32,
@@ -75,33 +93,35 @@ pub struct SoftMaterial {
 }
 
 impl SoftMaterial {
-    /// Woven cloth that tears at 2 kN per metre of width.
+    /// Canvas-like cloth, which tears at 15 kN per metre of width, near 30% strain.
     pub fn cloth() -> Self {
         Self {
             density: 0.3,
-            stiffness: 20_000.0,
+            stiffness: 50_000.0,
+            poisson: 0.3,
             compression: 0.05,
             bending: 0.002,
             rigidity: 0.0,
-            strength: Strength::brittle(2_000.0),
+            strength: Strength::brittle(15_000.0),
             damping: 1.0,
             friction: 0.5,
             thickness: 0.02,
         }
     }
 
-    /// Mild steel in a solid. It holds its shape until 1% strain, then dents.
+    /// Mild steel in a solid. It holds its shape until 3% strain, then dents.
     pub fn sheet_metal() -> Self {
         Self {
             density: 7800.0,
             stiffness: 2.0e9,
+            poisson: 0.3,
             compression: 1.0,
             bending: 0.0,
             rigidity: 1.0,
             strength: Strength {
-                yield_load: 2.0e7,
-                break_load: 8.0e7,
-                ductility: 5.0,
+                yield_load: 6.0e7,
+                break_load: 2.4e8,
+                ductility: 50.0,
             },
             damping: 2.0,
             friction: 0.5,
@@ -109,22 +129,40 @@ impl SoftMaterial {
         }
     }
 
-    /// The hollow body of a car, as a solid: light, and crushed by what steel
-    /// would shrug off.
+    /// The hollow body of a car, as a solid. Its yield is its crush strength
+    /// (Pa): this crushes a 1500 kg car about 0.55 m against a wall at 56 km/h,
+    /// within the 0.49 to 0.65 m of published crash tests.
     pub fn crumple_zone() -> Self {
         Self {
-            density: 150.0,
-            stiffness: 2.0e6,
+            density: 30.0,
+            stiffness: 7.0e6,
+            poisson: 0.3,
             compression: 1.0,
             bending: 0.0,
             rigidity: 1.0,
             strength: Strength {
-                yield_load: 2.0e4,
-                break_load: 8.0e4,
-                ductility: 20.0,
+                yield_load: 7.0e4,
+                break_load: 2.8e5,
+                ductility: 200.0,
             },
             damping: 2.0,
             friction: 0.5,
+            thickness: 0.01,
+        }
+    }
+
+    /// Brittle concrete: stiff, and cracks past 0.5% strain without bending.
+    pub fn concrete() -> Self {
+        Self {
+            density: 2400.0,
+            stiffness: 2.0e9,
+            poisson: 0.2,
+            compression: 1.0,
+            bending: 0.0,
+            rigidity: 1.0,
+            strength: Strength::brittle(1.0e7),
+            damping: 3.0,
+            friction: 0.7,
             thickness: 0.01,
         }
     }
@@ -134,6 +172,7 @@ impl SoftMaterial {
         Self {
             density: 1100.0,
             stiffness: 2.0e5,
+            poisson: 0.3,
             compression: 1.0,
             bending: 0.0,
             rigidity: 0.25,
@@ -145,56 +184,140 @@ impl SoftMaterial {
     }
 }
 
+/// One triangle of a sheet: a StVK membrane, in its rest shape.
 #[derive(Debug, Clone, Copy)]
-struct Beam {
-    a: u32,
-    b: u32,
-    rest: f32,
-    /// Rest length as built, the measure of strain.
-    original: f32,
-    /// Stiffness (N/m) and its share when shortened.
-    k: f32,
-    compression: f32,
-    /// How this beam fails, in newtons.
-    strength: Strength,
-    strain: f32,
+struct Element {
+    /// Each corner's gradient of the deformation, from the rest shape.
+    gradient: [Vec2; 3],
+    /// Corners at rest, in the triangle's plane.
+    rest: [Vec2; 3],
+    area: f32,
+    /// Largest principal stress, averaged (N/m).
     load: f32,
-    /// The force it carries (N): AVBD's multiplier, which a finite stiffness
-    /// relates to stretch by `stretch = force / k` at convergence.
-    force: f32,
-    /// A mesh edge, not a beam across a fold: only these tear the mesh.
-    edge: bool,
 }
 
-impl Beam {
-    fn cap(&self) -> f32 {
-        let s = self.strength;
-        if s.yield_load >= s.break_load {
-            f32::INFINITY
-        } else if s.break_load.is_infinite() {
-            s.yield_load
-        } else {
-            let hardened = (self.strain / s.ductility).min(1.0);
-            s.yield_load + (s.break_load - s.yield_load) * hardened
+impl Element {
+    fn new(points: [Vec3; 3]) -> Self {
+        let (e1, e2) = (points[1] - points[0], points[2] - points[0]);
+        let u = e1.normalize_or_zero();
+        let v = (e2 - u * u.dot(e2)).normalize_or_zero();
+        let (p1, p2) = (Vec2::new(e1.length(), 0.0), Vec2::new(u.dot(e2), v.dot(e2)));
+        let determinant = p1.x * p2.y - p1.y * p2.x;
+        let inverse = 1.0 / determinant;
+        // Rows of the inverse of the matrix with columns `p1` and `p2`.
+        let g1 = Vec2::new(p2.y, -p2.x) * inverse;
+        let g2 = Vec2::new(-p1.y, p1.x) * inverse;
+        Self {
+            gradient: [-g1 - g2, g1, g2],
+            rest: [Vec2::ZERO, p1, p2],
+            area: determinant.abs() * 0.5,
+            load: 0.0,
         }
     }
 
-    /// Stiffness for a force of this sign.
-    fn stiffness(&self, force: f32) -> f32 {
-        if force < 0.0 {
-            self.k * self.compression
-        } else {
-            self.k
-        }
+    /// The columns of the deformation gradient.
+    fn deformation(&self, x: [Vec3; 3]) -> (Vec3, Vec3) {
+        let g = &self.gradient;
+        (
+            x[0] * g[0].x + x[1] * g[1].x + x[2] * g[2].x,
+            x[0] * g[0].y + x[1] * g[1].y + x[2] * g[2].y,
+        )
     }
+}
 
-    /// The force at this length, by augmented Lagrangian: `stretch - force / k`
-    /// is the constraint, whose solution is Hooke's law.
-    fn force_at(&self, length: f32, penalty: f32, cap: f32) -> f32 {
-        let stretch = length - self.rest;
-        let force = penalty * (stretch - self.force / self.stiffness(self.force)) + self.force;
-        force.clamp(-cap, cap)
-    }
+/// The second Piola-Kirchhoff stress for deformation columns `(a, b)`, as
+/// `[xx, yy, xy]`, and how firm it is: shortening counts for `compression` of
+/// itself, as cloth buckles, so an element with no tension at all is soft.
+fn stress(a: Vec3, b: Vec3, material: &Membrane) -> ([f32; 3], f32) {
+    let (exx, eyy, exy) = (
+        0.5 * (a.dot(a) - 1.0),
+        0.5 * (b.dot(b) - 1.0),
+        0.5 * a.dot(b),
+    );
+    let (mean, half) = (0.5 * (exx + eyy), 0.5 * (exx - eyy));
+    let radius = (half * half + exy * exy).sqrt();
+    let (high, low) = (mean + radius, mean - radius);
+    let soften = |e: f32| if e < 0.0 { e * material.compression } else { e };
+    let (high_soft, low_soft) = (soften(high), soften(low));
+    // The strain with its negative principal part softened, same axes.
+    let (mean, ratio) = (
+        0.5 * (high_soft + low_soft),
+        if radius > 1.0e-12 {
+            0.5 * (high_soft - low_soft) / radius
+        } else {
+            0.0
+        },
+    );
+    let (exx, eyy, exy) = (mean + half * ratio, mean - half * ratio, exy * ratio);
+    let trace = material.lame * (exx + eyy);
+    let firm = if high > 0.0 {
+        1.0
+    } else {
+        material.compression
+    };
+    (
+        [
+            2.0 * material.shear * exx + trace,
+            2.0 * material.shear * eyy + trace,
+            2.0 * material.shear * exy,
+        ],
+        firm,
+    )
+}
+
+/// What an element's state was at the start of a Newton step.
+#[derive(Debug, Clone, Copy, Default)]
+struct ElementState {
+    a: Vec3,
+    b: Vec3,
+    stress: [f32; 3],
+    /// `stress` without compression, which must not make the step indefinite.
+    tension: [f32; 3],
+    firm: f32,
+}
+
+/// `[xx, yy, xy]` with its negative principal part removed.
+fn tension_only(s: [f32; 3]) -> [f32; 3] {
+    let (mean, half) = (0.5 * (s[0] + s[1]), 0.5 * (s[0] - s[1]));
+    let radius = (half * half + s[2] * s[2]).sqrt();
+    let (high, low) = ((mean + radius).max(0.0), (mean - radius).max(0.0));
+    let (mean, ratio) = (
+        0.5 * (high + low),
+        if radius > 1.0e-12 {
+            0.5 * (high - low) / radius
+        } else {
+            0.0
+        },
+    );
+    [mean + half * ratio, mean - half * ratio, s[2] * ratio]
+}
+
+/// A sheet's elastic constants (N/m).
+#[derive(Debug, Clone, Copy)]
+struct Membrane {
+    shear: f32,
+    lame: f32,
+    compression: f32,
+}
+
+/// Bending across one edge, by the quadratic model of Bergou et al. 2006: its
+/// energy is half the squared length of `Σ weights[i] x[i]`, whatever the pose.
+#[derive(Debug, Clone, Copy)]
+struct Hinge {
+    particles: [u32; 4],
+    weights: [f32; 4],
+}
+
+/// How a solid was laid out, to tie other points to it.
+#[derive(Debug, Clone)]
+struct Grid {
+    center: Vec3,
+    rotation: Quat,
+    half_extents: Vec3,
+    step: Vec3,
+    cells: [u32; 3],
+    /// Particle by grid point.
+    index: HashMap<u32, u32>,
 }
 
 /// A patch of a solid that keeps its shape.
@@ -231,6 +354,34 @@ impl Region {
             rotation: Quat::IDENTITY,
             mass,
             strain: 0.0,
+            thickness: reach.min_element().max(1.0e-4),
+        };
+        region.update_moment(masses);
+        region
+    }
+
+    /// A region of rest offsets taken from another, recentred.
+    fn from_rest(
+        particles: Vec<u32>,
+        rest: Vec<Vec3>,
+        rotation: Quat,
+        strain: f32,
+        masses: &[f32],
+    ) -> Self {
+        let mass: f32 = particles.iter().map(|&i| masses[i as usize]).sum();
+        let center = (particles.iter().zip(&rest))
+            .map(|(&i, &q)| q * masses[i as usize])
+            .sum::<Vec3>()
+            / mass;
+        let rest: Vec<Vec3> = rest.iter().map(|q| *q - center).collect();
+        let reach = rest.iter().fold(Vec3::ZERO, |m, q| m.max(q.abs()));
+        let mut region = Self {
+            particles,
+            rest,
+            moment: Mat3::IDENTITY,
+            rotation,
+            mass,
+            strain,
             thickness: reach.min_element().max(1.0e-4),
         };
         region.update_moment(masses);
@@ -372,6 +523,69 @@ impl Obstacle {
         ))
     }
 
+    /// Where a moving point padded by `pad` first meets this body, and the
+    /// outward normal there.
+    fn sweep(&self, from: Vec3, to: Vec3, pad: f32) -> Option<(Vec3, Vec3)> {
+        let a = self.rotation.conjugate() * (from - self.position);
+        let d = self.rotation.conjugate() * (to - from);
+        let (t, normal) = match self.shape {
+            Collider::Sphere { radius } => {
+                let r = radius + pad;
+                let (qa, qb, qc) = (d.dot(d), a.dot(d), a.dot(a) - r * r);
+                let discriminant = qb * qb - qa * qc;
+                if qa < 1.0e-12 || discriminant < 0.0 {
+                    return None;
+                }
+                let t = ((-qb - discriminant.sqrt()) / qa).max(0.0);
+                (t, (a + d * t).normalize_or_zero())
+            }
+            Collider::Cuboid { half_extents } => {
+                let h = half_extents + pad;
+                let (mut enter, mut leave, mut normal) = (f32::MIN, f32::MAX, Vec3::ZERO);
+                for axis in 0..3 {
+                    if d[axis].abs() < 1.0e-9 {
+                        if a[axis].abs() > h[axis] {
+                            return None;
+                        }
+                        continue;
+                    }
+                    let (t0, t1) = (
+                        (-h[axis] - a[axis]) / d[axis],
+                        (h[axis] - a[axis]) / d[axis],
+                    );
+                    let (near, far) = (t0.min(t1), t0.max(t1));
+                    if near > enter {
+                        enter = near;
+                        normal = Vec3::ZERO;
+                        normal[axis] = -d[axis].signum();
+                    }
+                    leave = leave.min(far);
+                }
+                if enter > leave || leave < 0.0 {
+                    return None;
+                }
+                // Starting inside the padding is already touching.
+                (enter.max(0.0), normal)
+            }
+        };
+        if !(0.0..=1.0).contains(&t) {
+            return None;
+        }
+        let surface = a + d * t - normal * pad;
+        Some((
+            self.position + self.rotation * surface,
+            self.rotation * normal,
+        ))
+    }
+
+    /// Its thinnest half extent.
+    fn narrowest(&self) -> f32 {
+        match self.shape {
+            Collider::Cuboid { half_extents } => half_extents.min_element(),
+            Collider::Sphere { radius } => radius,
+        }
+    }
+
     fn velocity_at(&self, point: Vec3) -> Vec3 {
         self.velocity + self.spin.cross(point - self.position)
     }
@@ -391,26 +605,43 @@ pub(crate) struct Reaction {
 pub struct SoftBody {
     positions: Vec<Vec3>,
     velocities: Vec<Vec3>,
+    /// How far a sheet's last solve moved each particle from free flight.
+    correction: Vec<Vec3>,
     masses: Vec<f32>,
     /// Each particle's index when built: the same edge keeps its identity
     /// after tearing duplicates its ends.
     origin: Vec<u32>,
     triangles: Vec<[u32; 3]>,
-    beams: Vec<Beam>,
-    regions: Vec<Region>,
-    /// Beams by particle: `entries[offsets[i]..offsets[i + 1]]`.
+    /// A sheet's elements, one per triangle, and each particle's as
+    /// `element * 3 + corner` in `entries[offsets[i]..offsets[i + 1]]`.
+    elements: Vec<Element>,
     offsets: Vec<u32>,
     entries: Vec<u32>,
+    /// Likewise, as `hinge * 4 + slot`.
+    hinges: Vec<Hinge>,
+    hinge_offsets: Vec<u32>,
+    hinge_entries: Vec<u32>,
+    grid: Option<Grid>,
+    /// Planes from other particles for this step: particle, normal, offset.
+    planes: Vec<(u32, Vec3, f32)>,
+    /// Half the particle spacing: how far apart particles keep (m).
+    radius: f32,
+    /// The membrane's Lamé constants, for `apply_stiffness`.
+    shear: f32,
+    lame: f32,
+    /// Each original particle's position when built.
+    rest: Vec<Vec3>,
+    regions: Vec<Region>,
     pins: Vec<Pin>,
     /// The pin on each particle, or `NONE`.
     pinned: Vec<u32>,
     material: SoftMaterial,
-    /// Length per cross-section: beam loads are the material's times this.
-    section: f32,
     /// Sheets rebuild their mesh when an edge breaks.
     sheet: bool,
-    /// Original edges that have broken, by `origin` indices.
+    /// Original edges that have torn, by `origin` indices.
     cuts: HashSet<(u32, u32)>,
+    /// Their ends: where tears can grow from.
+    cut_ends: HashSet<u32>,
     tears: usize,
     rest_time: f32,
     asleep: bool,
@@ -422,24 +653,34 @@ fn edge(a: u32, b: u32) -> (u32, u32) {
 }
 
 impl SoftBody {
-    fn new(positions: Vec<Vec3>, masses: Vec<f32>, material: SoftMaterial, section: f32) -> Self {
+    fn new(positions: Vec<Vec3>, masses: Vec<f32>, material: SoftMaterial) -> Self {
         let count = positions.len();
         Self {
             velocities: vec![Vec3::ZERO; count],
+            correction: vec![Vec3::ZERO; count],
             origin: (0..count as u32).collect(),
             pinned: vec![NONE; count],
+            rest: positions.clone(),
             positions,
             masses,
             triangles: Vec::new(),
-            beams: Vec::new(),
-            regions: Vec::new(),
+            elements: Vec::new(),
             offsets: Vec::new(),
             entries: Vec::new(),
+            hinges: Vec::new(),
+            hinge_offsets: Vec::new(),
+            hinge_entries: Vec::new(),
+            grid: None,
+            planes: Vec::new(),
+            radius: 0.0,
+            shear: 0.0,
+            lame: 0.0,
+            regions: Vec::new(),
             pins: Vec::new(),
             material,
-            section,
             sheet: false,
             cuts: HashSet::new(),
+            cut_ends: HashSet::new(),
             tears: 0,
             rest_time: 0.0,
             asleep: false,
@@ -489,9 +730,8 @@ impl SoftBody {
                 positions.push(center + rotation * local);
             }
         }
-        let mass = material.density * size[0] * size[1] / (nx * ny) as f32;
-        let cell = dx.min(dy);
-        let mut body = Self::new(positions, vec![mass; (nx * ny) as usize], material, cell);
+        let count = (nx * ny) as usize;
+        let mut body = Self::new(positions, vec![0.0; count], material);
         for y in 0..cells[1] {
             for x in 0..cells[0] {
                 let i = y * nx + x;
@@ -505,19 +745,39 @@ impl SoftBody {
             }
         }
         body.sheet = true;
-        body.rebuild(&HashMap::new());
+        body.radius = 0.45 * dx.min(dy);
+        for &[a, b, c] in &body.triangles {
+            let element = Element::new([a, b, c].map(|i| body.rest[i as usize]));
+            for i in [a, b, c] {
+                body.masses[i as usize] += material.density * element.area / 3.0;
+            }
+            body.elements.push(element);
+        }
+        body.rebuild();
         body
     }
 
     /// A solid box of `cells` along each axis: a particle at each grid point,
-    /// and beams along the edges and diagonals of each cell, so it keeps its
-    /// shape with no other help.
+    /// held in shape by overlapping regions.
     pub fn lattice(
         center: Vec3,
         rotation: Quat,
         half_extents: Vec3,
         cells: [u32; 3],
         material: SoftMaterial,
+    ) -> Self {
+        Self::voxels(center, rotation, half_extents, cells, material, |_| true)
+    }
+
+    /// A solid of any shape: the cells of a box whose centers `inside` accepts,
+    /// in the box's frame. Finer cells follow the shape more closely.
+    pub fn voxels(
+        center: Vec3,
+        rotation: Quat,
+        half_extents: Vec3,
+        cells: [u32; 3],
+        material: SoftMaterial,
+        inside: impl Fn(Vec3) -> bool,
     ) -> Self {
         assert!(
             cells.iter().all(|&c| c > 0),
@@ -527,24 +787,56 @@ impl SoftBody {
             half_extents.min_element() > 0.0,
             "a lattice's size must be positive"
         );
-        let [nx, ny, nz] = cells.map(|c| c + 1);
-        let at = |x: u32, y: u32, z: u32| (z * ny + y) * nx + x;
-        let step =
-            half_extents * 2.0 / Vec3::new(cells[0] as f32, cells[1] as f32, cells[2] as f32);
-        let mut positions = Vec::with_capacity((nx * ny * nz) as usize);
-        for z in 0..nz {
-            for y in 0..ny {
-                for x in 0..nx {
-                    let local = Vec3::new(x as f32, y as f32, z as f32) * step - half_extents;
-                    positions.push(center + rotation * local);
+        let size = Vec3::new(cells[0] as f32, cells[1] as f32, cells[2] as f32);
+        let step = half_extents * 2.0 / size;
+        let filled_at = |x: i64, y: i64, z: i64| {
+            let within = x >= 0
+                && y >= 0
+                && z >= 0
+                && x < cells[0] as i64
+                && y < cells[1] as i64
+                && z < cells[2] as i64;
+            within && inside((Vec3::new(x as f32, y as f32, z as f32) + 0.5) * step - half_extents)
+        };
+        // Particles are the corners of filled cells, each with an eighth of
+        // the mass of every cell it is a corner of.
+        let [nx, ny] = [cells[0] + 1, cells[1] + 1];
+        let grid = |x: u32, y: u32, z: u32| (z * ny + y) * nx + x;
+        let mut index = HashMap::new();
+        let (mut positions, mut masses) = (Vec::new(), Vec::new());
+        let cell_mass = material.density * step.x * step.y * step.z / 8.0;
+        for z in 0..cells[2] {
+            for y in 0..cells[1] {
+                for x in 0..cells[0] {
+                    if !filled_at(x as i64, y as i64, z as i64) {
+                        continue;
+                    }
+                    for corner in 0..8u32 {
+                        let (cx, cy, cz) =
+                            (x + (corner & 1), y + (corner >> 1 & 1), z + (corner >> 2));
+                        let i = *index.entry(grid(cx, cy, cz)).or_insert_with(|| {
+                            let local =
+                                Vec3::new(cx as f32, cy as f32, cz as f32) * step - half_extents;
+                            positions.push(center + rotation * local);
+                            masses.push(0.0);
+                            positions.len() as u32 - 1
+                        });
+                        masses[i as usize] += cell_mass;
+                    }
                 }
             }
         }
-        let volume = 8.0 * half_extents.x * half_extents.y * half_extents.z;
-        let mass = material.density * volume / positions.len() as f32;
-        let cell = step.min_element();
-        let count = positions.len();
-        let mut body = Self::new(positions, vec![mass; count], material, cell * cell);
+        assert!(!positions.is_empty(), "a solid needs at least one cell");
+        let mut body = Self::new(positions, masses, material);
+        body.radius = 0.5 * step.min_element();
+        body.grid = Some(Grid {
+            center,
+            rotation,
+            half_extents,
+            step,
+            cells,
+            index: index.clone(),
+        });
         // Overlapping regions on a stride, with one at each far edge.
         let centers = |cells: u32| {
             let mut list: Vec<u32> = (0..=cells).step_by(REGION_STRIDE as usize).collect();
@@ -558,145 +850,156 @@ impl SoftBody {
                 for &cx in &centers(cells[0]) {
                     let span = |c: u32, n: u32| {
                         let c = c as i32;
-                        (c - REGION_REACH).max(0) as u32
-                            ..=(c + REGION_REACH).min(n as i32 - 1) as u32
+                        (c - REGION_REACH).max(0) as u32..=(c + REGION_REACH).min(n as i32) as u32
                     };
                     let mut particles = Vec::new();
-                    for z in span(cz, nz) {
-                        for y in span(cy, ny) {
-                            for x in span(cx, nx) {
-                                particles.push(at(x, y, z));
+                    for z in span(cz, cells[2]) {
+                        for y in span(cy, cells[1]) {
+                            for x in span(cx, cells[0]) {
+                                particles.extend(index.get(&grid(x, y, z)));
                             }
                         }
                     }
-                    let region = Region::new(particles, &body.positions, &body.masses);
-                    body.regions.push(region);
+                    if particles.len() >= 4 {
+                        let region = Region::new(particles, &body.positions, &body.masses);
+                        body.regions.push(region);
+                    }
                 }
             }
         }
-        let mut quad = |a: u32, b: u32, c: u32, d: u32| {
-            body.triangles.extend([[a, b, c], [a, c, d]]);
-        };
-        for y in 0..cells[1] {
-            for x in 0..cells[0] {
-                let top = cells[2];
-                quad(
-                    at(x, y, 0),
-                    at(x, y + 1, 0),
-                    at(x + 1, y + 1, 0),
-                    at(x + 1, y, 0),
-                );
-                quad(
-                    at(x, y, top),
-                    at(x + 1, y, top),
-                    at(x + 1, y + 1, top),
-                    at(x, y + 1, top),
-                );
-            }
-        }
+        // The surface: every face of a filled cell with no filled neighbour.
+        let at = |x: u32, y: u32, z: u32| index[&grid(x, y, z)];
         for z in 0..cells[2] {
-            for x in 0..cells[0] {
-                let back = cells[1];
-                quad(
-                    at(x, 0, z),
-                    at(x + 1, 0, z),
-                    at(x + 1, 0, z + 1),
-                    at(x, 0, z + 1),
-                );
-                quad(
-                    at(x, back, z),
-                    at(x, back, z + 1),
-                    at(x + 1, back, z + 1),
-                    at(x + 1, back, z),
-                );
-            }
             for y in 0..cells[1] {
-                let right = cells[0];
-                quad(
-                    at(0, y, z),
-                    at(0, y, z + 1),
-                    at(0, y + 1, z + 1),
-                    at(0, y + 1, z),
-                );
-                quad(
-                    at(right, y, z),
-                    at(right, y + 1, z),
-                    at(right, y + 1, z + 1),
-                    at(right, y, z + 1),
-                );
+                for x in 0..cells[0] {
+                    let (i, j, k) = (x as i64, y as i64, z as i64);
+                    if !filled_at(i, j, k) {
+                        continue;
+                    }
+                    let (a, b, c) = (x + 1, y + 1, z + 1);
+                    let mut quad = |p: u32, q: u32, r: u32, s: u32| {
+                        body.triangles.extend([[p, q, r], [p, r, s]]);
+                    };
+                    if !filled_at(i, j, k - 1) {
+                        quad(at(x, y, z), at(x, b, z), at(a, b, z), at(a, y, z));
+                    }
+                    if !filled_at(i, j, k + 1) {
+                        quad(at(x, y, c), at(a, y, c), at(a, b, c), at(x, b, c));
+                    }
+                    if !filled_at(i, j - 1, k) {
+                        quad(at(x, y, z), at(a, y, z), at(a, y, c), at(x, y, c));
+                    }
+                    if !filled_at(i, j + 1, k) {
+                        quad(at(x, b, z), at(x, b, c), at(a, b, c), at(a, b, z));
+                    }
+                    if !filled_at(i - 1, j, k) {
+                        quad(at(x, y, z), at(x, y, c), at(x, b, c), at(x, b, z));
+                    }
+                    if !filled_at(i + 1, j, k) {
+                        quad(at(a, y, z), at(a, b, z), at(a, b, c), at(a, y, c));
+                    }
+                }
             }
         }
         body
     }
 
-    /// Add a beam between two particles at their current distance, keeping
-    /// `old`'s state when a mesh is rebuilt.
-    fn add_beam(&mut self, a: u32, b: u32, share: f32, edge: bool, old: Option<&Beam>) {
-        let beam = if let Some(old) = old {
-            Beam { a, b, ..*old }
-        } else {
-            let rest = self.positions[a as usize].distance(self.positions[b as usize]);
-            let m = self.material;
-            let scale = |load: f32| load * self.section;
-            Beam {
-                a,
-                b,
-                rest,
-                original: rest,
-                k: m.stiffness * share * self.section / rest.max(1.0e-6),
-                compression: m.compression,
-                strength: if edge || !self.sheet {
-                    Strength {
-                        yield_load: scale(m.strength.yield_load),
-                        break_load: scale(m.strength.break_load),
-                        ductility: m.strength.ductility,
+    /// Tie points, such as a detailed mesh's vertices, to this solid as built:
+    /// [`SoftBody::deformed`] then says where they have gone. Each follows the
+    /// corners of its grid cell, or the particle nearest it outside the solid.
+    pub fn embed(&self, points: &[Vec3]) -> Vec<[(u32, f32); 8]> {
+        let Some(grid) = &self.grid else {
+            return Vec::new();
+        };
+        let [nx, ny] = [grid.cells[0] + 1, grid.cells[1] + 1];
+        let limit = Vec3::new(
+            grid.cells[0] as f32,
+            grid.cells[1] as f32,
+            grid.cells[2] as f32,
+        );
+        (points.iter())
+            .map(|&point| {
+                let local = grid.rotation.conjugate() * (point - grid.center);
+                let cell = ((local + grid.half_extents) / grid.step).clamp(Vec3::ZERO, limit);
+                let base = cell.floor().min(limit - 1.0);
+                let t = cell - base;
+                let mut weights = [(0, 0.0); 8];
+                let mut total = 0.0;
+                for (corner, weight) in weights.iter_mut().enumerate() {
+                    let (dx, dy, dz) = (corner & 1, corner >> 1 & 1, corner >> 2);
+                    let (x, y, z) = (
+                        base.x as u32 + dx as u32,
+                        base.y as u32 + dy as u32,
+                        base.z as u32 + dz as u32,
+                    );
+                    let share = |d: usize, t: f32| if d == 1 { t } else { 1.0 - t };
+                    if let Some(&i) = grid.index.get(&((z * ny + y) * nx + x)) {
+                        let w = share(dx, t.x) * share(dy, t.y) * share(dz, t.z);
+                        *weight = (i, w);
+                        total += w;
+                    }
+                }
+                if total > 1.0e-6 {
+                    for weight in &mut weights {
+                        weight.1 /= total;
                     }
                 } else {
-                    Strength::default()
-                },
-                strain: 0.0,
-                load: 0.0,
-                force: 0.0,
-                edge,
-            }
-        };
-        self.beams.push(beam);
+                    let nearest = (0..self.rest.len() as u32)
+                        .min_by(|&a, &b| {
+                            let d = |i: u32| self.rest[i as usize].distance_squared(point);
+                            d(a).total_cmp(&d(b))
+                        })
+                        .unwrap_or(0);
+                    weights[0] = (nearest, 1.0);
+                }
+                weights
+            })
+            .collect()
     }
 
-    /// Build each particle's beam list.
-    fn index_beams(&mut self) {
-        let mut counts = vec![0u32; self.positions.len() + 1];
-        for beam in &self.beams {
-            counts[beam.a as usize + 1] += 1;
-            counts[beam.b as usize + 1] += 1;
-        }
-        for i in 1..counts.len() {
-            counts[i] += counts[i - 1];
-        }
-        self.offsets = counts.clone();
-        self.entries = vec![0; self.beams.len() * 2];
-        for (index, beam) in self.beams.iter().enumerate() {
-            for end in [beam.a, beam.b] {
-                self.entries[counts[end as usize] as usize] = index as u32;
-                counts[end as usize] += 1;
-            }
-        }
+    /// Where points tied by [`SoftBody::embed`] are now.
+    pub fn deformed(&self, embedding: &[[(u32, f32); 8]]) -> Vec<Vec3> {
+        (embedding.iter())
+            .map(|weights| {
+                (weights.iter()).fold(Vec3::ZERO, |sum, &(i, w)| {
+                    sum + self.positions[i as usize] * w
+                })
+            })
+            .collect()
     }
 
-    /// Duplicate particles the cuts have separated, then make a beam of every
-    /// uncut edge and every fold. `old` holds existing beams by original edge.
-    fn rebuild(&mut self, old: &HashMap<((u32, u32), bool), Beam>) {
+    /// After cuts: drop triangles torn on two edges, duplicate particles the
+    /// cuts have separated, and index what is left.
+    fn rebuild(&mut self) {
         // A triangle torn on two edges holds nothing: leaving it would hang a
         // sliver from the tear.
         let (origin, cuts) = (&self.origin, &self.cuts);
-        self.triangles.retain(|t| {
+        let torn = |t: &[u32; 3]| {
             let cut = |a: u32, b: u32| cuts.contains(&edge(origin[a as usize], origin[b as usize]));
-            let torn = [cut(t[0], t[1]), cut(t[1], t[2]), cut(t[2], t[0])];
-            torn.iter().filter(|&&c| c).count() < 2
+            [cut(t[0], t[1]), cut(t[1], t[2]), cut(t[2], t[0])]
+                .iter()
+                .filter(|&&c| c)
+                .count()
+        };
+        let keep: Vec<bool> = self.triangles.iter().map(|t| torn(t) < 2).collect();
+        let mut index = 0;
+        self.elements.retain(|_| {
+            index += 1;
+            keep[index - 1]
+        });
+        index = 0;
+        self.triangles.retain(|_| {
+            index += 1;
+            keep[index - 1]
         });
         self.split_particles();
-        let key = |origin: &[u32], a: u32, b: u32| edge(origin[a as usize], origin[b as usize]);
-        // Each edge's triangles, by current particles.
+
+        let count = self.positions.len();
+        let corners = (self.triangles.iter().enumerate())
+            .flat_map(|(t, tri)| (0..3).map(move |c| (tri[c], t as u32 * 3 + c as u32)));
+        (self.offsets, self.entries) = index_by_particle(count, corners);
+
+        // Each uncut edge between two triangles is a hinge.
         let mut sides: HashMap<(u32, u32), Vec<u32>> = HashMap::new();
         for (t, tri) in self.triangles.iter().enumerate() {
             for corner in 0..3 {
@@ -704,32 +1007,31 @@ impl SoftBody {
                 sides.entry(edge(a, b)).or_default().push(t as u32);
             }
         }
-        let mut edges: Vec<_> = sides.iter().map(|(&e, t)| (e, t.clone())).collect();
+        let mut edges: Vec<_> = sides.into_iter().filter(|(_, t)| t.len() == 2).collect();
         edges.sort_unstable();
-        self.beams.clear();
-        let bending = self.material.bending;
+        self.hinges.clear();
         for ((a, b), triangles) in edges {
-            let original = key(&self.origin, a, b);
-            if self.cuts.contains(&original) {
-                continue;
-            }
-            self.add_beam(a, b, 1.0, true, old.get(&(original, true)));
-            if bending > 0.0 && triangles.len() == 2 {
-                let opposite = |t: u32| {
-                    let tri = self.triangles[t as usize];
-                    tri.into_iter()
-                        .find(|&v| v != a && v != b)
-                        .expect("a triangle has three corners")
-                };
-                let (p, q) = (opposite(triangles[0]), opposite(triangles[1]));
-                let fold = key(&self.origin, p, q);
-                // Across a tear the two sides can be copies of one particle.
-                if fold.0 != fold.1 {
-                    self.add_beam(p, q, bending, false, old.get(&(fold, false)));
-                }
-            }
+            let opposite = |t: u32| {
+                let tri = self.triangles[t as usize];
+                tri.into_iter()
+                    .find(|&v| v != a && v != b)
+                    .expect("a triangle has three corners")
+            };
+            let (c, d) = (opposite(triangles[0]), opposite(triangles[1]));
+            let from = |i: u32| self.rest[self.origin[i as usize] as usize];
+            let area = self.elements[triangles[0] as usize].area
+                + self.elements[triangles[1] as usize].area;
+            let weights = hinge_weights([from(a), from(b), from(c), from(d)]);
+            let scale = (3.0 * self.material.bending / area).sqrt();
+            self.hinges.push(Hinge {
+                particles: [a, b, c, d],
+                weights: weights.map(|w| w * scale),
+            });
         }
-        self.index_beams();
+        let slots = (self.hinges.iter().enumerate()).flat_map(|(h, hinge)| {
+            (0..4).map(move |s| (hinge.particles[s], h as u32 * 4 + s as u32))
+        });
+        (self.hinge_offsets, self.hinge_entries) = index_by_particle(count, slots);
     }
 
     /// Where cuts have split the triangles around a particle into separate
@@ -784,6 +1086,7 @@ impl SoftBody {
                 let copy = self.positions.len() as u32;
                 self.positions.push(self.positions[v as usize]);
                 self.velocities.push(self.velocities[v as usize]);
+                self.correction.push(self.correction[v as usize]);
                 self.masses.push(share);
                 self.origin.push(self.origin[v as usize]);
                 self.pinned.push(NONE);
@@ -846,24 +1149,22 @@ impl SoftBody {
     pub fn triangles(&self) -> &[[u32; 3]] {
         &self.triangles
     }
-    /// Edges or beams broken so far.
+    /// Edges torn or cracks opened so far.
     pub fn tears(&self) -> usize {
         self.tears
     }
     pub fn pin_count(&self) -> usize {
         self.pins.len()
     }
-    /// The largest permanent strain of any beam or region.
+    /// The largest permanent strain of any region.
     pub fn permanent_strain(&self) -> f32 {
-        let beams = self.beams.iter().map(|b| b.strain);
-        let regions = self.regions.iter().map(|r| r.strain);
-        beams.chain(regions).fold(0.0, f32::max)
+        self.regions.iter().map(|r| r.strain).fold(0.0, f32::max)
     }
     /// Total mass (kg).
     pub fn mass(&self) -> f32 {
         self.masses.iter().sum()
     }
-    /// Separate pieces of surface, counted by shared beams.
+    /// Separate pieces of surface.
     pub fn pieces(&self) -> usize {
         let mut parent: Vec<u32> = (0..self.positions.len() as u32).collect();
         fn find(parent: &mut [u32], mut i: u32) -> u32 {
@@ -873,12 +1174,26 @@ impl SoftBody {
             }
             i
         }
-        if !self.sheet {
-            return 1;
+        for region in &self.regions {
+            for &i in &region.particles {
+                let (a, b) = (find(&mut parent, region.particles[0]), find(&mut parent, i));
+                parent[a as usize] = b;
+            }
         }
-        for beam in self.beams.iter().filter(|b| b.edge) {
-            let (a, b) = (find(&mut parent, beam.a), find(&mut parent, beam.b));
-            parent[a as usize] = b;
+        if !self.sheet {
+            let mut roots: Vec<u32> = (self.regions.iter())
+                .flat_map(|r| r.particles.iter().copied())
+                .map(|i| find(&mut parent, i))
+                .collect();
+            roots.sort_unstable();
+            roots.dedup();
+            return roots.len();
+        }
+        for t in &self.triangles {
+            for corner in 1..3 {
+                let (a, b) = (find(&mut parent, t[0]), find(&mut parent, t[corner]));
+                parent[a as usize] = b;
+            }
         }
         let mut roots: Vec<u32> = (self.triangles.iter().flatten())
             .map(|&i| find(&mut parent, i))
@@ -895,6 +1210,7 @@ impl SoftBody {
 
     /// Advance by `dt`. `pose` gives a pinned body's world point for a point
     /// on it; `None` drops the pin. Returns impulses for rigid bodies.
+    #[allow(clippy::needless_range_loop)]
     pub(crate) fn step(
         &mut self,
         dt: f32,
@@ -919,8 +1235,12 @@ impl SoftBody {
             })
             .map(|(i, _)| i as u32)
             .collect();
+        let carried = self.pins.iter().any(|pin| {
+            let held = pin.body.and_then(|body| pin_target(body, pin.point));
+            held.is_some_and(|(_, owner)| obstacles[owner as usize].awake)
+        });
         if self.asleep {
-            if !near.iter().any(|&i| obstacles[i as usize].awake) {
+            if !carried && !near.iter().any(|&i| obstacles[i as usize].awake) {
                 return;
             }
             self.asleep = false;
@@ -936,6 +1256,25 @@ impl SoftBody {
             .map(|(p, v)| *p + *v * dt + gravity * (dt * dt))
             .collect();
         self.positions.copy_from_slice(&inertial);
+        // A sheet starts from last step's answer to what held it up: at rest
+        // that is nearly this step's too, and the solve has little left to do.
+        if self.sheet {
+            // Only what opposed gravity is sure to repeat. Anything sideways left
+            // by an unfinished solve would feed itself, and the sheet never rest.
+            let fall = gravity * (dt * dt);
+            let down = fall.length_squared();
+            // A particle on a surface needs none: its contact holds it directly,
+            // and it must stay free to slide.
+            let mut touching = vec![false; self.positions.len()];
+            for contact in &self.contacts {
+                touching[contact.particle as usize] = true;
+            }
+            for (i, c) in self.correction.iter().enumerate() {
+                if down > 0.0 && !touching[i] {
+                    self.positions[i] -= fall * (-c.dot(fall) / down).clamp(0.0, 1.0);
+                }
+            }
+        }
 
         // Where each pin wants its particle.
         let mut targets = vec![Vec3::ZERO; self.pins.len()];
@@ -962,7 +1301,15 @@ impl SoftBody {
         for (i, &point) in inertial.iter().enumerate() {
             for &o in near.iter().filter(|o| !owners.contains(o)) {
                 let obstacle = &obstacles[o as usize];
-                if let Some((surface, normal)) = obstacle.nearest(point, reach) {
+                // Swept against the obstacle, so a fast particle meets a thin
+                // wall it would otherwise be past by the end of the step.
+                let path = point - start[i] - obstacle.velocity * dt;
+                let hit = if path.length() > obstacle.narrowest() {
+                    obstacle.sweep(point - path, point, thickness)
+                } else {
+                    obstacle.nearest(point, reach)
+                };
+                if let Some((surface, normal)) = hit {
                     self.contacts.push(Contact {
                         particle: i as u32,
                         obstacle: o,
@@ -975,27 +1322,47 @@ impl SoftBody {
                 }
             }
         }
-        // Contacts by particle: they are sorted by it.
-        let mut first_contact = vec![0u32; self.positions.len() + 1];
-        for contact in &self.contacts {
-            first_contact[contact.particle as usize + 1] += 1;
+        if self.sheet {
+            self.touch_triangles(&inertial, obstacles, &near, &owners, dt);
         }
-        for i in 1..first_contact.len() {
-            first_contact[i] += first_contact[i - 1];
+        for &(particle, normal, offset) in &self.planes {
+            self.contacts.push(Contact {
+                particle,
+                obstacle: NONE,
+                normal,
+                offset,
+                force: 0.0,
+                pushed: 0.0,
+                depth: 0.0,
+            });
         }
-        let caps: Vec<f32> = self.beams.iter().map(Beam::cap).collect();
-        let penalties: Vec<f32> = (self.beams.iter_mut())
-            .map(|beam| {
-                beam.force *= FORCE_MEMORY;
-                // The softer of its two stiffnesses: the multiplier reaches the
-                // stiffer one over a few sweeps, without overshooting.
-                (beam.k * beam.compression).max(beam.k * 0.01)
+        let m = self.material;
+        let membrane = Membrane {
+            shear: m.stiffness / (2.0 * (1.0 + m.poisson)),
+            lame: m.stiffness * m.poisson / (1.0 - m.poisson * m.poisson),
+            compression: m.compression,
+        };
+        // A pin holds as firmly as the sheet, but a rigid body feels it a step
+        // late: too firm for that body's mass, and the two would ring.
+        let pin_stiffness: Vec<f32> = (self.pins.iter().enumerate())
+            .map(|(i, pin)| {
+                let own = PIN_STIFFNESS * self.masses[pin.particle as usize] * scale;
+                let firm = if self.sheet {
+                    m.stiffness.max(own)
+                } else {
+                    own
+                };
+                if owners[i] == NONE {
+                    return firm;
+                }
+                let sharing = owners.iter().filter(|&&o| o == owners[i]).count() as f32;
+                firm.min(0.25 * obstacles[owners[i] as usize].mass * scale / sharing)
+                    .max(own)
             })
             .collect();
-
         let count = self.positions.len();
         let mut pin_pushed = vec![Vec3::ZERO; self.pins.len()];
-        let solid = !self.regions.is_empty();
+        let solid = !self.sheet;
         let mut goals = vec![Vec3::ZERO; if solid { count } else { 0 }];
         let mut shares = vec![0u32; goals.len()];
         let settling = gravity.length() * dt * dt;
@@ -1038,12 +1405,10 @@ impl SoftBody {
                     continue;
                 }
                 // A dynamic body lighter than the solid moves it only so far.
-                let obstacle = &obstacles[contact.obstacle as usize];
                 let local = self.masses[i] * CONTACT_SPREAD;
-                let share = if obstacle.mass > 0.0 {
-                    obstacle.mass / (obstacle.mass + local)
-                } else {
-                    1.0
+                let share = match obstacles.get(contact.obstacle as usize) {
+                    Some(o) if o.mass > 0.0 => o.mass / (o.mass + local),
+                    _ => 1.0,
                 };
                 self.positions[i] -= contact.normal * (gap * share);
                 contact.pushed -= gap * share;
@@ -1055,83 +1420,25 @@ impl SoftBody {
                 contact.force = mass * contact.pushed * scale;
             }
         }
-        for iteration in 0..if solid { 0 } else { ITERATIONS } {
-            // Alternating direction carries load through a mesh both ways.
-            for n in 0..count {
-                let i = if iteration % 2 == 0 { n } else { count - 1 - n };
-                let mass = self.masses[i] * scale;
-                let x = self.positions[i];
-                let mut gradient = (x - inertial[i]) * mass;
-                let mut hessian = Mat3::from_diagonal(Vec3::splat(mass));
-                let entries = &self.entries[self.offsets[i] as usize..self.offsets[i + 1] as usize];
-                for &index in entries {
-                    let beam = &self.beams[index as usize];
-                    let other = if beam.a as usize == i { beam.b } else { beam.a };
-                    let d = x - self.positions[other as usize];
-                    let length = d.length();
-                    if length < 1.0e-7 {
-                        continue;
-                    }
-                    let n = d / length;
-                    let cap = caps[index as usize];
-                    let k = penalties[index as usize];
-                    let force = beam.force_at(length, k, cap);
-                    // A saturated beam gives way: no stiffness holds it. Where few
-                    // beams meet, as on a torn fragment, nothing balances a force,
-                    // and a step on the penalty alone would overshoot by its ratio
-                    // to the true stiffness.
-                    let k = if force.abs() >= cap {
-                        0.0
-                    } else if entries.len() < SUPPORTED_BEAMS {
-                        beam.stiffness(force).max(k)
-                    } else {
-                        k
-                    };
-                    gradient += n * force;
-                    let along = outer(n, n);
-                    hessian += along * k;
-                    if force > 0.0 {
-                        // Tension's geometric stiffness; compression's is not
-                        // positive definite, and left out.
-                        hessian += (Mat3::IDENTITY - along) * (force / length);
-                    }
-                }
-                let pin = self.pinned[i];
-                if pin != NONE {
-                    let k = PIN_STIFFNESS * mass;
-                    gradient += (x - targets[pin as usize]) * k;
-                    hessian += Mat3::from_diagonal(Vec3::splat(k));
-                }
-                let before = x;
-                let mut x = x - solve(hessian, gradient);
-                let (from, to) = (first_contact[i] as usize, first_contact[i + 1] as usize);
-                for contact in &mut self.contacts[from..to] {
-                    // What presses it into the surface is what the surface
-                    // holds back: the block's unbalanced force along the normal.
-                    let touching = contact.normal.dot(before) - contact.offset < 1.0e-4;
-                    contact.force = if touching {
-                        contact.normal.dot(gradient).max(0.0)
-                    } else {
-                        0.0
-                    };
-                    let gap = contact.normal.dot(x) - contact.offset;
-                    contact.depth = (-gap).max(0.0);
-                    if gap < 0.0 {
-                        x -= contact.normal * gap;
-                        contact.pushed -= gap;
-                    }
-                }
-                self.positions[i] = x;
-            }
-            for (index, beam) in self.beams.iter_mut().enumerate() {
-                let (a, b) = (beam.a as usize, beam.b as usize);
-                let length = self.positions[a].distance(self.positions[b]);
-                beam.force = beam.force_at(length, penalties[index], caps[index]);
+        if !solid {
+            self.shear = membrane.shear;
+            self.lame = membrane.lame;
+            self.solve_sheet(
+                &inertial,
+                &start,
+                &targets,
+                &pin_stiffness,
+                &membrane,
+                obstacles,
+                dt,
+            );
+            for i in 0..count {
+                self.correction[i] = self.positions[i] - inertial[i];
             }
         }
 
-        // Friction, then velocities and what the rigid bodies feel.
-        for contact in &self.contacts {
+        // Friction on a solid, then velocities and what the rigid bodies feel.
+        for contact in self.contacts.iter().filter(|c| solid && c.obstacle != NONE) {
             let i = contact.particle as usize;
             let obstacle = &obstacles[contact.obstacle as usize];
             let surface = obstacle.velocity_at(self.positions[i]) * dt;
@@ -1146,26 +1453,6 @@ impl SoftBody {
                 tangent
             };
             self.positions[i] -= slip;
-        }
-        // Beams lose speed along their length: cloth rings at high frequency,
-        // which the multipliers would otherwise keep alive.
-        for beam in self.beams.iter().filter(|_| BEAM_DAMPING > 0.0) {
-            let (a, b) = (beam.a as usize, beam.b as usize);
-            let d = self.positions[a] - self.positions[b];
-            let length = d.length();
-            if length < 1.0e-7 {
-                continue;
-            }
-            let n = d / length;
-            let closing = n.dot((self.positions[a] - start[a]) - (self.positions[b] - start[b]));
-            let (ma, mb) = (self.masses[a], self.masses[b]);
-            let shift = closing * BEAM_DAMPING / (ma + mb);
-            if self.pinned[a] == NONE {
-                self.positions[a] -= n * (shift * mb);
-            }
-            if self.pinned[b] == NONE {
-                self.positions[b] += n * (shift * ma);
-            }
         }
         // Damping acts on motion within the body, not on the body as a whole,
         // which would be air resistance. Cloth has only motion within.
@@ -1187,7 +1474,6 @@ impl SoftBody {
         }
 
         let blend = 1.0 - (-dt / LOAD_TIME).exp();
-        let mut broken = false;
         // What the pins and contacts gave the body, from its change of momentum.
         let mut received = -gravity * (self.mass() * dt);
         for (i, &from) in start.iter().enumerate() {
@@ -1199,7 +1485,7 @@ impl SoftBody {
             let force = if solid {
                 -pin_pushed[i] * (mass * scale)
             } else {
-                (self.positions[particle] - targets[i]) * (PIN_STIFFNESS * mass * scale)
+                (self.positions[particle] - targets[i]) * pin_stiffness[i]
             };
             pin.load += (force.length() - pin.load) * blend;
             received += force * dt;
@@ -1212,11 +1498,45 @@ impl SoftBody {
             }
             gone[i] |= pin.load >= pin.strength;
         }
+        // A solid carrying a rigid body stops it as a crushing structure does:
+        // with its crush strength over the area touching what it hit.
+        if let (true, Some(&owner)) = (solid, owners.iter().find(|&&o| o != NONE)) {
+            let carried = &obstacles[owner as usize];
+            let face = self.grid.as_ref().map_or(0.0, |g| {
+                let s = g.step;
+                (s.x * s.y).min(s.y * s.z).min(s.x * s.z)
+            });
+            let crush = self.material.strength.yield_load * face * dt;
+            let (mut impulse, mut point, mut touching) = (Vec3::ZERO, Vec3::ZERO, 0.0);
+            for contact in self
+                .contacts
+                .iter()
+                .filter(|c| c.pushed > 0.0 && c.obstacle != NONE)
+            {
+                impulse += contact.normal * crush;
+                point += self.positions[contact.particle as usize];
+                touching += 1.0;
+            }
+            if touching > 0.0 {
+                let size = impulse.length().max(1.0e-9);
+                let closing = -carried.velocity.dot(impulse / size);
+                let impulse = impulse * ((closing.max(0.0) * carried.mass).min(size) / size);
+                reactions.push(Reaction {
+                    obstacle: owner,
+                    point: point / touching,
+                    impulse,
+                });
+            }
+        }
         // The rest came from contacts: share it by how hard each pushed.
         let total: f32 = self.contacts.iter().map(|c| c.pushed).sum();
         if total > 0.0 {
             let first = reactions.len();
-            for contact in self.contacts.iter().filter(|c| c.pushed > 0.0) {
+            for contact in self
+                .contacts
+                .iter()
+                .filter(|c| c.pushed > 0.0 && c.obstacle != NONE)
+            {
                 let obstacle = &obstacles[contact.obstacle as usize];
                 if obstacle.mass > 0.0 {
                     reactions.push(Reaction {
@@ -1249,7 +1569,10 @@ impl SoftBody {
                 if size == 0.0 {
                     continue;
                 }
-                let closing = (speed - obstacle.velocity - gravity * dt).dot(impulse / size);
+                // Cloth pressed by a body moves with it, so its speed says nothing
+                // of how fast they close: the body's own speed is the limit.
+                let surface = if solid { speed } else { Vec3::ZERO };
+                let closing = (surface - obstacle.velocity - gravity * dt).dot(impulse / size);
                 // Plus a gentle push out of any overlap left, or a body at rest
                 // would press into a solid for ever.
                 let depth = (self.contacts.iter())
@@ -1282,34 +1605,11 @@ impl SoftBody {
                 self.pinned[pin.particle as usize] = index as u32;
             }
         }
-        for (index, beam) in self.beams.iter_mut().enumerate() {
-            let length = self.positions[beam.a as usize].distance(self.positions[beam.b as usize]);
-            let cap = caps[index];
-            if beam.force.abs() >= cap {
-                // Stretch beyond what the force accounts for is now permanent.
-                let stretch = length - beam.rest;
-                let elastic = beam.force / beam.stiffness(beam.force);
-                let flow = stretch - elastic;
-                if flow * elastic > 0.0 {
-                    beam.rest += flow;
-                    beam.strain += flow.abs() / beam.original.max(1.0e-6);
-                }
-            }
-            beam.load += (beam.force.abs() - beam.load) * blend;
-            let s = beam.strength;
-            if s.break_load.is_finite()
-                && (beam.load >= s.break_load
-                    || (s.yield_load < s.break_load && beam.strain >= s.ductility))
-            {
-                beam.k = -1.0;
-                broken = true;
-            }
-        }
-        if broken {
-            self.break_beams();
+        if self.sheet {
+            self.tear(&membrane, blend);
         }
 
-        if fastest.sqrt() < SLEEP_SPEED && !released {
+        if fastest.sqrt() < SLEEP_SPEED && !released && !carried {
             self.rest_time += dt;
             self.asleep = self.rest_time >= TIME_TO_SLEEP;
         } else {
@@ -1322,11 +1622,12 @@ impl SoftBody {
     /// support, a body shows that much strain across its thickness at rest.
     fn flow_regions(&mut self, settling: f32) {
         let m = self.material;
-        let yield_strain = m.strength.yield_load / m.stiffness;
-        for region in &mut self.regions {
-            if region.strain >= m.strength.ductility {
-                continue;
-            }
+        let (yield_strain, break_strain) = (
+            m.strength.yield_load / m.stiffness,
+            m.strength.break_load / m.stiffness,
+        );
+        let mut overloaded = None;
+        for (index, region) in self.regions.iter_mut().enumerate() {
             let (_, deformation) = region.deformation(&self.positions, &self.masses);
             region.track_rotation(deformation);
             let stretch = Mat3::from_quat(region.rotation).transpose() * deformation;
@@ -1335,8 +1636,24 @@ impl SoftBody {
                 + excess.y_axis.length_squared()
                 + excess.z_axis.length_squared())
             .sqrt();
-            let threshold = yield_strain + 2.0 * settling / region.thickness;
-            if strain > threshold {
+            let allowance = 2.0 * settling / region.thickness;
+            let threshold = yield_strain + allowance;
+            // Past what it can take, a brittle region cracks at once, and a
+            // ductile one once it has run out of ductility.
+            let brittle = m.strength.yield_load >= m.strength.break_load;
+            let spent = if brittle {
+                strain > break_strain + allowance
+            } else {
+                m.strength.break_load.is_finite() && region.strain >= m.strength.ductility
+            };
+            if spent {
+                let worst = overloaded.map_or(0.0, |(_, s, _)| s);
+                if strain > worst {
+                    overloaded = Some((index, strain, excess));
+                }
+                continue;
+            }
+            if !brittle && strain > threshold {
                 let flow = (strain - threshold) / strain;
                 let change = Mat3::IDENTITY + excess * flow;
                 for q in &mut region.rest {
@@ -1346,41 +1663,619 @@ impl SoftBody {
                 region.strain += strain - threshold;
             }
         }
+        if let Some((index, _, excess)) = overloaded {
+            self.crack(index, principal_axis(excess));
+        }
     }
 
-    /// Remove beams marked broken, and tear a sheet along them.
-    fn break_beams(&mut self) {
-        let snapped = self.beams.iter().filter(|b| b.k < 0.0).count();
-        self.tears += snapped;
-        if !self.sheet {
-            self.beams.retain(|b| b.k >= 0.0);
-            self.index_beams();
+    /// Split the regions a crack crosses, so nothing holds its two sides
+    /// together: particles are coupled only through regions. The crack runs
+    /// across the region's largest strain, as far as a region reaches, so a
+    /// long crack grows as each new tip overloads.
+    fn crack(&mut self, region: usize, direction: Vec3) {
+        let (center, _) = self.regions[region].deformation(&self.positions, &self.masses);
+        let normal = self.regions[region].rotation * direction;
+        let reach = (self.regions[region].rest.iter())
+            .fold(0.0f32, |r, q| r.max(q.length_squared()))
+            .sqrt();
+        let positions = &self.positions;
+        let side = |i: u32| normal.dot(positions[i as usize] - center) >= 0.0;
+        let mut split = Vec::new();
+        self.regions.retain_mut(|r| {
+            let members = || r.particles.iter().zip(&r.rest);
+            let near = r
+                .particles
+                .iter()
+                .any(|&i| positions[i as usize].distance(center) <= reach);
+            let ahead = r.particles.iter().filter(|&&i| side(i)).count();
+            if !near || ahead == 0 || ahead == r.particles.len() {
+                return true;
+            }
+            for wanted in [true, false] {
+                let (particles, rest): (Vec<u32>, Vec<Vec3>) = members()
+                    .filter(|(i, _)| side(**i) == wanted)
+                    .map(|(i, q)| (*i, *q))
+                    .unzip();
+                if particles.len() >= 4 {
+                    split.push((particles, rest, r.rotation, r.strain));
+                }
+            }
+            false
+        });
+        for (particles, rest, rotation, strain) in split {
+            self.regions.push(Region::from_rest(
+                particles,
+                rest,
+                rotation,
+                strain,
+                &self.masses,
+            ));
+        }
+        // The surface opens along the crack.
+        self.triangles.retain(|t| {
+            let mixed = side(t[0]) != side(t[1]) || side(t[1]) != side(t[2]);
+            let far = positions[t[0] as usize].distance(center) > reach;
+            !mixed || far
+        });
+        self.tears += 1;
+    }
+
+    /// Contacts for bodies small enough to pass between particles: such a body
+    /// presses the triangle it meets, along its path through the step.
+    fn touch_triangles(
+        &mut self,
+        inertial: &[Vec3],
+        obstacles: &[Obstacle],
+        near: &[u32],
+        owners: &[u32],
+        dt: f32,
+    ) {
+        let thickness = self.material.thickness;
+        let small = self.radius * SMALL_BODY;
+        for &o in near.iter().filter(|o| !owners.contains(o)) {
+            let obstacle = &obstacles[o as usize];
+            let radius = obstacle.radius();
+            if radius > small {
+                continue;
+            }
+            let path = obstacle.velocity * dt;
+            let samples = ((path.length() / radius).ceil() as usize).clamp(1, MAX_SWEEP_SAMPLES);
+            let hit = (0..=samples).find_map(|s| {
+                let center = obstacle.position - path * (1.0 - s as f32 / samples as f32);
+                (self.triangles.iter()).find_map(|t| {
+                    let corners = t.map(|c| inertial[c as usize]);
+                    let closest = closest_on_triangle(center, corners);
+                    let d = closest - center;
+                    (d.length() < radius + thickness).then_some((*t, closest, d, center))
+                })
+            });
+            if let Some((t, closest, d, center)) = hit {
+                // Pressed along its travel, or away from its center if at rest.
+                let normal = path
+                    .try_normalize()
+                    .or(d.try_normalize())
+                    .unwrap_or(Vec3::Z);
+                let depth = radius + thickness - closest.distance(center);
+                for corner in t {
+                    let i = corner as usize;
+                    self.contacts.push(Contact {
+                        particle: corner,
+                        obstacle: o,
+                        normal,
+                        offset: normal.dot(inertial[i]) + depth + path.length(),
+                        force: 0.0,
+                        pushed: 0.0,
+                        depth: 0.0,
+                    });
+                }
+            }
+        }
+    }
+
+    /// One implicit step of a sheet (Baraff and Witkin 1998): Newton iterations,
+    /// each solved by conjugate gradients. Sweeping vertex by vertex cannot do
+    /// this: a stiff sheet's large motions barely change in a few sweeps, and
+    /// more so the finer its mesh.
+    #[allow(clippy::too_many_arguments, clippy::needless_range_loop)]
+    fn solve_sheet(
+        &mut self,
+        inertial: &[Vec3],
+        start: &[Vec3],
+        targets: &[Vec3],
+        pin_stiffness: &[f32],
+        membrane: &Membrane,
+        obstacles: &[Obstacle],
+        dt: f32,
+    ) {
+        let count = self.positions.len();
+        let scale = 1.0 / (dt * dt);
+        let rate = ELEMENT_DAMPING / dt;
+        let contact_stiffness = self.material.stiffness * CONTACT_STIFFNESS;
+        let inertia: Vec<f32> = self.masses.iter().map(|m| m * scale).collect();
+        let mut pin_of = vec![0.0f32; count];
+        for (pin, &k) in self.pins.iter().zip(pin_stiffness) {
+            pin_of[pin.particle as usize] = k;
+        }
+        let mut states = vec![ElementState::default(); self.elements.len()];
+        let mut work = vec![[Vec3::ZERO; 3]; self.elements.len()];
+        for newton in 0..NEWTON_STEPS {
+            let (elements, triangles, positions) =
+                (&self.elements, &self.triangles, &self.positions);
+            states
+                .par_iter_mut()
+                .with_min_len(PARALLEL_CHUNK)
+                .enumerate()
+                .for_each(|(t, state)| {
+                    let (a, b) =
+                        elements[t].deformation(triangles[t].map(|c| positions[c as usize]));
+                    let (stress, firm) = stress(a, b, membrane);
+                    *state = ElementState {
+                        a,
+                        b,
+                        stress,
+                        tension: tension_only(stress),
+                        firm,
+                    };
+                });
+            // Which contacts press, as springs along their normals.
+            let mut contact_of = vec![(Vec3::ZERO, 0.0f32, 0.0f32); count];
+            let mut pressing = vec![Vec3::ZERO; count];
+            let mut deepest = vec![0.0f32; count];
+            for contact in &mut self.contacts {
+                let i = contact.particle as usize;
+                let gap = contact.normal.dot(self.positions[i]) - contact.offset;
+                contact.depth = (-gap).max(0.0);
+                // The deepest of a particle's contacts, so its force and its
+                // stiffness in the solve stay one spring.
+                if gap < 0.0 && contact.depth > deepest[i] {
+                    deepest[i] = contact.depth;
+                    // Friction inside the solve, so the sheet can answer it: a
+                    // spring along the surface that slips at Coulomb's limit.
+                    let n = contact.normal;
+                    let (surface, friction) = match obstacles.get(contact.obstacle as usize) {
+                        Some(o) => (o.velocity_at(self.positions[i]), o.friction),
+                        None => (Vec3::ZERO, 0.0),
+                    };
+                    let moved = self.positions[i] - start[i] - surface * dt;
+                    let slip = moved - n * n.dot(moved);
+                    let limit =
+                        (self.material.friction * friction).sqrt() * contact_stiffness * -gap;
+                    let along = (limit / slip.length().max(1.0e-9)).min(contact_stiffness);
+                    contact_of[i] = (n, contact_stiffness, along);
+                    pressing[i] = n * (contact_stiffness * gap) + slip * along;
+                }
+            }
+
+            // The gradient: inertia, elastic forces, damping, pins, contacts.
+            let moved: Vec<Vec3> = (self.positions.iter().zip(start))
+                .map(|(x, s)| *x - *s)
+                .collect();
+            let mut damping = vec![Vec3::ZERO; count];
+            self.apply_stiffness(&states, &moved, &mut work, &mut damping);
+            let mut forces = vec![[Vec3::ZERO; 3]; self.elements.len()];
+            let (elements, positions) = (&self.elements, &self.positions);
+            forces
+                .par_iter_mut()
+                .with_min_len(PARALLEL_CHUNK)
+                .enumerate()
+                .for_each(|(t, f)| {
+                    let (element, state) = (&elements[t], &states[t]);
+                    let [sxx, syy, sxy] = state.stress;
+                    for c in 0..3 {
+                        let g = element.gradient[c];
+                        let sg = Vec2::new(sxx * g.x + sxy * g.y, sxy * g.x + syy * g.y);
+                        f[c] = (state.a * sg.x + state.b * sg.y) * element.area;
+                    }
+                });
+            let mut gradient = vec![Vec3::ZERO; count];
+            for i in 0..count {
+                let mut sum =
+                    (positions[i] - inertial[i]) * inertia[i] + damping[i] * rate + pressing[i];
+                for &entry in &self.entries[self.offsets[i] as usize..self.offsets[i + 1] as usize]
+                {
+                    sum += forces[(entry / 3) as usize][(entry % 3) as usize];
+                }
+                let hinges = &self.hinge_entries
+                    [self.hinge_offsets[i] as usize..self.hinge_offsets[i + 1] as usize];
+                for &entry in hinges {
+                    let hinge = &self.hinges[(entry / 4) as usize];
+                    let bend = (hinge.particles.iter().zip(&hinge.weights))
+                        .fold(Vec3::ZERO, |b, (&p, &w)| b + positions[p as usize] * w);
+                    sum += bend * hinge.weights[(entry % 4) as usize];
+                }
+                gradient[i] = sum;
+            }
+            for (pin, target) in self.pins.iter().zip(targets) {
+                let i = pin.particle as usize;
+                gradient[i] += (positions[i] - *target) * pin_of[i];
+            }
+
+            // Each particle's own block, to precondition with.
+            let mut diagonal = vec![Vec3::ZERO; count];
+            for (t, element) in self.elements.iter().enumerate() {
+                let state = &states[t];
+                let (a, b) = (state.a, state.b);
+                let [sxx, syy, sxy] = state.tension;
+                for c in 0..3 {
+                    let g = element.gradient[c];
+                    let sg = Vec2::new(sxx * g.x + sxy * g.y, sxy * g.x + syy * g.y);
+                    let along = a * g.x + b * g.y;
+                    let spread = membrane.shear * g.length_squared() * state.firm;
+                    let sum = Vec3::splat(g.dot(sg))
+                        + (a * a + b * b) * spread
+                        + along * along * ((membrane.shear + membrane.lame) * state.firm);
+                    diagonal[self.triangles[t][c] as usize] += sum * element.area;
+                }
+            }
+            for i in 0..count {
+                let (n, k, along) = contact_of[i];
+                diagonal[i] = diagonal[i] * (1.0 + rate)
+                    + Vec3::splat(inertia[i] + pin_of[i] + along)
+                    + n * n * (k - along);
+            }
+
+            // Conjugate gradients on (M/h² + (1 + rate)K + pins + contacts) d = -g.
+            let dot =
+                |a: &[Vec3], b: &[Vec3]| -> f32 { a.iter().zip(b).map(|(x, y)| x.dot(*y)).sum() };
+            let mut delta = vec![Vec3::ZERO; count];
+            let mut residual: Vec<Vec3> = gradient.iter().map(|g| -*g).collect();
+            let precondition = |r: &[Vec3]| -> Vec<Vec3> {
+                r.iter()
+                    .zip(&diagonal)
+                    .map(|(r, d)| *r / d.max(Vec3::splat(1.0e-12)))
+                    .collect()
+            };
+            let mut z = precondition(&residual);
+            let mut direction = z.clone();
+            let mut rz = dot(&residual, &z);
+            let goal = rz * CG_TOLERANCE * CG_TOLERANCE;
+            let mut product = vec![Vec3::ZERO; count];
+            // Stiff modes across a finer mesh take more iterations.
+            let iterations = CG_ITERATIONS + (count as f32).sqrt() as usize / 2;
+            for _ in 0..iterations {
+                if rz <= goal || rz <= 0.0 {
+                    break;
+                }
+                self.apply_stiffness(&states, &direction, &mut work, &mut product);
+                for i in 0..count {
+                    let (n, k, along) = contact_of[i];
+                    product[i] = product[i] * (1.0 + rate)
+                        + direction[i] * (inertia[i] + pin_of[i] + along)
+                        + n * ((k - along) * n.dot(direction[i]));
+                }
+                let curvature = dot(&direction, &product);
+                if curvature <= 0.0 {
+                    break;
+                }
+                let alpha = rz / curvature;
+                for i in 0..count {
+                    delta[i] += direction[i] * alpha;
+                    residual[i] -= product[i] * alpha;
+                }
+                z = precondition(&residual);
+                let next = dot(&residual, &z);
+                let beta = next / rz;
+                rz = next;
+                for i in 0..count {
+                    direction[i] = z[i] + direction[i] * beta;
+                }
+            }
+            for i in 0..count {
+                self.positions[i] += delta[i];
+            }
+            if newton + 1 == NEWTON_STEPS {
+                for contact in &mut self.contacts {
+                    let i = contact.particle as usize;
+                    let gap = contact.normal.dot(self.positions[i]) - contact.offset;
+                    contact.depth = (-gap).max(0.0);
+                    contact.force = contact_stiffness * contact.depth;
+                    contact.pushed = contact.depth;
+                }
+            }
+        }
+    }
+
+    /// `out = K v`: what displacements `v` change the elastic forces by, from
+    /// the elements directly, with no matrix built. Each element works alone,
+    /// then each particle gathers its corners, so both passes run in parallel
+    /// and sum in one order.
+    #[allow(clippy::needless_range_loop)]
+    fn apply_stiffness(
+        &self,
+        states: &[ElementState],
+        v: &[Vec3],
+        work: &mut [[Vec3; 3]],
+        out: &mut [Vec3],
+    ) {
+        let (elements, triangles) = (&self.elements, &self.triangles);
+        let (shear, lame) = (self.shear, self.lame);
+        work.par_iter_mut()
+            .with_min_len(PARALLEL_CHUNK)
+            .enumerate()
+            .for_each(|(t, corners)| {
+                let (element, state) = (&elements[t], &states[t]);
+                let (da, db) = element.deformation(triangles[t].map(|c| v[c as usize]));
+                let (a, b) = (state.a, state.b);
+                let (exx, eyy, exy) = (a.dot(da), b.dot(db), 0.5 * (a.dot(db) + b.dot(da)));
+                let trace = lame * (exx + eyy);
+                let firm = state.firm;
+                let (dxx, dyy, dxy) = (
+                    firm * (2.0 * shear * exx + trace),
+                    firm * (2.0 * shear * eyy + trace),
+                    firm * 2.0 * shear * exy,
+                );
+                let [sxx, syy, sxy] = state.tension;
+                for c in 0..3 {
+                    let g = element.gradient[c];
+                    let sg = Vec2::new(sxx * g.x + sxy * g.y, sxy * g.x + syy * g.y);
+                    let dg = Vec2::new(dxx * g.x + dxy * g.y, dxy * g.x + dyy * g.y);
+                    corners[c] = (da * sg.x + db * sg.y + a * dg.x + b * dg.y) * element.area;
+                }
+            });
+        let (offsets, entries) = (&self.offsets, &self.entries);
+        let (hinge_offsets, hinge_entries, hinges) =
+            (&self.hinge_offsets, &self.hinge_entries, &self.hinges);
+        let work = &*work;
+        out.par_iter_mut()
+            .with_min_len(PARALLEL_CHUNK)
+            .enumerate()
+            .for_each(|(i, value)| {
+                let mut sum = Vec3::ZERO;
+                for &entry in &entries[offsets[i] as usize..offsets[i + 1] as usize] {
+                    sum += work[(entry / 3) as usize][(entry % 3) as usize];
+                }
+                for &entry in
+                    &hinge_entries[hinge_offsets[i] as usize..hinge_offsets[i + 1] as usize]
+                {
+                    let hinge = &hinges[(entry / 4) as usize];
+                    let bend = (hinge.particles.iter().zip(&hinge.weights))
+                        .fold(Vec3::ZERO, |b, (&p, &w)| b + v[p as usize] * w);
+                    sum += bend * hinge.weights[(entry % 4) as usize];
+                }
+                *value = sum;
+            });
+    }
+
+    /// Average each element's largest principal stress, and tear those past
+    /// the material's strength along their edge most nearly across that stress.
+    fn tear(&mut self, membrane: &Membrane, blend: f32) {
+        let strength = self.material.strength.break_load;
+        let mut cuts = Vec::new();
+        for (t, element) in self.elements.iter_mut().enumerate() {
+            let tri = self.triangles[t];
+            let (a, b) = element.deformation(tri.map(|c| self.positions[c as usize]));
+            let ([sxx, syy, sxy], _) = stress(a, b, membrane);
+            let (mean, half) = (0.5 * (sxx + syy), 0.5 * (sxx - syy));
+            let radius = (half * half + sxy * sxy).sqrt();
+            element.load += (mean + radius - element.load) * blend;
+            if element.load < strength {
+                continue;
+            }
+            let load = element.load;
+            let pull = 0.5 * (2.0 * sxy).atan2(sxx - syy);
+            let pull = Vec2::new(pull.cos(), pull.sin());
+            let across = |corner: usize| {
+                let (p, q) = (element.rest[corner], element.rest[(corner + 1) % 3]);
+                (q - p).normalize_or_zero().dot(pull).abs()
+            };
+            let key = |corner: usize| {
+                let (p, q) = (tri[corner], tri[(corner + 1) % 3]);
+                edge(self.origin[p as usize], self.origin[q as usize])
+            };
+            let candidates = (0..3).filter(|&c| !self.cuts.contains(&key(c)));
+            // Tears grow from their tips: an edge touching a cut is preferred.
+            let touches = |c: usize| {
+                let (p, q) = key(c);
+                self.cut_ends.contains(&p) || self.cut_ends.contains(&q)
+            };
+            let score = |c: usize| across(c) - if touches(c) { 0.5 } else { 0.0 };
+            if let Some(best) = candidates.min_by(|&x, &y| score(x).total_cmp(&score(y))) {
+                cuts.push((load, t, key(best)));
+            }
+        }
+        if cuts.is_empty() {
             return;
         }
-        let origin = &self.origin;
-        let key = |b: &Beam| edge(origin[b.a as usize], origin[b.b as usize]);
-        let cuts: Vec<_> = (self.beams.iter()).filter(|b| b.k < 0.0).map(key).collect();
-        let old: HashMap<_, _> = (self.beams.iter())
-            .filter(|b| b.k >= 0.0)
-            .map(|b| ((key(b), b.edge), *b))
-            .collect();
+        // The worst first, and only a few: each cut relieves its neighbours, so
+        // a tear runs from where it started instead of shredding the sheet.
+        cuts.sort_unstable_by(|a, b| b.0.total_cmp(&a.0));
+        cuts.truncate(1 + self.elements.len() / TEARS_PER_STEP);
+        for &(_, t, _) in &cuts {
+            self.elements[t].load = 0.0;
+        }
+        let mut cuts: Vec<_> = cuts.into_iter().map(|(_, _, cut)| cut).collect();
+        cuts.sort_unstable();
+        cuts.dedup();
+        self.tears += cuts.len();
+        for &(a, b) in &cuts {
+            self.cut_ends.insert(a);
+            self.cut_ends.insert(b);
+        }
         self.cuts.extend(cuts);
-        self.rebuild(&old);
+        self.rebuild();
     }
+}
+
+/// The point of a triangle nearest `p` (Ericson, Real-Time Collision Detection).
+fn closest_on_triangle(p: Vec3, [a, b, c]: [Vec3; 3]) -> Vec3 {
+    let (ab, ac, ap) = (b - a, c - a, p - a);
+    let (d1, d2) = (ab.dot(ap), ac.dot(ap));
+    if d1 <= 0.0 && d2 <= 0.0 {
+        return a;
+    }
+    let bp = p - b;
+    let (d3, d4) = (ab.dot(bp), ac.dot(bp));
+    if d3 >= 0.0 && d4 <= d3 {
+        return b;
+    }
+    let vc = d1 * d4 - d3 * d2;
+    if vc <= 0.0 && d1 >= 0.0 && d3 <= 0.0 {
+        return a + ab * (d1 / (d1 - d3));
+    }
+    let cp = p - c;
+    let (d5, d6) = (ab.dot(cp), ac.dot(cp));
+    if d6 >= 0.0 && d5 <= d6 {
+        return c;
+    }
+    let vb = d5 * d2 - d1 * d6;
+    if vb <= 0.0 && d2 >= 0.0 && d6 <= 0.0 {
+        return a + ac * (d2 / (d2 - d6));
+    }
+    let va = d3 * d6 - d5 * d4;
+    if va <= 0.0 && d4 - d3 >= 0.0 && d5 - d6 >= 0.0 {
+        return b + (c - b) * ((d4 - d3) / ((d4 - d3) + (d5 - d6)));
+    }
+    let denominator = 1.0 / (va + vb + vc);
+    a + ab * (vb * denominator) + ac * (vc * denominator)
+}
+
+/// The axis of a matrix's symmetric part with the largest stretch.
+fn principal_axis(m: Mat3) -> Vec3 {
+    let symmetric = (m + m.transpose()) * 0.5;
+    let mut axis = Vec3::new(0.577, 0.578, 0.577);
+    for _ in 0..12 {
+        let next = symmetric * axis;
+        if next.length_squared() < 1.0e-20 {
+            break;
+        }
+        axis = next.normalize();
+    }
+    axis
+}
+
+/// The offsets and values of `(particle, value)` pairs grouped by particle.
+fn index_by_particle(
+    count: usize,
+    pairs: impl Iterator<Item = (u32, u32)> + Clone,
+) -> (Vec<u32>, Vec<u32>) {
+    let mut offsets = vec![0u32; count + 1];
+    for (particle, _) in pairs.clone() {
+        offsets[particle as usize + 1] += 1;
+    }
+    for i in 1..offsets.len() {
+        offsets[i] += offsets[i - 1];
+    }
+    let mut next = offsets.clone();
+    let mut values = vec![0; offsets[count] as usize];
+    for (particle, value) in pairs {
+        values[next[particle as usize] as usize] = value;
+        next[particle as usize] += 1;
+    }
+    (offsets, values)
+}
+
+/// The curvature weights of the hinge on edge `x[0]`, `x[1]`, with opposite
+/// corners `x[2]` and `x[3]` (Bergou et al. 2006).
+fn hinge_weights(x: [Vec3; 4]) -> [f32; 4] {
+    let cotangent = |a: Vec3, b: Vec3| a.dot(b) / a.cross(b).length().max(1.0e-9);
+    let (e0, e1, e2) = (x[1] - x[0], x[2] - x[0], x[3] - x[0]);
+    let (e3, e4) = (x[2] - x[1], x[3] - x[1]);
+    let (c01, c02) = (cotangent(e0, e1), cotangent(e0, e2));
+    let (c03, c04) = (cotangent(-e0, e3), cotangent(-e0, e4));
+    [c03 + c04, c01 + c02, -c01 - c03, -c02 - c04]
 }
 
 fn outer(a: Vec3, b: Vec3) -> Mat3 {
     Mat3::from_cols(a * b.x, a * b.y, a * b.z)
 }
 
-/// `H⁻¹ g`, for the symmetric positive definite block of one particle.
-fn solve(hessian: Mat3, gradient: Vec3) -> Vec3 {
-    let determinant = hessian.determinant();
-    if determinant.abs() > 1.0e-20 {
-        hessian.inverse() * gradient
-    } else {
-        Vec3::ZERO
+/// Find particles of soft bodies about to meet: a sheet and itself, and every
+/// body and the others. Each pair becomes a plane for each particle, so the
+/// solve can carry the load through the whole sheet: a push after it could not.
+/// A sheet's neighbours at rest are left out, as they belong close; so is a
+/// solid from itself, which its regions already hold.
+pub(crate) fn find_pairs(bodies: &mut [SoftBody], gravity: Vec3, dt: f32) {
+    for body in bodies.iter_mut() {
+        body.planes.clear();
     }
+    if bodies.iter().all(|b| b.asleep) || (bodies.len() < 2 && !bodies.iter().any(|b| b.sheet)) {
+        return;
+    }
+    let widest = bodies.iter().fold(0.0f32, |w, b| w.max(b.radius));
+    let fastest = (bodies.iter().flat_map(|b| b.velocities.iter()))
+        .fold(0.0f32, |s, v| s.max(v.length_squared()))
+        .sqrt();
+    let size = 2.0 * widest + 2.0 * (fastest * dt + gravity.length() * dt * dt);
+    if size <= 0.0 {
+        return;
+    }
+    let cell = |p: Vec3| (p / size).floor().as_ivec3().to_array();
+    let mut grid: HashMap<[i32; 3], Vec<(u32, u32)>> = HashMap::new();
+    for (b, body) in bodies.iter().enumerate() {
+        for (i, &p) in body.positions.iter().enumerate() {
+            grid.entry(cell(p)).or_default().push((b as u32, i as u32));
+        }
+    }
+    let mut cells: Vec<_> = grid.keys().copied().collect();
+    cells.sort_unstable();
+    for key in cells {
+        for &(b, i) in &grid[&key] {
+            for dz in -1..=1 {
+                for dy in -1..=1 {
+                    for dx in -1..=1 {
+                        let other = [key[0] + dx, key[1] + dy, key[2] + dz];
+                        let Some(list) = grid.get(&other) else {
+                            continue;
+                        };
+                        for &(c, j) in list {
+                            if (c, j) > (b, i) {
+                                add_pair(
+                                    bodies,
+                                    (b as usize, i as usize),
+                                    (c as usize, j as usize),
+                                    dt,
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// If two particles will come closer than their radii this step, keep each on
+/// its side of a plane between them, nearer the lighter.
+fn add_pair(bodies: &mut [SoftBody], (b, i): (usize, usize), (c, j): (usize, usize), dt: f32) {
+    let reach = bodies[b].radius + bodies[c].radius;
+    if b == c {
+        let body = &bodies[b];
+        let (oi, oj) = (body.origin[i] as usize, body.origin[j] as usize);
+        if !body.sheet || body.rest[oi].distance(body.rest[oj]) < NEIGHBOUR_REACH * reach {
+            return;
+        }
+    }
+    let (pi, pj) = (bodies[b].positions[i], bodies[c].positions[j]);
+    let d = pi - pj;
+    let distance = d.length();
+    if distance < 1.0e-7 {
+        return;
+    }
+    let n = d / distance;
+    let closing = n.dot(bodies[b].velocities[i] - bodies[c].velocities[j]) * dt;
+    if distance + closing >= reach {
+        return;
+    }
+    let weight = |body: &SoftBody, k: usize| {
+        if body.pinned[k] == NONE {
+            1.0 / body.masses[k]
+        } else {
+            0.0
+        }
+    };
+    let (wi, wj) = (weight(&bodies[b], i), weight(&bodies[c], j));
+    if wi + wj <= 0.0 {
+        return;
+    }
+    let split = pj + n * (distance * wj / (wi + wj));
+    let middle = n.dot(split);
+    let (ri, rj) = (reach * wi / (wi + wj), reach * wj / (wi + wj));
+    bodies[b]
+        .planes
+        .push((i as u32, n, middle + ri.min(distance.max(ri * 0.5))));
+    bodies[c]
+        .planes
+        .push((j as u32, -n, -middle + rj.min(distance.max(rj * 0.5))));
 }
 
 #[cfg(test)]
@@ -1388,7 +2283,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn a_cut_across_a_sheet_splits_it_and_no_beam_bridges_the_tear() {
+    fn a_cut_across_a_sheet_splits_it_and_no_hinge_bridges_the_tear() {
         let center = Vec3::ZERO;
         let mut cloth = SoftBody::cloth(
             center,
@@ -1401,21 +2296,29 @@ mod tests {
         let mass = cloth.mass();
         // Every edge between the two middle rows of particles.
         let rows = |i: u32| i / 5;
-        let cuts: Vec<_> = (cloth.beams.iter())
-            .filter(|b| b.edge && rows(b.a).min(rows(b.b)) == 1 && rows(b.a).max(rows(b.b)) == 2)
-            .map(|b| edge(b.a, b.b))
-            .collect();
+        let mut cuts = Vec::new();
+        for t in &cloth.triangles {
+            for c in 0..3 {
+                let (a, b) = (t[c], t[(c + 1) % 3]);
+                if rows(a).min(rows(b)) == 1 && rows(a).max(rows(b)) == 2 {
+                    cuts.push(edge(a, b));
+                }
+            }
+        }
         cloth.cuts.extend(cuts);
-        cloth.rebuild(&HashMap::new());
+        cloth.rebuild();
         assert_eq!(cloth.pieces(), 2);
         assert!(
             (cloth.mass() - mass).abs() < 1.0e-5,
             "mass is shared, not made"
         );
-        for beam in &cloth.beams {
-            let (a, b) = (cloth.origin[beam.a as usize], cloth.origin[beam.b as usize]);
-            assert_ne!(a, b, "a particle is tied to its own copy");
-            assert!(!(rows(a).min(rows(b)) == 1 && rows(a).max(rows(b)) == 2 && beam.edge));
+        for hinge in &cloth.hinges {
+            let origins = hinge.particles.map(|p| cloth.origin[p as usize]);
+            assert!(
+                origins
+                    .iter()
+                    .all(|o| origins.iter().filter(|p| *p == o).count() == 1)
+            );
         }
     }
 }
