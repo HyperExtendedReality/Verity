@@ -43,6 +43,38 @@ known first-frame GPU hang when the experimental GI extension is enabled with
 `--gi`; the notes after the PXTGI section describe the older Bevy implementation
 retained in `legacy/`, not the current Verity API or its supported features.
 
+## Split Radiance Cascades
+
+Each frame traces a budget of receivers into a world cache, merges cascades from
+far to near, and packs directional probes that every pixel reads. Three things
+keep the cost of a frame down:
+
+- `reduce` lists the entries that survive, so `merge` touches only those instead
+  of scanning the whole pool once per level.
+- Entries with no new sample merge every fourth frame. Any change to lights or
+  geometry merges them all.
+- `seed` writes only the fields descriptors use, not whole 272-byte entries.
+
+`Settings::multi_bounce`, on by default, carries light past the first bounce: a
+ray's hit reflects the irradiance last frame's probes hold there. Each bounce
+takes about one trip through the receivers, and hits outside every probe, off
+screen, stay at one bounce.
+
+`examples/sponza_gi.rs --bench=DIR` prints GPU time per pass and saves frames as
+PFM. In code, `SplitRadianceCascades::profile` and `request_capture` do the same.
+Sponza's atrium from `--eye=8,0,2 --target=-6,0,4` at 1280×720 on an RTX 4070
+Laptop GPU, 300 frames after starting:
+
+| Build | Updates | GI, still | GI, moving | Bounced light, mean | Median |
+| --- | --- | --- | --- | --- | --- |
+| Before | 512 | 14.5 ms | 16.6 ms | 0.658 | 0.123 |
+| `Settings::budgeted` | 1024 | 11.0 ms | 11.5 ms | 0.679 | 0.147 |
+| Before, `Settings::default` | 131,072 | 72.7 ms | not recorded | 0.715 | 0.227 |
+| `Settings::default` | 131,072 | 38.5 ms | 48.5 ms | 0.788 | 0.262 |
+
+Bounced light is added luminance × 10⁻³. PXTGI reads 0.835 and 0.417 here, but it
+is not a reference for this scene, so these show change rather than error.
+
 ## PXTGI
 
 PXTGI traces the physics scene rather than a GI scene of its own, and runs none

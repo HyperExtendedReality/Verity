@@ -88,12 +88,9 @@ DiffuseSources diffuseProbePage(uint page, IrradianceLookup lookup) {
     return result;
 }
 
-DiffuseSources diffuseProbeIrradiance(uint slot, IrradianceLookup lookup) {
-    uint page = (params.frame.x & 1u) * probeDirectoryCapacity(params) + slot;
-    return diffuseProbePage(page, lookup);
-}
-
-DiffuseSources diffuseAtLod(float3 position, IrradianceLookup lookup, uint lod) {
+// `previous` reads the probes last frame packed, as `findIrradianceProbe` does.
+DiffuseSources diffuseAtLod(float3 position, IrradianceLookup lookup, uint lod, bool previous,
+                            inout DependencyContext dependency) {
     DiffuseSources result = (DiffuseSources)0;
     float spacingValue = spacing(params, 0u, lod);
     float3 grid = position / spacingValue - 0.5;
@@ -114,9 +111,13 @@ DiffuseSources diffuseAtLod(float3 position, IrradianceLookup lookup, uint lod) 
         if (!(spatialWeight > 0.0)) continue;
         potentialWeight += spatialWeight;
         int4 key = int4(base + int3(bit), int(lod << 18u));
-        uint slot = findIrradianceProbe(key, false);
+        uint slot = findIrradianceProbe(key, previous);
         if (slot == EMPTY) continue;
-        DiffuseSources probe = diffuseProbeIrradiance(slot, lookup);
+        uint page = ((params.frame.x + (previous ? 1u : 0u)) & 1u)
+            * probeDirectoryCapacity(params) + slot;
+        DiffuseSources probe = diffuseProbePage(page, lookup);
+        if (previous) dependencyUnion(dependency, probeDependency(
+            directionalProbes[page].dependencyMin, directionalProbes[page].dependencyMax));
         [unroll] for (uint group = 0u; group < 3u; ++group) {
             uint source = 1u << group;
             if (!transportSourceActive(params, source)) continue;
@@ -167,9 +168,10 @@ float3 resolveSplitDiffuse(float3 position, float3 normal, out float coverage,
     float lodBlend;
     splitLodBlend(position, lowLod, highLod, lodBlend);
     IrradianceLookup lookup = irradianceLookup(normal);
-    DiffuseSources low = diffuseAtLod(position, lookup, lowLod);
+    DependencyContext unused = dependencyEmpty();
+    DiffuseSources low = diffuseAtLod(position, lookup, lowLod, false, unused);
     DiffuseSources high = (DiffuseSources)0;
-    if (highLod != lowLod) high = diffuseAtLod(position, lookup, highLod);
+    if (highLod != lowLod) high = diffuseAtLod(position, lookup, highLod, false, unused);
     else high.coverage = 1.0;
 
     float3 resolved = 0.0;
@@ -202,79 +204,29 @@ float3 resolveSplitDiffuse(float3 position, float3 normal, out float coverage) {
 }
 
 #ifndef GI_COMPOSITE_RESOLVE
-// Trace bindings 8/9 address the completed secondary cache, while binding 12
-// contains its two packed directional pages after the primary pages.
-DiffuseSources secondaryAtLod(float3 position, IrradianceLookup lookup, uint lod,
-                              inout DependencyContext dependency) {
-    DiffuseSources result = (DiffuseSources)0;
-    int4 key = cacheKey(position, 0u, 0u, params, lod);
-    uint capacity = probeDirectoryCapacity(params);
-    uint entryCount, stride;
-    previousEntries.GetDimensions(entryCount, stride);
-    uint slot = probeDirectoryBucket(key, params);
-    [loop] for (uint attempt = 0u; attempt < capacity; ++attempt) {
-        uint index = previousHeads[probeDirectoryHead(0u, slot, params)];
-        if (index == EMPTY) break;
-        if (index != TOMBSTONE && index < entryCount) {
-            Entry entry = previousEntries[index];
-            if (all(entry.key.xyz == key.xyz)
-                && (uint(entry.key.w) & PROBE_LOD) == (uint(key.w) & PROBE_LOD)) {
-                uint page = (2u + ((params.frame.x + 1u) & 1u)) * capacity + slot;
-                if (directionalProbes[page].cacheGeneration.y == 0u
-                    || directionalProbes[page].cacheGeneration.x != params.frame.x - 1u
-                    || any(directionalProbes[page].cacheKey != key)) break;
-                DependencyContext bounds = probeDependency(
-                    directionalProbes[page].dependencyMin, directionalProbes[page].dependencyMax);
-                if (dependencyIntersectsDirty(entryMergedDependency(entry))
-                    || dependencyIntersectsDirty(bounds)) break;
-                result = diffuseProbePage(page, lookup);
-                [unroll] for (uint group = 0u; group < 3u; ++group) {
-                    uint source = 1u << group;
-                    if (!transportSourceActive(params, source) || !(result.coverage[group] > 0.0)
-                        || !radianceHistoryEligible(bounds, unknownLightHitBounds(), source)
-                        || (source == BACKGROUND_SOURCE && !backgroundMotionHistoryAlive(entry.lastSample)))
-                        result.coverage[group] = 0.0;
-                }
-                if (any(result.coverage > 0.0)) dependencyUnion(dependency, bounds);
-                break;
-            }
-        }
-        slot = (slot + 1u) & (capacity - 1u);
-    }
-    return result;
-}
-
-TransportRadiance secondaryFeedback(float3 position, float3 normal,
-                                   inout DependencyContext dependency,
-                                   out float backgroundCoverage) {
+// Further bounces: the irradiance last frame's probes hold at a ray's hit, which
+// the hit reflects. Each frame adds a bounce, and reflectance below one makes the
+// series converge. Hits outside every probe, off screen, keep one bounce.
+TransportRadiance bounceFeedback(float3 position, float3 normal,
+                                 inout DependencyContext dependency,
+                                 out float backgroundCoverage) {
     TransportRadiance result = (TransportRadiance)0;
     backgroundCoverage = 0.0;
-    if (params.environmentScale.y <= 0.5 || params.environmentScale.w <= 0.5) return result;
-    uint low, high; float blend;
+    if (params.cacheTime.z == 0u) return result;
+    uint low, high;
+    float blend;
     splitLodBlendForParameters(position, params, low, high, blend);
-    low = min(low + 2u, MAX_PROBE_LOD);
-    high = min(high + 2u, MAX_PROBE_LOD);
-    if (low == high) blend = 0.0;
     IrradianceLookup lookup = irradianceLookup(normal);
-    DiffuseSources sample = secondaryAtLod(position, lookup, low, dependency);
-    DiffuseSources higher = (DiffuseSources)0;
-    if (high != low) higher = secondaryAtLod(position, lookup, high, dependency);
+    DiffuseSources near = diffuseAtLod(position, lookup, low, true, dependency);
+    DiffuseSources far = (DiffuseSources)0;
+    if (high != low) far = diffuseAtLod(position, lookup, high, true, dependency);
     float coverage;
-    result.background = resolveLodSource(sample.background, sample.coverage.x,
-        higher.background, higher.coverage.x, blend, coverage);
-    backgroundCoverage = coverage;
-    if (!(coverage > 0.0) && higher.coverage.x > 0.0) {
-        result.background = higher.background;
-        backgroundCoverage = higher.coverage.x;
-    }
-    result.emissive = resolveLodSource(sample.emissive, sample.coverage.y,
-        higher.emissive, higher.coverage.y, blend, coverage);
-    if (!(coverage > 0.0) && higher.coverage.y > 0.0)
-        result.emissive = higher.emissive;
-    result.punctual = resolveLodSource(sample.punctual, sample.coverage.z,
-        higher.punctual, higher.coverage.z, blend, coverage);
-    if (!(coverage > 0.0) && higher.coverage.z > 0.0)
-        result.punctual = higher.punctual;
+    result.background = resolveLodSource(near.background, near.coverage.x,
+        far.background, far.coverage.x, blend, backgroundCoverage);
+    result.emissive = resolveLodSource(near.emissive, near.coverage.y,
+        far.emissive, far.coverage.y, blend, coverage);
+    result.punctual = resolveLodSource(near.punctual, near.coverage.z,
+        far.punctual, far.coverage.z, blend, coverage);
     return result;
 }
 

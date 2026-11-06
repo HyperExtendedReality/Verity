@@ -532,6 +532,12 @@ void clear(uint3 thread : SV_DispatchThreadID) {
                 heads[2 * params.size.w + 10u + word].store(0u);
         }
     }
+    if (thread.x < CASCADES) {
+        mergeList[thread.x * 4u].store(0u);
+        mergeList[thread.x * 4u + 1u].store(1u);
+        mergeList[thread.x * 4u + 2u].store(1u);
+        mergeList[thread.x * 4u + 3u].store(0u);
+    }
     if (thread.x == 0u && params.ownerSequence.z != 0u) {
         heads[rootRayOffsetHead(params)].store(0u);
         heads[traceCountHead(params)].store(0u);
@@ -562,6 +568,19 @@ void clear(uint3 thread : SV_DispatchThreadID) {
     }
     // Entries unreachable from a hash head are never read. Avoid clearing the
     // large interval allocation; trace and retain initialize reachable nodes.
+}
+
+// Descriptors are read for these fields only, until a deposit replaces the whole
+// entry. Writing all 272 bytes of two variants and four levels per grid cell made
+// seeding bandwidth bound.
+void storeDescriptor(uint index, int4 key, float4 origin, uint valid, uint next,
+                     uint traced, uint initialized) {
+    entries[index].key = key;
+    entries[index].origin = origin;
+    entries[index].valid = valid;
+    entries[index].next = next;
+    entries[index].samples = 0u;
+    entries[index].padding = uint2(traced, initialized);
 }
 
 uint permuteCandidateDomain(uint value, uint mask, uint seed) {
@@ -743,7 +762,7 @@ void seed(uint3 thread : SV_DispatchThreadID) {
     if (!splitSampleSurface(thread.xy, surfacePosition, geometricNormal)) {
         [unroll] for (uint variant = 0u; variant < 2u; ++variant)
             [unroll] for (uint level = 0u; level < CASCADES; ++level)
-                entries[probeDescriptorIndex(sample, variant, level)] = (Entry)0;
+                storeDescriptor(probeDescriptorIndex(sample, variant, level), 0, 0.0, 0u, 0u, 0u, 0u);
         return;
     }
 
@@ -767,25 +786,18 @@ void seed(uint3 thread : SV_DispatchThreadID) {
     [unroll] for (uint variant = 0u; variant < 2u; ++variant) {
         if (variant == 1u && highLod == lowLod) {
             [unroll] for (uint level = 0u; level < CASCADES; ++level)
-                entries[probeDescriptorIndex(sample, variant, level)] = (Entry)0;
+                storeDescriptor(probeDescriptorIndex(sample, variant, level), 0, 0.0, 0u, 0u, 0u, 0u);
             continue;
         }
         uint lod = variant == 0u ? lowLod : highLod;
         [unroll] for (uint level = 0u; level < CASCADES; ++level) {
             uint index = probeDescriptorIndex(sample, variant, level);
             int4 key = cacheKey(surfacePosition, 0u, level, params, lod);
-            Entry entry = (Entry)0;
-            entry.key = key;
-            entry.origin = float4((float3(key.xyz) + 0.5)
-                * spacing(params, level, lod), 1.0);
-            entry.valid = 1u;
-            entry.next = EMPTY;
             // Each screen update traces once. In an LOD overlap, temporal
             // low-discrepancy assignment balances it between the two fields.
-            entry.padding.x = (level == 0u && eligibleRay && variant == selectedLod)
-                ? 1u : 0u;
-            entry.padding.y = 1u;
-            entries[index] = entry;
+            storeDescriptor(index, key,
+                float4((float3(key.xyz) + 0.5) * spacing(params, level, lod), 1.0),
+                1u, EMPTY, (level == 0u && eligibleRay && variant == selectedLod) ? 1u : 0u, 1u);
         }
     }
     if (selectedRay && !coldPriority && (!secondary || params.sampling.x == 0u))
@@ -1042,6 +1054,8 @@ void retain(uint3 thread : SV_DispatchThreadID) {
                 entry.punctualMerged = 0.0;
         }
         uint slot = capacity + bucketBase + bucketRetained++;
+        // `samples` holds accumulated mass here; reduce restores it if merge skips.
+        entry.identity.x = entry.samples;
         entry.samples = 0;
         entry.valid = params.frame.x | 0x80000000u;
         entry.next = heads[thread.x].exchange(slot);
@@ -1383,6 +1397,25 @@ void traceResolve(uint3 thread : SV_DispatchThreadID) {
     }
 }
 
+// Reduce leaves one canonical entry per key, and only those merge. Listing them
+// here spares merge a scan of the whole 272-byte-strided pool for every level.
+void queueMerge(uint index, uint level) {
+    uint words, stride;
+    mergeList.GetDimensions(words, stride);
+    uint ticket = mergeList[level * 4u + 3u].add(1u);
+    if (ticket % 64u == 0u) mergeList[level * 4u].add(1u);
+    mergeList[MERGE_LIST_HEADER + level * ((words - MERGE_LIST_HEADER) / CASCADES) + ticket]
+        .store(index);
+}
+
+// An entry with no new sample only picks up what changed in farther cascades, so
+// a quarter of them refresh each frame. Changes to light or geometry refresh all.
+bool retainedMergeDue(Entry entry) {
+    return params.sourceHistory.y != 0u || params.dirtyMin.w > 0.0
+        || !(entry.merged.w > 0.0)
+        || ((hashKey(entry.key, 4u) + params.frame.x) & 3u) == 0u;
+}
+
 [shader("compute")]
 [numthreads(64, 1, 1)]
 void reduce(uint3 thread : SV_DispatchThreadID) {
@@ -1459,14 +1492,18 @@ void reduce(uint3 thread : SV_DispatchThreadID) {
             aggregate.normal = freshBetaSegmentSphere;
             entries[source] = aggregate;
             unique = source;
+            queueMerge(source, level);
         } else if (retainedIndex != EMPTY) {
             // The walk only cleared this slot's valid word, which is rewritten below.
             Entry retained = entries[retainedIndex];
             retained.next = unique;
             retained.valid = params.frame.x | 0x80000000u;
-            retained.samples = 0u;
+            bool alive = intervalHistoryAlive(retained.lastSample, params);
+            bool due = alive && retainedMergeDue(retained);
+            retained.samples = alive && !due ? retained.identity.x : 0u;
             entries[source] = retained;
             unique = source;
+            if (due) queueMerge(source, (uint(retained.key.w) >> 12u) & 3u);
         } else {
             entries[source].valid = 0u;
         }
@@ -1726,16 +1763,13 @@ void mergeEntry(uint index) {
 [shader("compute")]
 [numthreads(64, 1, 1)]
 void merge(uint3 thread : SV_DispatchThreadID) {
-    uint index = thread.x * CASCADES + thread.y;
-    // Seed, deposit and reduce store level-L keys only at current descriptors with index % CASCADES == L.
-    if (index < currentCapacity() && thread.y != params.frame.y) return;
-    if (index >= currentCapacity() + cacheHistoryQuota(params) * params.size.w) return;
-    if (entries[index].valid != (params.frame.x | 0x80000000u)
-        || !intervalHistoryAlive(entries[index].lastSample, params)
-        || ((uint(entries[index].key.w) >> 12u) & 3u) != params.frame.y) return;
+    uint level = params.frame.y;
+    if (thread.x >= mergeList[level * 4u + 3u].load()) return;
+    uint words, stride;
+    mergeList.GetDimensions(words, stride);
     // One thread per canonical entry avoids serial ray traversals along a bucket.
-    // Retained physical offsets need not agree with the key's cascade level.
-    mergeEntry(index);
+    mergeEntry(mergeList[MERGE_LIST_HEADER + level * ((words - MERGE_LIST_HEADER) / CASCADES)
+        + thread.x].load());
 }
 
 [shader("compute")]

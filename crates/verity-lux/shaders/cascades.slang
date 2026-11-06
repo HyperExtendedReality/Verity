@@ -18,6 +18,9 @@
 [[vk::binding(10, 0)]] [format("rgba32f")] WTexture2D<float4> irradiance;
 [[vk::binding(11, 0)]] Texture2D<float4> previousIrradiance;
 [[vk::binding(12, 0)]] RWStructuredBuffer<DirectionalProbe> directionalProbes;
+// Per level: dispatch x, y, z and the entry count; then each level's entries.
+[[vk::binding(48, 0)]] RWStructuredBuffer<Atomic<uint>> mergeList;
+static const uint MERGE_LIST_HEADER = 16u;
 [[vk::binding(13, 0)]] Texture2D<float4> currentIrradiance;
 [[vk::binding(14, 0)]] [format("rgba32f")] WTexture2D<float4> historyMetadata;
 [[vk::binding(15, 0)]] Texture2D<float4> previousMetadata;
@@ -232,7 +235,7 @@ TransportRadiance outgoingTransportRadianceTracked(float3 origin, float3 directi
     float indirectBackgroundCoverage = 0.0;
     TransportRadiance indirect = (TransportRadiance)0;
     if (!rtgiDirectOnly)
-        indirect = secondaryFeedback(position, normal, dependency, indirectBackgroundCoverage);
+        indirect = bounceFeedback(position, normal, dependency, indirectBackgroundCoverage);
     bool skyFromCache = cachedHitSky(params) && indirectBackgroundCoverage > 0.0;
     bool emissiveSupported, environmentSupported = true, conventionalSupported;
     float3 emissiveNee = emissiveResponseTracked(position, normal, geometricNormal, view,

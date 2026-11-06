@@ -112,6 +112,7 @@ const MAIN_BINDINGS: &[(u32, D)] = &[
     (45, D::STORAGE_BUFFER),
     (46, D::STORAGE_BUFFER),
     (47, D::SAMPLED_IMAGE),
+    (48, D::STORAGE_BUFFER),
 ];
 /// composite.slang's set 0, both passes.
 const COMPOSITE_BINDINGS: &[(u32, D)] = &[
@@ -189,6 +190,7 @@ struct View {
     entries: Buffer,
     history: Buffer,
     probes: Buffer,
+    merge_list: Buffer,
     /// RTGI buffers the shaders declare; one placeholder each.
     rtgi: [Buffer; 5],
     irradiance: [Image; 4],
@@ -644,6 +646,12 @@ impl SplitRadianceCascades {
             storage,
             MemoryLocation::GpuOnly,
         )?;
+        let merge_list = buffer(
+            "gi merge list",
+            merge_list_bytes(samples, buckets),
+            storage | vk::BufferUsageFlags::INDIRECT_BUFFER,
+            MemoryLocation::GpuOnly,
+        )?;
         let rtgi =
             [(); 5].map(|()| buffer("gi rtgi placeholder", 256, storage, MemoryLocation::GpuOnly));
         let rtgi = rtgi
@@ -764,6 +772,7 @@ impl SplitRadianceCascades {
             entries,
             history,
             probes,
+            merge_list,
             rtgi,
             irradiance,
             metadata,
@@ -840,6 +849,7 @@ impl SplitRadianceCascades {
                     (45, Res::Buffer(view.rtgi[3].buffer)),
                     (46, Res::Buffer(view.rtgi[4].buffer)),
                     (47, placeholder),
+                    (48, Res::Buffer(view.merge_list.buffer)),
                 ]
             };
             let (irr, meta, bg) = (&view.irradiance, &view.metadata, &view.background);
@@ -955,7 +965,7 @@ impl SplitRadianceCascades {
         let buffers = view
             .heads
             .into_iter()
-            .chain([view.entries, view.history, view.probes])
+            .chain([view.entries, view.history, view.probes, view.merge_list])
             .chain(view.rtgi)
             .chain(view.lights)
             .chain(view.uniforms.into_iter().flatten());
@@ -1098,7 +1108,12 @@ impl SplitRadianceCascades {
                 quota,
                 sparse_candidate_phase_word(phase, first || camera_changed, false),
             ],
-            cache_time: [self.started.elapsed().as_millis() as u32, u32::MAX, 0, 0],
+            cache_time: [
+                self.started.elapsed().as_millis() as u32,
+                u32::MAX,
+                u32::from(settings.multi_bounce),
+                0,
+            ],
             ..Parameters::default()
         };
         for (index, uniform) in view.uniforms[slot].iter_mut().enumerate() {
@@ -1119,9 +1134,13 @@ impl SplitRadianceCascades {
             let barrier = [vk::MemoryBarrier2::default()
                 .src_stage_mask(S::COMPUTE_SHADER | S::TRANSFER)
                 .src_access_mask(A::SHADER_WRITE | A::TRANSFER_WRITE)
-                .dst_stage_mask(S::COMPUTE_SHADER | S::TRANSFER)
+                .dst_stage_mask(S::COMPUTE_SHADER | S::TRANSFER | S::DRAW_INDIRECT)
                 .dst_access_mask(
-                    A::SHADER_READ | A::SHADER_WRITE | A::TRANSFER_READ | A::TRANSFER_WRITE,
+                    A::SHADER_READ
+                        | A::SHADER_WRITE
+                        | A::TRANSFER_READ
+                        | A::TRANSFER_WRITE
+                        | A::INDIRECT_COMMAND_READ,
                 )];
             device.cmd_pipeline_barrier2(
                 cmd,
@@ -1169,7 +1188,7 @@ impl SplitRadianceCascades {
             for buffer in view
                 .heads
                 .iter()
-                .chain([&view.entries, &view.history, &view.probes])
+                .chain([&view.entries, &view.history, &view.probes, &view.merge_list])
                 .chain(&view.rtgi)
             {
                 device.cmd_fill_buffer(cmd, buffer.buffer, 0, vk::WHOLE_SIZE, 0);
@@ -1234,7 +1253,6 @@ impl SplitRadianceCascades {
             * DEFERRED_VISIBILITY_QUERIES
             * u64::from(TRACE_MAX_LANE_STRIDE);
         let work = cache_work_slots(samples);
-        let entry_count = work + CACHE_HISTORY_PER_BUCKET * u64::from(view.buckets);
         let (pack_x, pack_y) =
             pack_probe_dispatch_groups(samples).ok_or("receiver grid too large")?;
 
@@ -1269,12 +1287,19 @@ impl SplitRadianceCascades {
         dispatch("retain", compute[0], bucket_groups, 1);
         dispatch("reduce", compute[0], bucket_groups, 1);
         for level in (0..LEVELS).rev() {
-            dispatch(
-                "merge",
-                compute[level],
-                entry_count.div_ceil(64 * LEVELS as u64) as u32,
-                LEVELS as u32,
+            passes.set(passes.get() + 1);
+            if passes.get() > limit {
+                continue;
+            }
+            device.cmd_bind_pipeline(
+                cmd,
+                vk::PipelineBindPoint::COMPUTE,
+                pipelines.passes["merge"],
             );
+            bind(pipelines.layout, compute[level]);
+            device.cmd_dispatch_indirect(cmd, view.merge_list.buffer, level as u64 * 16);
+            compute_barrier();
+            stamp("merge");
         }
         dispatch(
             "seedProbes",

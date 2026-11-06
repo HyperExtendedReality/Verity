@@ -7,7 +7,7 @@
 //! `--bench=DIR` measures instead of viewing: from a fixed camera it warms up,
 //! prints each pass's mean GPU time, saves consecutive frames to `DIR` as PFM,
 //! then does the same along a moving camera. `--size=WxH`, `--warm=N`,
-//! `--eye=X,Y,Z`, `--target=X,Y,Z` and `--uncapped` adjust it, `--no-gi-light`
+//! `--eye=X,Y,Z`, `--target=X,Y,Z`, `--updates=N` and `--uncapped` adjust it, `--no-gi-light`
 //! saves direct light alone, and `--pxtgi` runs PXTGI to compare against.
 use glam::Vec3;
 use std::{collections::HashMap, path::Path, sync::Arc, time::Instant};
@@ -168,6 +168,11 @@ impl ApplicationHandler for Viewer {
                 } else {
                     Settings::budgeted()
                 };
+                if let Some(updates) = arg("updates") {
+                    settings.sampling.max_updates_per_frame = updates.parse().expect("--updates=N");
+                    settings.sampling.max_traversal_queries =
+                        settings.sampling.max_updates_per_frame * 32;
+                }
                 if flag("--no-gi-light") {
                     settings.intensity = 0.0;
                 }

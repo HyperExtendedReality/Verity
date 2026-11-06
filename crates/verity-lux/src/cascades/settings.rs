@@ -15,6 +15,8 @@ pub const CACHE_HISTORY_PER_BUCKET: u64 = 4;
 pub const SPARSE_HISTORY_RESET_FLAG: u32 = 1 << 31;
 pub const SPARSE_UPDATES_DISABLED_FLAG: u32 = 1 << 30;
 pub const TRACE_MAX_LANE_STRIDE: u32 = 8;
+/// Words before the first merge list; `MERGE_LIST_HEADER` in cascades.slang.
+pub const MERGE_LIST_HEADER: u64 = 16;
 const COLD_RANK_PHASES: [usize; 3] = [1, 2, 3];
 const PACK_PROBE_GROUPS_PER_ROW: u64 = 256;
 const HISTORY_DIAGNOSTIC_WORDS: u64 = 26;
@@ -52,6 +54,8 @@ pub struct Settings {
     pub history_frames: u32,
     pub spatial_filter_steps: u32,
     pub emissive_samples: u32,
+    /// Carry light past the first bounce, through last frame's probes.
+    pub multi_bounce: bool,
 }
 
 impl Default for Settings {
@@ -71,6 +75,7 @@ impl Default for Settings {
             history_frames: 24,
             spatial_filter_steps: 3,
             emissive_samples: 16,
+            multi_bounce: true,
         }
     }
 }
@@ -96,8 +101,8 @@ impl Settings {
         Self {
             sampling: Sampling {
                 max_cache_entries: 262_144,
-                max_updates_per_frame: 512,
-                max_traversal_queries: 16_384,
+                max_updates_per_frame: 1024,
+                max_traversal_queries: 32_768,
                 ..Sampling::default()
             },
             ..Self::default()
@@ -229,6 +234,12 @@ pub fn cache_work_slots(samples: u64) -> u64 {
 
 pub fn cache_entry_bytes(samples: u64, buckets: u64) -> u64 {
     (cache_work_slots(samples) + buckets * CACHE_HISTORY_PER_BUCKET) * ENTRY_SIZE
+}
+
+/// A dispatch and a count per level, then room for every entry on each level.
+pub fn merge_list_bytes(samples: u64, buckets: u64) -> u64 {
+    let entries = cache_work_slots(samples) + buckets * CACHE_HISTORY_PER_BUCKET;
+    (MERGE_LIST_HEADER + LEVELS as u64 * entries) * 4
 }
 
 pub fn cache_bucket_count(samples: u64, settings: &Settings) -> u64 {
