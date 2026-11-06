@@ -8,14 +8,15 @@
 //! prints each pass's mean GPU time, saves consecutive frames to `DIR` as PFM,
 //! then does the same along a moving camera. `--size=WxH`, `--warm=N`,
 //! `--eye=X,Y,Z`, `--target=X,Y,Z`, `--updates=N` and `--uncapped` adjust it, `--no-gi-light`
-//! saves direct light alone, and `--pxtgi` runs PXTGI to compare against.
+//! saves direct light alone, and `--pxtgi` and `--voxel` run those methods instead.
 use glam::Vec3;
 use std::{collections::HashMap, path::Path, sync::Arc, time::Instant};
 use verity_core::World;
 use verity_lux::{
     Lux, Method,
     cascades::{SplitRadianceCascades, settings::Settings},
-    pxtgi::{Capture, Pxtgi, PxtgiSettings},
+    pxtgi::{Capture, PxtgiSettings},
+    voxel::ScreenVoxelSettings,
 };
 use verity_render::{Renderer, Sun};
 use winit::{
@@ -178,6 +179,8 @@ impl ApplicationHandler for Viewer {
                 }
                 let mut lux = Lux::new(if flag("--pxtgi") {
                     Method::Pxtgi(PxtgiSettings::default())
+                } else if flag("--voxel") {
+                    Method::ScreenVoxel(ScreenVoxelSettings::default())
                 } else {
                     Method::SplitRadianceCascades(settings)
                 });
@@ -249,24 +252,16 @@ impl ApplicationHandler for Viewer {
                 self.frames += 1;
                 if let Some(bench) = &mut self.bench {
                     let lux = renderer.extension_mut::<Lux>().expect("GI is installed");
-                    let done = if let Some(cascades) = lux.method_mut::<SplitRadianceCascades>() {
-                        let finished = cascades.take_capture();
-                        let (done, capture) = bench.advance(cascades.pass_times(), finished);
-                        if capture {
-                            cascades.request_capture();
-                        }
-                        done
-                    } else {
-                        let time = lux.gpu_time().map(|t| ("pxtgi", t.as_secs_f32() * 1e3));
-                        let pxtgi = lux.method_mut::<Pxtgi>().unwrap();
-                        let finished = pxtgi.take_capture();
-                        let times: Vec<_> = time.into_iter().collect();
-                        let (done, capture) = bench.advance(&times, finished);
-                        if capture {
-                            pxtgi.request_capture();
-                        }
-                        done
+                    let finished = lux.take_capture();
+                    let time = lux.gpu_time().map(|t| ("all", t.as_secs_f32() * 1e3));
+                    let times = match lux.method_mut::<SplitRadianceCascades>() {
+                        Some(cascades) => cascades.pass_times().to_vec(),
+                        None => time.into_iter().collect(),
                     };
+                    let (done, capture) = bench.advance(&times, finished);
+                    if capture {
+                        lux.request_capture();
+                    }
                     if done {
                         event_loop.exit();
                     }

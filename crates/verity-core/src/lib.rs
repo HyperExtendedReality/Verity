@@ -114,6 +114,8 @@ pub enum LightingMethod {
     SplitRadianceCascades,
     /// PXTGI: GI traced against the physics scene.
     Pxtgi,
+    /// GI traced along the depth buffer, then through a voxel copy of the scene.
+    ScreenVoxel,
 }
 
 /// Scene-wide ambient lighting, expressed as linear RGB radiance.

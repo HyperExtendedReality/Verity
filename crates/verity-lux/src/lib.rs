@@ -4,6 +4,7 @@
 //!
 //! - [`cascades`], Split Radiance Cascades, which traces a GI scene of its own.
 //! - [`pxtgi`], which traces the physics scene.
+//! - [`voxel`], which traces the screen, then a voxel copy of the scene.
 //!
 //! The editor offers whatever [`METHODS`] lists. To add a method, implement
 //! [`GiMethod`] for it, add a [`Method`] variant and a row in [`METHODS`], and
@@ -16,13 +17,15 @@
 pub mod cascades;
 pub mod pxtgi;
 mod shared;
+pub mod voxel;
 
 use cascades::SplitRadianceCascades;
-use pxtgi::{Pxtgi, PxtgiSettings};
+use pxtgi::{Capture, Pxtgi, PxtgiSettings};
 use std::{
     any::Any,
     time::{Duration, Instant},
 };
+use voxel::{ScreenVoxel, ScreenVoxelSettings};
 use verity_core::{LightingMethod, World};
 use verity_physics::PhysicsWorld;
 use verity_render::{
@@ -61,12 +64,21 @@ pub trait GiMethod: RenderExtension {
     fn gpu_time(&self) -> Option<Duration> {
         None
     }
+
+    /// Read back the next frame's HDR image, if the method can.
+    fn request_capture(&mut self) {}
+
+    /// The capture asked for, once the GPU has finished it.
+    fn take_capture(&mut self) -> Option<Capture> {
+        None
+    }
 }
 
 /// A [`GiMethod`] to run, with its settings.
 pub enum Method {
     SplitRadianceCascades(cascades::settings::Settings),
     Pxtgi(PxtgiSettings),
+    ScreenVoxel(ScreenVoxelSettings),
 }
 
 /// What an application shows of a method.
@@ -94,6 +106,12 @@ pub const METHODS: &[MethodInfo] = &[
         about: "Rays through the physics scene, which follows bodies as they move.",
         method: || Method::Pxtgi(PxtgiSettings::default()),
     },
+    MethodInfo {
+        lighting: LightingMethod::ScreenVoxel,
+        name: "Screen and voxel GI",
+        about: "Rays along the depth buffer, then through a voxel copy of the scene.",
+        method: || Method::ScreenVoxel(ScreenVoxelSettings::default()),
+    },
 ];
 
 /// The [`MethodInfo`] of a scene's lighting, if it uses GI.
@@ -114,6 +132,7 @@ impl Lux {
                 Box::new(SplitRadianceCascades::new(settings))
             }
             Method::Pxtgi(settings) => Box::new(Pxtgi::new(settings)),
+            Method::ScreenVoxel(settings) => Box::new(ScreenVoxel::new(settings)),
         };
         Self { method }
     }
@@ -139,6 +158,16 @@ impl Lux {
 
     pub fn gpu_time(&self) -> Option<Duration> {
         self.method.gpu_time()
+    }
+
+    /// Read back the next frame's HDR image, if the method can.
+    pub fn request_capture(&mut self) {
+        self.method.request_capture();
+    }
+
+    /// The capture asked for, once the GPU has finished it.
+    pub fn take_capture(&mut self) -> Option<Capture> {
+        self.method.take_capture()
     }
 
     /// The running method, if it is a `T`, for what only that method offers.

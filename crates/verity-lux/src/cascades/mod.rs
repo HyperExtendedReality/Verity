@@ -19,7 +19,7 @@ use self::{
 };
 use crate::{
     GiMethod, GiStatus,
-    pxtgi::Capture,
+    pxtgi::{Capture, Readback},
     shared::{Patch, Res, upload, upload_ranges, write_set},
 };
 use ash::vk;
@@ -163,14 +163,6 @@ struct PassTimer {
     stamped: [Vec<&'static str>; SLOTS],
     /// Milliseconds per pass in the latest finished frame, repeats summed.
     times: Vec<(&'static str, f32)>,
-}
-
-/// A capture on its way back from the GPU.
-struct Readback {
-    buffer: Buffer,
-    frame: u64,
-    width: u32,
-    height: u32,
 }
 
 struct Pipelines {
@@ -1357,6 +1349,15 @@ impl SplitRadianceCascades {
             compute_barrier();
             stamp(name);
         }
+        if capturing {
+            let host = [vk::MemoryBarrier2::default()
+                .src_stage_mask(S::COMPUTE_SHADER)
+                .src_access_mask(A::SHADER_WRITE)
+                .dst_stage_mask(S::HOST)
+                .dst_access_mask(A::HOST_READ)];
+            device
+                .cmd_pipeline_barrier2(cmd, &vk::DependencyInfo::default().memory_barriers(&host));
+        }
         // Publish the world cache once composition is done reading it: without
         // this, next frame's history heads point at stale working entries and
         // every interval restarts from a single noisy sample.
@@ -1377,6 +1378,14 @@ impl GiMethod for SplitRadianceCascades {
     fn gpu_time(&self) -> Option<std::time::Duration> {
         let total: f32 = self.pass_times().iter().map(|(_, ms)| ms).sum();
         (total > 0.0).then(|| std::time::Duration::from_secs_f32(total * 1e-3))
+    }
+
+    fn request_capture(&mut self) {
+        SplitRadianceCascades::request_capture(self);
+    }
+
+    fn take_capture(&mut self) -> Option<Capture> {
+        SplitRadianceCascades::take_capture(self)
     }
 }
 

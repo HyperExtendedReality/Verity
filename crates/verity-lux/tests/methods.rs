@@ -4,7 +4,11 @@ use verity_lux::{Lux, METHODS, Method, method_info, pxtgi::Pxtgi};
 
 #[test]
 fn every_gi_lighting_method_has_a_method() {
-    for lighting in [LightingMethod::SplitRadianceCascades, LightingMethod::Pxtgi] {
+    for lighting in [
+        LightingMethod::SplitRadianceCascades,
+        LightingMethod::Pxtgi,
+        LightingMethod::ScreenVoxel,
+    ] {
         let info = method_info(lighting).expect("a method");
         assert_eq!(info.lighting, lighting);
         assert!(Lux::for_lighting(lighting).is_some());

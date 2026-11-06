@@ -8,6 +8,7 @@ hemisphere ambient belong to `verity-render`; they do not require Lux.
 | --- | --- | --- |
 | Split Radiance Cascades | `cascades` | A GI scene of its own |
 | PXTGI | `pxtgi` | The physics scene |
+| Screen and voxel GI | `voxel` | The depth buffer, then a voxel copy of the scene |
 
 Install `Lux` with `Renderer::set_extension` before loading the geometry that
 should take part:
@@ -74,6 +75,30 @@ Laptop GPU, 300 frames after starting:
 
 Bounced light is added luminance × 10⁻³. PXTGI reads 0.835 and 0.417 here, but it
 is not a reference for this scene, so these show change rather than error.
+
+## Screen and voxel GI
+
+A ray follows the depth buffer and takes its light from last frame's image. Past
+what the screen shows, it walks a 128³ grid of voxels fitted to the loaded scenes.
+Each frame a quarter of the voxels update their direct light and send one bounce
+ray, so light bounces further over time. History and filtering are PXTGI's, shared
+through `shaders/screen_gi.slang`.
+
+Sponza's atrium from the view above: 0.71 ms, against 11.0 ms for Split and 6.2 ms
+for PXTGI, with bounced light of 0.574 mean and 0.266 median. That is one view on
+one device, and no reference has been compared yet.
+
+This is a first version, and these are its limits:
+
+- Scenes voxelize on the CPU as they load, and the whole grid rebuilds with each
+  scene loaded.
+- Terrain and other retained meshes are not voxelized, and neither are moving
+  bodies, so they appear only through the screen rays.
+- One grid covers everything, so cells grow with the scene: about a quarter metre
+  in Sponza, and too coarse for a landscape. There are no clipmaps yet.
+- A voxel's colour is its material's mean colour, and materials have no emission.
+- History does not react when a light changes, so light that has bounced more
+  than once catches up over a few seconds.
 
 ## PXTGI
 

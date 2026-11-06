@@ -115,7 +115,7 @@ const SCENE_BINDINGS: &[(u32, D)] = &[
     (13, D::STORAGE_BUFFER),
 ];
 /// Set 1: one pass's inputs and outputs.
-const IO_BINDINGS: &[(u32, D)] = &[
+pub(crate) const IO_BINDINGS: &[(u32, D)] = &[
     (0, D::SAMPLED_IMAGE),
     (1, D::SAMPLED_IMAGE),
     (2, D::SAMPLED_IMAGE),
@@ -201,33 +201,33 @@ impl Default for PxtgiSettings {
 /// `Frame` in pxtgi.slang.
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
-struct FrameData {
-    clip_from_world: [[f32; 4]; 4],
-    world_from_clip: [[f32; 4]; 4],
-    prev_clip_from_world: [[f32; 4]; 4],
-    camera: [f32; 4],
-    sizes: [u32; 4],
-    origin: [u32; 4],
-    misc: [f32; 4],
-    sun_direction: [f32; 4],
-    sun_color: [f32; 4],
-    sky: [f32; 4],
-    ground: [f32; 4],
-    counts: [u32; 4],
-    cache: [u32; 4],
-    extra: [f32; 4],
-    reflection: [f32; 4],
-    fade: [f32; 4],
-    moved_min: [[f32; 4]; MAX_MOVED],
-    moved_max: [[f32; 4]; MAX_MOVED],
+pub(crate) struct FrameData {
+    pub(crate) clip_from_world: [[f32; 4]; 4],
+    pub(crate) world_from_clip: [[f32; 4]; 4],
+    pub(crate) prev_clip_from_world: [[f32; 4]; 4],
+    pub(crate) camera: [f32; 4],
+    pub(crate) sizes: [u32; 4],
+    pub(crate) origin: [u32; 4],
+    pub(crate) misc: [f32; 4],
+    pub(crate) sun_direction: [f32; 4],
+    pub(crate) sun_color: [f32; 4],
+    pub(crate) sky: [f32; 4],
+    pub(crate) ground: [f32; 4],
+    pub(crate) counts: [u32; 4],
+    pub(crate) cache: [u32; 4],
+    pub(crate) extra: [f32; 4],
+    pub(crate) reflection: [f32; 4],
+    pub(crate) fade: [f32; 4],
+    pub(crate) moved_min: [[f32; 4]; MAX_MOVED],
+    pub(crate) moved_max: [[f32; 4]; MAX_MOVED],
 }
 
 /// `Light` in pxtgi.slang.
 #[repr(C)]
 #[derive(Clone, Copy, Default, Pod, Zeroable)]
-struct GpuLight {
-    position: [f32; 4],
-    color: [f32; 4],
+pub(crate) struct GpuLight {
+    pub(crate) position: [f32; 4],
+    pub(crate) color: [f32; 4],
 }
 
 /// `Primitive` in pxtgi.slang.
@@ -257,11 +257,11 @@ struct SlotScene {
 }
 
 /// A capture on its way back from the GPU.
-struct Readback {
-    buffer: Buffer,
-    frame: u64,
-    width: u32,
-    height: u32,
+pub(crate) struct Readback {
+    pub(crate) buffer: Buffer,
+    pub(crate) frame: u64,
+    pub(crate) width: u32,
+    pub(crate) height: u32,
 }
 
 /// The scene as the shaders read it.
@@ -1336,6 +1336,14 @@ impl GiMethod for Pxtgi {
 
     fn gpu_time(&self) -> Option<std::time::Duration> {
         self.gpu_time
+    }
+
+    fn request_capture(&mut self) {
+        Pxtgi::request_capture(self);
+    }
+
+    fn take_capture(&mut self) -> Option<Capture> {
+        Pxtgi::take_capture(self)
     }
 }
 

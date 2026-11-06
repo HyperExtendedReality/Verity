@@ -43,6 +43,11 @@ const PXTGI_ENTRIES: &[&str] = &[
     "capture",
 ];
 
+/// The screen and voxel method's compute passes, all in `voxel.slang`.
+const VOXEL_ENTRIES: &[&str] = &[
+    "inject", "trace", "temporal", "atrous1", "atrous2", "atrous4", "composite", "capture",
+];
+
 /// Writes `OUT_DIR/{file}.{entry}.spv` for each entry point, compiling in
 /// parallel; the transport shaders are large.
 fn main() {
@@ -66,6 +71,11 @@ fn main() {
         PXTGI_ENTRIES
             .iter()
             .map(|&entry| ("pxtgi", entry, SlangStage::Compute)),
+    );
+    jobs.extend(
+        VOXEL_ENTRIES
+            .iter()
+            .map(|&entry| ("voxel", entry, SlangStage::Compute)),
     );
     let compiler = SlangCompiler::default().with_source_root("shaders");
     let failures: Vec<String> = thread::scope(|scope| {
