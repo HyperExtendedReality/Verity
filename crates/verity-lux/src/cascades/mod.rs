@@ -19,13 +19,14 @@ use self::{
 };
 use crate::{
     GiMethod, GiStatus,
+    pxtgi::Capture,
     shared::{Patch, Res, upload, upload_ranges, write_set},
 };
 use ash::vk;
-use std::ops::Range;
 use bytemuck::{Pod, Zeroable};
 use glam::{Mat4, Vec3};
 use gpu_allocator::MemoryLocation;
+use std::ops::Range;
 use std::{collections::HashMap, ffi::CString, mem, time::Instant};
 use verity_render::{
     FrameContext, Gpu, RenderExtension, RetainedChange, Targets,
@@ -72,6 +73,7 @@ const PASSES: &[(&str, &[u8])] = &[
     ("traceResolve", spirv!("cascades", "traceResolve")),
     ("compositeAnchors", spirv!("composite", "compositeAnchors")),
     ("compositeCompute", spirv!("composite", "compositeCompute")),
+    ("compositeCapture", spirv!("composite", "compositeCapture")),
 ];
 
 use vk::DescriptorType as D;
@@ -129,6 +131,7 @@ const COMPOSITE_BINDINGS: &[(u32, D)] = &[
     (15, D::STORAGE_IMAGE),
     (16, D::SAMPLED_IMAGE),
     (17, D::STORAGE_BUFFER),
+    (18, D::STORAGE_BUFFER),
     (19, D::STORAGE_IMAGE),
 ];
 /// Descriptor sets per slot: compute per level, two clears, temporal, world
@@ -146,6 +149,27 @@ struct GiLight {
     edge1: [f32; 4],
     edge2: [f32; 4],
     source: [u32; 4],
+}
+
+/// Timestamps a frame slot can hold: one per pass and one to start from.
+const TIMESTAMPS: u32 = 128;
+
+/// GPU time per pass, from a timestamp after each.
+struct PassTimer {
+    pool: vk::QueryPool,
+    period: f32,
+    /// The passes each slot's last frame stamped, in order.
+    stamped: [Vec<&'static str>; SLOTS],
+    /// Milliseconds per pass in the latest finished frame, repeats summed.
+    times: Vec<(&'static str, f32)>,
+}
+
+/// A capture on its way back from the GPU.
+struct Readback {
+    buffer: Buffer,
+    frame: u64,
+    width: u32,
+    height: u32,
 }
 
 struct Pipelines {
@@ -281,6 +305,11 @@ pub struct SplitRadianceCascades {
     /// Debugging aid: `VERITY_LUX_PASS_LIMIT=n` dispatches only the first
     /// `n` passes of each frame, to bisect GPU faults.
     pass_limit: Option<usize>,
+    timer: Option<PassTimer>,
+    profile: bool,
+    capture_requested: bool,
+    readback: Option<Readback>,
+    capture: Option<Capture>,
 }
 
 impl SplitRadianceCascades {
@@ -308,7 +337,139 @@ impl SplitRadianceCascades {
             pass_limit: std::env::var("VERITY_LUX_PASS_LIMIT")
                 .ok()
                 .and_then(|v| v.parse().ok()),
+            timer: None,
+            profile: false,
+            capture_requested: false,
+            readback: None,
+            capture: None,
         }
+    }
+
+    /// Time each pass on the GPU from the next frame on; see [`Self::pass_times`].
+    pub fn profile(&mut self) {
+        self.profile = true;
+    }
+
+    /// Milliseconds per pass in a recent frame, in frame order.
+    pub fn pass_times(&self) -> &[(&'static str, f32)] {
+        self.timer.as_ref().map_or(&[], |t| &t.times)
+    }
+
+    /// Read back the next frame's HDR image; see [`Self::take_capture`].
+    pub fn request_capture(&mut self) {
+        self.capture_requested = true;
+    }
+
+    /// The capture asked for, once the GPU has finished it.
+    pub fn take_capture(&mut self) -> Option<Capture> {
+        self.capture.take()
+    }
+
+    /// Read this slot's finished timestamps and start its next frame's.
+    unsafe fn tend_timer(&mut self, gpu: &Gpu, cmd: vk::CommandBuffer, slot: usize) -> Result<()> {
+        if !self.profile {
+            return Ok(());
+        }
+        if self.timer.is_none() {
+            let pool = gpu.device.create_query_pool(
+                &vk::QueryPoolCreateInfo::default()
+                    .query_type(vk::QueryType::TIMESTAMP)
+                    .query_count(SLOTS as u32 * TIMESTAMPS),
+                None,
+            )?;
+            let properties = gpu.instance.get_physical_device_properties(gpu.physical);
+            self.timer = Some(PassTimer {
+                pool,
+                period: properties.limits.timestamp_period,
+                stamped: Default::default(),
+                times: Vec::new(),
+            });
+        }
+        let timer = self.timer.as_mut().unwrap();
+        let first = slot as u32 * TIMESTAMPS;
+        let stamped = mem::take(&mut timer.stamped[slot]);
+        if !stamped.is_empty() {
+            let mut ticks = vec![0u64; stamped.len() + 1];
+            gpu.device.get_query_pool_results(
+                timer.pool,
+                first,
+                &mut ticks,
+                vk::QueryResultFlags::TYPE_64,
+            )?;
+            timer.times.clear();
+            for (name, pair) in stamped.iter().zip(ticks.windows(2)) {
+                let ms = pair[1].saturating_sub(pair[0]) as f32 * timer.period * 1e-6;
+                match timer.times.iter_mut().find(|(n, _)| n == name) {
+                    Some((_, total)) => *total += ms,
+                    None => timer.times.push((name, ms)),
+                }
+            }
+        }
+        gpu.device
+            .cmd_reset_query_pool(cmd, timer.pool, first, TIMESTAMPS);
+        gpu.device.cmd_write_timestamp2(
+            cmd,
+            vk::PipelineStageFlags2::ALL_COMMANDS,
+            timer.pool,
+            first,
+        );
+        Ok(())
+    }
+
+    /// Finish a capture whose frame the GPU is done with, then start any
+    /// requested one, on this slot since its last frame is done.
+    unsafe fn tend_capture(
+        &mut self,
+        gpu: &mut Gpu,
+        frame: &FrameContext,
+        slot: usize,
+    ) -> Result<()> {
+        let set = self.view.as_ref().unwrap().composite_sets[slot];
+        if self
+            .readback
+            .as_ref()
+            .is_some_and(|r| frame.frame_number > r.frame && r.frame & 1 == slot as u64)
+        {
+            let readback = self.readback.take().unwrap();
+            let idle = self.view.as_ref().unwrap().rtgi[3].buffer;
+            write_set(
+                gpu.device,
+                set,
+                COMPOSITE_BINDINGS,
+                &[(18, Res::Buffer(idle))],
+            );
+            self.capture = Some(Capture {
+                width: readback.width,
+                height: readback.height,
+                pixels: bytemuck::cast_slice(readback.buffer.read()).to_vec(),
+            });
+            gpu::destroy_buffer(gpu.device, gpu.allocator, readback.buffer);
+        }
+        if self.capture_requested && self.readback.is_none() {
+            self.capture_requested = false;
+            let [_, _, width, height] = frame.viewport;
+            let buffer = gpu::create_buffer(
+                gpu.device,
+                gpu.allocator,
+                "gi capture",
+                u64::from(width) * u64::from(height) * 16,
+                vk::BufferUsageFlags::STORAGE_BUFFER,
+                MemoryLocation::GpuToCpu,
+            )?;
+            write_set(
+                gpu.device,
+                set,
+                COMPOSITE_BINDINGS,
+                &[(18, Res::Buffer(buffer.buffer))],
+            );
+            self.readback = Some(Readback {
+                buffer,
+                frame: frame.frame_number,
+                width,
+                height,
+            });
+        }
+        Ok(())
     }
 
     unsafe fn pipelines(gpu: &mut Gpu) -> Result<Pipelines> {
@@ -772,6 +933,7 @@ impl SplitRadianceCascades {
                 (15, image(&view.anchors[1])),
                 (16, placeholder),
                 (17, Res::Buffer(view.rtgi[2].buffer)),
+                (18, Res::Buffer(view.rtgi[3].buffer)),
                 (19, Res::View(targets.hdr, general)),
             ];
             write_set(
@@ -844,12 +1006,14 @@ impl SplitRadianceCascades {
     }
 
     unsafe fn record_frame(&mut self, gpu: &mut Gpu, frame: &FrameContext) -> Result<()> {
+        let cmd = frame.cmd;
+        let slot = (frame.frame_number & 1) as usize;
+        self.tend_timer(gpu, cmd, slot)?;
+        self.tend_capture(gpu, frame, slot)?;
         let device = gpu.device;
         let settings = self.settings;
         let view = self.view.as_mut().unwrap();
         let pipelines = self.pipelines.as_ref().unwrap();
-        let cmd = frame.cmd;
-        let slot = (frame.frame_number & 1) as usize;
         debug_assert_eq!(
             slot, frame.frame_slot,
             "frame parity must match the in-flight slot"
@@ -1027,7 +1191,21 @@ impl SplitRadianceCascades {
         };
         let passes = std::cell::Cell::new(0usize);
         let limit = self.pass_limit.unwrap_or(usize::MAX);
-        let dispatch = |name: &str, set: vk::DescriptorSet, x: u32, y: u32| {
+        let timer = std::cell::RefCell::new(self.timer.as_mut());
+        let stamp = |name: &'static str| {
+            if let Some(timer) = timer.borrow_mut().as_mut() {
+                let stamped = &mut timer.stamped[slot];
+                stamped.push(name);
+                debug_assert!((stamped.len() as u32) < TIMESTAMPS);
+                device.cmd_write_timestamp2(
+                    cmd,
+                    S::ALL_COMMANDS,
+                    timer.pool,
+                    slot as u32 * TIMESTAMPS + stamped.len() as u32,
+                );
+            }
+        };
+        let dispatch = |name: &'static str, set: vk::DescriptorSet, x: u32, y: u32| {
             passes.set(passes.get() + 1);
             if passes.get() > limit {
                 return;
@@ -1036,6 +1214,7 @@ impl SplitRadianceCascades {
             bind(pipelines.layout, set);
             device.cmd_dispatch(cmd, x.max(1), y.max(1), 1);
             compute_barrier();
+            stamp(name);
         };
         let (compute, clear) = (&sets[..LEVELS], &sets[LEVELS..LEVELS + 2]);
         let (temporal, world_resolve, denoise) =
@@ -1128,22 +1307,30 @@ impl SplitRadianceCascades {
             &[region],
         );
         compute_barrier();
+        stamp("copyHistory");
         for &set in denoise.iter().take(settings.spatial_filter_steps as usize) {
             dispatch("denoise", set, shading_x, shading_y);
         }
         // Add diffuse GI times albedo into the HDR target.
         let composite = view.composite_sets[slot];
+        let full = [frame.viewport[2].div_ceil(8), frame.viewport[3].div_ceil(8)];
+        let capturing = self
+            .readback
+            .as_ref()
+            .is_some_and(|r| r.frame == frame.frame_number);
+        let capture = capturing.then_some(("compositeCapture", full));
         for (name, [x, y]) in [
             ("compositeAnchors", [shading_x, shading_y]),
-            (
-                "compositeCompute",
-                [frame.viewport[2].div_ceil(8), frame.viewport[3].div_ceil(8)],
-            ),
-        ] {
+            ("compositeCompute", full),
+        ]
+        .into_iter()
+        .chain(capture)
+        {
             device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, pipelines.passes[name]);
             bind(pipelines.composite_layout, composite);
             device.cmd_dispatch(cmd, x.max(1), y.max(1), 1);
             compute_barrier();
+            stamp(name);
         }
         // Publish the world cache once composition is done reading it: without
         // this, next frame's history heads point at stale working entries and
@@ -1160,6 +1347,11 @@ impl SplitRadianceCascades {
 impl GiMethod for SplitRadianceCascades {
     fn status(&self) -> GiStatus {
         self.status.clone()
+    }
+
+    fn gpu_time(&self) -> Option<std::time::Duration> {
+        let total: f32 = self.pass_times().iter().map(|(_, ms)| ms).sum();
+        (total > 0.0).then(|| std::time::Duration::from_secs_f32(total * 1e-3))
     }
 }
 
@@ -1289,6 +1481,12 @@ impl RenderExtension for SplitRadianceCascades {
         unsafe {
             if let Some(view) = self.view.take() {
                 Self::destroy_view(gpu.device, gpu.allocator, view);
+            }
+            if let Some(timer) = self.timer.take() {
+                gpu.device.destroy_query_pool(timer.pool, None);
+            }
+            if let Some(readback) = self.readback.take() {
+                gpu::destroy_buffer(gpu.device, gpu.allocator, readback.buffer);
             }
             if let Some(pipelines) = self.pipelines.take() {
                 Self::destroy_pipelines(gpu.device, pipelines);

@@ -387,3 +387,12 @@ void compositeCompute(uint3 id: SV_DispatchThreadID) {
     if (all(isfinite(gi.rgb)))
         hdrTarget[pixel] += float4(gi.rgb, 0.0);
 }
+
+[[vk::binding(18, 0)]] RWStructuredBuffer<float4> captured;
+
+[shader("compute")]
+[numthreads(8, 8, 1)]
+void compositeCapture(uint3 id: SV_DispatchThreadID) {
+    if (any(id.xy >= params.viewport.zw)) return;
+    captured[id.y * params.viewport.z + id.x] = hdrTarget[id.xy + params.viewport.xy];
+}

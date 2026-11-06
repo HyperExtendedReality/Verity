@@ -59,6 +59,7 @@ fn main() {
     jobs.extend([
         ("composite", "compositeAnchors", SlangStage::Compute),
         ("composite", "compositeCompute", SlangStage::Compute),
+        ("composite", "compositeCapture", SlangStage::Compute),
         ("debug_surface", "debugSurface", SlangStage::Compute),
     ]);
     jobs.extend(
