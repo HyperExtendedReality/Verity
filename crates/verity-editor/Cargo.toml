@@ -1,0 +1,21 @@
+[package]
+name = "verity-editor"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+verity-core = { path = "../verity-core" }
+verity-render = { path = "../verity-render" }
+verity-lux = { path = "../verity-lux" }
+verity-runtime = { path = "../verity-runtime" }
+winit = "0.30"
+rfd = "0.15"
+arboard = "3"
+serde_json = "1"
+egui = "0.36"
+egui-winit = "0.36"
+glam = "0.29"
+
+[dev-dependencies]
+verity-box3d = { path = "../verity-box3d" }

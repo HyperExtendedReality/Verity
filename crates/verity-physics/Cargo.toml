@@ -1,0 +1,16 @@
+[package]
+name = "verity-physics"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Augmented Vertex Block Descent rigid-body physics for the Verity runtime"
+publish = false
+
+[dependencies]
+verity-core = { path = "../verity-core" }
+glam = "0.29"
+rayon = "1"
+serde = { version = "1", features = ["derive"] }
+
+[dev-dependencies]
+verity-box3d = { path = "../verity-box3d" }

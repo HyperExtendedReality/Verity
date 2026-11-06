@@ -1,0 +1,21 @@
+[package]
+name = "verity-lux"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Split Radiance Cascades global illumination for the Verity renderer"
+publish = false
+
+[dependencies]
+verity-render = { path = "../verity-render" }
+glam = { version = "0.29", features = ["bytemuck"] }
+ash = "0.38"
+bytemuck = { version = "1.25.2", features = ["derive"] }
+gpu-allocator = { version = "0.28", default-features = false, features = ["std", "vulkan"] }
+
+[build-dependencies]
+verity-slang = { version = "0.1.0", path = "../verity-slang" }
+
+[dev-dependencies]
+verity-core = { path = "../verity-core" }
+winit = "0.30"

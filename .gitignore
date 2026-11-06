@@ -1,4 +1,4 @@
 /target
-*.hyperon.tmp
+*.verity.tmp
 # CocoIndex Code (ccc)
 /.cocoindex_code/

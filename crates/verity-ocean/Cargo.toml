@@ -1,0 +1,13 @@
+[package]
+name = "verity-ocean"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Ocean spectra, shore waves, dispersive shallow water and buoyancy for the Verity runtime"
+publish = false
+
+[dependencies]
+verity-core = { path = "../verity-core" }
+verity-physics = { path = "../verity-physics" }
+glam = "0.29"
+rayon = "1"

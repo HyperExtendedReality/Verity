@@ -1223,129 +1223,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7f24254aa9a54b5c858eaee2f5bccdb46aaf0e486a595ed5fd8f86ba55232a70"
 
 [[package]]
-name = "hyperon-box3d"
-version = "0.1.0"
-dependencies = [
- "cc",
- "glam",
- "hyperon-core",
- "serde",
-]
-
-[[package]]
-name = "hyperon-core"
-version = "0.1.0"
-dependencies = [
- "serde",
- "serde_json",
-]
-
-[[package]]
-name = "hyperon-editor"
-version = "0.1.0"
-dependencies = [
- "arboard",
- "egui",
- "egui-winit",
- "glam",
- "hyperon-box3d",
- "hyperon-core",
- "hyperon-lux",
- "hyperon-render",
- "hyperon-runtime",
- "rfd",
- "serde_json",
- "winit",
-]
-
-[[package]]
-name = "hyperon-lux"
-version = "0.1.0"
-dependencies = [
- "ash",
- "bytemuck",
- "glam",
- "gpu-allocator",
- "hyperon-core",
- "hyperon-render",
- "hyperon-slang",
- "winit",
-]
-
-[[package]]
-name = "hyperon-ocean"
-version = "0.1.0"
-dependencies = [
- "glam",
- "hyperon-core",
- "hyperon-physics",
- "rayon",
-]
-
-[[package]]
-name = "hyperon-physics"
-version = "0.1.0"
-dependencies = [
- "glam",
- "hyperon-box3d",
- "hyperon-core",
- "rayon",
-]
-
-[[package]]
-name = "hyperon-render"
-version = "0.1.0"
-dependencies = [
- "ash",
- "ash-window",
- "basis-universal",
- "bytemuck",
- "egui",
- "egui-ash-renderer",
- "glam",
- "gltf",
- "gpu-allocator",
- "hyperon-box3d",
- "hyperon-core",
- "hyperon-ocean",
- "hyperon-runtime",
- "hyperon-slang",
- "hyperon-strata",
- "ktx2",
- "raw-window-handle",
- "rayon",
- "ruzstd",
- "winit",
-]
-
-[[package]]
-name = "hyperon-runtime"
-version = "0.1.0"
-dependencies = [
- "glam",
- "hyperon-box3d",
- "hyperon-core",
- "hyperon-physics",
- "serde_json",
-]
-
-[[package]]
-name = "hyperon-slang"
-version = "0.1.0"
-dependencies = [
- "serde",
- "tempfile",
- "thiserror 2.0.21",
-]
-
-[[package]]
-name = "hyperon-strata"
-version = "0.1.0"
-dependencies = [
- "meshopt",
-]
-
-[[package]]
 name = "icu_collections"
 version = "2.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3105,6 +2982,131 @@ dependencies = [
  "glifo",
  "hashbrown",
  "vello_common",
+]
+
+[[package]]
+name = "verity-box3d"
+version = "0.1.0"
+dependencies = [
+ "cc",
+ "glam",
+ "serde",
+ "verity-core",
+]
+
+[[package]]
+name = "verity-core"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "verity-editor"
+version = "0.1.0"
+dependencies = [
+ "arboard",
+ "egui",
+ "egui-winit",
+ "glam",
+ "rfd",
+ "serde_json",
+ "verity-box3d",
+ "verity-core",
+ "verity-lux",
+ "verity-render",
+ "verity-runtime",
+ "winit",
+]
+
+[[package]]
+name = "verity-lux"
+version = "0.1.0"
+dependencies = [
+ "ash",
+ "bytemuck",
+ "glam",
+ "gpu-allocator",
+ "verity-core",
+ "verity-render",
+ "verity-slang",
+ "winit",
+]
+
+[[package]]
+name = "verity-ocean"
+version = "0.1.0"
+dependencies = [
+ "glam",
+ "rayon",
+ "verity-core",
+ "verity-physics",
+]
+
+[[package]]
+name = "verity-physics"
+version = "0.1.0"
+dependencies = [
+ "glam",
+ "rayon",
+ "serde",
+ "verity-box3d",
+ "verity-core",
+]
+
+[[package]]
+name = "verity-render"
+version = "0.1.0"
+dependencies = [
+ "ash",
+ "ash-window",
+ "basis-universal",
+ "bytemuck",
+ "egui",
+ "egui-ash-renderer",
+ "glam",
+ "gltf",
+ "gpu-allocator",
+ "ktx2",
+ "raw-window-handle",
+ "rayon",
+ "ruzstd",
+ "serde_json",
+ "verity-box3d",
+ "verity-core",
+ "verity-ocean",
+ "verity-runtime",
+ "verity-slang",
+ "verity-strata",
+ "winit",
+]
+
+[[package]]
+name = "verity-runtime"
+version = "0.1.0"
+dependencies = [
+ "glam",
+ "serde_json",
+ "verity-box3d",
+ "verity-core",
+ "verity-physics",
+]
+
+[[package]]
+name = "verity-slang"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "tempfile",
+ "thiserror 2.0.21",
+]
+
+[[package]]
+name = "verity-strata"
+version = "0.1.0"
+dependencies = [
+ "meshopt",
 ]
 
 [[package]]

@@ -1,0 +1,41 @@
+[package]
+name = "verity-lux"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.97.1"
+description = "Split Radiance Cascades, ray-traced and physics-collider-traced (PXTGI) global illumination for Bevy"
+license = "MIT OR Apache-2.0"
+keywords = ["bevy", "global-illumination", "radiance-cascades", "slang"]
+categories = ["game-development", "graphics", "rendering"]
+
+[dependencies]
+verity-core = { version = "0.20.0", default-features = false, features = ["3d_bevy_render", "bevy_log", "dfg_lut"] }
+verity-slang = { version = "0.1.0", path = "../bevy_slang", features = ["spirv_passthrough"] }
+wgpu = { version = "30.0.1", default-features = false, features = ["std"] }
+naga = { version = "30", features = ["wgsl-in", "spv-out"] }
+verity-box3d = { version = "0.1.0", path = "../verity_box3d", optional = true }
+
+[features]
+default = ["pxtgi"]
+# GiMethod::Pxtgi: GI traced against bevy_box3d colliders (see the `pxtgi` module).
+pxtgi = ["dep:bevy_box3d"]
+
+[dev-dependencies]
+bevy_texture_cache = { version = "0.1.0", path = "../bevy_texture_cache" }
+bevy_box3d = { version = "0.1.0", path = "../bevy_box3D" }
+bevy = { version = "0.20.0", default-features = false, features = ["3d", "png", "free_camera", "ui", "default_font"] }
+
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 3
+
+[lints.rust]
+missing_docs = "warn"
+
+[dependencies.indexmap]
+version = '2'
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+tempfile = "3"

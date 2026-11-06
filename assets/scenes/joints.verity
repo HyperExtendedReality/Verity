@@ -1,0 +1,780 @@
+{
+  "entities": [
+    {
+      "name": "Ground",
+      "transform": {
+        "translation": [
+          0,
+          0,
+          -0.5
+        ],
+        "rotation": [
+          0,
+          0,
+          0,
+          1
+        ],
+        "scale": [
+          60,
+          60,
+          1
+        ]
+      },
+      "material": {
+        "base_color": [
+          0.24,
+          0.28,
+          0.32
+        ],
+        "metallic": 0,
+        "roughness": 0.65
+      },
+      "components": {
+        "Rigid Body": {
+          "body_type": "Static",
+          "shape": "Cuboid",
+          "half_extents": [
+            30,
+            30,
+            0.5
+          ],
+          "friction": 0.8
+        }
+      }
+    },
+    {
+      "name": "Chain mount",
+      "transform": {
+        "translation": [
+          -6.0,
+          0.0,
+          12.0
+        ],
+        "rotation": [
+          0.0,
+          0.0,
+          0.0,
+          1.0
+        ],
+        "scale": [
+          0.6,
+          0.6,
+          0.6
+        ]
+      },
+      "material": {
+        "base_color": [
+          0.55,
+          0.6,
+          0.68
+        ],
+        "metallic": 0,
+        "roughness": 0.65
+      },
+      "components": {
+        "Rigid Body": {
+          "body_type": "Static",
+          "shape": "Cuboid",
+          "half_extents": [
+            0.3,
+            0.3,
+            0.3
+          ],
+          "density": 1000.0
+        }
+      }
+    },
+    {
+      "name": "Chain link 1",
+      "transform": {
+        "translation": [
+          -5.5,
+          0.0,
+          12.0
+        ],
+        "rotation": [
+          0.0,
+          0.0,
+          0.0,
+          1.0
+        ],
+        "scale": [
+          0.9,
+          0.16,
+          0.16
+        ]
+      },
+      "material": {
+        "base_color": [
+          0.55,
+          0.6,
+          0.68
+        ],
+        "metallic": 0,
+        "roughness": 0.65
+      },
+      "components": {
+        "Rigid Body": {
+          "body_type": "Dynamic",
+          "shape": "Cuboid",
+          "half_extents": [
+            0.45,
+            0.08,
+            0.08
+          ],
+          "density": 7800.0
+        },
+        "Joint": {
+          "connected_to": "Chain mount",
+          "anchor": [
+            -0.5,
+            0.0,
+            0.0
+          ],
+          "material": "Steel",
+          "section": 1.5,
+          "span": 0.5
+        }
+      }
+    },
+    {
+      "name": "Chain link 2",
+      "transform": {
+        "translation": [
+          -4.5,
+          0.0,
+          12.0
+        ],
+        "rotation": [
+          0.0,
+          0.0,
+          0.0,
+          1.0
+        ],
+        "scale": [
+          0.9,
+          0.16,
+          0.16
+        ]
+      },
+      "material": {
+        "base_color": [
+          0.55,
+          0.6,
+          0.68
+        ],
+        "metallic": 0,
+        "roughness": 0.65
+      },
+      "components": {
+        "Rigid Body": {
+          "body_type": "Dynamic",
+          "shape": "Cuboid",
+          "half_extents": [
+            0.45,
+            0.08,
+            0.08
+          ],
+          "density": 7800.0
+        },
+        "Joint": {
+          "connected_to": "Chain link 1",
+          "anchor": [
+            -0.5,
+            0.0,
+            0.0
+          ],
+          "material": "Steel",
+          "section": 1.5,
+          "span": 0.5
+        }
+      }
+    },
+    {
+      "name": "Chain link 3",
+      "transform": {
+        "translation": [
+          -3.5,
+          0.0,
+          12.0
+        ],
+        "rotation": [
+          0.0,
+          0.0,
+          0.0,
+          1.0
+        ],
+        "scale": [
+          0.9,
+          0.16,
+          0.16
+        ]
+      },
+      "material": {
+        "base_color": [
+          0.55,
+          0.6,
+          0.68
+        ],
+        "metallic": 0,
+        "roughness": 0.65
+      },
+      "components": {
+        "Rigid Body": {
+          "body_type": "Dynamic",
+          "shape": "Cuboid",
+          "half_extents": [
+            0.45,
+            0.08,
+            0.08
+          ],
+          "density": 7800.0
+        },
+        "Joint": {
+          "connected_to": "Chain link 2",
+          "anchor": [
+            -0.5,
+            0.0,
+            0.0
+          ],
+          "material": "Steel",
+          "section": 1.5,
+          "span": 0.5
+        }
+      }
+    },
+    {
+      "name": "Chain link 4",
+      "transform": {
+        "translation": [
+          -2.5,
+          0.0,
+          12.0
+        ],
+        "rotation": [
+          0.0,
+          0.0,
+          0.0,
+          1.0
+        ],
+        "scale": [
+          0.9,
+          0.16,
+          0.16
+        ]
+      },
+      "material": {
+        "base_color": [
+          0.55,
+          0.6,
+          0.68
+        ],
+        "metallic": 0,
+        "roughness": 0.65
+      },
+      "components": {
+        "Rigid Body": {
+          "body_type": "Dynamic",
+          "shape": "Cuboid",
+          "half_extents": [
+            0.45,
+            0.08,
+            0.08
+          ],
+          "density": 7800.0
+        },
+        "Joint": {
+          "connected_to": "Chain link 3",
+          "anchor": [
+            -0.5,
+            0.0,
+            0.0
+          ],
+          "material": "Steel",
+          "section": 1.5,
+          "span": 0.5
+        }
+      }
+    },
+    {
+      "name": "Chain link 5",
+      "transform": {
+        "translation": [
+          -1.5,
+          0.0,
+          12.0
+        ],
+        "rotation": [
+          0.0,
+          0.0,
+          0.0,
+          1.0
+        ],
+        "scale": [
+          0.9,
+          0.16,
+          0.16
+        ]
+      },
+      "material": {
+        "base_color": [
+          0.55,
+          0.6,
+          0.68
+        ],
+        "metallic": 0,
+        "roughness": 0.65
+      },
+      "components": {
+        "Rigid Body": {
+          "body_type": "Dynamic",
+          "shape": "Cuboid",
+          "half_extents": [
+            0.45,
+            0.08,
+            0.08
+          ],
+          "density": 7800.0
+        },
+        "Joint": {
+          "connected_to": "Chain link 4",
+          "anchor": [
+            -0.5,
+            0.0,
+            0.0
+          ],
+          "material": "Steel",
+          "section": 1.5,
+          "span": 0.5
+        }
+      }
+    },
+    {
+      "name": "Chain link 6",
+      "transform": {
+        "translation": [
+          -0.5,
+          0.0,
+          12.0
+        ],
+        "rotation": [
+          0.0,
+          0.0,
+          0.0,
+          1.0
+        ],
+        "scale": [
+          0.9,
+          0.16,
+          0.16
+        ]
+      },
+      "material": {
+        "base_color": [
+          0.55,
+          0.6,
+          0.68
+        ],
+        "metallic": 0,
+        "roughness": 0.65
+      },
+      "components": {
+        "Rigid Body": {
+          "body_type": "Dynamic",
+          "shape": "Cuboid",
+          "half_extents": [
+            0.45,
+            0.08,
+            0.08
+          ],
+          "density": 7800.0
+        },
+        "Joint": {
+          "connected_to": "Chain link 5",
+          "anchor": [
+            -0.5,
+            0.0,
+            0.0
+          ],
+          "material": "Steel",
+          "section": 1.5,
+          "span": 0.5
+        }
+      }
+    },
+    {
+      "name": "Chain load",
+      "transform": {
+        "translation": [
+          0.8,
+          0.0,
+          12.0
+        ],
+        "rotation": [
+          0.0,
+          0.0,
+          0.0,
+          1.0
+        ],
+        "scale": [
+          0.6,
+          0.6,
+          0.6
+        ]
+      },
+      "material": {
+        "base_color": [
+          0.55,
+          0.6,
+          0.68
+        ],
+        "metallic": 0,
+        "roughness": 0.65
+      },
+      "components": {
+        "Rigid Body": {
+          "body_type": "Dynamic",
+          "shape": "Cuboid",
+          "half_extents": [
+            0.3,
+            0.3,
+            0.3
+          ],
+          "density": 7800.0
+        },
+        "Joint": {
+          "connected_to": "Chain link 6",
+          "anchor": [
+            -0.3,
+            0.0,
+            0.0
+          ],
+          "material": "Steel",
+          "section": 1.5,
+          "span": 0.5
+        }
+      }
+    },
+    {
+      "name": "Rubber mount",
+      "transform": {
+        "translation": [
+          3.0,
+          0.0,
+          12.0
+        ],
+        "rotation": [
+          0.0,
+          0.0,
+          0.0,
+          1.0
+        ],
+        "scale": [
+          0.6,
+          0.6,
+          0.6
+        ]
+      },
+      "material": {
+        "base_color": [
+          0.75,
+          0.25,
+          0.2
+        ],
+        "metallic": 0,
+        "roughness": 0.65
+      },
+      "components": {
+        "Rigid Body": {
+          "body_type": "Static",
+          "shape": "Cuboid",
+          "half_extents": [
+            0.3,
+            0.3,
+            0.3
+          ],
+          "density": 1000.0
+        }
+      }
+    },
+    {
+      "name": "Rubber block",
+      "transform": {
+        "translation": [
+          3.0,
+          0.0,
+          10.0
+        ],
+        "rotation": [
+          0.0,
+          0.0,
+          0.0,
+          1.0
+        ],
+        "scale": [
+          0.6,
+          0.6,
+          0.6
+        ]
+      },
+      "material": {
+        "base_color": [
+          0.75,
+          0.25,
+          0.2
+        ],
+        "metallic": 0,
+        "roughness": 0.65
+      },
+      "components": {
+        "Rigid Body": {
+          "body_type": "Dynamic",
+          "shape": "Cuboid",
+          "half_extents": [
+            0.3,
+            0.3,
+            0.3
+          ],
+          "density": 500.0
+        },
+        "Joint": {
+          "connected_to": "Rubber mount",
+          "anchor": [
+            0.0,
+            0.0,
+            2.0
+          ],
+          "material": "Rubber",
+          "section": 4.0,
+          "span": 2.0
+        }
+      }
+    },
+    {
+      "name": "Upper arm",
+      "transform": {
+        "translation": [
+          7.0,
+          0.0,
+          10.0
+        ],
+        "rotation": [
+          0.0,
+          0.0,
+          0.0,
+          1.0
+        ],
+        "scale": [
+          0.8,
+          0.2,
+          0.2
+        ]
+      },
+      "material": {
+        "base_color": [
+          0.85,
+          0.8,
+          0.68
+        ],
+        "metallic": 0,
+        "roughness": 0.65
+      },
+      "components": {
+        "Rigid Body": {
+          "body_type": "Static",
+          "shape": "Cuboid",
+          "half_extents": [
+            0.4,
+            0.1,
+            0.1
+          ],
+          "density": 1000.0
+        }
+      }
+    },
+    {
+      "name": "Forearm",
+      "transform": {
+        "translation": [
+          7.9,
+          0.0,
+          10.0
+        ],
+        "rotation": [
+          0.0,
+          0.0,
+          0.0,
+          1.0
+        ],
+        "scale": [
+          0.9,
+          0.1,
+          0.1
+        ]
+      },
+      "material": {
+        "base_color": [
+          0.85,
+          0.8,
+          0.68
+        ],
+        "metallic": 0,
+        "roughness": 0.65
+      },
+      "components": {
+        "Rigid Body": {
+          "body_type": "Dynamic",
+          "shape": "Cuboid",
+          "half_extents": [
+            0.45,
+            0.05,
+            0.05
+          ],
+          "density": 1100.0
+        },
+        "Joint": {
+          "connected_to": "Upper arm",
+          "anchor": [
+            -0.5,
+            0.0,
+            0.0
+          ],
+          "material": "Custom",
+          "section": 2.0,
+          "limited": true,
+          "limit_min": [
+            0.0,
+            0.0,
+            0.0
+          ],
+          "limit_max": [
+            0.0,
+            60.0,
+            0.0
+          ],
+          "stop_stiffness": 2000.0,
+          "muscle": true,
+          "muscle_axis": [
+            0.0,
+            1.0,
+            0.0
+          ],
+          "muscle_section": 20.0,
+          "muscle_tension": 30.0,
+          "muscle_arm": 0.05,
+          "activation": 1.0,
+          "muscle_target": 30.0,
+          "muscle_stiffness": 300.0,
+          "yield_torque": 400.0,
+          "break_torque": 800.0,
+          "bend_to_break": 40.0
+        }
+      }
+    },
+    {
+      "name": "Hand weight",
+      "transform": {
+        "translation": [
+          8.45,
+          0.0,
+          10.0
+        ],
+        "rotation": [
+          0.0,
+          0.0,
+          0.0,
+          1.0
+        ],
+        "scale": [
+          0.1,
+          0.1,
+          0.1
+        ]
+      },
+      "material": {
+        "base_color": [
+          0.55,
+          0.6,
+          0.68
+        ],
+        "metallic": 0,
+        "roughness": 0.65
+      },
+      "components": {
+        "Rigid Body": {
+          "body_type": "Dynamic",
+          "shape": "Cuboid",
+          "half_extents": [
+            0.05,
+            0.05,
+            0.05
+          ],
+          "density": 7800.0
+        },
+        "Joint": {
+          "connected_to": "Forearm",
+          "anchor": [
+            -0.1,
+            0.0,
+            0.0
+          ],
+          "welded": true
+        }
+      }
+    }
+  ],
+  "lights": [],
+  "sun": {
+    "direction": [
+      -0.3,
+      -0.5,
+      -1
+    ],
+    "color": [
+      1,
+      0.95,
+      0.88
+    ],
+    "intensity": 3
+  },
+  "lighting": {
+    "method": "DirectAndHemisphere",
+    "sky": [
+      0.12,
+      0.14,
+      0.18
+    ],
+    "ground": [
+      0.04,
+      0.04,
+      0.04
+    ]
+  },
+  "assets": [],
+  "cameras": [
+    {
+      "name": "Physics playground overview",
+      "position": [
+        28,
+        -36,
+        27
+      ],
+      "target": [
+        -3,
+        0,
+        7
+      ],
+      "vertical_fov": 55
+    }
+  ],
+  "physics": {
+    "engine": "Verity",
+    "gravity": [
+      0,
+      0,
+      -9.81
+    ],
+    "iterations": 6,
+    "substeps": 4
+  }
+}

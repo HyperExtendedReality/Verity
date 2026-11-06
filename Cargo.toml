@@ -1,15 +1,15 @@
 [workspace]
 members = [
-    "crates/hyperon-core",
-    "crates/hyperon-render",
-    "crates/hyperon-strata",
-    "crates/hyperon-editor",
-    "crates/hyperon-runtime",
-    "crates/hyperon-box3d",
-    "crates/hyperon-physics",
-    "crates/hyperon-ocean",
-    "crates/hyperon-lux",
-    "crates/hyperon-slang",
+    "crates/verity-core",
+    "crates/verity-render",
+    "crates/verity-strata",
+    "crates/verity-editor",
+    "crates/verity-runtime",
+    "crates/verity-box3d",
+    "crates/verity-physics",
+    "crates/verity-ocean",
+    "crates/verity-lux",
+    "crates/verity-slang",
 ]
 resolver = "2"
 

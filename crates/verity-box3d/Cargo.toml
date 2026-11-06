@@ -1,0 +1,15 @@
+[package]
+name = "verity-box3d"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+description = "Box3D physics for the Verity runtime"
+publish = false
+
+[dependencies]
+verity-core = { path = "../verity-core" }
+serde = { version = "1", features = ["derive"] }
+glam = "0.29"
+
+[build-dependencies]
+cc = "1"

@@ -1,0 +1,547 @@
+{
+  "entities": [
+    {
+      "name": "Ground",
+      "transform": {
+        "translation": [
+          0,
+          0,
+          -0.5
+        ],
+        "rotation": [
+          0,
+          0,
+          0,
+          1
+        ],
+        "scale": [
+          60,
+          60,
+          1
+        ]
+      },
+      "material": {
+        "base_color": [
+          0.24,
+          0.28,
+          0.32
+        ],
+        "metallic": 0,
+        "roughness": 0.65
+      },
+      "components": {
+        "Rigid Body": {
+          "body_type": "Static",
+          "shape": "Cuboid",
+          "half_extents": [
+            30,
+            30,
+            0.5
+          ],
+          "friction": 0.8
+        }
+      }
+    },
+    {
+      "name": "Curtain",
+      "transform": {
+        "translation": [
+          -7.0,
+          0.0,
+          3.0
+        ],
+        "rotation": [
+          0.7071067811865476,
+          0.0,
+          0.0,
+          0.7071067811865476
+        ],
+        "scale": [
+          1,
+          1,
+          1
+        ]
+      },
+      "material": {
+        "base_color": [
+          0.7,
+          0.15,
+          0.12
+        ],
+        "metallic": 0,
+        "roughness": 0.65
+      },
+      "components": {
+        "Soft Body": {
+          "shape": "Cloth",
+          "material": "Cloth",
+          "size": [
+            3.0,
+            3.0,
+            0.1
+          ],
+          "cells": [
+            24.0,
+            24.0,
+            1.0
+          ],
+          "pin": "TopEdge"
+        }
+      }
+    },
+    {
+      "name": "Trampoline",
+      "transform": {
+        "translation": [
+          -2.0,
+          0.0,
+          3.0
+        ],
+        "rotation": [
+          0.0,
+          0.0,
+          0.0,
+          1.0
+        ],
+        "scale": [
+          1,
+          1,
+          1
+        ]
+      },
+      "material": {
+        "base_color": [
+          0.8,
+          0.75,
+          0.6
+        ],
+        "metallic": 0,
+        "roughness": 0.65
+      },
+      "components": {
+        "Soft Body": {
+          "shape": "Cloth",
+          "material": "Cloth",
+          "size": [
+            3.0,
+            3.0,
+            0.1
+          ],
+          "cells": [
+            28.0,
+            28.0,
+            1.0
+          ],
+          "pin": "AllEdges"
+        }
+      }
+    },
+    {
+      "name": "Heavy ball",
+      "transform": {
+        "translation": [
+          -2.0,
+          0.0,
+          6.0
+        ],
+        "rotation": [
+          0.0,
+          0.0,
+          0.0,
+          1.0
+        ],
+        "scale": [
+          0.6,
+          0.6,
+          0.6
+        ]
+      },
+      "material": {
+        "base_color": [
+          0.55,
+          0.6,
+          0.68
+        ],
+        "metallic": 0,
+        "roughness": 0.65
+      },
+      "components": {
+        "Rigid Body": {
+          "body_type": "Dynamic",
+          "shape": "Sphere",
+          "half_extents": [
+            0.3,
+            0.3,
+            0.3
+          ],
+          "radius": 0.3,
+          "density": 6000.0
+        }
+      }
+    },
+    {
+      "name": "Support 1.4",
+      "transform": {
+        "translation": [
+          1.4,
+          0.0,
+          0.5
+        ],
+        "rotation": [
+          0.0,
+          0.0,
+          0.0,
+          1.0
+        ],
+        "scale": [
+          0.4,
+          2.4,
+          1.0
+        ]
+      },
+      "material": {
+        "base_color": [
+          0.55,
+          0.6,
+          0.68
+        ],
+        "metallic": 0,
+        "roughness": 0.65
+      },
+      "components": {
+        "Rigid Body": {
+          "body_type": "Static",
+          "shape": "Cuboid",
+          "half_extents": [
+            0.2,
+            1.2,
+            0.5
+          ],
+          "radius": 0.5,
+          "density": 1000.0
+        }
+      }
+    },
+    {
+      "name": "Support 3.6",
+      "transform": {
+        "translation": [
+          3.6,
+          0.0,
+          0.5
+        ],
+        "rotation": [
+          0.0,
+          0.0,
+          0.0,
+          1.0
+        ],
+        "scale": [
+          0.4,
+          2.4,
+          1.0
+        ]
+      },
+      "material": {
+        "base_color": [
+          0.55,
+          0.6,
+          0.68
+        ],
+        "metallic": 0,
+        "roughness": 0.65
+      },
+      "components": {
+        "Rigid Body": {
+          "body_type": "Static",
+          "shape": "Cuboid",
+          "half_extents": [
+            0.2,
+            1.2,
+            0.5
+          ],
+          "radius": 0.5,
+          "density": 1000.0
+        }
+      }
+    },
+    {
+      "name": "Steel plate",
+      "transform": {
+        "translation": [
+          2.5,
+          0.0,
+          1.07
+        ],
+        "rotation": [
+          0.0,
+          0.0,
+          0.0,
+          1.0
+        ],
+        "scale": [
+          1,
+          1,
+          1
+        ]
+      },
+      "material": {
+        "base_color": [
+          0.55,
+          0.6,
+          0.68
+        ],
+        "metallic": 0,
+        "roughness": 0.65
+      },
+      "components": {
+        "Soft Body": {
+          "shape": "Solid",
+          "material": "Metal",
+          "size": [
+            2.4,
+            2.4,
+            0.12
+          ],
+          "cells": [
+            12.0,
+            12.0,
+            1.0
+          ],
+          "pin": "None"
+        }
+      }
+    },
+    {
+      "name": "Wrecking ball",
+      "transform": {
+        "translation": [
+          2.5,
+          0.0,
+          7.0
+        ],
+        "rotation": [
+          0.0,
+          0.0,
+          0.0,
+          1.0
+        ],
+        "scale": [
+          0.7,
+          0.7,
+          0.7
+        ]
+      },
+      "material": {
+        "base_color": [
+          0.55,
+          0.6,
+          0.68
+        ],
+        "metallic": 0,
+        "roughness": 0.65
+      },
+      "components": {
+        "Rigid Body": {
+          "body_type": "Dynamic",
+          "shape": "Sphere",
+          "half_extents": [
+            0.35,
+            0.35,
+            0.35
+          ],
+          "radius": 0.35,
+          "density": 8000.0
+        }
+      }
+    },
+    {
+      "name": "Block",
+      "transform": {
+        "translation": [
+          7.5,
+          0.0,
+          0.6
+        ],
+        "rotation": [
+          0.0,
+          0.0,
+          0.0,
+          1.0
+        ],
+        "scale": [
+          1.6,
+          2.4,
+          1.2
+        ]
+      },
+      "material": {
+        "base_color": [
+          0.55,
+          0.6,
+          0.68
+        ],
+        "metallic": 0,
+        "roughness": 0.65
+      },
+      "components": {
+        "Rigid Body": {
+          "body_type": "Static",
+          "shape": "Cuboid",
+          "half_extents": [
+            0.8,
+            1.2,
+            0.6
+          ],
+          "radius": 0.5,
+          "density": 1000.0
+        }
+      }
+    },
+    {
+      "name": "Car core",
+      "transform": {
+        "translation": [
+          7.5,
+          0.0,
+          6.0
+        ],
+        "rotation": [
+          0.0,
+          0.0,
+          0.0,
+          1.0
+        ],
+        "scale": [
+          1.2,
+          0.8,
+          0.5
+        ]
+      },
+      "material": {
+        "base_color": [
+          0.2,
+          0.35,
+          0.75
+        ],
+        "metallic": 0,
+        "roughness": 0.65
+      },
+      "components": {
+        "Rigid Body": {
+          "body_type": "Dynamic",
+          "shape": "Cuboid",
+          "half_extents": [
+            0.6,
+            0.4,
+            0.25
+          ],
+          "radius": 0.5,
+          "density": 300.0
+        }
+      }
+    },
+    {
+      "name": "Car shell",
+      "transform": {
+        "translation": [
+          7.5,
+          0.0,
+          6.0
+        ],
+        "rotation": [
+          0.0,
+          0.0,
+          0.0,
+          1.0
+        ],
+        "scale": [
+          1,
+          1,
+          1
+        ]
+      },
+      "material": {
+        "base_color": [
+          0.2,
+          0.35,
+          0.75
+        ],
+        "metallic": 0,
+        "roughness": 0.65
+      },
+      "components": {
+        "Soft Body": {
+          "shape": "Solid",
+          "material": "CrumpleZone",
+          "size": [
+            2.8,
+            1.4,
+            0.9
+          ],
+          "cells": [
+            8.0,
+            3.0,
+            2.0
+          ],
+          "pin": "InsideBody",
+          "connected_to": "Car core"
+        }
+      }
+    }
+  ],
+  "lights": [],
+  "sun": {
+    "direction": [
+      -0.3,
+      -0.5,
+      -1
+    ],
+    "color": [
+      1,
+      0.95,
+      0.88
+    ],
+    "intensity": 3
+  },
+  "lighting": {
+    "method": "DirectAndHemisphere",
+    "sky": [
+      0.12,
+      0.14,
+      0.18
+    ],
+    "ground": [
+      0.04,
+      0.04,
+      0.04
+    ]
+  },
+  "assets": [],
+  "cameras": [
+    {
+      "name": "Physics playground overview",
+      "position": [
+        28,
+        -36,
+        27
+      ],
+      "target": [
+        -3,
+        0,
+        7
+      ],
+      "vertical_fov": 55
+    }
+  ],
+  "physics": {
+    "engine": "Verity",
+    "gravity": [
+      0,
+      0,
+      -9.81
+    ],
+    "iterations": 6,
+    "substeps": 4
+  }
+}
