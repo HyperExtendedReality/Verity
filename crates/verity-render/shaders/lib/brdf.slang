@@ -12,6 +12,9 @@ struct Surface {
     float3 base_color;
     float metallic;
     float roughness;
+    /// 1 for one surface. Towards 0 the point stands for many facets turned
+    /// every way, and `normal` is only their mean.
+    float agreement;
 };
 
 /// View-dependent terms shared by every light at one shading point.
@@ -99,5 +102,9 @@ float3 brdf_value(Brdf b, float3 n, float3 v, float3 l) {
 
 /// Reflected radiance per unit incident irradiance from direction `l`, times N·L.
 float3 evaluate_brdf(Brdf b, Surface s, float3 l) {
-    return brdf_value(b, s.normal, s.view, l) * max(dot(s.normal, l), 0.0);
+    float n_dot_l = dot(s.normal, l);
+    // Facets spread over the hemisphere around their mean average (1 + n.l) / 4,
+    // which a clamped cosine of the mean does not.
+    float cosine = lerp((1.0 + n_dot_l) * 0.25, max(n_dot_l, 0.0), s.agreement);
+    return brdf_value(b, s.normal, s.view, l) * cosine;
 }

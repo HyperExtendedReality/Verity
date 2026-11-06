@@ -1,92 +1,72 @@
-// PXTGI: bounce light traced on screen, then against the physics colliders.
+// PXTGI: bounce light traced on screen, then against the physics scene.
 // Ported from the godot_physx module's PXTGI (physx_gi_effect.cpp) to world
-// space: Bevy's prepass depth is reverse-Z infinite perspective and its
-// deferred normals are world space. Light is kept as Godot's GI buffer holds
-// it: the mean radiance arriving, cosine weighted (irradiance / pi), exposed.
-// Compiled to WGSL by slangc at startup (src/pxtgi.rs).
+// space. Depth is reverse-Z infinite perspective and normals are world space.
+// Light is kept as Godot's GI buffer holds it: the mean radiance arriving,
+// cosine weighted (irradiance / pi).
+//
+// Rays run against verity-physics: `RayScene` builds the trees and refits them
+// as bodies move, and tells these passes where things moved.
+
+#define MATERIAL_SET 2
+#include "materials.slang"
+#include "brdf.slang"
+#include "terrain.slang"
 
 static const float PI = 3.14159265;
 static const int STEPS = 24;
-static const int MAX_PROBES = 8;
+static const int MAX_MOVED = 16;
 
-// Debug views, as `PxtgiDebug` numbers them (1-5 as Godot's).
-static const int DEBUG_LAST_FRAME = 1;
-static const int DEBUG_ROUND_TRIP = 2;
-static const int DEBUG_WORLD_ONLY = 3;
-static const int DEBUG_WORLD_HITS = 4;
-static const int DEBUG_WORLD_POSITION = 5;
-static const int DEBUG_BOUNCE_LIGHT = 6;
-static const int DEBUG_REFLECTIONS = 7;
+// Debug views, as `PxtgiDebug` numbers them.
+static const int DEBUG_ROUND_TRIP = 1;
+static const int DEBUG_WORLD_ONLY = 2;
+static const int DEBUG_WORLD_HITS = 3;
+static const int DEBUG_WORLD_POSITION = 4;
+static const int DEBUG_BOUNCE_LIGHT = 5;
+static const int DEBUG_REFLECTIONS = 6;
 
-// Reflection probe flags (probeBox.w bits).
-static const int PROBE_OVERRIDES_AMBIENT = 1;
-static const int PROBE_OVERRIDES_REFLECTIONS = 2;
-static const int PROBE_PARALLAX = 4;
+// Primitive kinds.
+static const int KIND_BOX = 0;
+static const int KIND_SPHERE = 1;
+static const int KIND_MESH = 2;
+static const int KIND_SOFT = 3;
+static const uint NO_MATERIAL = 0xffffffffu;
 
 struct Frame {
     float4x4 clipFromWorld;
     float4x4 worldFromClip;
     float4x4 prevClipFromWorld;
-    float4 camera;          // xyz position, w near plane
-    uint4 sizes;            // xy frame, zw trace
-    float4 misc;            // frame index, screen ray distance, intensity, debug
-    float4 sunDirection;    // toward the sun; w 1 when there is one
-    float4 sunColor;        // irradiance / pi, exposed; w exposure
-    float4 sky;             // radiance a ray leaving the scene sees; w world ray distance
-    uint4 counts;           // primitives, nodes, point lights, spot lights
-    uint4 cache;            // frame, slot mask, on, rays per texel
-    float4 extra;           // emissives, light sources just changed, history valid, reflection history valid
-    float4 reflection;      // mode (0 off, 1 screen, 2 and the colliders, 3 and probes), roughness cutoff
-    uint4 reflectSize;      // xy the half-size reflection textures
-    float4 env;             // environment map strength (exposed), roughest mip, present, lights the scene
-    float4 envX;            // world-to-environment rotation rows
-    float4 envY;
-    float4 envZ;
-    float4 omniPosition[8]; // w 1 / range^2
-    float4 omniColor[8];
-    float4 spotPosition[8]; // w 1 / range^2
-    float4 spotDirection[8]; // w angular scale
-    float4 spotColor[8];     // w angular offset
-    float4 emitCenter[16];
-    float4 emitX[16]; // half axes
-    float4 emitY[16];
-    float4 emitZ[16];
-    float4 emitColor[16];
-    float4 ambient;          // rgb the camera's ambient light (exposed radiance)
-    uint4 probes;            // x reflection probes; y 1 when they are sources (Traced + Probes)
-    // Per reflection probe (a Bevy LightProbe with an EnvironmentMapLight):
-    // world to its unit cube [-0.5, 0.5] (rows, w translation); its unit cube
-    // to world directions (rows); parallax half extents in the unit cube (w
-    // flags); the core where it overrides PXTGI and its falloff ratios; the
-    // capture point (w strength, exposed); the world-to-map rotation rows (w of
-    // the first its roughest mip).
-    float4 probeX[8];
-    float4 probeY[8];
-    float4 probeZ[8];
-    float4 probeDirX[8];
-    float4 probeDirY[8];
-    float4 probeDirZ[8];
-    float4 probeBox[8];
-    float4 probeCore[8];
-    float4 probeFalloff[8];
-    float4 probeCapture[8];
-    float4 probeRotX[8];
-    float4 probeRotY[8];
-    float4 probeRotZ[8];
+    float4 camera;       // xyz position, w near plane
+    uint4 sizes;         // xy frame, zw trace
+    uint4 origin;        // xy where the viewport starts in the targets, zw the half-size reflections
+    float4 misc;         // frame index, screen ray distance, intensity, debug
+    float4 sunDirection; // toward the sun; w 1 when there is one
+    float4 sunColor;     // irradiance / pi
+    float4 sky;          // radiance from straight up; w world ray distance
+    float4 ground;       // radiance from straight down
+    uint4 counts;        // primitives, nodes, point lights, moved regions
+    uint4 cache;         // frame, slot mask, on, rays per texel
+    float4 extra;        // x unused, y history cap while lights change (0 steady), z history valid, w reflection history valid
+    float4 reflection;   // mode (0 off, 1 screen, 2 and the scene), roughness cutoff
+    // Light is linear in its sources: when their power changes, everything
+    // remembered scales with it, this frame only. Waiting instead would take
+    // many frames, as last frame's image feeds this frame's rays.
+    float4 fade;
+    // Where physics moved something since last frame, grown by how far its
+    // shadow and bounce light reach. Light there is stale.
+    float4 movedMin[MAX_MOVED];
+    float4 movedMax[MAX_MOVED];
 };
 
-// One collider: world-to-local rows; shape (x: 0 box, 1 sphere, 2 capsule,
-// 3 cylinder along local y, 4 convex hull, 5 triangle mesh; yzw half extents /
-// radius / radius and half height; a hull's first plane and plane count, a
-// mesh's first tree node and first triangle in the geometry buffer, as int
-// bits); its body's albedo and emitted radiance.
+// One thing rays hit: world-to-local rows; shape (x kind; box yzw half extents;
+// sphere y radius; a mesh's first tree node and first triangle in its geometry
+// buffer, as int bits); albedo (w a material index as bits, whose textures
+// tint it: NO_MATERIAL for none).
 struct Primitive {
     float4 r0;
     float4 r1;
     float4 r2;
     float4 shape;
     float4 albedo;
-    float4 emission;
 };
 
 // Two float4 per node: lo (w: right child, or first primitive of a leaf) and
@@ -106,29 +86,27 @@ struct Cell {
     float4 outgoing;
 };
 
+// A point light: position (w 1 / range^2) and irradiance / pi at a metre.
+struct Light {
+    float4 position;
+    float4 color;
+};
+
 [[vk::binding(0, 0)]] ConstantBuffer<Frame> f;
-[[vk::binding(1, 0)]] DepthTexture2D depthTexture;
+[[vk::binding(1, 0)]] Texture2D<float> depthTexture;
 [[vk::binding(2, 0)]] Texture2D<uint4> gbuffer;
 [[vk::binding(3, 0)]] Texture2D<float4> colorTexture; // last frame's lit image
-[[vk::binding(4, 0)]] SamplerState linearSampler;
-[[vk::binding(5, 0)]] StructuredBuffer<Primitive> prims;
-[[vk::binding(6, 0)]] StructuredBuffer<Node> nodes;
-[[vk::binding(7, 0)]] RWStructuredBuffer<Atomic<uint>> cacheKeys;
-[[vk::binding(8, 0)]] RWStructuredBuffer<Cell> cells;
-// Hull planes (normal, offset), mesh tree nodes (two each) and mesh triangles
-// (three corners), shared by the colliders that point into it.
-[[vk::binding(9, 0)]] StructuredBuffer<float4> geo;
-// The camera's specular environment map: what rays leaving the scene see.
-[[vk::binding(10, 0)]] TextureCube<float4> envMap;
-// The reflection probes' specular maps.
-[[vk::binding(11, 0)]] TextureCube<float4> probeMap0;
-[[vk::binding(12, 0)]] TextureCube<float4> probeMap1;
-[[vk::binding(13, 0)]] TextureCube<float4> probeMap2;
-[[vk::binding(14, 0)]] TextureCube<float4> probeMap3;
-[[vk::binding(15, 0)]] TextureCube<float4> probeMap4;
-[[vk::binding(16, 0)]] TextureCube<float4> probeMap5;
-[[vk::binding(17, 0)]] TextureCube<float4> probeMap6;
-[[vk::binding(18, 0)]] TextureCube<float4> probeMap7;
+[[vk::binding(4, 0)]] StructuredBuffer<Primitive> prims;
+[[vk::binding(5, 0)]] StructuredBuffer<Node> nodes;
+[[vk::binding(6, 0)]] RWStructuredBuffer<Atomic<uint>> cacheKeys;
+[[vk::binding(7, 0)]] RWStructuredBuffer<Cell> cells;
+// Static mesh tree nodes (two each) and triangles (three corners).
+[[vk::binding(8, 0)]] StructuredBuffer<float4> geo;
+// The same for soft bodies, rewritten as they deform.
+[[vk::binding(9, 0)]] StructuredBuffer<float4> softGeo;
+[[vk::binding(10, 0)]] StructuredBuffer<Light> lights;
+[[vk::binding(11, 0)]] [format("rgba16f")] RWTexture2D<float4> hdr;
+[[vk::binding(12, 0)]] [format("rgba16f")] WTexture2D<float4> colorOut;
 
 // Per-pass inputs and outputs.
 [[vk::binding(0, 1)]] Texture2D<float4> in0;
@@ -150,7 +128,7 @@ struct Cell {
 
 float2 frameSize() { return float2(f.sizes.xy); }
 int2 traceSize() { return int2(f.sizes.zw); }
-int2 reflectSize() { return int2(f.reflectSize.xy); }
+int2 reflectSize() { return int2(f.origin.zw); }
 
 float linearDepth(float d) { return f.camera.w / d; }
 
@@ -170,8 +148,10 @@ float3 project(float4x4 m, float3 x) {
 
 bool onScreen(float2 pc) { return all(pc >= 0.0) && all(pc < frameSize()); }
 
-float loadDepth(int2 p) { return depthTexture.Load(int3(p, 0)); }
-uint4 loadGbuffer(int2 p) { return gbuffer.Load(int3(p, 0)); }
+int3 target(int2 p) { return int3(p + int2(f.origin.xy), 0); }
+float loadDepth(int2 p) { return depthTexture.Load(target(p)); }
+uint4 loadGbuffer(int2 p) { return gbuffer.Load(target(p)); }
+float3 lastImage(float2 pc) { return colorTexture.Load(target(int2(pc))).rgb * f.fade.rgb; }
 
 float surfaceDepth(float2 pc) {
     float d = loadDepth(int2(pc));
@@ -204,143 +184,15 @@ float gbufferMetallic(uint4 g) { return float((g.z >> 8u) & 255u) / 255.0; }
 float3 gbufferAlbedo(uint4 g) { return gbufferBase(g) * (1.0 - gbufferMetallic(g)); }
 float gbufferRoughness(uint4 g) { return float(g.x >> 24u) / 255.0; }
 
-// Specular reflectance at normal incidence, as Bevy's PBR takes it.
+// Specular reflectance at normal incidence.
 float3 gbufferF0(uint4 g) {
     float reflectance = float(g.z & 255u) / 255.0;
     float metallic = gbufferMetallic(g);
     return 0.16 * reflectance * reflectance * (1.0 - metallic) + gbufferBase(g) * metallic;
 }
 
-// Split-sum environment BRDF, analytic fit (Karis, "Physically Based Shading
-// on Mobile").
-float3 envBrdf(float3 f0, float roughness, float nv) {
-    float4 r = roughness * float4(-1.0, -0.0275, -0.572, 0.022) + float4(1.0, 0.0425, 1.04, -0.04);
-    float a004 = min(r.x * r.x, exp2(-9.28 * nv)) * r.x + r.y;
-    float2 ab = float2(-1.04, 1.04) * a004 + r.zw;
-    return f0 * ab.x + ab.y;
-}
-
-// What a ray leaving the scene along d sees: the environment map (blurred to
-// `level` of its roughest mip), or the sky colour. Cube maps are left-handed.
-float3 backgroundLight(float3 d, float level) {
-    if (f.env.z < 0.5) return f.sky.rgb;
-    float3 e = float3(dot(f.envX.xyz, d), dot(f.envY.xyz, d), -dot(f.envZ.xyz, d));
-    return envMap.SampleLevel(linearSampler, e, level * f.env.y).rgb * f.env.x;
-}
-
-// ---------------------------------------------------------------- reflection probes
-
-// World point w in probe i's unit cube [-0.5, 0.5].
-float3 probeLocal(int i, float3 w) {
-    return float3(dot(f.probeX[i].xyz, w) + f.probeX[i].w, dot(f.probeY[i].xyz, w) + f.probeY[i].w,
-        dot(f.probeZ[i].xyz, w) + f.probeZ[i].w);
-}
-
-// A unit-cube direction or offset of probe i in world space.
-float3 probeWorldDir(int i, float3 l) {
-    return float3(dot(f.probeDirX[i].xyz, l), dot(f.probeDirY[i].xyz, l), dot(f.probeDirZ[i].xyz, l));
-}
-
-// A world direction in probe i's unit cube.
-float3 probeLocalDir(int i, float3 d) {
-    return float3(dot(f.probeX[i].xyz, d), dot(f.probeY[i].xyz, d), dot(f.probeZ[i].xyz, d));
-}
-
-// Probe i's specular capture along world direction d (left-handed, as the
-// environment map), at mip `level`.
-float3 probeSample(int i, float3 d, float level) {
-    float3 e = float3(dot(f.probeRotX[i].xyz, d), dot(f.probeRotY[i].xyz, d), -dot(f.probeRotZ[i].xyz, d));
-    float3 c = 0.0;
-    switch (i) {
-    case 0: c = probeMap0.SampleLevel(linearSampler, e, level).rgb; break;
-    case 1: c = probeMap1.SampleLevel(linearSampler, e, level).rgb; break;
-    case 2: c = probeMap2.SampleLevel(linearSampler, e, level).rgb; break;
-    case 3: c = probeMap3.SampleLevel(linearSampler, e, level).rgb; break;
-    case 4: c = probeMap4.SampleLevel(linearSampler, e, level).rgb; break;
-    case 5: c = probeMap5.SampleLevel(linearSampler, e, level).rgb; break;
-    case 6: c = probeMap6.SampleLevel(linearSampler, e, level).rgb; break;
-    default: c = probeMap7.SampleLevel(linearSampler, e, level).rgb; break;
-    }
-    return c * f.probeCapture[i].w;
-}
-
-// Whether a probe that takes over `what` (ambient or reflections) holds w in
-// its core: there PXTGI leaves that light to Bevy's probe.
-bool probeOverrides(float3 w, int what) {
-    [loop] for (int i = 0; i < int(f.probes.x); i++) {
-        if ((int(f.probeBox[i].w) & what) == 0) continue;
-        if (all(abs(probeLocal(i, w)) <= f.probeCore[i].xyz)) return true;
-    }
-    return false;
-}
-
-// The smallest probe holding w (-1 for none), its unit-cube position and its
-// influence there (falling off over the probe's falloff ratio, as Bevy's).
-int probeAt(float3 w, out float3 l, out float weight) {
-    int best = -1;
-    float bestVolume = 1e30;
-    l = 0.0;
-    weight = 0.0;
-    [loop] for (int i = 0; i < int(f.probes.x); i++) {
-        float3 li = probeLocal(i, w);
-        if (any(abs(li) > 0.5)) continue;
-        // Its world volume, kept in the core's w.
-        float volume = f.probeCore[i].w;
-        if (volume < bestVolume) {
-            best = i;
-            bestVolume = volume;
-            l = li;
-        }
-    }
-    if (best >= 0) {
-        float3 falloff = max(f.probeFalloff[best].xyz, 1e-4);
-        float3 b = saturate((0.5 - abs(l)) / (0.5 * falloff));
-        weight = b.x * b.y * b.z;
-    }
-    return best;
-}
-
-// Probe i's reflection along world direction r from world point w: the
-// direction box-projected onto its parallax box when it has one.
-float3 probeReflection(int i, float3 w, float3 l, float3 r, float rough) {
-    float3 d = r;
-    if ((int(f.probeBox[i].w) & PROBE_PARALLAX) != 0) {
-        float3 dl = probeLocalDir(i, r);
-        float3 e = f.probeBox[i].xyz;
-        float3 inv = safeInv(dl);
-        float3 farSide = max((e - l) * inv, (-e - l) * inv);
-        float t = min(min(farSide.x, farSide.y), farSide.z);
-        d = probeWorldDir(i, l + dl * t);
-    }
-    return probeSample(i, normalize(d), sqrt(rough) * f.probeRotX[i].w);
-}
-
-// What Bevy reflects at w along r: the probe it is in (blended over its
-// falloff into the camera's environment map), else the environment map.
-float3 bevyReflection(float3 w, float3 r, float rough) {
-    float3 env = f.env.w > 0.5 ? backgroundLight(r, rough) : float3(0.0);
-    float3 l;
-    float weight;
-    int i = probeAt(w, l, weight);
-    if (i < 0) return env;
-    return lerp(env, probeReflection(i, w, l, r, rough), weight);
-}
-
-// Off screen, a reflection probe's capture may have seen a static body's
-// point itself (textures and all): its light there, when it did.
-bool probeSource(float3 x, float3 n, int hit, out float3 seen) {
-    seen = 0.0;
-    if (prims[hit].emission.w < 0.5) return false;
-    [loop] for (int i = 0; i < int(f.probes.x); i++) {
-        if (any(abs(probeLocal(i, x)) > 0.5)) continue;
-        float3 to = f.probeCapture[i].xyz - x;
-        float dist = length(to);
-        if (dist < 0.05 || dot(n, to) <= 0.0 || blocked(x + n * 0.02, to / dist, dist - 0.05)) continue;
-        seen = probeSample(i, -to / dist, 0.0);
-        return true;
-    }
-    return false;
-}
+// What a ray leaving the scene along d sees: the renderer's hemisphere.
+float3 background(float3 d) { return lerp(f.ground.rgb, f.sky.rgb, d.z * 0.5 + 0.5); }
 
 // A texture read at continuous texel position t (texel centres at +0.5),
 // blended from the four nearest texels as a linear sampler clamped to the
@@ -356,7 +208,7 @@ float4 bilinear(Texture2D<float4> tex, float2 t, int2 size) {
     return lerp(lerp(a, bx, fr.x), lerp(by, bxy, fr.x), fr.y);
 }
 
-// Lit surfaces only: Bevy's unlit flag is gbuffer bit 24.
+// Lit surfaces only: the unlit flag is gbuffer bit 24.
 bool receives(float depth, uint4 g) { return depth > 0.0 && (g.w & (1u << 24u)) == 0u; }
 
 float luminance(float3 c) { return dot(c, float3(0.2126, 0.7152, 0.0722)); }
@@ -368,6 +220,14 @@ float3 clampFirefly(float3 c) { return c * min(1.0, 4.0 / max(luminance(c), 1e-4
 bool bad(float4 v) { return any(v != v) || any(abs(v) > 1e30); }
 
 float3 safeInv(float3 d) { return 1.0 / select(abs(d) < 1e-20, float3(1e-20), d); }
+
+// Whether physics moved something around x since last frame.
+bool movedNear(float3 x) {
+    [loop] for (uint i = 0u; i < f.counts.w; i++) {
+        if (all(x >= f.movedMin[i].xyz) && all(x <= f.movedMax[i].xyz)) return true;
+    }
+    return false;
+}
 
 // A march step found the ray behind the depth buffer: bisect the crossing so
 // the hit doesn't glitter from texel to texel and frame to frame.
@@ -406,7 +266,7 @@ float ign(float2 p) { return frac(52.9829189 * frac(dot(p, float2(0.06711056, 0.
 // The a-trous kernel's taps, by distance from the centre.
 float kernelTap(int i) { return i == 0 ? 0.375 : (i == 1 ? 0.25 : 0.0625); }
 
-// ---------------------------------------------------------------- collider trace
+// ---------------------------------------------------------------- scene trace
 
 // Where the ray enters a box (1e30: misses it, or only beyond best).
 float boxEntry(float3 o, float3 inv, float3 lo, float3 hi, float best) {
@@ -419,32 +279,39 @@ float boxEntry(float3 o, float3 inv, float3 lo, float3 hi, float best) {
     return enter <= leave ? enter : 1e30;
 }
 
-float meshBoxEntry(float3 o, float3 inv, int at, float best) {
-    return boxEntry(o, inv, geo[at].xyz, geo[at + 1].xyz, best);
+float4 geoAt(bool soft, int at) { return soft ? softGeo[at] : geo[at]; }
+
+// The first corner of the static triangle the last closest-hit ray took, for
+// what the corners' w holds.
+static int hitCorners = 0;
+
+float meshBoxEntry(bool soft, float3 o, float3 inv, int at, float best) {
+    return boxEntry(o, inv, geoAt(soft, at).xyz, geoAt(soft, at + 1).xyz, best);
 }
 
 // The nearest triangle of a mesh along a local ray (either side), walking its
 // own tree near child first. Shadow rays only need the first intersection.
-// Box3D's trees stay shallow; a deeper one only drops the farthest branches.
-bool hitMesh(int nodesAt, int tris, float3 o, float3 d, inout float t, inout float3 n, bool anyHit) {
+// The trees are bounded to about this deep; a deeper one only drops the
+// farthest branches.
+bool hitMesh(bool soft, int nodesAt, int tris, float3 o, float3 d, inout float t, inout float3 n, bool anyHit) {
     bool found = false;
     float3 inv = safeInv(d);
-    if (meshBoxEntry(o, inv, nodesAt, t) >= 1e30) return false;
-    int stack[24];
+    if (meshBoxEntry(soft, o, inv, nodesAt, t) >= 1e30) return false;
+    int stack[32];
     int top = 0;
     int node = 0;
     [loop] while (true) {
-        float4 lo = geo[nodesAt + node * 2];
-        float4 hi = geo[nodesAt + node * 2 + 1];
+        float4 lo = geoAt(soft, nodesAt + node * 2);
+        float4 hi = geoAt(soft, nodesAt + node * 2 + 1);
         int count = asint(hi.w);
         if (count == 0) {
             int left = node + 1;
             int right = asint(lo.w);
-            float tl = meshBoxEntry(o, inv, nodesAt + left * 2, t);
-            float tr = meshBoxEntry(o, inv, nodesAt + right * 2, t);
+            float tl = meshBoxEntry(soft, o, inv, nodesAt + left * 2, t);
+            float tr = meshBoxEntry(soft, o, inv, nodesAt + right * 2, t);
             if (tl < 1e30 && tr < 1e30) {
                 bool leftFirst = tl <= tr;
-                if (top < 24) {
+                if (top < 32) {
                     stack[top] = leftFirst ? right : left;
                     top++;
                 }
@@ -460,9 +327,9 @@ bool hitMesh(int nodesAt, int tris, float3 o, float3 d, inout float t, inout flo
         } else {
             int first = asint(lo.w);
             [loop] for (int k = first; k < first + count; k++) {
-                float3 a = geo[tris + k * 3].xyz;
-                float3 e1 = geo[tris + k * 3 + 1].xyz - a;
-                float3 e2 = geo[tris + k * 3 + 2].xyz - a;
+                float3 a = geoAt(soft, tris + k * 3).xyz;
+                float3 e1 = geoAt(soft, tris + k * 3 + 1).xyz - a;
+                float3 e2 = geoAt(soft, tris + k * 3 + 2).xyz - a;
                 float3 pv = cross(d, e2);
                 float det = dot(e1, pv);
                 if (abs(det) < 1e-12) continue;
@@ -479,6 +346,7 @@ bool hitMesh(int nodesAt, int tris, float3 o, float3 d, inout float t, inout flo
                     n = cross(e1, e2);
                     found = true;
                     if (anyHit) return true;
+                    hitCorners = tris + k * 3;
                 }
             }
         }
@@ -486,7 +354,7 @@ bool hitMesh(int nodesAt, int tris, float3 o, float3 d, inout float t, inout flo
         [loop] while (top > 0) {
             top--;
             int s = stack[top];
-            if (meshBoxEntry(o, inv, nodesAt + s * 2, t) < 1e30) {
+            if (meshBoxEntry(soft, o, inv, nodesAt + s * 2, t) < 1e30) {
                 node = s;
                 next = true;
                 break;
@@ -499,7 +367,7 @@ bool hitMesh(int nodesAt, int tris, float3 o, float3 d, inout float t, inout flo
     return found;
 }
 
-// The nearest hit of one collider closer than best; its world normal.
+// The nearest hit of one primitive closer than best; its world normal.
 bool hitPrimitive(Primitive q, float3 o, float3 d, inout float best, out float3 normal, bool anyHit) {
     normal = float3(0.0);
     float3 lo = float3(dot(q.r0.xyz, o) + q.r0.w, dot(q.r1.xyz, o) + q.r1.w, dot(q.r2.xyz, o) + q.r2.w);
@@ -507,71 +375,10 @@ bool hitPrimitive(Primitive q, float3 o, float3 d, inout float best, out float3 
     float3 n = float3(0.0);
     float t = 0.0;
     int kind = int(q.shape.x + 0.5);
-    if (kind == 4) {
-        // Convex hull: the ray's span inside every face plane's half space.
-        int first = asint(q.shape.y);
-        int count = asint(q.shape.z);
-        float tIn = -1e30;
-        float tOut = best;
-        [loop] for (int i = first; i < first + count; i++) {
-            float4 plane = geo[i];
-            float denom = dot(plane.xyz, ld);
-            float dist = dot(plane.xyz, lo) - plane.w;
-            if (abs(denom) < 1e-12) {
-                if (dist > 0.0) return false;
-                continue;
-            }
-            float th = -dist / denom;
-            if (denom < 0.0) {
-                if (th > tIn) {
-                    tIn = th;
-                    n = plane.xyz;
-                }
-            } else {
-                tOut = min(tOut, th);
-            }
-        }
-        if (tIn > tOut || tIn <= 0.0 || tIn >= best) return false;
-        t = tIn;
-    } else if (kind == 5) {
+    if (kind >= KIND_MESH) {
         t = best;
-        if (!hitMesh(asint(q.shape.y), asint(q.shape.z), lo, ld, t, n, anyHit)) return false;
-    } else if (kind == 2 || kind == 3) {
-        // Capsule / cylinder along local y: the infinite cylinder, then the caps.
-        float r = q.shape.y;
-        float halfLen = kind == 2 ? max(q.shape.z - r, 0.0) : q.shape.z;
-        float3 pa = float3(0.0, -halfLen, 0.0);
-        float3 ba = float3(0.0, 2.0 * halfLen, 0.0);
-        float3 oa = lo - pa;
-        float baba = dot(ba, ba);
-        float bard = dot(ba, ld);
-        float baoa = dot(ba, oa);
-        float a = baba * dot(ld, ld) - bard * bard;
-        float b = baba * dot(oa, ld) - baoa * bard;
-        float c = baba * dot(oa, oa) - baoa * baoa - r * r * baba;
-        float h = b * b - a * c;
-        if (h < 0.0) return false;
-        h = sqrt(h);
-        t = (-b - h) / a;
-        float y = baoa + t * bard;
-        if (y > 0.0 && y < baba) {
-            n = (oa + ld * t - ba * (y / baba)) / r;
-        } else if (kind == 2) {
-            float3 oc = y <= 0.0 ? oa : lo - (pa + ba);
-            float qa = dot(ld, ld);
-            float qb = dot(oc, ld);
-            float qc = dot(oc, oc) - r * r;
-            float qh = qb * qb - qa * qc;
-            if (qh < 0.0) return false;
-            t = (-qb - sqrt(qh)) / qa;
-            n = oc + ld * t;
-        } else {
-            t = ((y < 0.0 ? 0.0 : baba) - baoa) / bard;
-            if (abs(b + a * t) >= h) return false;
-            n = float3(0.0, y < 0.0 ? -1.0 : 1.0, 0.0);
-        }
-        if (t <= 0.0 || t >= best) return false;
-    } else if (kind == 0) {
+        if (!hitMesh(kind == KIND_SOFT, asint(q.shape.y), asint(q.shape.z), lo, ld, t, n, anyHit)) return false;
+    } else if (kind == KIND_BOX) {
         float3 inv = safeInv(ld);
         float3 t0 = (-q.shape.yzw - lo) * inv;
         float3 t1 = (q.shape.yzw - lo) * inv;
@@ -603,7 +410,7 @@ bool hitPrimitive(Primitive q, float3 o, float3 d, inout float best, out float3 
     return true;
 }
 
-// The nearest collider along the ray, near child first; with anyHit the first
+// The nearest primitive along the ray, near child first; with anyHit the first
 // one in the way (shadow rays). Returns its index, or -1.
 int walkWorld(float3 o, float3 d, inout float t, out float3 normal, bool anyHit) {
     normal = float3(0.0);
@@ -611,7 +418,7 @@ int walkWorld(float3 o, float3 d, inout float t, out float3 normal, bool anyHit)
     if (f.counts.y == 0u) return hit;
     float3 inv = safeInv(d);
     if (boxEntry(o, inv, nodes[0].lo.xyz, nodes[0].hi.xyz, t) >= 1e30) return hit;
-    int stack[16];
+    int stack[24];
     int top = 0;
     int node = 0;
     [loop] while (true) {
@@ -624,7 +431,7 @@ int walkWorld(float3 o, float3 d, inout float t, out float3 normal, bool anyHit)
             float tr = boxEntry(o, inv, nodes[right].lo.xyz, nodes[right].hi.xyz, t);
             if (tl < 1e30 && tr < 1e30) {
                 bool leftFirst = tl <= tr;
-                if (top < 16) {
+                if (top < 24) {
                     stack[top] = leftFirst ? right : left;
                     top++;
                 }
@@ -671,12 +478,38 @@ bool blocked(float3 o, float3 d, float reach) {
 }
 
 // A ray that hit nothing within reach has left the scene only if it also left
-// the box around every collider (a long tunnel doesn't see the sky).
+// the box around everything (a long tunnel doesn't see the sky).
 bool escapes(float3 o, float3 d, float reach) {
     if (f.counts.y == 0u) return true;
     float3 inv = safeInv(d);
     float3 farT = max((nodes[0].lo.xyz - o) * inv, (nodes[0].hi.xyz - o) * inv);
     return min(min(farT.x, farT.y), farT.z) <= reach;
+}
+
+// The albedo of what a ray hit. A material's texture counts by its last mip,
+// the mean colour: rays carry no texture coordinates. Terrain is worked out at
+// the hit `x` with normal `n`, as its mean colour varies across the mesh.
+float3 hitAlbedo(int hit, float3 x, float3 n) {
+    float4 a = prims[hit].albedo;
+    uint index = asuint(a.w);
+    if (index == NO_MATERIAL) return a.rgb;
+    Material m = materials[index];
+    if ((m.textures.w & TERRAIN_SURFACE) != 0) {
+        // Corners hold the ground as `pack_ground` in pxtgi.rs laid it out.
+        float height = 0.0;
+        float wet = 0.0;
+        for (int corner = 0; corner < 3; corner++) {
+            uint ground = asuint(geo[hitCorners + corner].w);
+            height += float(ground & 0xffffu) / 16.0 - 2048.0;
+            wet += float(ground >> 16u) / 65535.0;
+        }
+        return terrain_albedo(x, n, height / 3.0, wet / 3.0, m.params.w);
+    }
+    float3 base = m.base_color.rgb;
+    if (m.textures.x != NO_TEXTURE) {
+        base *= textures[NonUniformResourceIndex(m.textures.x)].SampleLevel(material_sampler, float2(0.5), 16.0).rgb;
+    }
+    return base * (1.0 - m.params.x);
 }
 
 // ---------------------------------------------------------------- radiance cache
@@ -767,34 +600,24 @@ float3 smoothCache(float3 x, float3 n, bool leaving) {
 
 // ---------------------------------------------------------------- lighting
 
-// Irradiance / pi at a surface patch straight from the camera's ambient light,
-// the sun, point and spot lights, shadowed by the colliders.
+// Irradiance / pi at a surface patch straight from the sun and point lights,
+// shadowed by the scene. Point lights fall off as the resolve's do.
 float3 directLight(float3 x, float3 n) {
-    float3 light = f.ambient.rgb;
+    float3 light = 0.0;
     float3 o = x + n * 0.02;
     float lit = dot(n, f.sunDirection.xyz);
     if (lit > 0.0 && f.sunDirection.w > 0.5 && !blocked(o, f.sunDirection.xyz, 1e6)) {
         light += f.sunColor.rgb * lit;
     }
-    // Bevy's falloff: inverse square, windowed to zero at the range.
     [loop] for (uint i = 0u; i < f.counts.z; i++) {
-        float3 to = f.omniPosition[i].xyz - x;
-        float d2 = max(dot(to, to), 1e-4);
+        Light source = lights[i];
+        float3 to = source.position.xyz - x;
+        float d2 = max(dot(to, to), 1e-2);
         float3 l = to * rsqrt(d2);
         float nl = dot(n, l);
-        float w = saturate(1.0 - pow(d2 * f.omniPosition[i].w, 2.0));
+        float w = saturate(1.0 - pow(d2 * source.position.w, 2.0));
         if (nl <= 0.0 || w <= 0.0 || blocked(o, l, sqrt(d2) - 0.05)) continue;
-        light += f.omniColor[i].rgb * nl * w * w / d2;
-    }
-    [loop] for (uint i = 0u; i < f.counts.w; i++) {
-        float3 to = f.spotPosition[i].xyz - x;
-        float d2 = max(dot(to, to), 1e-4);
-        float3 l = to * rsqrt(d2);
-        float nl = dot(n, l);
-        float w = saturate(1.0 - pow(d2 * f.spotPosition[i].w, 2.0));
-        float cone = saturate(dot(-l, f.spotDirection[i].xyz) * f.spotDirection[i].w + f.spotColor[i].w);
-        if (nl <= 0.0 || w <= 0.0 || cone <= 0.0 || blocked(o, l, sqrt(d2) - 0.05)) continue;
-        light += f.spotColor[i].rgb * nl * w * w * cone * cone / d2;
+        light += source.color.rgb * nl * w * w / d2;
     }
     return light;
 }
@@ -803,10 +626,6 @@ float3 directLight(float3 x, float3 n) {
 static const uint SEEN_DIFFUSE = 0u;
 static const uint SEEN_GLOSSY = 1u;
 static const uint SEEN_MIRROR = 2u;
-
-// Set by the reflection pass for texels whose off-screen hits may take a
-// reflection probe's capture (Traced + Probes).
-static bool probeTexture = false;
 
 // All tracing passes bind the previous diffuse linear depth as in1. Reject
 // previous colour when another surface occupied the projected location.
@@ -823,32 +642,20 @@ bool previousSurface(float3 p, out float2 pc) {
     return true;
 }
 
-// The light leaving a collider's surface toward the ray: last frame's image
-// where that point was on it; off screen, for a reflection, a probe's capture
-// of a static body when it saw the point; otherwise its glow, plus its cache
-// cell once refined, or else the direct light on its albedo. A pixel's ray
-// claims the cell and keeps it alive. A reflection shows the point itself, so
-// it takes the cells around it blended; a mirror's lights the point directly
-// and takes only their bounce light (lit directly, a glossy surface's
-// scattered rays would flicker between light and shadow).
-float3 worldLight(float3 x, float3 n, int hit, bool fromPixels, bool withGlow, uint seenAs) {
-    // Bevy weights a material's emission by the exposure by its
-    // `emissive_exposure_weight` (albedo.w).
-    float3 glowAll = prims[hit].emission.rgb * lerp(1.0, f.sunColor.w, prims[hit].albedo.w);
+// The light leaving a surface toward the ray: last frame's image where that
+// point was on it; otherwise its cache cell once refined, or else the direct
+// light on its albedo. A pixel's ray claims the cell and keeps it alive. A
+// reflection shows the point itself, so it takes the cells around it blended;
+// a mirror's lights the point directly and takes only their bounce light (lit
+// directly, a glossy surface's scattered rays would flicker between light and
+// shadow).
+float3 worldLight(float3 x, float3 n, int hit, bool fromPixels, uint seenAs) {
     float3 s = project(f.clipFromWorld, x);
     if (f.extra.z > 0.5 && s.z > f.camera.w && onScreen(s.xy) && abs(surfaceDepth(s.xy) - s.z) < 0.1 + 0.02 * s.z) {
         float2 pc;
-        if (previousSurface(x, pc)) {
-            float3 seen = colorTexture.SampleLevel(linearSampler, pc / frameSize(), 0.0).rgb;
-            return withGlow ? seen : max(seen - glowAll, 0.0);
-        }
+        if (previousSurface(x, pc)) return lastImage(pc);
     }
-    if (seenAs != SEEN_DIFFUSE && probeTexture) {
-        float3 seen;
-        if (probeSource(x, n, hit, seen)) return seen;
-    }
-    float3 albedo = prims[hit].albedo.rgb;
-    float3 glow = withGlow ? glowAll : float3(0.0);
+    float3 albedo = hitAlbedo(hit, x, n);
     if (f.cache.z != 0u) {
         bool claimed;
         int slot = cacheSlot(x, n, fromPixels, claimed);
@@ -861,81 +668,16 @@ float3 worldLight(float3 x, float3 n, int hit, bool fromPixels, bool withGlow, u
             } else {
                 if (fromPixels) cells[slot].pos.w = asfloat(f.cache.x);
                 if (cells[slot].normal.w > 0.5) {
-                    if (seenAs == SEEN_DIFFUSE) return glow + cells[slot].outgoing.rgb;
-                    if (seenAs == SEEN_GLOSSY) return glow + smoothCache(x, n, true);
-                    return glow + albedo * (directLight(x, n) + smoothCache(x, n, false));
+                    // Trace runs after the cache took its fade; the cache's own rays don't.
+                    if (seenAs == SEEN_DIFFUSE) return cells[slot].outgoing.rgb * (fromPixels ? 1.0 : f.fade.rgb);
+                    if (seenAs == SEEN_GLOSSY) return smoothCache(x, n, true);
+                    return albedo * (directLight(x, n) + smoothCache(x, n, false));
                 }
             }
         }
     }
-    return glow + albedo * directLight(x, n);
+    return albedo * directLight(x, n);
 }
-
-// The emissive whose box holds world point w (a little grown), or -1.
-int emissiveAt(float3 w) {
-    [loop] for (int i = 0; i < int(f.extra.x); i++) {
-        float3 d = w - f.emitCenter[i].xyz;
-        float3 ax = f.emitX[i].xyz;
-        float3 ay = f.emitY[i].xyz;
-        float3 az = f.emitZ[i].xyz;
-        if (abs(dot(d, ax)) <= dot(ax, ax) + 0.03 * length(ax)
-            && abs(dot(d, ay)) <= dot(ay, ay) + 0.03 * length(ay)
-            && abs(dot(d, az)) <= dot(az, az) + 0.03 * length(az)) {
-            return i;
-        }
-    }
-    return -1;
-}
-
-// One emissive (picked uniformly), a point on its box's faces toward x
-// (picked by area), a shadow ray: its light at x as irradiance / pi.
-float3 sampleEmissive(float3 x, float3 n, float2 xi, float pick, int count) {
-    int i = min(int(pick * float(count)), count - 1);
-    float3 c = f.emitCenter[i].xyz;
-    float3 ax = f.emitX[i].xyz;
-    float3 ay = f.emitY[i].xyz;
-    float3 az = f.emitZ[i].xyz;
-    float a0 = length(ay) * length(az);
-    float a1 = length(ax) * length(az);
-    float a2 = length(ax) * length(ay);
-    float total = a0 + a1 + a2;
-    if (total <= 0.0) return 0.0;
-    float r = xi.x * total;
-    float3 face = az;
-    float3 u = ax;
-    float3 v = ay;
-    if (r < a0) {
-        face = ax;
-        u = ay;
-        v = az;
-        xi.x = r / a0;
-    } else if (r < a0 + a1) {
-        face = ay;
-        u = ax;
-        v = az;
-        xi.x = (r - a0) / a1;
-    } else {
-        xi.x = (r - a0 - a1) / a2;
-    }
-    float3 faceN = normalize(face);
-    if (dot(x - c, faceN) < 0.0) {
-        face = -face;
-        faceN = -faceN;
-    }
-    float3 to = c + face + u * (2.0 * xi.x - 1.0) + v * (2.0 * xi.y - 1.0) - x;
-    float d2 = max(dot(to, to), 1e-2);
-    float dist = sqrt(d2);
-    float3 l = to / dist;
-    float cosX = dot(n, l);
-    float cosE = dot(faceN, -l);
-    if (cosX <= 0.0 || cosE <= 0.0 || blocked(x + n * 0.03, l, dist - 0.05)) return 0.0;
-    // pdf over the facing faces' area: 1 / (4 * total); one emissive of count.
-    float3 e = f.emitColor[i].rgb * cosX * cosE * (4.0 * total) / d2 * float(count) / PI;
-    return e * min(1.0, 8.0 / max(luminance(e), 1e-4));
-}
-
-// Where the last march's hit was, in world space.
-static float3 marchHit;
 
 // A ray marched against the depth buffer in `steps` steps growing to reach;
 // on a hit, the light that point had in last frame's image (w 1).
@@ -957,11 +699,9 @@ float4 march(float3 origin, float3 dir, float reach, int steps, float jitter) {
             float3 hq = project(f.clipFromWorld, origin + dir * refineHit(origin, dir, inFront, along));
             float2 hp = clamp(hq.xy, 0.0, frameSize() - 1.0);
             float hd = loadDepth(int2(hp));
-            marchHit = worldFromPixel(floor(hp) + 0.5, hd > 0.0 ? hd : sd);
+            float3 hit = worldFromPixel(floor(hp) + 0.5, hd > 0.0 ? hd : sd);
             float2 pc;
-            if (previousSurface(marchHit, pc)) {
-                return float4(colorTexture.SampleLevel(linearSampler, pc / frameSize(), 0.0).rgb, 1.0);
-            }
+            if (previousSurface(hit, pc)) return float4(lastImage(pc), 1.0);
             break;
         }
     }
@@ -970,18 +710,29 @@ float4 march(float3 origin, float3 dir, float reach, int steps, float jitter) {
 
 // ---------------------------------------------------------------- passes
 
-// A quarter of the cache slots a frame, one ray each: the cell's arriving
-// light as a running mean, and the light leaving it.
+// A quarter of the cells a frame, plus every cell near something physics moved
+// and all of them while the lights change.
+bool cacheDue(uint slot, float3 x) {
+    return (slot & 3u) == (f.cache.x & 3u) || f.extra.y > 0.0 || movedNear(x);
+}
+
+// The arriving half of a cache update: one ray per due cell, into a running
+// mean. It reads other cells' `outgoing` and writes only its own `incoming`;
+// `cache_shade` then turns that into `outgoing`. Split like this no cell is
+// read while it is written, so a bounce never sees a half-updated neighbour.
 [shader("compute")]
 [numthreads(8, 8, 1)]
-void cache_update(uint3 id : SV_DispatchThreadID) {
-    uint slot = (id.y * 512u + id.x) * 4u + (f.cache.x & 3u);
+void cache_gather(uint3 id : SV_DispatchThreadID) {
+    uint slot = id.y * 512u + id.x;
     if (slot > f.cache.y || cacheKeys[slot].load() == 0u) return;
     Cell cell = cells[slot];
     if (f.cache.x - asuint(cell.pos.w) > 600u) {
+        // Refinements first: whoever claims the slot must not read this as refined.
+        cells[slot].normal.w = 0.0;
         cacheKeys[slot].store(0u);
         return;
     }
+    if (!cacheDue(slot, cell.pos.xyz)) return;
     float3 n = normalize(cell.normal.xyz);
     float u = frac(float(hashU(slot) & 0xffffu) / 65536.0 + float(f.cache.x) * 0.7548776662);
     float phi = 6.2831853 * frac(float(hashU(slot ^ 0x5bd1e995u) & 0xffffu) / 65536.0 + float(f.cache.x) * 0.5698402910);
@@ -992,22 +743,33 @@ void cache_update(uint3 id : SV_DispatchThreadID) {
     float3 wn;
     int hit = walkWorld(origin, dir, far, wn, false);
     if (hit >= 0) {
-        arriving = clampFirefly(worldLight(origin + dir * far, wn, hit, false, true, SEEN_DIFFUSE));
+        arriving = clampFirefly(worldLight(origin + dir * far, wn, hit, false, SEEN_DIFFUSE));
     } else if (escapes(origin, dir, f.sky.w)) {
-        arriving = backgroundLight(dir, 1.0);
+        arriving = background(dir);
     }
-    // The last 32 samples; while the light sources just changed, the last 4.
-    float samples = min(cell.normal.w + 1.0, f.extra.y > 0.0 ? 4.0 : 32.0);
-    float3 incoming = lerp(cell.incoming.rgb, arriving, 1.0 / samples);
+    // The last 32 samples; fewer where the light just changed.
+    float limit = f.extra.y > 0.0 ? f.extra.y : (movedNear(cell.pos.xyz) ? 4.0 : 32.0);
+    float samples = min(cell.normal.w + 1.0, limit);
+    float3 incoming = lerp(cell.incoming.rgb * f.fade.rgb, arriving, 1.0 / samples);
     if (any(incoming != incoming)) incoming = 0.0;
     cells[slot].incoming = float4(incoming, 0.0);
     cells[slot].normal.w = samples;
-    cells[slot].outgoing = float4(cell.albedo.rgb * (directLight(cell.pos.xyz, n) + incoming), 0.0);
+}
+
+[shader("compute")]
+[numthreads(8, 8, 1)]
+void cache_shade(uint3 id : SV_DispatchThreadID) {
+    uint slot = id.y * 512u + id.x;
+    if (slot > f.cache.y || cacheKeys[slot].load() == 0u) return;
+    Cell cell = cells[slot];
+    if (!cacheDue(slot, cell.pos.xyz)) return;
+    float3 n = normalize(cell.normal.xyz);
+    cells[slot].outgoing = float4(cell.albedo.rgb * (directLight(cell.pos.xyz, n) + cell.incoming.rgb), 0.0);
 }
 
 // A few cosine-weighted rays per texel, marched against the depth buffer (a
 // hit takes that point's light on last frame's image), continuing against the
-// colliders. Writes the hits' light / rays and the fraction that hit.
+// scene. Writes the hits' light / rays and the fraction that hit.
 [shader("compute")]
 [numthreads(8, 8, 1)]
 void trace(uint3 id : SV_DispatchThreadID) {
@@ -1021,18 +783,12 @@ void trace(uint3 id : SV_DispatchThreadID) {
         return;
     }
     float3 p = worldFromPixel(float2(fp) + 0.5, depth);
-    // A reflection probe that takes over the ambient light lights this point.
-    if (probeOverrides(p, PROBE_OVERRIDES_AMBIENT)) {
-        out0.Store(px, 0.0);
-        return;
-    }
     float3 n = gbufferNormal(g);
     float2 pf = float2(px);
     float3 noise = float3(ign(pf), ign(pf + float2(47.0, 17.0)), ign(pf + float2(13.0, 101.0)));
-    int emissives = int(f.extra.x);
     int rays = clamp(int(f.cache.w), 1, 4);
-    // Godot's debug views 3 to 5 show the colliders' light alone: no screen march.
     int debug = int(f.misc.w);
+    // The world-only debug views show the scene's light alone: no screen march.
     int steps = debug >= DEBUG_WORLD_ONLY && debug <= DEBUG_WORLD_POSITION ? 0 : STEPS;
     float3 light = 0.0;
     float hits = 0.0;
@@ -1044,40 +800,29 @@ void trace(uint3 id : SV_DispatchThreadID) {
         float3 dir = cosineDir(n, u, phi);
         float jitter = frac(noise.z + index * 0.6180339887);
         float4 seen = march(origin, dir, f.misc.y, steps, jitter);
-        bool found = seen.w > 0.5;
-        if (found) {
-            float3 lightSeen = seen.rgb;
-            if (emissives > 0) {
-                // Sampled directly below: don't count its glow twice.
-                int e = emissiveAt(marchHit);
-                if (e >= 0) lightSeen = max(lightSeen - f.emitColor[e].rgb, 0.0);
-            }
-            light += clampFirefly(lightSeen);
+        if (seen.w > 0.5) {
+            light += clampFirefly(seen.rgb);
             hits += 1.0;
-        }
-        if (!found && f.counts.x > 0u) {
-            // Off the screen, or past what it shows: the colliders.
+        } else if (f.counts.x > 0u) {
+            // Off the screen, or past what it shows: the scene.
             float t = f.sky.w;
             float3 wn;
             int hit = walkWorld(origin, dir, t, wn, false);
             if (hit >= 0) {
-                light += clampFirefly(worldLight(origin + dir * t, wn, hit, true, emissives == 0, SEEN_DIFFUSE));
+                light += clampFirefly(worldLight(origin + dir * t, wn, hit, true, SEEN_DIFFUSE));
                 hits += 1.0;
             }
         }
     }
     float4 result = float4(light, hits) / float(rays);
-    if (emissives > 0) {
-        float2 xi = float2(frac(noise.x + 0.37 + f.misc.x * 0.7548776662), frac(noise.y + 0.71 + f.misc.x * 0.5698402910));
-        float pick = frac(noise.z + 0.13 + f.misc.x * 0.6180339887);
-        result.rgb += sampleEmissive(p, n, xi, pick, emissives);
-    }
     // One bad sample would otherwise live on in the accumulation forever.
     out0.Store(px, bad(result) ? float4(0.0) : result);
 }
 
 // This frame's rays blended into what the same surface accumulated before
-// (reprojected onto last frame; a different depth there starts over).
+// (reprojected onto last frame; a different depth there starts over). Light
+// that just changed keeps less history: the whole view when a light did, and
+// around whatever physics moved.
 // in0 trace, in1 previous light, in2 previous depth, in3 previous moments;
 // out0 light, out1 linear depth, out2 moments, out3 variance.
 [shader("compute")]
@@ -1111,8 +856,12 @@ void temporal(uint3 id : SV_DispatchThreadID) {
                 float4 wasLight = bilinear(in1, at, size);
                 float4 wasM = bilinear(in3, at, size);
                 if (!bad(wasLight) && !bad(wasM)) {
+                    float fade = luminance(f.fade.rgb);
+                    wasLight.rgb *= f.fade.rgb;
+                    wasM.xy *= float2(fade, fade * fade);
                     // A surface just uncovered takes its first frames at full weight.
-                    float frames = min(wasM.z + 1.0, 32.0);
+                    float limit = f.extra.y > 0.0 ? f.extra.y : (movedNear(p) ? 4.0 : 32.0);
+                    float frames = min(wasM.z + 1.0, limit);
                     float alpha = max(1.0 / frames, 0.05);
                     result = lerp(wasLight, now, alpha);
                     m = float3(lerp(wasM.xy, float2(l, l * l), alpha), frames);
@@ -1188,8 +937,8 @@ void atrous4(uint3 id : SV_DispatchThreadID) { atrous(int2(id.xy), 4); }
 
 // One reflection ray per half-size texel, the view mirrored about a GGX
 // microfacet normal (a mirror's rays stay together, a rough surface's spread),
-// marched on screen, then against the colliders. Surfaces rougher than the
-// cutoff, and rays that find nothing, keep Bevy's own reflection.
+// marched on screen, then against the scene. Surfaces rougher than the cutoff,
+// and rays that find nothing, fall back on the hemisphere.
 // out0: the light found, w 1 when found.
 [shader("compute")]
 [numthreads(8, 8, 1)]
@@ -1207,11 +956,6 @@ void reflect_trace(uint3 id : SV_DispatchThreadID) {
     }
     float3 n = gbufferNormal(g);
     float3 p = worldFromPixel(float2(fp) + 0.5, depth);
-    // A reflection probe that takes over reflections shows here instead.
-    if (probeOverrides(p, PROBE_OVERRIDES_REFLECTIONS)) {
-        out0.Store(px, 0.0);
-        return;
-    }
     float3 v = normalize(p - f.camera.xyz);
     float2 pf = float2(px);
     float2 xi = float2(frac(ign(pf) + f.misc.x * 0.7548776662), frac(ign(pf + float2(47.0, 17.0)) + f.misc.x * 0.5698402910));
@@ -1224,10 +968,6 @@ void reflect_trace(uint3 id : SV_DispatchThreadID) {
     if (dot(dir, n) <= 0.0) dir = reflect(v, n);
     float3 origin = p + n * (0.02 + 0.002 * linearDepth(depth));
     float jitter = frac(ign(pf + float2(13.0, 101.0)) + f.misc.x * 0.6180339887);
-    // Traced + Probes: a share of the texels, all of a smooth surface's and
-    // fewer of a rougher one's, take a probe's capture of what they hit.
-    probeTexture = f.probes.y != 0u
-        && frac(ign(pf + float2(71.0, 29.0)) + f.misc.x * 0.3819660113) < 1.0 - smoothstep(0.15, 0.25, rough);
     float4 result = march(origin, dir, 3.0 * f.misc.y, 32, jitter);
     if (result.w < 0.5 && f.reflection.x > 1.5 && f.counts.x > 0u) {
         float far = 60.0;
@@ -1235,7 +975,7 @@ void reflect_trace(uint3 id : SV_DispatchThreadID) {
         int hit = walkWorld(origin, dir, far, wn, false);
         if (hit >= 0) {
             uint seenAs = rough < 0.06 ? SEEN_MIRROR : SEEN_GLOSSY;
-            result = float4(worldLight(origin + dir * far, wn, hit, true, true, seenAs), 1.0);
+            result = float4(worldLight(origin + dir * far, wn, hit, true, seenAs), 1.0);
         }
     }
     out0.Store(px, bad(result) ? float4(0.0) : result);
@@ -1272,7 +1012,9 @@ void reflect_temporal(uint3 id : SV_DispatchThreadID) {
             float was = in2.Load(int3(tp, 0)).r;
             float4 wasLight = bilinear(in1, at, size);
             if (abs(was - pp.z) < 0.05 * pp.z && !bad(wasLight)) {
+                wasLight.rgb *= f.fade.rgb;
                 float take = lerp(0.45, 0.06, min(sqrt(rough * 2.5), 1.0));
+                if (f.extra.y > 0.0 || movedNear(p)) take = max(take, 0.45);
                 float wWas = (1.0 - take) / (1.0 + luminance(wasLight.rgb));
                 float wNow = take / (1.0 + luminance(now.rgb));
                 result = (wasLight * wWas + now * wNow) / (wWas + wNow);
@@ -1339,7 +1081,6 @@ void reflect_filter2(uint3 id : SV_DispatchThreadID) { reflectFilter(int2(id.xy)
 // over the last quarter of the cutoff).
 float4 resolveReflection(int2 fp, float3 n, float d, float rough) {
     if (f.reflection.x < 0.5 || rough > f.reflection.y) return 0.0;
-    if (probeOverrides(worldFromPixel(float2(fp) + 0.5, f.camera.w / d), PROBE_OVERRIDES_REFLECTIONS)) return 0.0;
     int2 size = reflectSize();
     float2 rc = (float2(fp) + 0.5) * float2(size) / frameSize() - 0.5;
     int2 rb = int2(floor(rc));
@@ -1406,100 +1147,71 @@ float4 upsampleGi(int2 fp, float3 n, float d) {
     return weights > 1e-4 ? sum / weights : float4(0.0);
 }
 
-// Bevy's own diffuse ambient at a surface facing n, before its albedo: the
-// camera's ambient light plus, when an environment map lights the scene, its
-// irradiance (the specular map's roughest mip stands in for the diffuse map).
-float3 bevyAmbient(float3 n) {
-    float3 ambient = f.ambient.rgb;
-    if (f.env.w > 0.5) ambient += backgroundLight(n, 1.0);
-    return ambient;
+// What the debug views show in place of the lit image, w 1 when they do.
+float4 debugView(int2 fp, float3 p, float4 gi, float4 reflection) {
+    int debug = int(f.misc.w);
+    // The pixel the reconstructed point projects back to: red where it lands
+    // away from this one.
+    float err = length(project(f.clipFromWorld, p).xy - (float2(fp) + 0.5));
+    if (debug == DEBUG_ROUND_TRIP) return float4(saturate(err), saturate(1.0 - err), 0.0, 1.0);
+    // One-metre bands: a floor at z = 0 shows a clean band edge at its surface.
+    if (debug == DEBUG_WORLD_POSITION) return float4(frac(p), 1.0);
+    if (debug == DEBUG_BOUNCE_LIGHT) return float4(gi.rgb * f.misc.z, 1.0);
+    if (debug == DEBUG_WORLD_HITS) return float4(gi.aaa, 1.0);
+    if (debug == DEBUG_REFLECTIONS) return float4(reflection.rgb * reflection.a, 1.0);
+    return 0.0;
 }
 
 // Up to full size, each pixel taking the filtered texels around it on the same
-// surface. As Godot's surface shader mixes its GI buffer over its own ambient
-// light by the fraction of rays that hit, this replaces Bevy's ambient light
-// by the traced light where rays hit (rgb is premultiplied by that fraction),
-// times the albedo: the difference is added onto Bevy's lit image.
-[shader("fragment")]
-float4 composite(float4 position : SV_Position) : SV_Target {
-    int2 fp = int2(position.xy);
-    float depth = loadDepth(fp);
-    uint4 g = loadGbuffer(fp);
-    if (!receives(depth, g)) return 0.0;
-    int debug = int(f.misc.w);
-    float3 p = worldFromPixel(float2(fp) + 0.5, depth);
-    if (debug == DEBUG_LAST_FRAME) {
-        float3 pp = project(f.prevClipFromWorld, p);
-        return float4(colorTexture.SampleLevel(linearSampler, pp.xy / frameSize(), 0.0).rgb, 1.0);
-    }
-    if (debug == DEBUG_ROUND_TRIP) {
-        // The pixel the reconstructed point projects back to: red where it
-        // lands away from this one.
-        float err = length(project(f.clipFromWorld, p).xy - (float2(fp) + 0.5));
-        return float4(saturate(err), saturate(1.0 - err), 0.0, 1.0);
-    }
-    if (debug == DEBUG_WORLD_POSITION) {
-        // One-metre bands: a floor at y = 0 shows a clean band edge at its surface.
-        return float4(frac(p), 1.0);
-    }
-    float3 n = gbufferNormal(g);
-    float d = linearDepth(depth);
-    float4 gi = upsampleGi(fp, n, d);
-    if (debug == DEBUG_BOUNCE_LIGHT) return float4(gi.rgb * f.misc.z, 1.0);
-    if (debug == DEBUG_WORLD_HITS) return float4(gi.aaa, 1.0);
-    // Traced reflections take over from Bevy's own reflection (its
-    // environment map or reflection probe) where they found something: add
-    // the difference, weighted by the split-sum specular response (Bevy's own
-    // reflection is already in the image).
-    float rough = gbufferRoughness(g);
-    float4 reflection = resolveReflection(fp, n, d, rough);
-    float3 view = normalize(f.camera.xyz - p);
-    float3 mirrored = reflect(-view, n);
-    if (f.probes.y != 0u && f.reflection.x > 0.5 && rough <= f.reflection.y
-        && !probeOverrides(p, PROBE_OVERRIDES_REFLECTIONS)) {
-        // Traced + Probes: where rays found nothing, the probe the point is in
-        // fills in, box-projected, faded over its falloff.
-        float3 l;
-        float weight;
-        int i = probeAt(p, l, weight);
-        if (i >= 0 && weight > 0.0) {
-            float3 r = normalize(lerp(mirrored, n, rough * rough));
-            float3 fromProbe = probeReflection(i, p, l, r, rough);
-            float a = reflection.a;
-            float alpha = a + (1.0 - a) * weight;
-            reflection = float4((reflection.rgb * a + fromProbe * (1.0 - a) * weight) / alpha, alpha);
-        }
-    }
-    if (debug == DEBUG_REFLECTIONS) return float4(reflection.rgb * reflection.a, 1.0);
-    float3 specular = 0.0;
-    if (reflection.a > 0.0) {
-        specular = envBrdf(gbufferF0(g), rough, max(dot(n, view), 1e-4))
-            * reflection.a * (reflection.rgb - bevyReflection(p, mirrored, rough));
-    }
-    float3 diffuse = gi.rgb * f.misc.z - gi.a * bevyAmbient(n);
-    return float4(diffuse * gbufferAlbedo(g) + specular, 0.0);
-}
-
-// The raw diffuse estimate for `RadianceCascadesRawOutput`, at that image's
-// size: rgb the light arriving (cosine weighted, divided by pi) before albedo,
-// intensity and exposure; a 0 off receivers, else 1 + 0.25 * the fraction of
-// rays that hit.
-[[vk::binding(12, 1)]] [format("rgba32f")] WTexture2D<float4> rawOut;
-
+// surface, added to the resolve's direct light. As Godot's surface shader mixes
+// its GI buffer over its own ambient light by the fraction of rays that hit,
+// the traced light stands where rays hit (rgb is premultiplied by that
+// fraction) and the renderer's hemisphere where they found nothing. That image
+// is what next frame's rays see, which is how light keeps bouncing.
 [shader("compute")]
 [numthreads(8, 8, 1)]
-void raw_output(uint3 id : SV_DispatchThreadID) {
-    uint width, height;
-    rawOut.GetDimensions(width, height);
-    int2 px = int2(id.xy);
-    if (any(px >= int2(width, height))) return;
-    int2 fp = clamp(int2((float2(px) + 0.5) * frameSize() / float2(width, height)), 0, int2(frameSize()) - 1);
+void composite(uint3 id : SV_DispatchThreadID) {
+    int2 fp = int2(id.xy);
+    if (any(fp >= int2(f.sizes.xy))) return;
+    int2 at = target(fp).xy;
+    float4 lit = hdr[at];
     float depth = loadDepth(fp);
     uint4 g = loadGbuffer(fp);
     if (!receives(depth, g)) {
-        rawOut.Store(px, 0.0);
+        colorOut.Store(at, lit);
         return;
     }
-    float4 gi = upsampleGi(fp, gbufferNormal(g), linearDepth(depth));
-    rawOut.Store(px, float4(gi.rgb / max(f.sunColor.w, 1e-20), 1.0 + 0.25 * saturate(gi.a)));
+    float3 p = worldFromPixel(float2(fp) + 0.5, depth);
+    float3 n = gbufferNormal(g);
+    float d = linearDepth(depth);
+    float rough = gbufferRoughness(g);
+    float4 gi = upsampleGi(fp, n, d);
+    float4 reflection = resolveReflection(fp, n, d, rough);
+    float3 view = normalize(f.camera.xyz - p);
+    float3 mirrored = reflect(-view, n);
+    float open = 1.0 - saturate(gi.a);
+    float3 diffuse = gi.rgb * f.misc.z + open * background(n);
+    // Rays that found no reflection still only see the sky where it is open.
+    float3 specular = lerp(open * background(mirrored), reflection.rgb, reflection.a);
+    // The energy split the resolve gives its own ambient term.
+    float nv = max(dot(n, view), 1e-4);
+    float2 dfg = env_brdf(nv, rough);
+    Brdf brdf = make_brdf(gbufferBase(g), gbufferMetallic(g), rough, nv, dfg);
+    float3 total = lit.rgb + diffuse * brdf.diffuse_color + specular * specular_albedo(brdf.f0, dfg);
+    float4 result = float4(total, lit.a);
+    // A debug view replaces what is shown, not what next frame's rays see.
+    float4 shown = debugView(fp, p, gi, reflection);
+    hdr[at] = shown.w > 0.5 ? float4(shown.rgb, lit.a) : result;
+    colorOut.Store(at, result);
+}
+
+// The final image, for reading back on the CPU.
+[[vk::binding(13, 0)]] RWStructuredBuffer<float4> captured;
+
+[shader("compute")]
+[numthreads(8, 8, 1)]
+void capture(uint3 id : SV_DispatchThreadID) {
+    int2 fp = int2(id.xy);
+    if (any(fp >= int2(f.sizes.xy))) return;
+    captured[fp.y * int(f.sizes.x) + fp.x] = hdr[target(fp).xy];
 }

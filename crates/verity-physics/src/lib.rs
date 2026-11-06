@@ -37,15 +37,22 @@
 mod collide;
 mod component;
 mod link;
+mod query;
 mod soft;
 mod solver;
 
 pub use component::{
-    JointComponent, JointMaterial, SoftBodyComponent, SoftPin, SoftPreset, SoftShape,
+    JointComponent, JointMaterial, RigidBodyComponent, Shape, SoftBodyComponent, SoftPin,
+    SoftPreset, SoftShape,
 };
 use glam::{Mat3, Quat, Vec3, Vec3A};
-pub use soft::{SoftBody, SoftMaterial};
+use rayon::prelude::*;
+pub use query::{
+    Bounds, Bvh, BvhNode, RayHit, RayItem, RayScene, RayShape, RaySource, RaySync, TriMesh,
+};
+pub use soft::{Impact, Interest, SoftBody, SoftMaterial};
 use std::collections::HashMap;
+use std::sync::Arc;
 use verity_core::{EntityHandle, Transform, World};
 
 /// Solver parameters. The caller supplies the fixed timestep to [`PhysicsWorld::step`].
@@ -94,7 +101,7 @@ impl Default for PhysicsSettings {
 }
 
 /// A body in world space. Transform scale is visual only; size the collider itself.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 pub enum RigidBody {
     #[default]
     Static,
@@ -106,8 +113,27 @@ pub enum RigidBody {
 /// One centered collider per body, in metres.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Collider {
-    Cuboid { half_extents: Vec3 },
-    Sphere { radius: f32 },
+    Cuboid {
+        half_extents: Vec3,
+    },
+    Sphere {
+        radius: f32,
+    },
+    /// The shape given to [`PhysicsWorld::set_ground`], in this body's frame.
+    /// Ground is solid and unbounded: give it to one static body.
+    Ground,
+}
+
+/// Solid ground of any shape, asked about points in the frame of the body whose
+/// collider is [`Collider::Ground`]. Knowing what is inside, rather than only
+/// where a surface lies, means nothing can tunnel through it, and an edit takes
+/// effect at once. Terrain implements this.
+pub trait Ground: Send + Sync {
+    /// How far `point` is from the surface, negative inside. Only needs to be
+    /// accurate near the surface, and never to read over twice the true value.
+    fn distance(&self, point: Vec3) -> f32;
+    /// The unit outward normal at the surface nearest `point`.
+    fn normal(&self, point: Vec3) -> Vec3;
 }
 
 impl Collider {
@@ -132,6 +158,8 @@ impl Collider {
                 let mass = 4.0 / 3.0 * std::f32::consts::PI * radius.powi(3) * density;
                 (mass, Vec3::splat(0.4 * mass * radius * radius))
             }
+            // Massless, so it never moves, whatever the body's type.
+            Self::Ground => (0.0, Vec3::ZERO),
         }
     }
 }
@@ -520,11 +548,15 @@ pub struct PhysicsWorld {
     next_link: u64,
     joint_events: Vec<JointEvent>,
     soft: Vec<SoftBody>,
+    interests: Vec<Interest>,
 }
 
 /// Identifies a soft body in its [`PhysicsWorld`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct SoftId(usize);
+
+/// How close to a change in the ground a body must be to notice it.
+const CHANGE_MARGIN: f32 = 0.1;
 
 /// Awake dynamic bodies per solver thread worth waking.
 const BODIES_PER_THREAD: usize = 32;
@@ -565,6 +597,25 @@ impl PhysicsWorld {
         self.index
             .get(&entity)
             .is_some_and(|&i| self.slots[i].asleep)
+    }
+
+    /// Give [`Collider::Ground`] bodies this shape, replacing any earlier one.
+    /// After an edit, pass a new shape with the region it changed: bodies there
+    /// wake and collide afresh, so nothing is left hanging over a hole. Bounds
+    /// are in the world.
+    pub fn set_ground(&mut self, ground: Arc<dyn Ground>, changed: Bounds) {
+        self.solver.set_ground(ground, changed);
+        let bodies = &self.solver.bodies;
+        let woken: Vec<_> = (self.slots.iter().zip(bodies))
+            .filter(|(_, body)| {
+                let reach = Vec3::splat(body.bound() + CHANGE_MARGIN);
+                body.shape != Collider::Ground
+                    && (body.position + reach).cmpge(changed.min).all()
+                    && (body.position - reach).cmple(changed.max).all()
+            })
+            .map(|(slot, _)| (slot.asleep, slot.island, key(slot.entity)))
+            .collect();
+        self.wake_islands_of(woken);
     }
 
     /// Wake the islands these slots sleep in or that rest on them: they are
@@ -827,6 +878,10 @@ impl PhysicsWorld {
         self.soft.get(id.0)
     }
 
+    pub fn soft_bodies(&self) -> impl Iterator<Item = (SoftId, &SoftBody)> {
+        self.soft.iter().enumerate().map(|(i, b)| (SoftId(i), b))
+    }
+
     pub fn soft_body_mut(&mut self, id: SoftId) -> Option<&mut SoftBody> {
         self.soft.get_mut(id.0)
     }
@@ -848,8 +903,18 @@ impl PhysicsWorld {
         let position = Vec3::from_array(transform.translation);
         let rotation = Quat::from_array(transform.rotation).normalize();
         let body = self.soft.get_mut(id.0).ok_or(InvalidEntity)?;
-        let to_local = |point: Vec3| rotation.conjugate() * (point - position);
+        // Particles are relative to the body's anchor: so is this, to stay exact.
+        let origin = position - body.anchor();
+        let to_local = |point: Vec3| rotation.conjugate() * (point - origin);
         Ok(body.pin_with(&mut select, Some(entity), to_local, strength))
+    }
+
+    /// Solve soft bodies only within these, such as each player's surroundings
+    /// and view. Rigid bodies always step: unseen cars still collide. Empty, the
+    /// default, solves everything, which is what an authoritative server wants:
+    /// a car's crush force comes from its solve, and riding keeps idle ones cheap.
+    pub fn set_interest(&mut self, interests: Vec<Interest>) {
+        self.interests = interests;
     }
 
     /// Step the soft bodies against the rigid bodies' new poses, and give the
@@ -863,6 +928,9 @@ impl PhysicsWorld {
         let obstacles: Vec<_> = (bodies.iter().filter(|_| aligned))
             .map(|b| soft::Obstacle {
                 shape: b.shape,
+                ground: (b.shape == Collider::Ground)
+                    .then(|| self.solver.ground())
+                    .flatten(),
                 position: b.position,
                 rotation: b.rotation,
                 velocity: b.velocity,
@@ -873,17 +941,28 @@ impl PhysicsWorld {
             })
             .collect();
         let index = &self.index;
-        let pin_target = |entity: EntityHandle, point: Vec3| {
+        let pin_target = &|entity: EntityHandle, point: Vec3| {
             let &i = index.get(&entity)?;
             let body = obstacles.get(i)?;
             Some((body.position + body.rotation * point, i as u32))
         };
-        soft::find_pairs(&mut self.soft, settings.gravity, dt);
-        let mut reactions = Vec::new();
+        let interests = &self.interests;
         for body in &mut self.soft {
-            body.step(dt, settings.gravity, &obstacles, pin_target, &mut reactions);
+            let seen = interests.is_empty() || body.in_interest(interests);
+            body.set_culled(!seen);
         }
-        for reaction in reactions {
+        soft::wake_riders(&mut self.soft, dt);
+        soft::find_pairs(&mut self.soft, settings.gravity, dt);
+        // Bodies touch only through `find_pairs`, so they step independently;
+        // joining their reactions in body order keeps runs repeatable.
+        let reactions: Vec<Vec<soft::Reaction>> = (self.soft.par_iter_mut())
+            .map(|body| {
+                let mut reactions = Vec::new();
+                body.step(dt, settings.gravity, &obstacles, pin_target, &mut reactions);
+                reactions
+            })
+            .collect();
+        for reaction in reactions.into_iter().flatten() {
             let slot = &mut self.slots[reaction.obstacle as usize];
             if slot.body.body_type == RigidBody::Dynamic {
                 let center = obstacles[reaction.obstacle as usize].position;

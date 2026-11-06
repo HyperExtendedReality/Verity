@@ -28,6 +28,14 @@ impl Buffer {
         mapped[..bytes.len()].copy_from_slice(bytes);
     }
 
+    /// The contents of a host-visible buffer.
+    pub fn read(&self) -> &[u8] {
+        self.allocation
+            .as_ref()
+            .and_then(Allocation::mapped_slice)
+            .expect("buffer is host visible")
+    }
+
     pub fn info(&self) -> vk::DescriptorBufferInfo {
         vk::DescriptorBufferInfo::default()
             .buffer(self.buffer)
@@ -93,6 +101,17 @@ pub unsafe fn destroy_buffer(device: &ash::Device, allocator: &mut Allocator, bu
         // Freeing only fails for double frees, which ownership rules out.
         let _ = allocator.free(allocation);
     }
+}
+
+/// The present mode to use from those a surface offers. Uncapped, immediate comes
+/// first, though it may tear: Windows throttles mailbox in a window (120 FPS on a
+/// 60 Hz display, against 617 immediate). FIFO, which every surface has, waits for vsync.
+pub fn present_mode(available: &[vk::PresentModeKHR], uncapped: bool) -> vk::PresentModeKHR {
+    use vk::PresentModeKHR as P;
+    let wanted = [P::IMMEDIATE, P::MAILBOX];
+    (wanted.into_iter())
+        .find(|mode| uncapped && available.contains(mode))
+        .unwrap_or(P::FIFO)
 }
 
 /// A device-local 2D image with `levels` mips and a view of all of them.
@@ -254,6 +273,19 @@ pub unsafe fn graphics_pipeline(
     layout: vk::PipelineLayout,
     raster: &Raster<'_>,
 ) -> Result<vk::Pipeline> {
+    graphics_pipeline_targets(device, layout, raster, &[])
+}
+
+/// [`graphics_pipeline`] with `extra_colors` after `raster.color`.
+///
+/// # Safety
+/// As for [`graphics_pipeline`].
+pub unsafe fn graphics_pipeline_targets(
+    device: &ash::Device,
+    layout: vk::PipelineLayout,
+    raster: &Raster<'_>,
+    extra_colors: &[vk::Format],
+) -> Result<vk::Pipeline> {
     let vs = shader_module(device, raster.vertex)?;
     let fs = match shader_module(device, raster.fragment) {
         Ok(fs) => fs,
@@ -272,7 +304,11 @@ pub unsafe fn graphics_pipeline(
             .module(fs)
             .name(c"fragmentMain"),
     ];
-    let colors: Vec<vk::Format> = raster.color.into_iter().collect();
+    let colors: Vec<vk::Format> = raster
+        .color
+        .into_iter()
+        .chain(extra_colors.iter().copied())
+        .collect();
     let mut rendering =
         vk::PipelineRenderingCreateInfo::default().color_attachment_formats(&colors);
     let mut depth_state = vk::PipelineDepthStencilStateCreateInfo::default();
@@ -415,4 +451,19 @@ pub unsafe fn create_depth_layers(
         },
         layer_views,
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use vk::PresentModeKHR as P;
+
+    #[test]
+    fn present_mode_uncaps_only_when_asked_and_offered() {
+        let all = [P::FIFO, P::IMMEDIATE, P::MAILBOX];
+        assert_eq!(present_mode(&all, false), P::FIFO);
+        assert_eq!(present_mode(&all, true), P::IMMEDIATE);
+        assert_eq!(present_mode(&[P::FIFO, P::MAILBOX], true), P::MAILBOX);
+        assert_eq!(present_mode(&[P::FIFO], true), P::FIFO);
+    }
 }

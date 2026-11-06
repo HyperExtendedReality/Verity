@@ -1,9 +1,7 @@
 //! Native Box3D rigid bodies synchronized with a Verity runtime world.
 
-pub mod component;
 pub mod ffi;
 
-pub use component::{RigidBodyComponent, Shape};
 
 use glam::{Quat, Vec3};
 use std::{

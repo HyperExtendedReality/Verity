@@ -58,6 +58,42 @@ pub struct TextureData {
     pub srgb: bool,
     /// Transcoded mip levels, largest first.
     pub levels: Vec<Vec<u8>>,
+    /// A small uncompressed copy for baking on the CPU, when one could be decoded.
+    pub preview: Option<Preview>,
+}
+
+/// A low mip level, uncompressed.
+pub struct Preview {
+    pub width: u32,
+    pub height: u32,
+    /// Encoded as in the file, four bytes per texel.
+    pub rgba: Vec<u8>,
+    pub srgb: bool,
+}
+
+impl Preview {
+    /// Linear color and alpha at a wrapped texture coordinate, nearest texel.
+    pub fn sample(&self, uv: [f32; 2]) -> [f32; 4] {
+        let texel = |value: f32, size: u32| {
+            ((value - value.floor()) * size as f32).min(size as f32 - 1.0) as usize
+        };
+        let (x, y) = (texel(uv[0], self.width), texel(uv[1], self.height));
+        let at = (y * self.width as usize + x) * 4;
+        let decode = |byte: u8| {
+            let value = f32::from(byte) / 255.0;
+            match self.srgb {
+                true if value <= 0.04045 => value / 12.92,
+                true => ((value + 0.055) / 1.055).powf(2.4),
+                false => value,
+            }
+        };
+        [
+            decode(self.rgba[at]),
+            decode(self.rgba[at + 1]),
+            decode(self.rgba[at + 2]),
+            f32::from(self.rgba[at + 3]) / 255.0,
+        ]
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -388,7 +424,13 @@ pub fn decode_ktx2(bytes: &[u8], options: LoadOptions) -> Result<TextureData> {
     let transcoder = LowLevelUastcTranscoder::new();
     let mut decoder = ruzstd::decoding::FrameDecoder::new();
     let mut out = Vec::with_capacity(levels - skip);
-    for (index, level) in reader.levels().enumerate().skip(skip) {
+    // The largest level at most this size, or the last one if none is.
+    const PREVIEW_SIZE: u32 = 128;
+    let preview_level = (0..levels)
+        .find(|&l| size(l).0.max(size(l).1) <= PREVIEW_SIZE)
+        .unwrap_or(levels - 1);
+    let mut preview = None;
+    for (index, level) in reader.levels().enumerate().skip(skip.min(preview_level)) {
         let data = if zstd {
             let mut raw = Vec::with_capacity(level.uncompressed_byte_length as usize);
             decoder
@@ -413,6 +455,25 @@ pub fn decode_ktx2(bytes: &[u8], options: LoadOptions) -> Result<TextureData> {
             original_width: width,
             original_height: height,
         };
+        if index == preview_level {
+            // The binding sizes pixel formats' output in blocks and overruns it,
+            // so go through a block format and decode that here.
+            let blocks = transcoder.transcode_slice(
+                &data,
+                SliceParametersUastc { ..params },
+                DecodeFlags::HIGH_QUALITY,
+                TranscoderBlockFormat::BC3,
+            );
+            preview = blocks.ok().map(|blocks| Preview {
+                width,
+                height,
+                rgba: decode_bc3(&blocks, width, height),
+                srgb,
+            });
+        }
+        if index < skip {
+            continue;
+        }
         out.push(
             transcoder
                 .transcode_slice(
@@ -431,7 +492,59 @@ pub fn decode_ktx2(bytes: &[u8], options: LoadOptions) -> Result<TextureData> {
         format: options.format,
         srgb,
         levels: out,
+        preview,
     })
+}
+
+/// Expand BC3 blocks, row by row, to RGBA8.
+fn decode_bc3(blocks: &[u8], width: u32, height: u32) -> Vec<u8> {
+    let (width, height) = (width as usize, height as usize);
+    let mut rgba = vec![0; width * height * 4];
+    for (index, block) in blocks.as_chunks::<16>().0.iter().enumerate() {
+        let (block_x, block_y) = (index % width.div_ceil(4) * 4, index / width.div_ceil(4) * 4);
+        let (a0, a1) = (u32::from(block[0]), u32::from(block[1]));
+        let alpha_bits = block[2..8]
+            .iter()
+            .rev()
+            .fold(0u64, |bits, &byte| bits << 8 | u64::from(byte));
+        let alpha = |code: u32| match code {
+            0 => a0,
+            1 => a1,
+            _ if a0 > a1 => ((8 - code) * a0 + (code - 1) * a1) / 7,
+            6 => 0,
+            7 => 255,
+            _ => ((6 - code) * a0 + (code - 1) * a1) / 5,
+        };
+        let endpoint = |low: u8, high: u8| {
+            let packed = u32::from(low) | u32::from(high) << 8;
+            [
+                (packed >> 11 & 31) * 255 / 31,
+                (packed >> 5 & 63) * 255 / 63,
+                (packed & 31) * 255 / 31,
+            ]
+        };
+        let (c0, c1) = (endpoint(block[8], block[9]), endpoint(block[10], block[11]));
+        let color = |code: u32, channel: usize| match code {
+            0 => c0[channel],
+            1 => c1[channel],
+            2 => (2 * c0[channel] + c1[channel]) / 3,
+            _ => (c0[channel] + 2 * c1[channel]) / 3,
+        };
+        let color_bits = u32::from_le_bytes([block[12], block[13], block[14], block[15]]);
+        for texel in 0..16 {
+            let (x, y) = (block_x + texel % 4, block_y + texel / 4);
+            if x >= width || y >= height {
+                continue;
+            }
+            let code = color_bits >> (texel * 2) & 3;
+            let at = (y * width + x) * 4;
+            for channel in 0..3 {
+                rgba[at + channel] = color(code, channel) as u8;
+            }
+            rgba[at + 3] = alpha((alpha_bits >> (texel * 3) & 7) as u32) as u8;
+        }
+    }
+    rgba
 }
 
 fn percent_decode(uri: &str) -> String {
@@ -484,12 +597,52 @@ mod tests {
     }
 
     #[test]
+    fn bc3_blocks_decode_to_their_endpoints() {
+        // Red to blue with every texel on the first endpoint; alpha 200 to 100
+        // with every texel on the second.
+        let mut block = [0u8; 16];
+        block[0] = 200;
+        block[1] = 100;
+        block[2..8].copy_from_slice(&[0b0100_1001, 0b1001_0010, 0b0010_0100, 0x49, 0x92, 0x24]);
+        block[8..10].copy_from_slice(&0xf800u16.to_le_bytes());
+        block[10..12].copy_from_slice(&0x001fu16.to_le_bytes());
+        let rgba = decode_bc3(&block, 4, 4);
+        assert_eq!(rgba.len(), 64);
+        assert!(rgba.chunks_exact(4).all(|t| t == [255, 0, 0, 100]));
+
+        // A size that is not a whole number of blocks stays in bounds.
+        assert_eq!(decode_bc3(&block, 3, 2).len(), 24);
+    }
+
+    #[test]
     fn percent_decoding_keeps_plain_text() {
         assert_eq!(
             percent_decode("textures/Fortress-Ka%C5%A1tel.ktx2"),
             "textures/Fortress-Kaštel.ktx2"
         );
         assert_eq!(percent_decode("100%"), "100%");
+    }
+
+    #[test]
+    fn previews_match_the_texture_they_came_from() {
+        let Some(dir) = packed("textures") else {
+            return;
+        };
+        let bytes = fs::read(dir.join("curtain_fabric_red_BaseColor.ktx2")).unwrap();
+        let options = LoadOptions {
+            format: TextureFormat::Bc7,
+            max_texture_size: 256,
+        };
+        let preview = decode_ktx2(&bytes, options).unwrap().preview.unwrap();
+        assert!(preview.width.max(preview.height) <= 128);
+        assert_eq!(
+            preview.rgba.len(),
+            (preview.width * preview.height * 4) as usize
+        );
+        // It is a red curtain.
+        let texel = preview.sample([0.5, 0.5]);
+        assert!(texel[0] > texel[1] && texel[0] > texel[2], "{texel:?}");
+        assert!(preview.sample([1.5, -0.5]) == texel, "coordinates wrap");
     }
 
     #[test]

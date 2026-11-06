@@ -1,8 +1,10 @@
 [package]
-name = "verity-strata"
+name = "verity-matrix"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 
 [dependencies]
+bytemuck = { version = "1.25.2", features = ["derive"] }
 meshopt = "0.7.0"
+rayon = "1.12.0"

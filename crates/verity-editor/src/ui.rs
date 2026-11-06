@@ -5,8 +5,7 @@ use egui::{
 };
 use glam::Vec3;
 use verity_core::{
-    ComponentRegistry, Entity, FieldMut, LightingMethod, Material, PhysicsEngine, PointLight,
-    Scene, Transform,
+    ComponentRegistry, Entity, FieldMut, LightingMethod, Material, PointLight, Scene, Transform,
 };
 use verity_render::UP;
 use winit::window::ResizeDirection;
@@ -94,10 +93,12 @@ pub struct Tools {
     pub flying: bool,
     pub maximized: bool,
     pub light_limit: usize,
-    /// Enable Strata geometry selection for the current editor session.
-    pub strata_enabled: bool,
-    /// Display the renderer's Strata geometry diagnostics.
-    pub strata_debug: bool,
+    /// Enable Matrix geometry selection for the current editor session.
+    pub matrix_enabled: bool,
+    /// Display the renderer's Matrix geometry diagnostics.
+    pub matrix_debug: bool,
+    /// Draw as fast as the GPU allows instead of at the display's refresh rate.
+    pub uncapped: bool,
     /// GI readiness, shown while the scene uses Split Radiance Cascades.
     pub gi_status: Option<String>,
     /// While playing: each jointed entity's load as text, and its share of
@@ -129,8 +130,9 @@ impl Default for Tools {
             flying: false,
             maximized: false,
             light_limit: verity_render::MAX_LIGHTS,
-            strata_enabled: false,
-            strata_debug: false,
+            matrix_enabled: false,
+            matrix_debug: false,
+            uncapped: false,
             gi_status: None,
             joint_status: Default::default(),
             registry: verity_runtime::registry(),
@@ -983,12 +985,15 @@ pub fn show(
                     });
                 }
                 ui.menu_button(RichText::new("View").size(12.5), |ui| {
-                    ui.checkbox(&mut tools.strata_enabled, "Enable Strata")
-                        .on_hover_text("Use Strata virtualized geometry");
-                    ui.add_enabled_ui(tools.strata_enabled, |ui| {
-                        ui.checkbox(&mut tools.strata_debug, "Strata LOD debug view")
+                    ui.checkbox(&mut tools.matrix_enabled, "Enable Matrix")
+                        .on_hover_text("Use Matrix virtualized geometry");
+                    ui.add_enabled_ui(tools.matrix_enabled, |ui| {
+                        ui.checkbox(&mut tools.matrix_debug, "Matrix LOD debug view")
                             .on_hover_text("Color geometry by the LOD selected for rendering");
                     });
+                    ui.separator();
+                    ui.checkbox(&mut tools.uncapped, "Uncap FPS")
+                        .on_hover_text("Draw continuously, without waiting for vsync; may tear");
                 });
                 // The rest of the bar drags the window; double-click maximizes.
                 let buttons = 46.0 * 3.0;
@@ -1415,71 +1420,49 @@ pub fn show(
                 }
                 Selection::Lighting => {
                     section(ui, "SCENE PHYSICS");
-                    let previous = scene.physics.engine;
-                    ui.horizontal(|ui| {
-                        ui.label(RichText::new("Engine").size(11.5).color(MUTED));
-                        egui::ComboBox::from_id_salt("physics_engine")
-                            .width(ui.available_width())
-                            .selected_text(match scene.physics.engine {
-                                PhysicsEngine::Box3d => "Box3D",
-                                PhysicsEngine::Verity => "Verity",
-                            })
-                            .show_ui(ui, |ui| {
-                                ui.selectable_value(&mut scene.physics.engine, PhysicsEngine::Box3d, "Box3D");
-                                ui.selectable_value(&mut scene.physics.engine, PhysicsEngine::Verity, "Verity");
-                            });
-                    });
-                    changed |= previous != scene.physics.engine;
                     changed |= vector(ui, "Gravity", &mut scene.physics.gravity);
-                    let (label, value, max) = match scene.physics.engine {
-                        PhysicsEngine::Box3d => ("Substeps", &mut scene.physics.substeps, i32::MAX as u32),
-                        PhysicsEngine::Verity => ("Iterations", &mut scene.physics.iterations, u32::MAX),
-                    };
                     ui.horizontal(|ui| {
-                        ui.label(RichText::new(label).size(11.5).color(MUTED));
-                        changed |= ui.add(DragValue::new(value).range(1..=max)).changed();
+                        ui.label(RichText::new("Iterations").size(11.5).color(MUTED));
+                        let iterations = DragValue::new(&mut scene.physics.iterations);
+                        changed |= ui.add(iterations.range(1..=u32::MAX)).changed();
                     });
                     ui.label(
                         RichText::new("Play uses these settings until Stop.")
                             .size(11.0)
                             .color(MUTED),
                     );
-                    if scene.physics.engine == PhysicsEngine::Verity {
-                        ui.label(
-                            RichText::new("Verity supports cuboids and spheres; capsules and bounce are unavailable.")
-                                .size(11.0)
-                                .color(MUTED),
-                        );
-                    }
+                    ui.label(
+                        RichText::new("Verity supports cuboids and spheres; capsules and bounce are unavailable.")
+                            .size(11.0)
+                            .color(MUTED),
+                    );
                     section(ui, "SCENE LIGHTING");
                     let previous = scene.lighting.method;
                     ui.horizontal(|ui| {
                         ui.label(RichText::new("Method").size(11.5).color(MUTED));
                         egui::ComboBox::from_id_salt("lighting_method")
                             .width(ui.available_width())
-                            .selected_text(match scene.lighting.method {
-                                LightingMethod::DirectOnly => "Direct only",
-                                LightingMethod::DirectAndHemisphere => "Direct + hemisphere",
-                                LightingMethod::SplitRadianceCascades => {
-                                    "Split radiance cascades GI"
-                                }
-                            })
+                            .selected_text(lighting_name(scene.lighting.method))
                             .show_ui(ui, |ui| {
-                                ui.selectable_value(
-                                    &mut scene.lighting.method,
+                                for method in [
                                     LightingMethod::DirectOnly,
-                                    "Direct only",
-                                );
-                                ui.selectable_value(
-                                    &mut scene.lighting.method,
                                     LightingMethod::DirectAndHemisphere,
-                                    "Direct + hemisphere",
-                                );
-                                ui.selectable_value(
-                                    &mut scene.lighting.method,
-                                    LightingMethod::SplitRadianceCascades,
-                                    "Split radiance cascades GI",
-                                );
+                                ] {
+                                    ui.selectable_value(
+                                        &mut scene.lighting.method,
+                                        method,
+                                        lighting_name(method),
+                                    );
+                                }
+                                ui.separator();
+                                for info in verity_lux::METHODS {
+                                    ui.selectable_value(
+                                        &mut scene.lighting.method,
+                                        info.lighting,
+                                        info.name,
+                                    )
+                                    .on_hover_text(info.about);
+                                }
                             });
                     });
                     changed |= previous != scene.lighting.method;
@@ -1616,6 +1599,15 @@ fn add_cube(scene: &mut Scene, selected: &mut Selection) {
     *selected = Selection::Entity(scene.entities.len() - 1);
 }
 
+/// A lighting method's name: the GI methods name themselves.
+fn lighting_name(method: LightingMethod) -> &'static str {
+    match method {
+        LightingMethod::DirectOnly => "Direct only",
+        LightingMethod::DirectAndHemisphere => "Direct + hemisphere",
+        method => verity_lux::method_info(method).map_or("Unknown", |info| info.name),
+    }
+}
+
 fn camera_from_view(name: String, view: &verity_render::Camera) -> verity_core::Camera {
     verity_core::Camera {
         name,
@@ -1722,7 +1714,7 @@ mod tests {
     #[test]
     fn inspector_offers_other_bodies_for_a_joint() {
         let mut scene = Scene::default();
-        let body = serde_json::to_value(verity_box3d::RigidBodyComponent::default()).unwrap();
+        let body = serde_json::json!({});
         scene.entities[0]
             .components
             .insert("Rigid Body".into(), body.clone());
@@ -1830,58 +1822,14 @@ mod tests {
     #[test]
     fn scene_physics_inspector_does_not_change_settings_when_idle() {
         let context = egui::Context::default();
-        for engine in [PhysicsEngine::Box3d, PhysicsEngine::Verity] {
-            let mut scene = Scene::default();
-            scene.physics.engine = engine;
-            let before = scene.clone();
-            let (mut selected, mut tools) = (Selection::Lighting, Tools::default());
-            let mut output = context.run_ui(egui::RawInput::default(), |ui| {
-                assert!(!show(ui, &mut scene, &mut selected, None, false, &mut tools).changed);
-            });
-            output.textures_delta.clear();
-            assert_eq!(scene, before);
-        }
-    }
-
-    #[test]
-    fn scene_physics_engine_can_be_changed() {
-        let context = egui::Context::default();
         let mut scene = Scene::default();
+        let before = scene.clone();
         let (mut selected, mut tools) = (Selection::Lighting, Tools::default());
-        let mut changed = false;
-        let input = |events| egui::RawInput {
-            screen_rect: Some(Rect::from_min_size(Pos2::ZERO, egui::vec2(1600.0, 1200.0))),
-            events,
-            ..Default::default()
-        };
-        for label in ["Box3D", "Verity"] {
-            let mut output = context.run_ui(input(vec![]), |ui| {
-                show(ui, &mut scene, &mut selected, None, false, &mut tools);
-            });
-            let pos = output
-                .shapes
-                .iter()
-                .find_map(|s| text_position(&s.shape, label))
-                .expect("engine option is visible");
-            output.textures_delta.clear();
-            for pressed in [true, false] {
-                let events = vec![
-                    egui::Event::PointerMoved(pos),
-                    egui::Event::PointerButton {
-                        pos,
-                        button: egui::PointerButton::Primary,
-                        pressed,
-                        modifiers: egui::Modifiers::NONE,
-                    },
-                ];
-                let mut output = context.run_ui(input(events), |ui| {
-                    changed |= show(ui, &mut scene, &mut selected, None, false, &mut tools).changed;
-                });
-                output.textures_delta.clear();
-            }
-        }
-        assert_eq!(scene.physics.engine, PhysicsEngine::Verity);
-        assert!(changed);
+        let mut output = context.run_ui(egui::RawInput::default(), |ui| {
+            assert!(!show(ui, &mut scene, &mut selected, None, false, &mut tools).changed);
+        });
+        output.textures_delta.clear();
+        assert_eq!(scene, before);
     }
 
     #[test]

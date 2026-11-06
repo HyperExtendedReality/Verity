@@ -107,6 +107,7 @@ fn size(shape: Collider) -> Vec3 {
     match shape {
         Collider::Cuboid { half_extents } => half_extents * 2.0,
         Collider::Sphere { radius } => Vec3::splat(radius * 2.0),
+        Collider::Ground => Vec3::ONE,
     }
 }
 

@@ -12,10 +12,12 @@
 //! Bounds describe static object-space positions only: they are not valid after
 //! skinning, morphing, displacement, or any other vertex deformation unless the
 //! caller supplies conservative bounds for the deformed geometry.
-//! [`lod`] provides whole-primitive simplification; [`residency`] provides a
-//! CPU page cache; and [`culling`] provides a CPU reverse-Z occlusion reference.
-//! These components are not a GPU-driven streaming or continuous-LOD renderer.
+//! [`cluster_lod`] cooks the continuous LOD the renderer draws: a cluster DAG
+//! whose coarse clusters can be voxel bricks. [`lod`] provides whole-primitive
+//! simplification; [`residency`] provides a CPU page cache; and [`culling`]
+//! provides a CPU reverse-Z occlusion reference.
 
+pub mod cluster_lod;
 pub mod culling;
 pub mod lod;
 pub mod residency;

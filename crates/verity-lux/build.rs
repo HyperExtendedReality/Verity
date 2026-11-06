@@ -26,6 +26,23 @@ const CASCADE_ENTRIES: &[&str] = &[
     "traceResolve",
 ];
 
+/// PXTGI's compute passes, all in `pxtgi.slang`.
+const PXTGI_ENTRIES: &[&str] = &[
+    "cache_gather",
+    "cache_shade",
+    "trace",
+    "temporal",
+    "atrous1",
+    "atrous2",
+    "atrous4",
+    "reflect_trace",
+    "reflect_temporal",
+    "reflect_filter1",
+    "reflect_filter2",
+    "composite",
+    "capture",
+];
+
 /// Writes `OUT_DIR/{file}.{entry}.spv` for each entry point, compiling in
 /// parallel; the transport shaders are large.
 fn main() {
@@ -44,6 +61,11 @@ fn main() {
         ("composite", "compositeCompute", SlangStage::Compute),
         ("debug_surface", "debugSurface", SlangStage::Compute),
     ]);
+    jobs.extend(
+        PXTGI_ENTRIES
+            .iter()
+            .map(|&entry| ("pxtgi", entry, SlangStage::Compute)),
+    );
     let compiler = SlangCompiler::default().with_source_root("shaders");
     let failures: Vec<String> = thread::scope(|scope| {
         let handles: Vec<_> = jobs

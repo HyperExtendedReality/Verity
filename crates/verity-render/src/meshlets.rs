@@ -1,7 +1,7 @@
 //! CPU meshlet preparation and conservative homogeneous-frustum testing.
 
 use glam::{Mat4, Vec4};
-use verity_strata::Bounds;
+use verity_matrix::Bounds;
 
 /// Only draw ranges and bounds are needed: the GPU keeps the original indices.
 pub(crate) struct Meshlet {
@@ -12,7 +12,7 @@ pub(crate) struct Meshlet {
 
 /// Failure leaves the original draw available as an uncullled fallback.
 pub(crate) fn build(positions: &[[f32; 3]], indices: &[u32]) -> Option<Vec<Meshlet>> {
-    verity_strata::build_meshlets(positions, indices)
+    verity_matrix::build_meshlets(positions, indices)
         .ok()
         .map(|meshlets| {
             meshlets

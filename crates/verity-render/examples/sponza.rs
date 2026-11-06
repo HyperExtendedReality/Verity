@@ -2,6 +2,8 @@
 //! with a slow orbiting camera, a sun and a few warm point lights.
 //!
 //! `cargo run --release -p verity-render --example sponza [max texture size]`
+//!
+//! `--matrix` draws through Matrix; `--matrix-debug` also colors by tier.
 use glam::Vec3;
 use std::{
     error::Error,
@@ -48,6 +50,10 @@ impl Viewer {
             let stats = renderer.load_gltf(packed.join(scene), self.max_texture_size)?;
             println!("{scene}: {stats:?} in {:.2?}", started.elapsed());
         }
+        let args: Vec<String> = std::env::args().collect();
+        let debug = args.iter().any(|a| a == "--matrix-debug");
+        renderer.set_matrix_enabled(debug || args.iter().any(|a| a == "--matrix"));
+        renderer.set_matrix_debug(debug);
         // Until GI: a blue sky above, warm stone bouncing up from below.
         renderer.set_ambient(Vec3::new(0.25, 0.3, 0.4), Vec3::new(0.12, 0.1, 0.08));
         renderer.set_sun(Some(Sun {

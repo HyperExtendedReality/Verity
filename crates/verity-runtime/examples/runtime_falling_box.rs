@@ -1,8 +1,8 @@
 use std::{error::Error, time::Duration};
 
 use glam::Vec3;
-use verity_box3d::{Collider, PhysicsBody, RigidBody};
 use verity_core::{Entity, Material, Transform};
+use verity_physics::{Collider, PhysicsBody, RigidBody};
 use verity_runtime::Runtime;
 
 fn main() -> Result<(), Box<dyn Error>> {
@@ -10,7 +10,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     let floor = runtime.world.spawn(Entity {
         name: "Floor".into(),
         transform: Transform {
-            translation: [0.0, -0.5, 0.0],
+            translation: [0.0, 0.0, -0.5],
             ..Transform::default()
         },
         material: Material::default(),
@@ -19,7 +19,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     let cube = runtime.world.spawn(Entity {
         name: "Cube".into(),
         transform: Transform {
-            translation: [0.0, 3.0, 0.0],
+            translation: [0.0, 0.0, 3.0],
             ..Transform::default()
         },
         material: Material::default(),
@@ -31,7 +31,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         PhysicsBody::new(
             RigidBody::Static,
             Collider::Cuboid {
-                half_extents: Vec3::new(5.0, 0.5, 5.0),
+                half_extents: Vec3::new(5.0, 5.0, 0.5),
             },
         ),
     )?;
@@ -45,22 +45,22 @@ fn main() -> Result<(), Box<dyn Error>> {
             },
         ),
     )?;
-    let initial_y = runtime
+    let initial_z = runtime
         .world
         .get(cube)
         .ok_or("cube missing")?
         .transform
-        .translation[1];
+        .translation[2];
     let ticks = runtime.advance(Duration::from_secs(2));
-    let final_y = runtime
+    let final_z = runtime
         .world
         .get(cube)
         .ok_or("cube missing")?
         .transform
-        .translation[1];
-    println!("{ticks} fixed ticks: cube y {initial_y:.3} -> {final_y:.3}");
-    if !(0.45..0.65).contains(&final_y) {
-        return Err(format!("cube did not settle on the floor: y={final_y}").into());
+        .translation[2];
+    println!("{ticks} fixed ticks: cube z {initial_z:.3} -> {final_z:.3}");
+    if !(0.45..0.65).contains(&final_z) {
+        return Err(format!("cube did not settle on the floor: z={final_z}").into());
     }
     Ok(())
 }

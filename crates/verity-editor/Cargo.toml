@@ -8,6 +8,7 @@ license.workspace = true
 verity-core = { path = "../verity-core" }
 verity-render = { path = "../verity-render" }
 verity-lux = { path = "../verity-lux" }
+verity-physics = { path = "../verity-physics" }
 verity-runtime = { path = "../verity-runtime" }
 winit = "0.30"
 rfd = "0.15"
@@ -17,5 +18,3 @@ egui = "0.36"
 egui-winit = "0.36"
 glam = "0.29"
 
-[dev-dependencies]
-verity-box3d = { path = "../verity-box3d" }

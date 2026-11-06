@@ -2,8 +2,10 @@
 // then shade it with the sun and clustered lights into the HDR target.
 
 #include "lib/common.slang"
+#include "lib/matrix.slang"
 #include "lib/brdf.slang"
 #include "lib/gi_surface.slang"
+#include "lib/terrain.slang"
 
 
 /// Barycentrics (b1, b2) and distance of a ray hit on a triangle's plane;
@@ -109,81 +111,169 @@ void resolveMain(uint3 id: SV_DispatchThreadID) {
         return;
     }
 
-    Instance instance = instances[hit.x];
+    uint kind = hit.y >> MATRIX_KIND_SHIFT;
+    bool is_matrix = kind != 0;
+    MatrixInstance matrix_instance;
+    Instance instance;
+    if (is_matrix) {
+        matrix_instance = matrix_instances[hit.x];
+        instance = matrix_instance.base;
+    } else {
+        instance = instances[hit.x];
+    }
     Material material = materials[instance.draw.z];
     float3x3 model = (float3x3)instance.model;
-    float3 p[3];
-    float3 n[3];
-    float3 t[3];
-    float2 uv[3];
-    float4 color[3];
-    float tangent_sign = 1.0;
-    for (uint k = 0; k < 3; ++k) {
-        Vertex v = instance_vertex(instance, hit.y * 3 + k);
-        p[k] = mul(instance.model, float4(v.position.xyz, 1.0)).xyz;
-        n[k] = instance.normal_columns[0].xyz * v.normal.x
-            + instance.normal_columns[1].xyz * v.normal.y
-            + instance.normal_columns[2].xyz * v.normal.z;
-        t[k] = mul(model, v.tangent.xyz);
-        uv[k] = float2(v.position.w, v.normal.w);
-        color[k] = v.color;
-        tangent_sign = v.tangent.w < 0.0 ? -1.0 : 1.0;
-    }
-
-    // Barycentrics here and one pixel right and down give exact UV gradients.
     float3 eye = globals.eye.xyz;
     float2 center = float2(id.xy) + 0.5;
     float3 direction = pixel_ray(center);
-    float3 b = intersect(eye, direction, p[0], p[1], p[2]);
-    float3 bx = intersect(eye, pixel_ray(center + float2(1, 0)), p[0], p[1], p[2]);
-    float3 by = intersect(eye, pixel_ray(center + float2(0, 1)), p[0], p[1], p[2]);
-    float2 texcoord = interpolate(uv[0], uv[1], uv[2], b);
-    float2 dx = interpolate(uv[0], uv[1], uv[2], bx) - texcoord;
-    float2 dy = interpolate(uv[0], uv[1], uv[2], by) - texcoord;
-
-    float4 base = material.base_color
-        * (color[0] * (1.0 - b.x - b.y) + color[1] * b.x + color[2] * b.y)
-        * sample_material(material.textures.x, texcoord, dx, dy, 1.0);
-    // glTF packs roughness in green and metalness in blue.
-    float4 metal_rough = sample_material(material.textures.y, texcoord, dx, dy, 1.0);
-
     Surface s;
-    s.position = eye + direction * b.z;
     s.view = -direction;
-    float3 normal = normalize(interpolate(n[0], n[1], n[2], b));
-    float3 face = normalize(cross(p[1] - p[0], p[2] - p[0]));
-    // Two-sided: shade the side facing the camera.
-    if (dot(face, s.view) < 0.0) {
-        normal = -normal;
-        face = -face;
-    }
-    float normal_variance = 0.0;
-    if (material.textures.z != NO_TEXTURE) {
-        float3 tangent = interpolate(t[0], t[1], t[2], b);
-        if (dot(tangent, tangent) < 1.0e-12) {
-            // No authored tangents: derive one from the triangle's UV layout.
-            float2 duv1 = uv[1] - uv[0];
-            float2 duv2 = uv[2] - uv[0];
-            float det = duv1.x * duv2.y - duv2.x * duv1.y;
-            tangent = abs(det) > 1.0e-12 ? ((p[1] - p[0]) * duv2.y - (p[2] - p[0]) * duv1.y) / det : float3(1, 0, 0);
-            tangent_sign = det < 0.0 ? -1.0 : 1.0;
+    s.agreement = 1.0;
+    float3 face;
+    uint level = uint(instance.normal_columns[0].w);
+
+    if (kind == MATRIX_VOXEL) {
+        uint id_bits = hit.y & MATRIX_ID_MASK;
+        MatrixBrick brick = matrix_bricks[id_bits >> MATRIX_VOXEL_BITS];
+        uint bit = id_bits & ((1u << MATRIX_VOXEL_BITS) - 1);
+        uint2 voxel = matrix_voxels[brick.first_voxel + voxel_rank(brick, bit)];
+        // Enter the voxel's box along the camera ray, in object space.
+        float3 origin = mul(matrix_instance.inverse, float4(eye, 1.0)).xyz;
+        float3 ray = normalize(mul(matrix_instance.inverse, float4(direction, 0.0)).xyz);
+        float3 low = brick.origin + float3(bit & 3, (bit >> 2) & 3, bit >> 4) * brick.voxel_size;
+        float3 safe = select(abs(ray) < 1.0e-6, float3(1.0e-6), ray);
+        float3 t0 = (low - origin) / safe;
+        float3 t1 = (low + brick.voxel_size - origin) / safe;
+        float3 near = min(t0, t1);
+        float enter = max(near.x, max(near.y, near.z));
+        float3 side = near.x >= near.y && near.x >= near.z ? float3(1, 0, 0)
+                    : near.y >= near.z ? float3(0, 1, 0) : float3(0, 0, 1);
+        side *= -sign(ray);
+        s.position = mul(instance.model, float4(origin + ray * enter, 1.0)).xyz;
+        float3 object_normal = decode_octahedral(voxel.y);
+        float3 normal = instance.normal_columns[0].xyz * object_normal.x
+            + instance.normal_columns[1].xyz * object_normal.y
+            + instance.normal_columns[2].xyz * object_normal.z;
+        s.normal = normalize(normal);
+        face = normalize(instance.normal_columns[0].xyz * side.x
+            + instance.normal_columns[1].xyz * side.y
+            + instance.normal_columns[2].xyz * side.z);
+        if (dot(s.normal, s.view) < 0.0)
+            s.normal = -s.normal;
+        s.base_color = srgb_to_linear(float3(voxel.x & 255, (voxel.x >> 8) & 255, (voxel.x >> 16) & 255) / 255.0);
+        s.metallic = material.params.x;
+        // Normals that disagree inside a voxel act like a rougher surface.
+        s.roughness = lerp(material.params.y, 1.0, float(voxel.x >> 24) / 255.0);
+        level = 3;
+    } else if (kind == MATRIX_IMPOSTER) {
+        MatrixAsset asset = matrix_assets[matrix_instance.info.x];
+        float distance = length(matrix_instance.sphere.xyz - eye);
+        float pixels = 2.0 * matrix_instance.sphere.w * abs(globals.projection.y) * 0.5 * viewport.w
+            / max(distance, globals.projection.z);
+        ImposterHit imposter = imposter_sample(matrix_instance, asset, eye, direction, pixels);
+        float3 origin = mul(matrix_instance.inverse, float4(eye, 1.0)).xyz;
+        float3 ray = normalize(mul(matrix_instance.inverse, float4(direction, 0.0)).xyz);
+        s.position = mul(instance.model, float4(origin + ray * imposter.distance, 1.0)).xyz;
+        float3 normal = instance.normal_columns[0].xyz * imposter.normal.x
+            + instance.normal_columns[1].xyz * imposter.normal.y
+            + instance.normal_columns[2].xyz * imposter.normal.z;
+        s.normal = normalize(normal);
+        face = s.normal;
+        s.base_color = imposter.albedo;
+        s.metallic = material.params.x;
+        s.roughness = material.params.y;
+        // A hemisphere of facets has a mean half a unit long.
+        s.agreement = saturate(imposter.mean_length * 2.0 - 1.0);
+        level = 4;
+    } else {
+        uint triangle = hit.y;
+        MatrixCluster cluster;
+        if (is_matrix) {
+            uint id_bits = hit.y & MATRIX_ID_MASK;
+            cluster = matrix_clusters[id_bits >> MATRIX_TRIANGLE_BITS];
+            triangle = id_bits & ((1u << MATRIX_TRIANGLE_BITS) - 1);
+            level = min(cluster.depth, 2);
         }
-        tangent = normalize(tangent - normal * dot(normal, tangent));
-        float3 bitangent = cross(normal, tangent) * tangent_sign;
-        float3 local = sample_material(material.textures.z, texcoord, dx, dy, 0.5).xyz * 2.0 - 1.0;
-        // Toksvig: filtered mips shorten the normal where it varies within the
-        // footprint; widen the lobe by that variance to stop specular sparkle.
-        float length_n = clamp(length(local), 0.01, 1.0);
-        normal_variance = (1.0 - length_n) / length_n;
-        local.xy *= material.params.z;
-        normal = normalize(tangent * local.x + bitangent * local.y + normal * local.z);
+        float3 p[3];
+        float3 n[3];
+        float3 t[3];
+        float2 uv[3];
+        float4 color[3];
+        float tangent_sign = 1.0;
+        for (uint k = 0; k < 3; ++k) {
+            Vertex v = is_matrix ? matrix_vertex(matrix_instance, cluster.first_index, triangle * 3 + k)
+                                 : instance_vertex(instance, triangle * 3 + k);
+            p[k] = mul(instance.model, float4(v.position.xyz, 1.0)).xyz;
+            n[k] = instance.normal_columns[0].xyz * v.normal.x
+                + instance.normal_columns[1].xyz * v.normal.y
+                + instance.normal_columns[2].xyz * v.normal.z;
+            t[k] = mul(model, v.tangent.xyz);
+            uv[k] = float2(v.position.w, v.normal.w);
+            color[k] = v.color;
+            tangent_sign = v.tangent.w < 0.0 ? -1.0 : 1.0;
+        }
+
+        // Barycentrics here and one pixel right and down give exact UV gradients.
+        float3 b = intersect(eye, direction, p[0], p[1], p[2]);
+        float3 bx = intersect(eye, pixel_ray(center + float2(1, 0)), p[0], p[1], p[2]);
+        float3 by = intersect(eye, pixel_ray(center + float2(0, 1)), p[0], p[1], p[2]);
+        float2 texcoord = interpolate(uv[0], uv[1], uv[2], b);
+        float2 dx = interpolate(uv[0], uv[1], uv[2], bx) - texcoord;
+        float2 dy = interpolate(uv[0], uv[1], uv[2], by) - texcoord;
+
+        float4 base = material.base_color
+            * (color[0] * (1.0 - b.x - b.y) + color[1] * b.x + color[2] * b.y)
+            * sample_material(material.textures.x, texcoord, dx, dy, 1.0);
+        // glTF packs roughness in green and metalness in blue.
+        float4 metal_rough = sample_material(material.textures.y, texcoord, dx, dy, 1.0);
+
+        s.position = eye + direction * b.z;
+        float3 normal = normalize(interpolate(n[0], n[1], n[2], b));
+        face = normalize(cross(p[1] - p[0], p[2] - p[0]));
+        // Two-sided: shade the side facing the camera.
+        if (dot(face, s.view) < 0.0) {
+            normal = -normal;
+            face = -face;
+        }
+        float normal_variance = 0.0;
+        if (material.textures.z != NO_TEXTURE) {
+            float3 tangent = interpolate(t[0], t[1], t[2], b);
+            if (dot(tangent, tangent) < 1.0e-12) {
+                // No authored tangents: derive one from the triangle's UV layout.
+                float2 duv1 = uv[1] - uv[0];
+                float2 duv2 = uv[2] - uv[0];
+                float det = duv1.x * duv2.y - duv2.x * duv1.y;
+                tangent = abs(det) > 1.0e-12 ? ((p[1] - p[0]) * duv2.y - (p[2] - p[0]) * duv1.y) / det : float3(1, 0, 0);
+                tangent_sign = det < 0.0 ? -1.0 : 1.0;
+            }
+            tangent = normalize(tangent - normal * dot(normal, tangent));
+            float3 bitangent = cross(normal, tangent) * tangent_sign;
+            float3 local = sample_material(material.textures.z, texcoord, dx, dy, 0.5).xyz * 2.0 - 1.0;
+            // Toksvig: filtered mips shorten the normal where it varies within the
+            // footprint; widen the lobe by that variance to stop specular sparkle.
+            float length_n = clamp(length(local), 0.01, 1.0);
+            normal_variance = (1.0 - length_n) / length_n;
+            local.xy *= material.params.z;
+            normal = normalize(tangent * local.x + bitangent * local.y + normal * local.z);
+        }
+        s.normal = normal;
+        s.base_color = base.rgb;
+        s.metallic = material.params.x * metal_rough.b;
+        float roughness = material.params.y * metal_rough.g;
+        // Add the variance to alpha² and convert back to perceptual roughness.
+        s.roughness = sqrt(sqrt(min(pow(roughness, 4.0) + 2.0 * normal_variance, 1.0)));
+        if ((material.textures.w & TERRAIN_SURFACE) != 0) {
+            float3 across = interpolate(p[0], p[1], p[2], bx) - s.position;
+            float3 along = interpolate(p[0], p[1], p[2], by) - s.position;
+            float footprint = sqrt(max(dot(across, across), dot(along, along)));
+            TerrainSurface ground = terrain_surface(
+                s.position, s.normal, texcoord.x, texcoord.y, footprint, material.params.w, material.params.z);
+            s.base_color = ground.albedo;
+            s.roughness = ground.roughness;
+            // Bumps can tilt a grazing normal past the viewer, where the specular term blows up.
+            s.normal = normalize(ground.normal + s.view * max(0.05 - dot(ground.normal, s.view), 0.0));
+        }
     }
-    s.normal = normal;
-    s.base_color = base.rgb;
-    s.metallic = material.params.x * metal_rough.b;
-    float roughness = material.params.y * metal_rough.g;
-    // Add the variance to alpha² and convert back to perceptual roughness.
-    s.roughness = sqrt(sqrt(min(pow(roughness, 4.0) + 2.0 * normal_variance, 1.0)));
     float nv = max(dot(s.normal, s.view), 0.0001);
     float2 dfg = env_brdf(nv, s.roughness);
     Brdf brdf = make_brdf(s.base_color, s.metallic, s.roughness, nv, dfg);
@@ -204,6 +294,9 @@ void resolveMain(uint3 id: SV_DispatchThreadID) {
     if (globals.counts.z == 0) {
         float3 hemisphere = lerp(globals.ground.rgb, globals.sky.rgb, s.normal.z * 0.5 + 0.5);
         result = (brdf.diffuse_color + specular_albedo(brdf.f0, dfg)) * hemisphere;
+    } else if ((globals.counts.z & 2) != 0) {
+        float3 mirrored = reflect(-s.view, s.normal);
+        result = specular_albedo(brdf.f0, dfg) * lerp(globals.ground.rgb, globals.sky.rgb, mirrored.z * 0.5 + 0.5);
     }
     if (globals.sun_direction.w > 0.0) {
         float3 l = -globals.sun_direction.xyz;
@@ -230,7 +323,6 @@ void resolveMain(uint3 id: SV_DispatchThreadID) {
         }
     }
     if (globals.counts.w != 0) {
-        uint level = uint(instance.normal_columns[0].w);
         float3 colors[5] = {
             float3(0.1, 0.8, 0.2), float3(0.1, 0.5, 1.0),
             float3(1.0, 0.8, 0.1), float3(1.0, 0.3, 0.1),

@@ -11,24 +11,30 @@
 //!   Jacobian whitecaps that persist and fade.
 //! - [`ShoreWaves`]: a swell refracted over a seabed by solving the eikonal
 //!   equation |∇φ| = k(h) (geometric optics, so Snell's law falls out),
-//!   shoaled by energy-flux conservation, depth-limited by the McCowan and
+//!   shoaled and focused by solving energy-flux transport along the rays,
+//!   so land casts a lee shadow; arriving in wave groups that travel at the
+//!   group speed and move the break point; depth-limited by the McCowan and
 //!   Miche breaking criteria, and shaped as parametric orbits with
 //!   a predefined, adjustable breaking profile. [`ShoreWaves::breaker_grid`]
 //!   exposes the same field to the GPU renderer; CPU height queries approximate
 //!   one branch when a crest overturns.
+//! - [`Coast`]: an [`Ocean`] running into [`ShoreWaves`], fading as the depth
+//!   saturates (Thornton & Guza 1982), and a target for simulated beaches.
 //! - [`ShallowWater`]: mass-conserving, wetting-and-drying shallow water on a
 //!   staggered grid (Stelling & Duinmeijer 2003) with Manning friction, plus
 //!   the dispersive surface-wave layer of Jeschke & Wojtan 2023
 //!   ("Generalizing Shallow Water Simulations with Dispersive Surface
-//!   Waves"): short waves are split off and propagated exactly by Airy
-//!   theory, so they travel at their true depth-dependent speed instead of
-//!   the shallow-water one. Nyquist-axis modes are retained but not propagated
-//!   by the dispersive layer. Water and momentum modifiers, edge relaxation
-//!   zones that generate waves from any other [`Water`] (ocean blending), and
-//!   foam advected with the flow.
-//! - [`Ripples`]: a small damped wave-equation grid that scrolls with a
-//!   character, for wakes and splashes at almost no cost. It tracks vertical
-//!   speed explicitly so varying frame durations preserve ripple momentum.
+//!   Waves"): short waves are split off by a depth-aware filter, propagated
+//!   exactly by Airy theory at their true depth-dependent speed, and carried
+//!   by the bulk flow, so waves ride a river. Nyquist-axis modes are retained
+//!   but not propagated by the dispersive layer. Discharge and open edges for
+//!   rivers, water and momentum modifiers, edge relaxation zones that generate
+//!   waves from any other [`Water`] (ocean blending), foam made by published
+//!   breaking criteria and advected with the flow, and a wetness map of where
+//!   water has been.
+//! - [`Ripples`]: a small window that scrolls with a character, advanced
+//!   exactly by the gravity-capillary dispersion relation (eWave), so wakes
+//!   and splashes disperse as real ones do, at almost no cost.
 //!
 //! Everything runs on CPU threads with fields laid out as the textures a GPU
 //! port or the renderer uploads (displacement, slope, foam per texel).
@@ -41,14 +47,20 @@ mod shore;
 
 pub use ocean::{Cascade, Ocean, OceanSettings, Spectrum};
 pub use ripples::{Ripples, RipplesSettings};
-pub use shallow::{ShallowWater, ShallowWaterSettings};
-pub use shore::{BreakerGrid, BreakerProfile, BreakerShape, LocalWave, ShoreSettings, ShoreWaves};
+pub use shallow::{Edge, ShallowWater, ShallowWaterSettings};
+pub use shore::{
+    BreakerGrid, BreakerProfile, BreakerShape, Coast, LocalWave, ShoreSettings, ShoreWaves,
+    WAVES_PER_GROUP, break_wave, group_envelope,
+};
 
 use glam::{Mat3, Quat, Vec2, Vec3};
 use std::f32::consts::PI;
 use std::ops::{Add, Mul};
 use verity_core::Transform;
 use verity_physics::{Collider, ExternalForce, PhysicsBody};
+
+/// Cells per parallel task: below this, scheduling costs more than the work.
+pub(crate) const GRAIN: usize = 2048;
 
 /// Standard gravity, m/s². Wave dispersion assumes gravity along −Z.
 pub const GRAVITY: f32 = 9.81;
@@ -228,6 +240,8 @@ pub fn buoyancy(
                 }
             }
         }
+        // Ground is not something water lifts.
+        Collider::Ground => {}
     }
     out
 }
@@ -238,20 +252,25 @@ pub(crate) fn bilinear<T>(grid: &[T], width: usize, q: Vec2, wrap: bool) -> T
 where
     T: Copy + Add<Output = T> + Mul<f32, Output = T>,
 {
-    let rows = (grid.len() / width) as i64;
+    let (columns, rows) = (width as i64, (grid.len() / width) as i64);
     let base = q.floor();
     let f = q - base;
-    let at = |dx: i64, dy: i64| {
-        let (x, y) = (base.x as i64 + dx, base.y as i64 + dy);
-        let (x, y) = if wrap {
-            (x.rem_euclid(width as i64), y.rem_euclid(rows))
-        } else {
-            (x.clamp(0, width as i64 - 1), y.clamp(0, rows - 1))
-        };
-        grid[x as usize + y as usize * width]
+    let (x, y) = (base.x as i64, base.y as i64);
+    let (x0, x1, y0, y1) = if wrap {
+        let (x0, y0) = (x.rem_euclid(columns), y.rem_euclid(rows));
+        let next = |i: i64, size: i64| if i + 1 == size { 0 } else { i + 1 };
+        (x0, next(x0, columns), y0, next(y0, rows))
+    } else {
+        (
+            x.clamp(0, columns - 1),
+            (x + 1).clamp(0, columns - 1),
+            y.clamp(0, rows - 1),
+            (y + 1).clamp(0, rows - 1),
+        )
     };
-    (at(0, 0) * (1.0 - f.x) + at(1, 0) * f.x) * (1.0 - f.y)
-        + (at(0, 1) * (1.0 - f.x) + at(1, 1) * f.x) * f.y
+    let at = |x: i64, y: i64| grid[x as usize + y as usize * width];
+    (at(x0, y0) * (1.0 - f.x) + at(x1, y0) * f.x) * (1.0 - f.y)
+        + (at(x0, y1) * (1.0 - f.x) + at(x1, y1) * f.x) * f.y
 }
 
 /// Finds the rest position whose displaced position lands on `point`, since

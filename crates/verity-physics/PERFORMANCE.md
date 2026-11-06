@@ -1210,3 +1210,256 @@ Limits that remain:
 Checks: each behaviour here fails a test when removed, except two with no visible
 effect: preferring the deepest contact, as a later one overwrites it anyway, and
 keeping carried cloth awake, as it wakes next step.
+
+## Many cars: riding, impacts and interest (adopted)
+
+Collected on 2026-11-05 on a Ryzen 7 8845HS. A game needs many cars, so the question
+stopped being how to make a car's lattice better and became how rarely to run it.
+Thin shells per panel were rejected: 40 x 40 of sheet costs about 7 ms a step.
+
+### Riding
+
+A carried solid never slept, so every driving car paid for a full solve. Now a settled
+solid with one carrier and no contacts rides: its particles follow the carrier and
+nothing solves until something could reach it. `examples/soft_cost.rs`, 100 cars of
+240 particles on rigid cores, driving:
+
+| Threads | All solving | All riding |
+| --- | --- | --- |
+| 1 | 29.8 ms | 0.36 ms |
+| 4 | 18.5 ms | 0.19 ms |
+| 8 | 16.1 ms | 0.18 ms |
+
+The same 100 rigid bodies alone cost 0.04 ms. Solving scales poorly, about 2x on eight
+threads, not traced. It matters less now that only crashing cars solve.
+
+Bodies now step in parallel, in order-independent work joined in body order, so a run
+gives the same positions on any number of threads.
+
+Mistakes worth keeping:
+
+- A rider dropped out of its carrier's sums. Its weight and what the carrier's own
+  acceleration took must still be applied, or a car speeds up when its shell settles.
+- Regions stop tracking rotation while riding. Woken after half a turn, the warm-started
+  rotation solve left the shape 0.10 m out, so regions catch up by the carrier's turn.
+  At 108 degrees the solve recovers alone: only a half turn shows the fault.
+- Unseen cars first had no crush force, so the core ran on and the shell ended up
+  through the wall. `UNSEEN_CRUSH` stands in for the pins' share of stopping a car. It
+  is 4 from one wall crash, and is not derived.
+
+### Impacts and interest
+
+A collision is recorded as one `Impact`: point, normal, energy and radius, in the
+carrier's frame, from the worst of its steps. Under 100 J leaves no record. They are
+what to send over a network, as a few bytes per crash; there is no network layer yet.
+
+`set_interest` limits solving to spheres and frustums. Rigid bodies always step. Outside,
+a carried body rides on and an uncarried one freezes, and impacts wait. On return they
+press into the rest shape by `energy / (yield_load x area)`. Empty, the default, solves
+everything, which suits a server: riding keeps it cheap, and a car's stopping force
+comes from its solve.
+
+A wall crash at 56 km/h replays to 0.63 m at the nose, inside the 0.49 to 0.65 m of the
+crash data. A solved crash leaves only 0.21 m at the same point once it has sprung back,
+though it peaks within that range, so seen and unseen cars do not end up alike.
+
+Limits:
+
+- Riding needs no contact at all, so a car whose shell rests on the ground keeps solving,
+  as does one pressed against what it crashed into.
+- Only a rigid core counts while unseen: one car's shell passes through another's until
+  their cores meet.
+- Spin is left out of a rider's momentum, and a body spinning fast may never settle.
+- Only solids ride on their own. Cloth carried by one body rides only while unseen, and
+  uncarried soft bodies pop to life when seen again.
+
+### Solving far from the origin
+
+Solved in world space, rounding acts as a steady force, because the same particle rounds
+the same way each step. 64 cars driving in lanes, with no contact at all:
+
+| Lanes | Riding after 5 s | Worst sideways speed |
+| --- | --- | --- |
+| Within 190 m of the origin | 64 of 64 | 0.05 m/s |
+| Out to 378 m | 61 of 64 | 1.2 m/s, and they hit each other |
+| From 2,000 m | 15 of 64 | 5.4 m/s |
+
+So each body now solves around its own anchor, and publishes world positions at the end
+of a step. Obstacles are shifted to it, and pins are taken from anchored poses, as a
+world point is already rounded. A body is also built around its anchor: built in world
+space, its rest shape and pins kept the rounding of wherever it was made, which alone
+gave a car 0.12 m/s at 400 m. Cars now run straight at 20 km, and crush and cloth sag
+match the origin's at 5 km and 3 km.
+
+Riding's cost in the first measurements of this work, 1.27 ms, turned out to be this:
+it was the cars that could never settle, not thread wake-ups as first supposed.
+
+Rigid bodies still live in world space, and the anchor only protects the solve.
+
+## Deforming cars on the GPU (adopted)
+
+Collected on 2026-11-05 on a Ryzen 7 8845HS with its integrated GPU.
+
+Soft bodies drew by rebuilding world-space vertices on the CPU each frame, untextured and
+unculled. `EmbeddedModel` uploads a mesh once, with UVs, tangents and a material, and
+instances share it: each owns only its output vertices. A lattice is about 4 KB against
+megabytes of vertices. `embedded.slang` skins a car only when its shape changed, so a riding
+car is a transform and an ordinary culled draw.
+
+Instances share one copy of their indices: the renderer rewrites `frame_indices` every
+frame, and a copy per car would cost 100 cars of this mesh 33 MB a frame.
+
+Normals are exact, from the cofactors of each cell's deformation, which trilinear weights
+already give: `(w0 + w1)` across an axis weighs that axis's edges. `embed` used to clamp
+points to the lattice, flattening whatever stuck out, and now extrapolates.
+
+A lattice cell is 35 to 40 cm, so dents alone look soft. `Dent`s add creased detail in the
+shader from a short list, and need no per-vertex storage. Only a share of the crush goes
+there, as the lattice already has the rest.
+
+`examples/embedded_cars.rs` crashes real cars and fails unless the GPU's vertices match
+`SoftBody::deformed`:
+
+| Check | Result |
+| --- | --- |
+| GPU against CPU, over a 0.21 m crush | 0.012 mm |
+| Dent detail | 0.08 m from 2 dents |
+| Dispatches a frame, 4 cars crashing, 64 or 100 cars | 3.9 |
+| Vulkan validation errors | 0 |
+
+Frame time read 16.8 ms at both 64 and 100 cars, which is the display's refresh, so it
+says nothing of the cost. This has no GPU timing.
+
+Limits:
+
+- Nothing loads a car: a model is built by hand, and a loaded glTF's vertices and textures
+  do not reach `EmbeddedModel`. Scenes and the editor do not use this yet.
+- Instances cannot be removed, and adding them waits for the GPU.
+- Dents are in the rest frame and do not follow later crushing of that spot.
+- Embedded meshes are not in Lux's GI scene, like other soft bodies.
+- A cracked solid's weights still span the crack. Cars do not crack.
+
+## Tearing: threads, tips and cohesive bonds (adopted)
+
+Collected on 2026-11-05 on a Ryzen 7 8845HS, with `examples/tear_quality.rs`.
+
+Tears followed mesh edges, branched from anywhere along their length, and a uniform load
+shredded a sheet. An element now fails on its weakest plane given its threads, and a tear
+grows only from its tips, cutting through triangles in the direction the material wants.
+
+### What made tears run
+
+The first measurements cut about 2,100 of a sheet's 3,000 edges. In order, what mattered:
+
+- While any tear grows no other starts, as a tear shields the sheet around it, which a
+  step's averaged load cannot show. Alone this changed nothing: every cut vertex still
+  counted as a tip.
+- Tips are particles where exactly one cut ends, and each makes one cut per pass, or a tear
+  branches from every point on it. This took 2,100 edges to about 340.
+- A tear runs at `TEAR_SPEED`, not an edge per step, which made finer cloth tear slower.
+- Next to a tip an element needs only `TIP_LOAD`: stress gathers faster than a step's average
+  shows, and a tip that stalled for one step let a new tear start elsewhere.
+
+### Threads
+
+Strength has to climb sharply off a thread's line. With Hill's smooth criterion the weakest
+plane under a pull stayed within about 10 degrees of square to that pull, whatever the
+thread, because any plane cutting yarns looked nearly as weak as one along them.
+
+Direction from X, pulled along Y from a central nick, warp at 30 degrees:
+
+| Material | 24 cells | 40 cells |
+| --- | --- | --- |
+| Felt (`weave` 0) | 1.5 | 2.5 |
+| Plain weave | 12.8 | 18.5 |
+| Strong grain (`grain` 0.3) | 19.3 | 32.8 |
+
+The right trend, not a clean result: these tears are not straight, at 0.3 to 0.7 where 1 is a
+line, and a weave's should be 30. `failure` itself picks the thread exactly, which tests hold.
+What is lost is at tips, where the stress is the mesh's, and at clamped edges, below.
+
+### Cohesive bonds
+
+A bond's zone is `stiffness x toughness / strength^2`: 3.3 cm for `cloth`. Weakening strength
+alone spread it to 3.3 m in a test, and no stress gathered at the tip at all, so keep them in
+proportion. Secant stiffness goes into the solve, as true softening stiffness is negative.
+
+Work per metre of tear was 30 J/m at 16 cells and 38 J/m at 32, so it holds across
+resolution. That is about a quarter of `toughness`: length counts every cut, and an edge with
+no particle split yet has no bond.
+
+Speed through a sheet could not show any of this: a 50 kg ball carries far more energy than a
+tear costs, and speed varied more with the mesh than with toughness.
+
+### Pins
+
+Pins to immovable bodies were weak: stiffness was capped by the holder's mass, which is 0 for
+immovable. A kinematic bar stretched a sheet 100% before it tore, and now 20%.
+
+Limits:
+
+- A slow pull in `pull_apart` leaves about 13 m of tear in a 2 m sheet, 6 times what it needs.
+  Fixed edges tear too: rows beside a moving grip overload long before load spreads, as one
+  Newton step carries a fast edge load slowly.
+- A heavy ball was sometimes caught at 96 cells and not at 32, so behaviour still depends on
+  the mesh where one object makes a whole tear.
+- A bond stands for one cell of tear, whatever the real length of the edges around it.
+- Particles gain UVs, and `DeformingMesh` can take them with `textured`, but nothing in
+  scenes or the editor sets either yet.
+- A tear's fraying is not drawn.
+
+## Tetrahedra for flesh (adopted)
+
+Collected on 2026-11-06 on a Ryzen 7 8845HS.
+
+`SoftBody::finite_elements` turns a voxel solid into six tetrahedra per cell, so shapes, pins
+and `embed` carry over. Elements are stable neo-Hookean, in the implicit solve cloth uses,
+with no decomposition. Cars stay on the lattice: this is for what must tear.
+
+| Check | Result | Theory |
+| --- | --- | --- |
+| Cantilever droop, 40 x 4 x 4 cells | 0.1506 m | 0.1472 m |
+| Same, 20 x 2 x 2 | 0.0916 m | 0.1472 m |
+
+The hanging block test holds its stretch within 10% of rho g L^2 / 2E. The coarse beam is the
+usual locking of linear tetrahedra: this needs four cells across for anything that bends.
+
+| Body | Particles | Time per step, 8 threads |
+| --- | --- | --- |
+| Flesh 6 x 6 x 6 | 343 | 0.40 ms |
+| Flesh 12 x 12 x 12 | 2,197 | 2.6 ms |
+
+Mistakes worth keeping:
+
+- Leaving out the change of the cofactors keeps the Hessian positive, and halves it in shear.
+  Every Newton step then overshoots twofold, and a stiff block ran to infinity. It is all in
+  now, and an indefinite result stops conjugate gradients early.
+- The energy's constant is not Lame's: at rest it acts as itself less the shear. Given the plain
+  value, Poisson 0 had negative volume stiffness.
+- A 20 m/s hammer crushed elements until Newton's step ran to infinity. A step is limited to a
+  cell (`TET_TRUST`), and if the first direction is already indefinite the solve still moves
+  along it.
+- Bonds took `break_load`, so one between fibres held three times what parted it.
+- Comparing extreme points of a hanging block counted its pins' uneven sag as stretch: 11%.
+
+Plasticity needs no decomposition either: Green strain's deviator moves each element's
+gradients, so nothing else knows it happened. A block held at 30% keeps most of it. A free
+block snaps back in about two frames, too fast to flow.
+
+A face only one element holds is surface, so torn faces close themselves. Fracture tests each
+element's four faces directly: their normals are its gradients, and they are the only planes
+it can part on, so no direction is sampled.
+
+Limits:
+
+- Cracks follow element faces, so they are jagged at a cell's scale, and there is no tip
+  splitting as in cloth. Flesh's torn edges ran 0.45 along a pull along its fibres, against
+  0.31 for the same material without them: the right way, not a clean split.
+- Pulled along its fibres, flesh does not last the three times longer its strength suggests:
+  clamped ends give it sideways tension, and it splits lengthwise at about the same strain.
+- Fibres affect strength only, not stiffness.
+- Particles copied by a crack share mass evenly, not by volume.
+- `embed` weights span a crack, so a detailed mesh over one stretches across it.
+- A tetrahedral body does not ride, nor take `Impact`s, nor `nick`.
+- A particle at a crack is pulled at up to its bond's stiffness until `opened` updates at
+  the end of a step, so a body teleported apart closes up again.

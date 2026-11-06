@@ -1,7 +1,7 @@
 //! Times the GI scene build for the converted Sponza in `assets/packed`.
 //! `cargo run --release -p verity-lux --example build_sponza`
 use std::{path::Path, time::Instant};
-use verity_lux::scene::GiScene;
+use verity_lux::cascades::scene::GiScene;
 use verity_render::asset::{LoadOptions, TextureFormat, load_gltf};
 
 fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {

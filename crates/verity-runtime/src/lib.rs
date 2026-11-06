@@ -2,16 +2,17 @@
 
 use std::{collections::HashMap, time::Duration};
 
-use verity_box3d::{Box3dSettings, PhysicsWorld, RigidBodyComponent};
-use verity_core::{ComponentRegistry, EntityHandle, PhysicsEngine, Scene, World};
-use verity_physics::{JointComponent, SoftBodyComponent};
+use verity_core::{ComponentRegistry, EntityHandle, Scene, World};
+use verity_physics::{
+    JointComponent, PhysicsSettings, PhysicsWorld, RigidBodyComponent, SoftBodyComponent,
+};
 
 /// Every component type the runtime simulates.
 pub fn registry() -> ComponentRegistry {
     let mut registry = ComponentRegistry::default();
     registry.register::<RigidBodyComponent>();
-    registry.register::<verity_physics::JointComponent>();
-    registry.register::<verity_physics::SoftBodyComponent>();
+    registry.register::<JointComponent>();
+    registry.register::<SoftBodyComponent>();
     registry
 }
 
@@ -22,9 +23,7 @@ pub fn registry() -> ComponentRegistry {
 pub struct Runtime {
     pub world: World,
     pub physics: PhysicsWorld,
-    pub physics_settings: Box3dSettings,
-    pub verity_physics: Option<verity_physics::PhysicsWorld>,
-    pub verity_settings: verity_physics::PhysicsSettings,
+    pub physics_settings: PhysicsSettings,
     /// Each entity's Joint component in the simulation.
     joints: HashMap<EntityHandle, verity_physics::LinkId>,
     /// Each entity's Soft Body component in the simulation.
@@ -41,9 +40,7 @@ impl Runtime {
         Self {
             world: World::new(),
             physics: PhysicsWorld::default(),
-            physics_settings: Box3dSettings::default(),
-            verity_physics: None,
-            verity_settings: verity_physics::PhysicsSettings::default(),
+            physics_settings: PhysicsSettings::default(),
             joints: HashMap::new(),
             soft: Vec::new(),
             joint_events: Vec::new(),
@@ -66,17 +63,8 @@ impl Runtime {
         if physics.iterations == 0 {
             return Err("Physics iterations must be positive".into());
         }
-        if physics.substeps == 0 || physics.substeps > i32::MAX as u32 {
-            return Err("Physics substeps must fit a positive integer".into());
-        }
-        let gravity = glam::Vec3::from_array(physics.gravity);
-        runtime.physics_settings.gravity = gravity;
-        runtime.physics_settings.substeps = physics.substeps;
-        runtime.verity_settings.gravity = gravity;
-        runtime.verity_settings.iterations = physics.iterations;
-        if physics.engine == PhysicsEngine::Verity {
-            runtime.verity_physics = Some(verity_physics::PhysicsWorld::default());
-        }
+        runtime.physics_settings.gravity = glam::Vec3::from_array(physics.gravity);
+        runtime.physics_settings.iterations = physics.iterations;
         let bodies = runtime
             .world
             .query::<RigidBodyComponent>()
@@ -97,46 +85,10 @@ impl Runtime {
             })
             .collect::<Result<Vec<_>, _>>()?;
         for (entity, body) in bodies {
-            if let Some(physics) = &mut runtime.verity_physics {
-                let name = runtime.world.get(entity).map_or("", |e| e.name);
-                let collider = match body.collider {
-                    verity_box3d::Collider::Cuboid { half_extents } => {
-                        verity_physics::Collider::Cuboid { half_extents }
-                    }
-                    verity_box3d::Collider::Sphere { radius } => {
-                        verity_physics::Collider::Sphere { radius }
-                    }
-                    _ => {
-                        return Err(format!(
-                            "{name}: Rigid Body: Verity physics does not support this collider"
-                        ));
-                    }
-                };
-                if body.material.restitution != 0.0 {
-                    return Err(format!(
-                        "{name}: Rigid Body: Verity physics does not support restitution"
-                    ));
-                }
-                let body_type = match body.body_type {
-                    verity_box3d::RigidBody::Static => verity_physics::RigidBody::Static,
-                    verity_box3d::RigidBody::Kinematic => verity_physics::RigidBody::Kinematic,
-                    verity_box3d::RigidBody::Dynamic => verity_physics::RigidBody::Dynamic,
-                };
-                let mut custom = verity_physics::PhysicsBody::new(body_type, collider);
-                custom.material = verity_physics::PhysicsMaterial {
-                    density: body.material.density,
-                    friction: body.material.friction,
-                    static_friction: body.material.friction,
-                };
-                physics
-                    .insert(&runtime.world, entity, custom)
-                    .expect("entities come from this world");
-            } else {
-                runtime
-                    .physics
-                    .insert(&runtime.world, entity, body)
-                    .expect("entities come from this world");
-            }
+            runtime
+                .physics
+                .insert(&runtime.world, entity, body)
+                .expect("entities come from this world");
         }
         runtime.add_joints()?;
         runtime.add_soft_bodies()?;
@@ -151,9 +103,6 @@ impl Runtime {
             .collect();
         for (entity, joint) in joints {
             let name = self.world.get(entity).map_or("", |e| e.name).to_owned();
-            let Some(physics) = &mut self.verity_physics else {
-                return Err(format!("{name}: Joint: needs the Verity physics engine"));
-            };
             let other = if joint.connected_to.is_empty() {
                 None
             } else {
@@ -181,7 +130,7 @@ impl Runtime {
             let authored = joint
                 .to_joint(other, entity, anchor)
                 .map_err(|e| format!("{name}: Joint: {e}"))?;
-            let id = physics
+            let id = (self.physics)
                 .add_joint(&self.world, authored)
                 .map_err(|_| format!("{name}: Joint: both entities need a Rigid Body"))?;
             self.joints.insert(entity, id);
@@ -197,9 +146,7 @@ impl Runtime {
         for (entity, soft) in soft {
             let name = self.world.get(entity).map_or("", |e| e.name).to_owned();
             let error = |e: String| format!("{name}: Soft Body: {e}");
-            let Some(physics) = &mut self.verity_physics else {
-                return Err(error("needs the Verity physics engine".into()));
-            };
+            let physics = &mut self.physics;
             let t = &self
                 .world
                 .get(entity)
@@ -244,7 +191,7 @@ impl Runtime {
                         Some(verity_physics::Collider::Sphere { radius }) => {
                             q.length() <= radius + 0.05
                         }
-                        None => false,
+                        Some(verity_physics::Collider::Ground) | None => false,
                     }
                 };
                 physics
@@ -273,7 +220,7 @@ impl Runtime {
         &self,
     ) -> impl Iterator<Item = (EntityHandle, &[glam::Vec3], &[[u32; 3]])> + '_ {
         (self.soft.iter()).filter_map(|&(entity, id)| {
-            let body = self.verity_physics.as_ref()?.soft_body(id)?;
+            let body = self.physics.soft_body(id)?;
             Some((entity, body.positions(), body.triangles()))
         })
     }
@@ -281,7 +228,7 @@ impl Runtime {
     /// An entity's Joint component in the simulation, if it has one.
     pub fn joint_status(&self, entity: EntityHandle) -> Option<verity_physics::JointStatus> {
         let id = self.joints.get(&entity)?;
-        self.verity_physics.as_ref()?.joint_status(*id)
+        self.physics.joint_status(*id)
     }
 
     /// Returns the simulation interval used by [`Self::advance`].
@@ -309,20 +256,13 @@ impl Runtime {
         let mut ticks = 0u64;
         self.joint_events.clear();
         while self.accumulated >= self.fixed_timestep {
-            if let Some(physics) = &mut self.verity_physics {
-                physics.step(
-                    &mut self.world,
-                    &self.verity_settings,
-                    self.fixed_timestep.as_secs_f32(),
-                );
-                self.joint_events.extend_from_slice(physics.joint_events());
-            } else {
-                self.physics.step(
-                    &mut self.world,
-                    &self.physics_settings,
-                    self.fixed_timestep.as_secs_f32(),
-                );
-            }
+            self.physics.step(
+                &mut self.world,
+                &self.physics_settings,
+                self.fixed_timestep.as_secs_f32(),
+            );
+            self.joint_events
+                .extend_from_slice(self.physics.joint_events());
             self.accumulated -= self.fixed_timestep;
             ticks = ticks.checked_add(1).expect("physics tick count overflow");
         }
@@ -352,8 +292,8 @@ impl Default for Runtime {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use verity_box3d::{Collider, PhysicsBody, RigidBody};
     use verity_core::{Entity, Material, Transform};
+    use verity_physics::{Collider, PhysicsBody, RigidBody};
 
     #[test]
     fn fixed_step_carries_fractional_time_and_moves_dynamic_body() {
@@ -364,7 +304,7 @@ mod tests {
         let entity = runtime.world.spawn(Entity {
             name: "falling".into(),
             transform: Transform {
-                translation: [0.0, 5.0, 0.0],
+                translation: [0.0, 0.0, 5.0],
                 ..Transform::default()
             },
             material: Material::default(),
@@ -380,11 +320,11 @@ mod tests {
             .unwrap();
         assert_eq!(runtime.advance(Duration::from_millis(9)), 0);
         assert_eq!(
-            runtime.world.get(entity).unwrap().transform.translation[1],
+            runtime.world.get(entity).unwrap().transform.translation[2],
             5.0
         );
         assert_eq!(runtime.advance(Duration::from_millis(21)), 3);
-        assert!(runtime.world.get(entity).unwrap().transform.translation[1] < 5.0);
+        assert!(runtime.world.get(entity).unwrap().transform.translation[2] < 5.0);
     }
 
     #[test]
@@ -416,7 +356,6 @@ mod tests {
 
     fn jointed_scene() -> Scene {
         let mut scene = Scene::default();
-        scene.physics.engine = PhysicsEngine::Verity;
         scene.entities[0].name = "Hanging".into();
         scene.entities[0].transform.translation = [0.0, 0.0, 5.0];
         scene.entities[0].components.insert(
@@ -438,7 +377,6 @@ mod tests {
     #[test]
     fn authored_cloth_hangs_from_its_top_edge_and_hides_nothing_else() {
         let mut scene = Scene::default();
-        scene.physics.engine = PhysicsEngine::Verity;
         scene.entities[0].transform.translation = [0.0, 0.0, 5.0];
         scene.entities[0].components.insert(
             "Soft Body".into(),
@@ -464,12 +402,6 @@ mod tests {
             "Soft Body".into(),
             serde_json::to_value(SoftBodyComponent::default()).unwrap(),
         );
-        let error = Runtime::from_scene(&scene).err().unwrap();
-        assert!(
-            error.contains("Flag") && error.contains("Verity"),
-            "{error}"
-        );
-        scene.physics.engine = PhysicsEngine::Verity;
         let bad = SoftBodyComponent {
             size: [0.0; 3],
             ..Default::default()
@@ -478,7 +410,7 @@ mod tests {
             .components
             .insert("Soft Body".into(), serde_json::to_value(bad).unwrap());
         let error = Runtime::from_scene(&scene).err().unwrap();
-        assert!(error.contains("size"), "{error}");
+        assert!(error.contains("Flag") && error.contains("size"), "{error}");
     }
 
     #[test]
@@ -501,14 +433,6 @@ mod tests {
 
     #[test]
     fn invalid_joints_are_reported_by_entity_name() {
-        let mut scene = jointed_scene();
-        scene.physics.engine = PhysicsEngine::Box3d;
-        let error = Runtime::from_scene(&scene).err().unwrap();
-        assert!(
-            error.contains("Hanging") && error.contains("Verity"),
-            "{error}"
-        );
-
         let mut scene = jointed_scene();
         scene.entities[0].components.insert(
             "Joint".into(),
@@ -538,7 +462,6 @@ mod tests {
     #[test]
     fn verity_scene_simulates_authored_body_with_scene_settings() {
         let mut scene = Scene::default();
-        scene.physics.engine = PhysicsEngine::Verity;
         scene.physics.gravity = [0.0, 0.0, -3.0];
         scene.physics.iterations = 3;
         scene.entities[0].transform.translation = [0.0, 0.0, 5.0];
@@ -548,11 +471,10 @@ mod tests {
         );
         let mut runtime = Runtime::from_scene(&scene).unwrap();
         let entity = runtime.world.handles()[0];
-        assert!(runtime.verity_physics.as_ref().unwrap().contains(entity));
-        assert!(!runtime.physics.contains(entity));
-        assert_eq!(runtime.verity_settings.iterations, 3);
+        assert!(runtime.physics.contains(entity));
+        assert_eq!(runtime.physics_settings.iterations, 3);
         assert_eq!(
-            runtime.verity_settings.gravity.to_array(),
+            runtime.physics_settings.gravity.to_array(),
             scene.physics.gravity
         );
         runtime.advance(Duration::from_millis(100));
@@ -562,7 +484,6 @@ mod tests {
     #[test]
     fn verity_scene_rejects_unsupported_and_invalid_physics() {
         let mut scene = Scene::default();
-        scene.physics.engine = PhysicsEngine::Verity;
         for (body, expected) in [
             (serde_json::json!({ "shape": "Capsule" }), "collider"),
             (serde_json::json!({ "restitution": 0.5 }), "restitution"),
@@ -589,14 +510,6 @@ mod tests {
                 .contains("iterations")
         );
         scene.physics.iterations = 6;
-        scene.physics.substeps = 0;
-        assert!(
-            Runtime::from_scene(&scene)
-                .err()
-                .unwrap()
-                .contains("substeps")
-        );
-        scene.physics.substeps = 4;
         scene.physics.gravity[2] = f32::NAN;
         assert!(
             Runtime::from_scene(&scene)

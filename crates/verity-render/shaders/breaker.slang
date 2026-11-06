@@ -1,8 +1,8 @@
 // Parametric shore surface. Cell-centered wave data and profile coefficients
 // are the same ones used by the CPU's sparse gameplay queries.
 struct Cell {
-    float4 wave;      // phase, direction x/y, height
-    float4 medium;    // wavenumber, depth, breaking, unused
+    float4 wave;      // phase, direction x/y, unbroken height
+    float4 medium;    // wavenumber, depth, height limit, group arrival
 };
 [[vk::binding(0, 0)]] StructuredBuffer<Cell> cells;
 
@@ -11,7 +11,7 @@ struct Constants {
     uint4 dimensions; // width, height, x/y subdivision count
     float4 domain;    // origin x/y, cell size, sea level
     float4 animation; // omega, time, lean, horizontal harmonic
-    float4 profile;   // vertical harmonic
+    float4 profile;   // vertical harmonic, groups, group phase per metre x/y
 };
 [[vk::push_constant]] ConstantBuffer<Constants> wave;
 
@@ -55,12 +55,19 @@ VertexOutput vertexMain(uint vertex: SV_VertexID) {
     direction = len > 1e-6 ? direction / len : float2(1, 0);
     float k = max(c.medium.x, 1e-6);
     float depth = max(c.medium.y, 0.05);
-    float b = saturate(c.medium.z);
+    // verity_ocean::group_envelope and break_wave.
+    float t = wave.animation.x / 7.0 * (wave.animation.y - c.medium.w);
+    float across = dot(wave.profile.zw, p);
+    float unbroken = c.wave.w * (1.0 + wave.profile.y
+        * (0.6 * sin(t + across) + 0.4 * sin(1.618 * t - 0.7 * across)));
+    float limit = c.medium.z;
+    float height = min(unbroken, limit);
+    float b = limit > 0.0 ? saturate((unbroken / limit - 0.9) / 0.3) : 0.0;
     float theta = c.wave.x - wave.animation.x * wave.animation.y;
-    float horizontal = min(0.5 * c.wave.w / tanh(k * depth), 0.9 / k);
+    float horizontal = min(0.5 * height / tanh(k * depth), 0.9 / k);
     float wet = c.medium.y > 0.0 ? 1.0 : 0.0;
     float x = wet * (-sin(theta) - wave.animation.w * b * sin(2.0 * theta)) * horizontal;
-    float z = wet * (cos(theta) + wave.profile.x * b * cos(2.0 * theta)) * 0.5 * c.wave.w;
+    float z = wet * (cos(theta) + wave.profile.x * b * cos(2.0 * theta)) * 0.5 * height;
     float angle = wave.animation.z * b;
     float dx = x * cos(angle) + z * sin(angle);
     float dz = z * cos(angle) - x * sin(angle);

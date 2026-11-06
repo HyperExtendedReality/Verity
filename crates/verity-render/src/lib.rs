@@ -15,14 +15,19 @@
 pub mod asset;
 pub mod extension;
 pub mod gpu;
+mod embedded;
+mod retained;
 mod gpu_culling;
 mod meshlets;
 mod scene;
 mod upload;
 
 pub use asset::{Sun, TextureFormat};
-pub use extension::{FrameContext, Gpu, RenderExtension, Targets};
-pub use scene::{Camera, DeformingMesh, Vertex, UP};
+pub use matrix::MatrixStats;
+pub use extension::{FrameContext, Gpu, RenderExtension, RetainedChange, Targets};
+pub use embedded::{Dent, EmbeddedInstanceId, EmbeddedModel, EmbeddedModelId, MAX_DENTS};
+pub use retained::RetainedMesh;
+pub use scene::{Camera, DeformingMesh, GpuMaterial, Vertex, UP};
 pub use upload::SceneStats;
 
 use ash::{vk, Entry};
@@ -52,6 +57,9 @@ pub const MAX_POINT_SHADOWS: usize = scene::MAX_POINT_SHADOWS;
 const FRAMES: usize = 2;
 /// Marks a draw that belongs to no static primitive.
 const NO_PRIMITIVE: usize = usize::MAX;
+/// Marks a draw of an embedded instance: its bounds are at `this + index`, in
+/// `Renderer::embedded_bounds`.
+const EMBEDDED_PRIMITIVE: usize = usize::MAX / 2;
 const VISIBILITY_FORMAT: vk::Format = vk::Format::R32G32_UINT;
 const HDR_FORMAT: vk::Format = vk::Format::R16G16B16A16_SFLOAT;
 // Neutral gray, matching the editor chrome.
@@ -64,6 +72,7 @@ macro_rules! spirv {
 }
 
 pub mod breaker;
+mod matrix;
 
 /// Tessellated UI and the physical-pixel scene viewport within the swapchain.
 pub struct UiFrame {
@@ -143,6 +152,8 @@ struct Frame {
     materials: Buffer,
     /// This frame's deforming vertices, on their way into `Renderer::vertices`.
     deforming: Buffer,
+    /// New retained vertices, on their way into `Renderer::vertices`.
+    retained: Buffer,
     /// egui textures to free once this frame's fence signals.
     frees: Vec<egui::TextureId>,
 }
@@ -236,7 +247,6 @@ pub struct Renderer {
     primitives: Vec<asset::Primitive>,
     /// Meshlets in primitive order; missing metadata means draw the whole primitive.
     primitive_meshlets: Vec<Option<Vec<meshlets::Meshlet>>>,
-    virtual_geometry: Vec<Option<verity_strata::virtual_geometry::VirtualGeometry>>,
     /// Original indices remain available for exact fallback.
     source_indices: Vec<u32>,
     frame_indices: Vec<u32>,
@@ -246,8 +256,15 @@ pub struct Renderer {
     deforming_vertices: Vec<Vertex>,
     deforming_base: u32,
     deforming_capacity: u32,
-    strata_enabled: bool,
-    strata_debug: bool,
+    retained: retained::Retained,
+    clear_color: [f32; 4],
+    shadow_distance: f32,
+    embedded: Option<embedded::Embedded>,
+    /// This frame's embedded draws, in draw order.
+    embedded_bounds: Vec<(glam::Vec3, glam::Vec3)>,
+    matrix: matrix::Matrix,
+    matrix_enabled: bool,
+    matrix_debug: bool,
     model_draws: Vec<asset::Draw>,
     materials: Vec<LoadedMaterial>,
     scene_lights: Vec<PointLight>,
@@ -255,6 +272,8 @@ pub struct Renderer {
     sun_is_imported: bool,
     /// Directional light selected for the current frame.
     frame_sun: Option<Sun>,
+    /// This frame's ambient hemisphere: sky, ground.
+    frame_ambient: (glam::Vec3, glam::Vec3),
     camera: Camera,
     previous_view_proj: Option<glam::Mat4>,
     /// This frame's view-projection and the one before it.
@@ -265,6 +284,8 @@ pub struct Renderer {
     breakers: breaker::BreakerPass,
     requested_size: (u32, u32),
     recreate: bool,
+    /// Present as fast as frames finish instead of waiting for vsync.
+    uncapped: bool,
     ui_renderer:
         Option<egui_ash_renderer::Renderer<egui_ash_renderer::allocator::DefaultAllocator>>,
     ui_format: Option<vk::Format>,
@@ -401,21 +422,27 @@ impl Renderer {
                 textures: Vec::new(),
                 primitives: Vec::new(),
                 primitive_meshlets: Vec::new(),
-                virtual_geometry: Vec::new(),
                 source_indices: Vec::new(),
                 frame_indices: Vec::new(),
                 deforming: Vec::new(),
                 deforming_vertices: Vec::new(),
                 deforming_base: 0,
                 deforming_capacity: 0,
-                strata_enabled: false,
-                strata_debug: false,
+                retained: Default::default(),
+                clear_color: CLEAR_COLOR,
+                shadow_distance: scene::SHADOW_DISTANCE,
+                embedded: None,
+                embedded_bounds: Vec::new(),
+                matrix: Default::default(),
+                matrix_enabled: false,
+                matrix_debug: false,
                 model_draws: Vec::new(),
                 materials: Vec::new(),
                 scene_lights: Vec::new(),
                 sun: None,
                 sun_is_imported: false,
                 frame_sun: None,
+                frame_ambient: Default::default(),
                 camera: Camera::default(),
                 previous_view_proj: None,
                 frame_view_proj: Default::default(),
@@ -425,6 +452,7 @@ impl Renderer {
                 breakers: breaker::BreakerPass::default(),
                 requested_size: (size.width, size.height),
                 recreate: true,
+                uncapped: false,
                 ui_renderer: None,
                 ui_format: None,
                 pending_textures: Vec::new(),
@@ -446,6 +474,7 @@ impl Renderer {
                 .get_physical_device_properties(physical)
                 .limits;
             renderer.culler = gpu_culling::Culler::new(&renderer.device, limits).ok();
+            renderer.embedded = Some(embedded::Embedded::new(&renderer.device)?);
             renderer.depth_sampled = renderer
                 .instance
                 .get_physical_device_format_properties(physical, renderer.depth_format)
@@ -493,6 +522,18 @@ impl Renderer {
             D::SAMPLED_IMAGE,
             D::SAMPLER,
             D::SAMPLED_IMAGE,
+            // Matrix: see `matrix.rs`.
+            D::STORAGE_BUFFER,
+            D::STORAGE_BUFFER,
+            D::STORAGE_BUFFER,
+            D::STORAGE_BUFFER,
+            D::STORAGE_BUFFER,
+            D::STORAGE_BUFFER,
+            D::STORAGE_BUFFER,
+            D::STORAGE_BUFFER,
+            D::STORAGE_BUFFER,
+            D::STORAGE_BUFFER,
+            D::STORAGE_BUFFER,
         ];
         let textures_binding = 12;
         let count = |i: usize| {
@@ -532,9 +573,15 @@ impl Renderer {
             None,
         )?;
         let set_layouts = [self.set_layout];
-        let push = [vk::PushConstantRange::default()
-            .stage_flags(vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT)
-            .size(8)];
+        let push = [
+            vk::PushConstantRange::default()
+                .stage_flags(vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT)
+                .size(8),
+            vk::PushConstantRange::default()
+                .stage_flags(vk::ShaderStageFlags::COMPUTE)
+                .offset(8)
+                .size(8),
+        ];
         self.pipeline_layout = device.create_pipeline_layout(
             &vk::PipelineLayoutCreateInfo::default()
                 .set_layouts(&set_layouts)
@@ -771,6 +818,7 @@ impl Renderer {
                 MemoryLocation::CpuToGpu,
             )?;
         }
+        self.matrix = matrix::Matrix::new(device, allocator, layout, self.depth_format)?;
         // Appending the cube also writes every frame's buffer descriptors.
         let (vertices, indices) = scene::cube();
         self.append_geometry(&vertices, &indices)?;
@@ -786,7 +834,6 @@ impl Renderer {
             .collect();
         self.primitive_meshlets
             .push(meshlets::build(&positions, &indices));
-        self.virtual_geometry.push(None);
         self.source_indices.extend_from_slice(&indices);
         self.write_texture_descriptors();
         Ok(())
@@ -868,6 +915,17 @@ impl Renderer {
         };
     }
 
+    /// How far from the camera the sun casts shadows, in metres. A longer reach
+    /// spreads the same shadow map over more ground, so close shadows soften.
+    pub fn set_shadow_distance(&mut self, distance: f32) {
+        self.shadow_distance = distance;
+    }
+
+    /// The color behind the scene, in the swapchain's encoding.
+    pub fn set_clear_color(&mut self, color: [f32; 4]) {
+        self.clear_color = color;
+    }
+
     /// Override the scene's hemisphere colors. Direct-only scenes remain direct-only.
     pub fn set_ambient(&mut self, sky: glam::Vec3, ground: glam::Vec3) {
         self.ambient_override = Some((sky, ground));
@@ -915,6 +973,7 @@ impl Renderer {
             extension.targets_changed(&mut self.gpu(), &targets)?;
         }
         self.extension = Some(extension);
+        self.retained.notify_all();
         Ok(())
     }
 
@@ -976,20 +1035,26 @@ impl Renderer {
         self.texture_format
     }
 
-    /// Enable demand-resolved, per-frame virtual geometry for imported meshes.
     /// Replace the meshes whose vertices change every frame: cloth and other
     /// soft bodies. They are in world space and cast shadows.
     pub fn set_deforming_meshes(&mut self, meshes: Vec<DeformingMesh>) {
         self.deforming = meshes;
     }
 
-    pub fn set_strata_enabled(&mut self, enabled: bool) {
-        self.strata_enabled = enabled;
+    /// Draw cooked meshes through Matrix instead of triangle by triangle.
+    pub fn set_matrix_enabled(&mut self, enabled: bool) {
+        self.matrix_enabled = enabled;
+    }
+
+    /// Stop waiting for vsync, where the surface allows it.
+    pub fn set_uncapped(&mut self, uncapped: bool) {
+        self.recreate |= uncapped != self.uncapped;
+        self.uncapped = uncapped;
     }
 
     /// Color visible surfaces by the LOD actually selected for that frame.
-    pub fn set_strata_debug(&mut self, enabled: bool) {
-        self.strata_debug = enabled;
+    pub fn set_matrix_debug(&mut self, enabled: bool) {
+        self.matrix_debug = enabled;
     }
 
     /// Point a frame's descriptor set at its buffers and the shared ones.
@@ -1010,6 +1075,7 @@ impl Renderer {
             .map(|(binding, b)| (binding as u32, [b.info()]))
             .collect();
         infos.push((10, [frame.materials.info()]));
+        infos.extend(self.matrix.buffers().map(|(binding, b)| (binding, [b.info()])));
         let writes: Vec<_> = infos
             .iter()
             .map(|(binding, info)| {
@@ -1134,6 +1200,9 @@ impl Renderer {
         let formats = self
             .surface_loader
             .get_physical_device_surface_formats(self.physical, self.surface)?;
+        let present_modes = self
+            .surface_loader
+            .get_physical_device_surface_present_modes(self.physical, self.surface)?;
         let srgb_space =
             |f: &vk::SurfaceFormatKHR| f.color_space == vk::ColorSpaceKHR::SRGB_NONLINEAR;
         let format = formats
@@ -1216,7 +1285,7 @@ impl Renderer {
                 .image_sharing_mode(vk::SharingMode::EXCLUSIVE)
                 .pre_transform(caps.current_transform)
                 .composite_alpha(composite)
-                .present_mode(vk::PresentModeKHR::FIFO)
+                .present_mode(gpu::present_mode(&present_modes, self.uncapped))
                 .clipped(true),
             None,
         )?;
@@ -1445,7 +1514,19 @@ impl Renderer {
                 &vk::CommandBufferBeginInfo::default()
                     .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
             )?;
-            self.record_deforming(command);
+            if let Some(embedded) = &mut self.embedded {
+                embedded.record(&self.device, command, frame_index, self.vertices.buffer);
+            }
+            self.record_vertex_copies(
+                command,
+                self.frames[self.frame].deforming.buffer,
+                &self.deforming_copy(),
+            );
+            self.record_vertex_copies(
+                command,
+                self.frames[self.frame].retained.buffer,
+                &self.retained.copies,
+            );
             self.record_scene(command, set, viewport)?;
             self.record_extension(command, set, viewport)?;
             self.breakers.record(
@@ -1539,19 +1620,22 @@ impl Renderer {
     /// Build this frame's draws, materials and lights and write them with the
     /// globals, growing buffers as needed.
     unsafe fn upload_frame(&mut self, scene: &RenderInput<'_>, viewport: [u32; 4]) -> Result<()> {
+        self.place_retained()?;
         self.instance_data.clear();
         self.draw_calls.clear();
         self.shadow_calls.clear();
         self.frame_indices.clear();
         let mut ranges = std::collections::HashMap::<(usize, usize), (u32, u32)>::new();
-        let mut selected_indices = Vec::new();
+        self.matrix.read_stats(self.frame);
+        self.matrix.set_active(self.matrix_enabled);
         self.material_data.clear();
         self.material_data
             .extend(self.materials.iter().map(|m| m.gpu));
         for (index, draw) in self.model_draws.iter().enumerate() {
             let primitive = self.primitives[draw.primitive as usize];
             let material = &self.materials[primitive.material as usize];
-            if material.hidden {
+            let primitive_index = draw.primitive as usize;
+            if material.hidden || (self.matrix_enabled && self.matrix.owns(primitive_index)) {
                 continue;
             }
             let mut instance = scene::instance(
@@ -1560,34 +1644,16 @@ impl Renderer {
                 primitive.base_vertex,
                 primitive.material,
             );
-            let primitive_index = draw.primitive as usize;
-            let mut level = 0;
-            if self.strata_enabled {
-                if let Some(geometry) = self.virtual_geometry[primitive_index].as_mut() {
-                    let scale = geometry.bounds().map_or(f64::INFINITY, |bounds| {
-                        scene::lod_projection_scale(&self.camera, viewport, draw.transform, bounds)
-                    });
-                    level = geometry
-                        .resolve(scale, 1.0, &mut selected_indices)
-                        .unwrap_or(0);
-                }
-            }
             let original_start = primitive.first_index as usize;
             let original_end = original_start + primitive.index_count as usize;
-            let indices = if level == 0 {
-                &self.source_indices[original_start..original_end]
-            } else {
-                &selected_indices
-            };
             let (first, index_count) = append_lod_range(
                 &mut self.frame_indices,
                 &mut ranges,
-                (primitive_index, level),
-                indices,
+                (primitive_index, 0),
+                &self.source_indices[original_start..original_end],
             )
             .ok_or_else(|| failure("too many frame geometry indices"))?;
             instance.draw[0] = first;
-            instance.normal_columns[0][3] = level as f32;
             // The stable draw index extensions know from `scene_loaded`.
             instance.draw[3] = index as u32;
             self.instance_data.push(instance);
@@ -1632,7 +1698,8 @@ impl Renderer {
         let entities = self.instance_data.len() as u32;
         for (slot, mesh) in self.deforming.iter().enumerate() {
             let index = self.material_data.len() as u32;
-            self.material_data.push(scene::GpuMaterial::plain(&mesh.material));
+            let plain = || scene::GpuMaterial::plain(&mesh.material);
+            self.material_data.push(mesh.textured.unwrap_or_else(plain));
             let first = u32::try_from(self.frame_indices.len())
                 .map_err(|_| failure("too many frame geometry indices"))?;
             let base = self.deforming_base + self.deforming_vertices.len() as u32;
@@ -1644,6 +1711,27 @@ impl Renderer {
             self.draw_calls
                 .push((mesh.indices.len() as u32, true, NO_PRIMITIVE));
         }
+        self.embedded_bounds.clear();
+        let mut slot = entities + self.deforming.len() as u32;
+        for draw in self.embedded.iter().flat_map(|e| e.draws()) {
+            let index = self.material_data.len() as u32;
+            self.material_data.push(draw.material);
+            // Instances share one copy of the indices: only their vertices differ.
+            let first = u32::try_from(self.frame_indices.len())
+                .map_err(|_| failure("too many frame geometry indices"))?;
+            self.frame_indices.extend_from_slice(draw.indices);
+            for (base, transform, bounds) in draw.instances {
+                let mut instance = scene::instance(transform, first, base, index);
+                instance.draw[3] = slot;
+                slot += 1;
+                self.instance_data.push(instance);
+                let primitive = EMBEDDED_PRIMITIVE + self.embedded_bounds.len();
+                self.draw_calls
+                    .push((draw.indices.len() as u32, false, primitive));
+                self.embedded_bounds.push(bounds);
+            }
+        }
+        self.push_retained_draws(slot, viewport, scene.sun().or(self.sun).as_ref())?;
         // All casters are retained, including those outside the camera.
         self.shadow_calls.extend(
             self.draw_calls
@@ -1673,23 +1761,27 @@ impl Renderer {
                 )
             })
         };
+        self.frame_ambient = (sky, ground);
         let mut globals = scene::globals(
             &self.camera,
             &scene::Lighting {
                 sun: self.frame_sun.as_ref(),
                 sky,
                 ground,
+                shadow_distance: self.shadow_distance,
             },
             viewport,
             [
                 self.light_data.len() as u32,
                 self.instance_data.len() as u32,
-                u32::from(self.extension.as_ref().is_some_and(|e| e.active())),
+                self.extension.as_ref().map_or(0, |e| {
+                    u32::from(e.active()) | u32::from(e.active() && e.sky_reflections()) << 1
+                }),
             ],
             self.previous_view_proj,
             self.swap.srgb,
         );
-        globals.counts[3] = u32::from(self.strata_debug);
+        globals.counts[3] = u32::from(self.matrix_debug);
         for (slot, light) in self.frame_lights.iter().take(MAX_POINT_SHADOWS).enumerate() {
             if light.radius.is_finite()
                 && light.radius > 0.0
@@ -1706,7 +1798,7 @@ impl Renderer {
         self.previous_view_proj = Some(view_proj);
         self.culling_ranges.clear();
         let mut jobs = Vec::new();
-        let use_culling = self.strata_enabled && self.culler.is_some();
+        let use_culling = self.matrix_enabled && self.culler.is_some();
         for (instance, &(count, _, primitive)) in
             self.draw_calls.iter().enumerate().filter(|_| use_culling)
         {
@@ -1715,31 +1807,32 @@ impl Renderer {
             let start = jobs.len();
             if primitive == NO_PRIMITIVE {
                 // Unculled: its bounds change every frame.
-            } else if record.normal_columns[0][3] == 0.0 {
-                if let Some(meshlets) = &self.primitive_meshlets[primitive] {
-                    for meshlet in meshlets {
-                        jobs.push(gpu_culling::Job::new(
-                            view_proj,
-                            model,
-                            meshlet.bounds.min,
-                            meshlet.bounds.max,
-                            meshlet.first_triangle * 3,
-                            meshlet.triangle_count * 3,
-                        ));
-                    }
-                }
-            } else if let Some(bounds) = self.virtual_geometry[primitive]
-                .as_ref()
-                .and_then(|geometry| geometry.bounds())
-            {
+            } else if primitive >= EMBEDDED_PRIMITIVE {
+                let (min, max) = self.embedded_bounds[primitive - EMBEDDED_PRIMITIVE];
                 jobs.push(gpu_culling::Job::new(
-                    view_proj, model, bounds.min, bounds.max, 0, count,
+                    view_proj,
+                    model,
+                    min.to_array(),
+                    max.to_array(),
+                    0,
+                    count,
                 ));
+            } else if let Some(meshlets) = &self.primitive_meshlets[primitive] {
+                for meshlet in meshlets {
+                    jobs.push(gpu_culling::Job::new(
+                        view_proj,
+                        model,
+                        meshlet.bounds.min,
+                        meshlet.bounds.max,
+                        meshlet.first_triangle * 3,
+                        meshlet.triangle_count * 3,
+                    ));
+                }
             }
             self.culling_ranges
                 .push((jobs.len() > start).then_some((start, jobs.len())));
         }
-        self.culling_active = self.strata_enabled
+        self.culling_active = self.matrix_enabled
             && self.culler.as_mut().is_some_and(|culler| {
                 culler
                     .prepare(
@@ -1810,20 +1903,36 @@ impl Renderer {
             }
             buffer.write(bytes);
         }
-        let bytes: &[u8] = bytemuck::cast_slice(&self.deforming_vertices);
-        if bytes.len() as u64 > frame.deforming.size {
-            gpu::destroy_buffer(device, allocator, mem::take(&mut frame.deforming));
-            frame.deforming = gpu::create_buffer(
-                device,
-                allocator,
+        for (buffer, name, vertices) in [
+            (
+                &mut frame.deforming,
                 "deforming vertices",
-                (bytes.len() as u64).next_power_of_two(),
-                vk::BufferUsageFlags::TRANSFER_SRC,
-                MemoryLocation::CpuToGpu,
-            )?;
+                &self.deforming_vertices,
+            ),
+            (
+                &mut frame.retained,
+                "retained vertices",
+                &self.retained.staging,
+            ),
+        ] {
+            let bytes: &[u8] = bytemuck::cast_slice(vertices);
+            if bytes.len() as u64 > buffer.size {
+                gpu::destroy_buffer(device, allocator, mem::take(buffer));
+                *buffer = gpu::create_buffer(
+                    device,
+                    allocator,
+                    name,
+                    (bytes.len() as u64).next_power_of_two(),
+                    vk::BufferUsageFlags::TRANSFER_SRC,
+                    MemoryLocation::CpuToGpu,
+                )?;
+            }
+            if !bytes.is_empty() {
+                buffer.write(bytes);
+            }
         }
-        if !bytes.is_empty() {
-            frame.deforming.write(bytes);
+        if let Some(embedded) = &mut self.embedded {
+            embedded.prepare(device, allocator, self.frame, &self.vertices)?;
         }
         if grown {
             self.write_buffer_descriptors(self.frame);
@@ -1831,20 +1940,32 @@ impl Renderer {
         Ok(())
     }
 
-    /// Copy this frame's deforming vertices into the shared vertex buffer. The
-    /// first barrier also waits for the previous frame, which may still read them.
-    unsafe fn record_deforming(&self, cmd: vk::CommandBuffer) {
-        if self.deforming_vertices.is_empty() {
+    /// This frame's deforming vertices as a copy, if there are any.
+    fn deforming_copy(&self) -> Vec<vk::BufferCopy> {
+        let stride = mem::size_of::<scene::Vertex>() as u64;
+        (!self.deforming_vertices.is_empty())
+            .then(|| vk::BufferCopy {
+                src_offset: 0,
+                dst_offset: self.deforming_base as u64 * stride,
+                size: self.deforming_vertices.len() as u64 * stride,
+            })
+            .into_iter()
+            .collect()
+    }
+
+    /// Copy staged vertices into the shared vertex buffer. The first barrier
+    /// also waits for the previous frame, which may still read those ranges.
+    unsafe fn record_vertex_copies(
+        &self,
+        cmd: vk::CommandBuffer,
+        source: vk::Buffer,
+        copies: &[vk::BufferCopy],
+    ) {
+        if copies.is_empty() {
             return;
         }
         use vk::AccessFlags2 as A;
         use vk::PipelineStageFlags2 as S;
-        let stride = mem::size_of::<scene::Vertex>() as u64;
-        let copy = vk::BufferCopy {
-            src_offset: 0,
-            dst_offset: self.deforming_base as u64 * stride,
-            size: self.deforming_vertices.len() as u64 * stride,
-        };
         let barrier = |src_stage, src_access, dst_stage, dst_access| {
             let barrier = vk::BufferMemoryBarrier2::default()
                 .src_stage_mask(src_stage)
@@ -1854,20 +1975,15 @@ impl Renderer {
                 .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
                 .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
                 .buffer(self.vertices.buffer)
-                .offset(copy.dst_offset)
-                .size(copy.size);
+                .size(vk::WHOLE_SIZE);
             self.device.cmd_pipeline_barrier2(
                 cmd,
                 &vk::DependencyInfo::default().buffer_memory_barriers(&[barrier]),
             );
         };
         barrier(S::ALL_COMMANDS, A::MEMORY_READ, S::COPY, A::TRANSFER_WRITE);
-        self.device.cmd_copy_buffer(
-            cmd,
-            self.frames[self.frame].deforming.buffer,
-            self.vertices.buffer,
-            &[copy],
-        );
+        self.device
+            .cmd_copy_buffer(cmd, source, self.vertices.buffer, copies);
         barrier(S::COPY, A::TRANSFER_WRITE, S::ALL_COMMANDS, A::MEMORY_READ);
     }
 
@@ -1881,6 +1997,7 @@ impl Renderer {
         use vk::AccessFlags2 as A;
         use vk::ImageLayout as L;
         use vk::PipelineStageFlags2 as S;
+        self.record_bakes(cmd, set);
         let device = &self.device;
         let extent = self.swap.extent;
         let (depth, visibility, hdr, gbuffer, receiver, motion) = (
@@ -1924,6 +2041,8 @@ impl Renderer {
             extent: vk::Extent2D { width, height },
         };
         let visible = width > 0 && height > 0;
+        self.matrix
+            .record_select(device, cmd, self.pipeline_layout, self.frame);
 
         // Bin lights. The previous frame's resolve may still read the clusters.
         barrier(
@@ -2055,6 +2174,9 @@ impl Renderer {
                         );
                         device.cmd_draw(cmd, index_count, 1, 0, 0);
                     }
+                    let layer = index + if point { scene::CASCADES } else { 0 };
+                    self.matrix
+                        .record_shadows(device, cmd, self.pipeline_layout, layer as u32);
                 }
                 device.cmd_end_rendering(cmd);
             }
@@ -2129,6 +2251,12 @@ impl Renderer {
                 );
                 device.cmd_draw(cmd, count, 1, 0, 0);
             }
+            self.matrix.record_draws(
+                device,
+                cmd,
+                self.pipeline_layout,
+                matrix::Target::Depth,
+            );
             device.cmd_end_rendering(cmd);
             barrier(
                 &[gpu::image_barrier(
@@ -2261,9 +2389,8 @@ impl Renderer {
                     for job in start..end {
                         culler.draw(device, cmd, self.frame, job);
                     }
-                } else if let Some(meshlets) = (self.primitive_meshlets.get(primitive))
-                    .and_then(Option::as_ref)
-                    .filter(|_| self.instance_data[instance].normal_columns[0][3] == 0.0)
+                } else if let Some(meshlets) =
+                    (self.primitive_meshlets.get(primitive)).and_then(Option::as_ref)
                 {
                     let model = glam::Mat4::from_cols_array_2d(&self.instance_data[instance].model);
                     meshlets::visible_runs(
@@ -2278,6 +2405,12 @@ impl Renderer {
                     device.cmd_draw(cmd, index_count, 1, 0, 0);
                 }
             }
+            self.matrix.record_draws(
+                device,
+                cmd,
+                self.pipeline_layout,
+                matrix::Target::Visibility,
+            );
         }
         device.cmd_end_rendering(cmd);
 
@@ -2396,6 +2529,9 @@ impl Renderer {
             previous_view_proj: self.frame_view_proj.1,
             sun: self.frame_sun,
             lights: &lights,
+            sky: self.frame_ambient.0,
+            ground: self.frame_ambient.1,
+            near: scene::NEAR,
         };
         let result = extension.record(&mut self.gpu(), &frame);
         self.frame_lights = lights;
@@ -2415,6 +2551,7 @@ impl Renderer {
         use vk::AccessFlags2 as A;
         use vk::ImageLayout as L;
         use vk::PipelineStageFlags2 as S;
+        self.record_bakes(cmd, set);
         let device = &self.device;
         let extent = self.swap.extent;
         let hdr = self.swap.hdr.as_ref().unwrap();
@@ -2484,7 +2621,7 @@ impl Renderer {
             .store_op(vk::AttachmentStoreOp::STORE)
             .clear_value(vk::ClearValue {
                 color: vk::ClearColorValue {
-                    float32: CLEAR_COLOR,
+                    float32: self.clear_color,
                 },
             })];
         device.cmd_begin_rendering(
@@ -2718,6 +2855,7 @@ impl Drop for Renderer {
                 if let Some(culler) = self.culler.take() {
                     culler.destroy(&self.device, allocator);
                 }
+                mem::take(&mut self.matrix).destroy(&self.device, allocator);
                 self.breakers.destroy(&self.device, allocator);
             }
             if self.allocator.is_some() {
@@ -2732,6 +2870,9 @@ impl Drop for Renderer {
                 device.destroy_image_view(view, None);
             }
             if let Some(allocator) = self.allocator.as_mut() {
+                if let Some(embedded) = self.embedded.take() {
+                    embedded.destroy(device, allocator);
+                }
                 for frame in self.frames.drain(..) {
                     device.destroy_fence(frame.fence, None);
                     device.destroy_semaphore(frame.acquired, None);
@@ -2742,6 +2883,7 @@ impl Drop for Renderer {
                         frame.lights,
                         frame.materials,
                         frame.deforming,
+                        frame.retained,
                     ] {
                         gpu::destroy_buffer(device, allocator, buffer);
                     }

@@ -25,19 +25,114 @@ Building the renderer requires Vulkan and the Slang compiler (`slangc` on
 `PATH`, or the `SLANGC` environment variable). Run the editor with
 `cargo run -p verity-editor`.
 
-## Strata virtual geometry
+## Terra terrain
 
-`verity-strata` cooks static material primitives into whole-primitive index
-LODs and triangle-aligned pages. In the editor, open **View → Enable Strata**
-to select LODs at runtime; **View → Strata LOD debug view** colors surfaces by
-the selected level. Both options are editor-session settings, not scene data.
+`verity-terra` generates eroded landforms and keeps them as an editable 3D
+density field, so digging makes real cavities and overhangs. Fly over one and
+dig into it with:
 
-Strata synchronously resolves CPU index pages with a pinned coarse fallback.
-The renderer uploads the selected index streams into frame-local GPU buffers,
-reusing a stream for instances with the same primitive and LOD. Visibility,
-resolve, and shadows use that selected geometry. Off-screen shadow casters
-remain submitted. Simplified triangles have new IDs; resolve reads the
-selected index stream and extensions retain their stable draw IDs.
+```powershell
+cargo run --release -p verity-lux --example terrain -- --landform island --seed 7 --gi pxtgi
+```
+
+Landforms are `valley`, `island`, `archipelago`, `continent`, `mountains` and
+`plains`, and `--gi` is `none`, `lux` or `pxtgi`. Click to capture the mouse, then use WASD to fly, Q/E to descend and
+rise, Shift to go faster, the left and right buttons to dig and fill, F to throw
+a box, and the wheel for brush size. Set `VERITY_SMOKE` to drop boxes and dig a
+trench under them through the real renderer, report, and exit.
+
+```rust
+let terrain = Terrain::new(Landscape::generate(Settings {
+    seed: 42,
+    ..Landform::Continent.into()
+}));
+```
+
+The world is 384 × 384 m at 1 m voxels, Z-up, from −48 to 144 m. Relief is
+eroded by stream-power river incision, droplets and thermal slumping, and a seed
+reproduces it exactly on any thread count. `Terrain::brush` edits the field and
+returns dirty chunks; `Mesher` turns them into Surface Nets meshes on worker
+threads and rejects results an edit has overtaken.
+
+Chunks draw through `Renderer::set_retained_mesh`, which keeps vertices on the
+GPU until they change, so a frame pays only for the indices of visible chunks.
+`GpuMaterial::terrain` shades them procedurally in the resolve pass
+(`shaders/lib/terrain.slang`), from a mesh whose texture coordinates hold the
+original ground height and wetness. Landscapes want a longer shadow reach than
+interiors: see `Renderer::set_shadow_distance`.
+
+GI methods follow terrain through `RenderExtension::retained_changed`: the
+renderer batches edits and hands over only what changed, at most twice a second,
+so bounced light can trail a brush stroke by up to half a second. A new method
+implements that hook and, for a hit on a `TERRAIN_SURFACE` material, calls
+`terrain_albedo` from `shaders/lib/terrain.slang`, so bounced light matches the
+ground on screen. Split Radiance Cascades and PXTGI both do, updating only the
+changed chunks in place. With Lux, use `Settings::landscape`: its defaults are
+sized for rooms, leave its budgets uncapped and give it no sky. A method that
+only adds diffuse light can return true from `RenderExtension::sky_reflections`
+to keep sky reflections on glossy surfaces such as water.
+
+Bodies collide with terrain as a field rather than a mesh, so an edit applies at
+once and nothing can tunnel through. Give one static body `Collider::Ground` and
+hand physics a snapshot, which is cheap as chunks are shared until edited:
+
+```rust
+physics.insert(&world, ground, PhysicsBody::new(RigidBody::Static, Collider::Ground))?;
+physics.set_ground(Arc::new(terrain.clone()), Bounds::EMPTY);
+// After digging, the same with the region that changed: bodies there wake.
+physics.set_ground(Arc::new(terrain.clone()), changed);
+```
+
+Any shape implementing `verity_physics::Ground` works the same way. Rigid and
+soft bodies both rest on it.
+
+There is no distance LOD, streaming or
+saving, and Surface Nets does not guarantee manifold topology for every
+ambiguous sampled field.
+
+## Matrix virtual geometry
+
+`verity-matrix` cooks every static material primitive into a continuous LOD. In
+the editor, open **View → Enable Matrix** to draw through it; **View → Matrix LOD
+debug view** colors surfaces by tier: green, blue and yellow for cluster levels,
+orange for voxels, purple for imposters. Both are editor-session settings, not
+scene data. `Renderer::set_matrix_enabled` is the same switch in code.
+
+There are three tiers, chosen on the GPU each frame by `matrix_select.slang`, and
+the CPU records a fixed number of indirect draws however large the scene:
+
+- **Clusters.** A DAG built with meshoptimizer's `clusterlod`, cut at about one
+  pixel of error.
+- **Voxels.** Simplifying foliage removes whole leaves: a 6000-leaf test canopy
+  keeps 0.2% of its area. A mesh that loses more than 95% of its area counts as an
+  aggregate, and its clusters that thinned are rebuilt from the original triangles
+  as bricks of 4x4x4 voxels, as Nanite Foliage does, and marched in the fragment
+  shader. Each voxel is kept with the probability its contents cover it, chosen by
+  a stable hash, so density survives (0.625 opacity against 0.653 for the source in
+  the test canopy) without per-pixel noise. A voxel of scattered leaves shades as
+  one leaf picked from them, which keeps their lighting statistics.
+- **Imposters.** `Renderer::place_copies` plants copies of a model. An aggregate
+  placed this way gets a 12x12 hemi-octahedral atlas of color, normal and depth,
+  baked on the GPU, and below 64 pixels across each copy is one card blending three
+  frames with parallax. The atlas stores a mean normal, so lighting uses the average
+  a spread of facets would give (`Surface::agreement`) rather than a cosine of the
+  mean.
+
+All tiers write the same visibility buffer, with the tier in the top bits of the
+ID, so resolve, shadows and the G-buffer treat them alike. Shadows use the same
+selection, except that a copy drawn as an imposter casts its coarsest cut.
+
+`cargo run --release -p verity-render --example forest -- --debug` shows the tiers.
+On an RTX 4070 Laptop at 1600x900, 2500 trees of 20000 leaves take 1.7 ms against
+209 ms drawing every triangle, and New Sponza 20 ms against 63 ms, within 0.3/255
+of the exact image.
+
+Limits: geometry is static and fully resident, with no streaming or wind. Cooking
+runs at load and is not cached: about 29 s for the 4.9M-triangle ivy. Voxels and
+imposters use a material's scalar roughness and no normal map, so distant textured
+foliage reads somewhat darker than exact. Tiers swap in one frame, with no
+crossfade. Clusters are frustum culled but not occlusion culled. Selection lists
+have fixed capacities; `Renderer::matrix_stats` shows how full they run.
 
 The renderer uses GPU frustum culling and, when supported, a current-frame
 reverse-Z minimum-depth pyramid for occlusion. The depth prepass draws all
@@ -46,9 +141,9 @@ avoid the prepass geometry cost. Unsupported culling resources fall back to
 conservative drawing. The CPU meshlet scan preserves input triangle order and
 winding, with up to 64 vertices and 124 triangles per meshlet.
 
-LOD error is meshoptimizer's approximate position-only metric, not a guaranteed
-pixel or geometric error bound. Geometry bounds and LODs are for static meshes;
-skin, morph, or displacement needs conservative updated data. Vertices remain
+LOD error is meshoptimizer's approximate metric, not a guaranteed pixel or
+geometric error bound. Geometry bounds and LODs are for static meshes; skin,
+morph, or displacement needs conservative updated data. Vertices remain
 fully GPU-resident; index paging and upload are synchronous. This is not
 continuous cluster LOD or asynchronous device-local geometry streaming, and
 performance depends on content and hardware.
@@ -179,13 +274,14 @@ viewport.
   also accepts numeric transforms.
 - Select Environment & Physics to choose direct-only or direct plus hemisphere ambient
   lighting and edit the sky and ground colors. Sun is directional; point lights
-  can be added and edited separately. Lux GI is not an editor lighting option.
+  can be added and edited separately.
 - Open `assets/scenes/physics-playground.verity` from the Assets browser and
   press Play to test Verity physics with a pyramid and a falling pile. Select
-  Environment & Physics to change the engine, gravity, and solver settings.
+  Environment & Physics to change gravity and solver settings.
   Select an object to add or edit its Rigid Body component. Collider dimensions
-  do not follow visual scale. Verity does not support capsules or restitution;
-  older scenes continue to use Box3D by default.
+  do not follow visual scale. The editor simulates every scene with Verity, which
+  does not support capsules or restitution. **View → Uncap FPS** stops waiting for
+  vsync and draws continuously, which may tear.
 - The Asset Browser is rooted at `assets/`. Double-click folders to navigate,
   a `.verity` or `.json` scene to open it, or a `.glb` to import it. Imported
   paths are saved relative to the project and reloaded with the scene. Models

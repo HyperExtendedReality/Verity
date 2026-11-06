@@ -1,15 +1,17 @@
-use crate::{Water, WaterSample, bilinear};
+use crate::fft::{Fft2, conj, negated, signed, times_i};
+use crate::{GRAVITY, Water, WaterSample, bilinear};
 use glam::{IVec2, Vec2, Vec3};
+use std::f32::consts::TAU;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct RipplesSettings {
-    /// Cells per side.
+    /// Cells per side, a power of two.
     pub resolution: usize,
     /// m.
     pub cell: f32,
-    /// m/s; around 0.3 for the short ripples a wading character makes.
-    pub wave_speed: f32,
-    /// Fraction of ripple speed lost per second.
+    /// Water depth, m; `f32::INFINITY` for open water.
+    pub depth: f32,
+    /// Oscillator damping, 1/s: ripple amplitude fades as exp(−damping·t/2).
     pub damping: f32,
 }
 
@@ -18,36 +20,70 @@ impl Default for RipplesSettings {
         Self {
             resolution: 64,
             cell: 0.1,
-            wave_speed: 0.4,
+            depth: 1.0,
             damping: 1.5,
         }
     }
 }
 
-/// Cells near the window edge that absorb outgoing ripples.
-const BORDER: usize = 4;
+/// Surface tension over density for clean water, m³/s².
+const TENSION: f32 = 7.2e-5;
 
-/// Damped wave equation on a small window that scrolls with a character,
-/// so ripples stay where they were made. Its [`Water`] height is an offset:
+/// Linear water waves on a small window that scrolls with a character, so
+/// ripples stay where they were made. Each Fourier mode advances exactly by
+/// the gravity-capillary dispersion relation (Tessendorf's eWave, 2014): any
+/// `dt` is stable, a splash disperses into a train of rings with the short
+/// ones trailing, and a moving hull draws a true Kelvin wake rather than the
+/// Mach cone of a plain wave equation. Its [`Water`] height is an offset:
 /// layer it over another water as `(water, &ripples)`.
 pub struct Ripples {
     settings: RipplesSettings,
     corner: IVec2,
     height: Vec<f32>,
     rate: Vec<f32>,
+    fft: Fft2,
+    omega: Vec<f32>,
+    /// Absorption by cell, 1/s: the FFT is periodic, so waves must die in
+    /// this border before they wrap around the window.
+    sponge: Vec<f32>,
+    modes: Vec<Vec2>,
 }
 
 impl Ripples {
     pub fn new(settings: RipplesSettings) -> Self {
         let n = settings.resolution;
         assert!(
-            n > 2 * BORDER && settings.cell > 0.0 && settings.wave_speed > 0.0,
-            "ripples need a resolution above 8 and positive cell and speed"
+            n >= 16 && settings.cell > 0.0 && settings.depth > 0.0 && settings.damping >= 0.0,
+            "ripples need a resolution of at least 16 and positive cell and depth"
         );
+        let dk = TAU / (n as f32 * settings.cell);
+        let omega = (0..n * n)
+            .map(|c| {
+                let k = dk * Vec2::new(signed(c % n, n), signed(c / n, n)).length();
+                let tanh = (k * settings.depth).min(20.0).tanh();
+                ((GRAVITY * k + TENSION * k * k * k) * tanh).sqrt()
+            })
+            .collect();
+        // Strong enough to stop the fastest wave the window holds, its longest.
+        let border = n as f32 / 8.0;
+        let window = n as f32 * settings.cell;
+        let fastest = 0.5 * (GRAVITY * window / TAU).sqrt();
+        let peak = 12.0 * fastest / (border * settings.cell);
+        let sponge = (0..n * n)
+            .map(|c| {
+                let (x, y) = (c % n, c / n);
+                let edge = x.min(y).min(n - 1 - x).min(n - 1 - y) as f32 + 0.5;
+                peak * (1.0 - edge / border).max(0.0).powi(2)
+            })
+            .collect();
         Self {
             corner: IVec2::splat(-(n as i32) / 2),
             height: vec![0.0; n * n],
             rate: vec![0.0; n * n],
+            fft: Fft2::new(n),
+            omega,
+            sponge,
+            modes: vec![Vec2::ZERO; n * n],
             settings,
         }
     }
@@ -91,9 +127,6 @@ impl Ripples {
     }
 
     /// Advance the simulation by `dt` seconds. A zero duration leaves it unchanged.
-    ///
-    /// Surface velocity is stored in meters per second, so changing the frame
-    /// duration does not reinterpret the previous frame's displacement.
     pub fn step(&mut self, dt: f32) {
         assert!(
             dt.is_finite() && dt >= 0.0,
@@ -102,39 +135,36 @@ impl Ripples {
         if dt == 0.0 {
             return;
         }
-        let s = &self.settings;
-        let n = s.resolution;
-        let substeps = (dt * s.wave_speed / (0.5 * s.cell)).ceil().max(1.0) as usize;
-        let h = dt / substeps as f32;
-        let c2 = (s.wave_speed * h / s.cell).powi(2);
-        let keep = (1.0 - s.damping * h).max(0.0);
-        let mut next = vec![0.0; n * n];
-        for _ in 0..substeps {
-            for y in 0..n {
-                for x in 0..n {
-                    let i = x + y * n;
-                    let at = |dx: isize, dy: isize| {
-                        let (nx, ny) = (x as isize + dx, y as isize + dy);
-                        if nx < 0 || ny < 0 || nx >= n as isize || ny >= n as isize {
-                            0.0
-                        } else {
-                            self.height[nx as usize + ny as usize * n]
-                        }
-                    };
-                    let laplacian =
-                        at(-1, 0) + at(1, 0) + at(0, -1) + at(0, 1) - 4.0 * self.height[i];
-                    let edge = x.min(y).min(n - 1 - x).min(n - 1 - y);
-                    let absorb = if edge < BORDER {
-                        edge as f32 / BORDER as f32
-                    } else {
-                        1.0
-                    };
-                    let height = self.height[i];
-                    next[i] = (height + self.rate[i] * h * keep + c2 * laplacian) * absorb;
-                    self.rate[i] = (next[i] - height) / h;
-                }
+        let n = self.settings.resolution;
+        // Height and speed are real, so one transform carries both: Z = H + iR.
+        for (z, (h, r)) in self
+            .modes
+            .iter_mut()
+            .zip(self.height.iter().zip(&self.rate))
+        {
+            *z = Vec2::new(*h, *r);
+        }
+        self.fft.run(&mut self.modes, false);
+        let keep = (-0.5 * self.settings.damping * dt).exp() / (n * n) as f32;
+        for c in 0..n * n {
+            let mirror = negated(c, n);
+            if mirror < c {
+                continue;
             }
-            std::mem::swap(&mut self.height, &mut next);
+            let (a, b) = (self.modes[c], conj(self.modes[mirror]));
+            let (h, r) = ((a + b) * 0.5, -times_i((a - b) * 0.5));
+            // Above zero, so the still mode's sin(ωt)/ω tends to t.
+            let w = self.omega[c].max(1e-6);
+            let (s, co) = (w * dt).sin_cos();
+            let (h, r) = (h * co + r * (s / w), r * co - h * (w * s));
+            self.modes[c] = (h + times_i(r)) * keep;
+            self.modes[mirror] = conj(h - times_i(r)) * keep;
+        }
+        self.fft.run(&mut self.modes, true);
+        for (c, z) in self.modes.iter().enumerate() {
+            let absorb = (-self.sponge[c] * dt).exp();
+            self.height[c] = z.x * absorb;
+            self.rate[c] = z.y * absorb;
         }
     }
 }
@@ -147,9 +177,12 @@ impl Water for Ripples {
         if !inside {
             return WaterSample::default();
         }
+        let height = bilinear(&self.height, n, q, false);
+        // `rate` is the undamped oscillator's; damping adds its own decay.
+        let rate = bilinear(&self.rate, n, q, false);
         WaterSample {
-            height: bilinear(&self.height, n, q, false),
-            velocity: Vec3::Z * bilinear(&self.rate, n, q, false),
+            height,
+            velocity: Vec3::Z * (rate - 0.5 * self.settings.damping * height),
         }
     }
 }
@@ -157,6 +190,27 @@ impl Water for Ripples {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn modes_oscillate_at_the_gravity_capillary_frequency() {
+        let settings = RipplesSettings {
+            damping: 0.0,
+            depth: f32::INFINITY,
+            ..RipplesSettings::default()
+        };
+        let (n, cell) = (settings.resolution, settings.cell);
+        let mut ripples = Ripples::new(settings);
+        ripples.sponge.fill(0.0);
+        let k = TAU * 16.0 / (n as f32 * cell);
+        for c in 0..n * n {
+            ripples.height[c] = (k * (c % n) as f32 * cell).cos();
+        }
+        let omega = (GRAVITY * k + TENSION * k * k * k).sqrt();
+        // One long step: stability and phase must not depend on its size.
+        let time = 1.37;
+        ripples.step(time);
+        assert!((ripples.height[0] - (omega * time).cos()).abs() < 1e-3);
+    }
 
     #[test]
     fn changing_frame_duration_preserves_velocity_units() {
@@ -171,7 +225,8 @@ mod tests {
         ripples.step(dt);
         let after = ripples.sample(point);
         let expected = before.height + before.velocity.z * dt;
-        assert!((after.height - expected).abs() < 0.0001);
+        // The neglected acceleration term: ω²·dt²/2 for ω near 17 rad/s.
+        assert!((after.height - expected).abs() < 0.0002);
     }
 
     #[test]

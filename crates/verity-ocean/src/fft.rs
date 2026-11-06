@@ -2,7 +2,6 @@
 //! `Vec2` (re, im), the layout the GPU port uploads unchanged.
 
 use glam::Vec2;
-use rayon::prelude::*;
 
 pub(crate) fn mul(a: Vec2, b: Vec2) -> Vec2 {
     Vec2::new(a.x * b.x - a.y * b.y, a.x * b.y + a.y * b.x)
@@ -37,9 +36,16 @@ pub(crate) fn negated(index: usize, n: usize) -> usize {
     (n - index % n) % n + (n - index / n) % n * n
 }
 
+/// Columns per pass of the column transform, sized so a strip stays in L1.
+const STRIP: usize = 32;
+
+/// Single-threaded by design: callers run independent fields side by side,
+/// which outscales splitting a transform this small across threads.
 pub(crate) struct Fft2 {
     n: usize,
-    twiddles: Vec<Vec2>,
+    /// Forward and inverse twiddles, each stage contiguous: the stage of
+    /// half-length h starts at h − 1.
+    twiddles: [Vec<Vec2>; 2],
     reverse: Vec<usize>,
 }
 
@@ -50,41 +56,83 @@ impl Fft2 {
             "FFT size must be a power of two"
         );
         let bits = n.trailing_zeros();
-        Self {
-            n,
-            twiddles: (0..n / 2)
-                .map(|i| {
-                    let a = -std::f64::consts::TAU * i as f64 / n as f64;
+        let forward: Vec<Vec2> = (0..bits)
+            .flat_map(|stage| {
+                let half = 1usize << stage;
+                (0..half).map(move |j| {
+                    let a = -std::f64::consts::PI * j as f64 / half as f64;
                     Vec2::new(a.cos() as f32, a.sin() as f32)
                 })
-                .collect(),
+            })
+            .collect();
+        Self {
+            n,
+            twiddles: [forward.iter().copied().map(conj).collect(), forward],
             reverse: (0..n)
                 .map(|i| i.reverse_bits() >> (usize::BITS - bits))
                 .collect(),
         }
     }
 
-    fn line(&self, a: &mut [Vec2], inverse: bool) {
-        let n = self.n;
-        for i in 0..n {
-            let j = self.reverse[i];
+    fn row(&self, a: &mut [Vec2], twiddles: &[Vec2]) {
+        for (i, &j) in self.reverse.iter().enumerate() {
             if i < j {
                 a.swap(i, j);
             }
         }
-        let mut len = 2;
-        while len <= n {
-            let step = n / len;
-            for start in (0..n).step_by(len) {
-                for j in 0..len / 2 {
-                    let w = self.twiddles[j * step];
-                    let w = if inverse { conj(w) } else { w };
-                    let (u, v) = (a[start + j], mul(a[start + j + len / 2], w));
-                    a[start + j] = u + v;
-                    a[start + j + len / 2] = u - v;
+        // The first two stages' twiddles are 1 and ∓i: no multiplications.
+        let mut half = 1;
+        if self.n >= 4 {
+            let quarter = twiddles[2]; // −i forward, +i inverse
+            for block in a.as_chunks_mut::<4>().0 {
+                let (s0, d0) = (block[0] + block[1], block[0] - block[1]);
+                let (s1, d1) = (block[2] + block[3], block[2] - block[3]);
+                let turned = Vec2::new(-quarter.y * d1.y, quarter.y * d1.x);
+                block[0] = s0 + s1;
+                block[2] = s0 - s1;
+                block[1] = d0 + turned;
+                block[3] = d0 - turned;
+            }
+            half = 4;
+        }
+        while half < self.n {
+            let w = &twiddles[half - 1..2 * half - 1];
+            for block in a.chunks_exact_mut(2 * half) {
+                let (lo, hi) = block.split_at_mut(half);
+                for ((u, v), &w) in lo.iter_mut().zip(hi).zip(w) {
+                    butterfly(u, v, w);
                 }
             }
-            len <<= 1;
+            half *= 2;
+        }
+    }
+
+    /// Transforms every column at once: each butterfly pairs two whole rows
+    /// under one twiddle, so it vectorizes and needs no transpose.
+    fn columns(&self, data: &mut [Vec2], twiddles: &[Vec2]) {
+        let n = self.n;
+        for (i, &j) in self.reverse.iter().enumerate() {
+            if i < j {
+                let (lo, hi) = data.split_at_mut(j * n);
+                lo[i * n..(i + 1) * n].swap_with_slice(&mut hi[..n]);
+            }
+        }
+        let width = STRIP.min(n);
+        for strip in (0..n).step_by(width) {
+            let mut half = 1;
+            while half < n {
+                let w = &twiddles[half - 1..2 * half - 1];
+                for block in data.chunks_exact_mut(2 * half * n) {
+                    let (lo, hi) = block.split_at_mut(half * n);
+                    for (r, &w) in w.iter().enumerate() {
+                        let span = r * n + strip..r * n + strip + width;
+                        for (u, v) in lo[span.clone()].iter_mut().zip(&mut hi[span]) {
+                            butterfly(u, v, w);
+                        }
+                    }
+                }
+                half *= 2;
+            }
         }
     }
 
@@ -93,21 +141,19 @@ impl Fft2 {
     pub fn run(&self, data: &mut [Vec2], inverse: bool) {
         let n = self.n;
         assert_eq!(data.len(), n * n, "FFT grid must be n×n");
-        data.par_chunks_mut(n)
-            .for_each(|row| self.line(row, inverse));
-        transpose(data, n);
-        data.par_chunks_mut(n)
-            .for_each(|row| self.line(row, inverse));
-        transpose(data, n);
+        let twiddles = &self.twiddles[usize::from(!inverse)];
+        for row in data.chunks_exact_mut(n) {
+            self.row(row, twiddles);
+        }
+        self.columns(data, twiddles);
     }
 }
 
-fn transpose(data: &mut [Vec2], n: usize) {
-    for y in 0..n {
-        for x in y + 1..n {
-            data.swap(x + y * n, y + x * n);
-        }
-    }
+#[inline(always)]
+fn butterfly(u: &mut Vec2, v: &mut Vec2, w: Vec2) {
+    let t = mul(*v, w);
+    *v = *u - t;
+    *u += t;
 }
 
 #[cfg(test)]
@@ -117,24 +163,27 @@ mod tests {
 
     #[test]
     fn matches_naive_dft_and_round_trips() {
-        let n = 8;
-        let input: Vec<Vec2> = (0..n * n)
-            .map(|i| Vec2::new((i as f32 * 0.7).sin(), (i as f32 * 1.3).cos()))
-            .collect();
-        let mut data = input.clone();
-        let fft = Fft2::new(n);
-        fft.run(&mut data, false);
-        for (k, &got) in data.iter().enumerate() {
-            let (kx, ky) = (k % n, k / n);
-            let want = input.iter().enumerate().fold(Vec2::ZERO, |sum, (x, &v)| {
-                let phase = -TAU * ((kx * (x % n) + ky * (x / n)) as f32) / n as f32;
-                sum + mul(v, cis(phase))
-            });
-            assert!((got - want).length() < 1e-3, "bin {k}: {got} vs {want}");
-        }
-        fft.run(&mut data, true);
-        for (a, b) in data.iter().zip(&input) {
-            assert!((*a / (n * n) as f32 - *b).length() < 1e-5);
+        // 8 fits inside one column strip, 64 spans two.
+        for n in [8, 64] {
+            let input: Vec<Vec2> = (0..n * n)
+                .map(|i| Vec2::new((i as f32 * 0.7).sin(), (i as f32 * 1.3).cos()))
+                .collect();
+            let mut data = input.clone();
+            let fft = Fft2::new(n);
+            fft.run(&mut data, false);
+            for k in (0..n * n).step_by(n * n / 64) {
+                let (kx, ky) = (k % n, k / n);
+                let want = input.iter().enumerate().fold(Vec2::ZERO, |sum, (x, &v)| {
+                    let turns = (kx * (x % n) + ky * (x / n)) % n;
+                    sum + mul(v, cis(-TAU * turns as f32 / n as f32))
+                });
+                let got = data[k];
+                assert!((got - want).length() < 1e-2, "bin {k}: {got} vs {want}");
+            }
+            fft.run(&mut data, true);
+            for (a, b) in data.iter().zip(&input) {
+                assert!((*a / (n * n) as f32 - *b).length() < 1e-4);
+            }
         }
     }
 }

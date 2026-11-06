@@ -44,6 +44,9 @@ pub struct Settings {
     pub intensity: f32,
     /// Constant sky radiance seen by rays that escape the scene.
     pub environment: [f32; 3],
+    /// Keep the renderer's sky reflection, which Lux does not trace. It ignores
+    /// occlusion, so leave it off indoors.
+    pub sky_reflections: bool,
     pub temporal_blend: f32,
     pub split_transmittance_blend: f32,
     pub history_frames: u32,
@@ -62,11 +65,42 @@ impl Default for Settings {
             normal_bias: 0.005,
             intensity: 1.0,
             environment: [0.0; 3],
+            sky_reflections: false,
             temporal_blend: 0.88,
             split_transmittance_blend: 0.98,
             history_frames: 24,
             spatial_filter_steps: 3,
             emissive_samples: 16,
+        }
+    }
+}
+
+impl Settings {
+    /// For open ground hundreds of metres across, under a sky of this radiance.
+    /// The defaults suit rooms. Outdoors, what they leave uncapped costs several
+    /// times more, and with the budgets below their quarter-metre probes spread
+    /// the samples too thin and turn noisy.
+    pub fn landscape(environment: [f32; 3]) -> Self {
+        Self {
+            probe_spacing: 4.0,
+            interval_length: 6.0,
+            environment,
+            sky_reflections: true,
+            ..Self::budgeted()
+        }
+    }
+
+    /// The benchmarked budget for a frame, with about 300 MB of world cache in
+    /// place of the uncapped default.
+    pub fn budgeted() -> Self {
+        Self {
+            sampling: Sampling {
+                max_cache_entries: 262_144,
+                max_updates_per_frame: 512,
+                max_traversal_queries: 16_384,
+                ..Sampling::default()
+            },
+            ..Self::default()
         }
     }
 }

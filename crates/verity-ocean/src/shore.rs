@@ -1,7 +1,8 @@
 use crate::{
-    GRAVITY, Seabed, Water, WaterSample, bilinear, group_velocity, undisplace, wavenumber,
+    GRAVITY, Ocean, Seabed, Water, WaterSample, bilinear, group_velocity, undisplace, wavenumber,
 };
 use glam::{Vec2, Vec3};
+use rayon::prelude::*;
 use std::f32::consts::{PI, TAU};
 
 /// An incoming swell. Several trains are several [`ShoreWaves`], summed.
@@ -17,6 +18,10 @@ pub struct ShoreSettings {
     pub breaker_index: f32,
     /// Forward tilt of fully breaking crests, radians.
     pub lean: f32,
+    /// Wave groups, in [0, 1]: how far sets rise above and lulls fall below
+    /// `height`. 0 is an endless identical train. Sets travel at the group
+    /// speed and vary along the crests, so the break point moves with them.
+    pub groups: f32,
 }
 
 impl Default for ShoreSettings {
@@ -27,6 +32,7 @@ impl Default for ShoreSettings {
             direction: 0.0,
             breaker_index: 0.78,
             lean: 0.6,
+            groups: 0.4,
         }
     }
 }
@@ -91,17 +97,46 @@ impl BreakerProfile {
     }
 }
 
+/// Waves in a typical set, so groups repeat this many times slower than waves.
+pub const WAVES_PER_GROUP: f32 = 7.0;
+/// Second group component, an irrational ratio so that sets never repeat.
+const GROUP_RATIO: f32 = 1.618;
+/// Crest length of a set, in offshore wavelengths.
+const CRESTS_PER_GROUP: f32 = 8.0;
+
+/// Wave group envelope. `lag` is seconds since the group front passed
+/// (time − arrival), `across` the phase along the crest in radians.
+pub fn group_envelope(groups: f32, omega: f32, lag: f32, across: f32) -> f32 {
+    let t = omega / WAVES_PER_GROUP * lag;
+    1.0 + groups * (0.6 * (t + across).sin() + 0.4 * (GROUP_RATIO * t - 0.7 * across).sin())
+}
+
+/// Height and breaking strength of a wave of `unbroken` height against the
+/// depth-limited height `limit`.
+pub fn break_wave(unbroken: f32, limit: f32) -> (f32, f32) {
+    if limit <= 0.0 {
+        return (0.0, 0.0);
+    }
+    (
+        unbroken.min(limit),
+        ((unbroken / limit - 0.9) / 0.3).clamp(0.0, 1.0),
+    )
+}
+
 /// Borrowed, row-major cell-centered wave fields for rendering.
 ///
 /// For a rest position `p`, interpolate each field at
 /// `(p - origin) / cell - 0.5`, clamping at the grid edge, and normalize the
 /// interpolated direction (falling back to +X if zero). Interpolated signed
 /// depth <= 0 is dry and must be masked; otherwise clamp depth to at least
-/// 0.05 m for the orbit. The phase is `phase - omega * time`. Evaluate the
-/// profile, scale along by `min(wave_height / (2*tanh(k*depth)), 0.9/k)` and
-/// up by `wave_height/2`, then rotate by `lean * breaking` as in
-/// [`ShoreWaves::displacement_at_rest`]. Wave height is in metres, signed
-/// depth and cell are metres, omega is radians/second, and time is seconds.
+/// 0.05 m for the orbit. The phase is `phase - omega * time`. Multiply
+/// `wave_height` by [`group_envelope`] of `groups`, `omega`,
+/// `time - arrival` and `across.dot(p)`, and pass it with `limit` through
+/// [`break_wave`] for the height and breaking strength. Evaluate the profile,
+/// scale along by `min(height / (2*tanh(k*depth)), 0.9/k)` and up by
+/// `height/2`, then rotate by `lean * breaking` as in
+/// [`ShoreWaves::displacement_at_rest`]. Heights, signed depth and cell are
+/// metres, omega is radians/second, and time and arrival are seconds.
 #[derive(Debug, Clone, Copy)]
 pub struct BreakerGrid<'a> {
     pub width: usize,
@@ -112,12 +147,19 @@ pub struct BreakerGrid<'a> {
     pub omega: f32,
     pub time: f32,
     pub lean: f32,
+    pub groups: f32,
+    /// Radians per metre along the offshore crests.
+    pub across: Vec2,
     pub phase: &'a [f32],
     pub direction: &'a [Vec2],
+    /// Height the wave would reach unbroken, before the group envelope.
     pub wave_height: &'a [f32],
     pub wavenumber: &'a [f32],
     pub depth: &'a [f32],
-    pub breaking: &'a [f32],
+    /// Tallest wave the depth can hold.
+    pub limit: &'a [f32],
+    /// When the group front reaches the cell, s.
+    pub arrival: &'a [f32],
 }
 
 /// Shallowest depth waves are traced through, so phase stays smooth across
@@ -136,12 +178,14 @@ pub struct ShoreWaves {
     cell: f32,
     origin: Vec2,
     omega: f32,
+    across: Vec2,
     phase: Vec<f32>,
     direction: Vec<Vec2>,
     wave_height: Vec<f32>,
     wavenumber: Vec<f32>,
     depth: Vec<f32>,
-    breaking: Vec<f32>,
+    limit: Vec<f32>,
+    arrival: Vec<f32>,
     time: f32,
     profile: BreakerProfile,
 }
@@ -150,8 +194,11 @@ impl ShoreWaves {
     pub fn new(seabed: &Seabed, sea_level: f32, settings: ShoreSettings) -> Self {
         seabed.validate();
         assert!(
-            settings.period > 0.0 && settings.height >= 0.0 && settings.breaker_index > 0.0,
-            "period and breaker index must be positive, height nonnegative"
+            settings.period > 0.0
+                && settings.height >= 0.0
+                && settings.breaker_index > 0.0
+                && (0.0..=1.0).contains(&settings.groups),
+            "period and breaker index must be positive, height nonnegative, groups in [0, 1]"
         );
         let (w, h) = (seabed.width, seabed.height);
         let omega = TAU / settings.period;
@@ -168,7 +215,13 @@ impl ShoreWaves {
         // keep the area of interest away from the other upwave edge.
         let along_x = incoming.x.abs() >= incoming.y.abs();
         let mut phase = vec![f32::INFINITY; w * h];
+        let mut arrival = vec![f32::INFINITY; w * h];
         let mut fixed = vec![false; w * h];
+        let lag: Vec<f32> = wavenumber
+            .iter()
+            .zip(&depth)
+            .map(|(&k, &d)| 1.0 / group_velocity(k, d.max(MIN_DEPTH)))
+            .collect();
         for y in 0..h {
             for x in 0..w {
                 let i = x + y * w;
@@ -178,17 +231,21 @@ impl ShoreWaves {
                     y == if incoming.y > 0.0 { 0 } else { h - 1 }
                 };
                 if depth[i] > 0.0 && (edge || wavenumber[i] * depth[i] > PI) {
-                    phase[i] = wavenumber[i] * incoming.dot(seabed.cell_center(x, y));
+                    let along = incoming.dot(seabed.cell_center(x, y));
+                    phase[i] = wavenumber[i] * along;
+                    arrival[i] = lag[i] * along;
                     fixed[i] = true;
                 }
             }
         }
-        sweep_eikonal(&mut phase, &fixed, &wavenumber, w, h, seabed.cell);
+        // Crests follow the phase speed; sets follow the group speed.
+        rayon::join(
+            || sweep_eikonal(&mut phase, &fixed, &wavenumber, w, h, seabed.cell),
+            || sweep_eikonal(&mut arrival, &fixed, &lag, w, h, seabed.cell),
+        );
 
         let deep_group = GRAVITY / (2.0 * omega);
         let mut direction = vec![incoming; w * h];
-        let mut wave_height = vec![0.0; w * h];
-        let mut breaking = vec![0.0; w * h];
         for y in 0..h {
             for x in 0..w {
                 let i = x + y * w;
@@ -205,25 +262,30 @@ impl ShoreWaves {
                 if g.is_finite() && g != Vec2::ZERO {
                     direction[i] = g.normalize();
                 }
-                if depth[i] <= 0.0 || phase[i].is_infinite() {
-                    continue;
-                }
-                let k = wavenumber[i];
-                // shortcut: energy flux conserved along rays without the refraction
-                // coefficient (ray spreading); add a transport solve if focusing over
-                // reefs and canyons matters.
-                let shoaled = settings.height * (deep_group / group_velocity(k, depth[i])).sqrt();
-                let limit = (settings.breaker_index * depth[i])
-                    .min(0.142 * TAU / k * (k * depth[i]).tanh());
-                wave_height[i] = shoaled.min(limit);
-                breaking[i] = ((shoaled / limit - 0.9) / 0.3).clamp(0.0, 1.0);
             }
         }
+        let flux = energy_flux(&phase, &direction, &depth, w, h);
+        let mut wave_height = vec![0.0; w * h];
+        let mut limit = vec![0.0; w * h];
+        for i in 0..w * h {
+            if depth[i] <= 0.0 || phase[i].is_infinite() {
+                continue;
+            }
+            let k = wavenumber[i];
+            wave_height[i] =
+                settings.height * (flux[i] * deep_group / group_velocity(k, depth[i])).sqrt();
+            limit[i] =
+                (settings.breaker_index * depth[i]).min(0.142 * TAU / k * (k * depth[i]).tanh());
+        }
         // Water no wave reaches stays calm.
-        phase
-            .iter_mut()
-            .filter(|p| p.is_infinite())
-            .for_each(|p| *p = 0.0);
+        for field in [&mut phase, &mut arrival] {
+            field
+                .iter_mut()
+                .filter(|p| p.is_infinite())
+                .for_each(|p| *p = 0.0);
+        }
+        let offshore = omega * omega / GRAVITY;
+        let across = incoming.perp() * offshore / CRESTS_PER_GROUP;
         Self {
             settings,
             sea_level,
@@ -231,12 +293,14 @@ impl ShoreWaves {
             cell: seabed.cell,
             origin: seabed.origin,
             omega,
+            across,
             phase,
             direction,
             wave_height,
             wavenumber,
             depth,
-            breaking,
+            limit,
+            arrival,
             time: 0.0,
             profile: BreakerProfile::default(),
         }
@@ -277,23 +341,44 @@ impl ShoreWaves {
             omega: self.omega,
             time: self.time,
             lean: self.settings.lean,
+            groups: self.settings.groups,
+            across: self.across,
             phase: &self.phase,
             direction: &self.direction,
             wave_height: &self.wave_height,
             wavenumber: &self.wavenumber,
             depth: &self.depth,
-            breaking: &self.breaking,
+            limit: &self.limit,
+            arrival: &self.arrival,
         }
     }
 
+    /// The wave train at `point` at the current time.
     pub fn local_wave(&self, point: Vec2) -> LocalWave {
         let q = (point - self.origin) / self.cell - 0.5;
+        let lag = self.time - bilinear(&self.arrival, self.width, q, false);
+        let group = group_envelope(
+            self.settings.groups,
+            self.omega,
+            lag,
+            self.across.dot(point),
+        );
+        let (height, breaking) = break_wave(
+            bilinear(&self.wave_height, self.width, q, false) * group,
+            bilinear(&self.limit, self.width, q, false),
+        );
         LocalWave {
             direction: bilinear(&self.direction, self.width, q, false).normalize_or(Vec2::X),
-            height: bilinear(&self.wave_height, self.width, q, false),
+            height,
             wavenumber: bilinear(&self.wavenumber, self.width, q, false),
-            breaking: bilinear(&self.breaking, self.width, q, false),
+            breaking,
         }
+    }
+
+    /// Still-water depth at a point, m; negative on land.
+    pub fn depth_at(&self, point: Vec2) -> f32 {
+        let q = (point - self.origin) / self.cell - 0.5;
+        bilinear(&self.depth, self.width, q, false)
     }
 
     /// Parametric displacement (m) and particle velocity (m/s) at a rest
@@ -340,6 +425,79 @@ impl Water for ShoreWaves {
             velocity,
         }
     }
+}
+
+/// Significant wave height surf can hold, over depth: saturated surf keeps
+/// its root-mean-square height near 0.42 of the depth (Thornton & Guza 1982).
+const SATURATED_SURF: f32 = 0.6;
+
+/// An open ocean running into a coast: the swell of a [`ShoreWaves`] with the
+/// sea of an [`Ocean`] on top, whose waves die away as the water grows too
+/// shallow to hold them. As a [`Water`] it is also a target for
+/// [`ShallowWater::relax_edges`](crate::ShallowWater::relax_edges), for a
+/// simulated beach inside it. Update both before sampling.
+#[derive(Clone, Copy)]
+pub struct Coast<'a> {
+    pub ocean: &'a Ocean,
+    pub shore: &'a ShoreWaves,
+}
+
+impl Coast<'_> {
+    /// Share of the open sea's waves the depth at `point` lets through.
+    pub fn survival(&self, point: Vec2) -> f32 {
+        let held = SATURATED_SURF * self.shore.depth_at(point);
+        (held / self.ocean.significant_height().max(1e-6)).clamp(0.0, 1.0)
+    }
+
+    /// Whitewater at a point: whitecaps at sea, breakers at the shore.
+    pub fn foam(&self, point: Vec2) -> f32 {
+        (self.survival(point) * self.ocean.foam(point)).max(self.shore.local_wave(point).breaking)
+    }
+}
+
+impl Water for Coast<'_> {
+    fn sample(&self, point: Vec2) -> WaterSample {
+        let (sea, swell) = (self.ocean.sample(point), self.shore.sample(point));
+        let survival = self.survival(point);
+        WaterSample {
+            height: swell.height + survival * sea.height,
+            velocity: swell.velocity + survival * sea.velocity,
+        }
+    }
+}
+
+/// Energy flux along the rays, relative to the open sea: the steady transport
+/// ∇·(F k̂) = 0 solved upwind in phase order, so diverging rays lose height,
+/// converging ones gain it, and land casts a lee shadow. First-order upwinding
+/// spreads shadow edges a little, which stands in for diffraction.
+fn energy_flux(phase: &[f32], direction: &[Vec2], depth: &[f32], w: usize, h: usize) -> Vec<f32> {
+    let mut order: Vec<usize> = (0..w * h)
+        .filter(|&i| depth[i] > 0.0 && phase[i].is_finite())
+        .collect();
+    order.par_sort_unstable_by(|&a, &b| phase[a].total_cmp(&phase[b]));
+    let mut flux = vec![0.0f32; w * h];
+    for i in order {
+        let (x, y, d) = (i % w, i / w, direction[i]);
+        let upwave_x = if d.x >= 0.0 {
+            (x > 0).then(|| i - 1)
+        } else {
+            (x + 1 < w).then(|| i + 1)
+        };
+        let upwave_y = if d.y >= 0.0 {
+            (y > 0).then(|| i - w)
+        } else {
+            (y + 1 < h).then(|| i + w)
+        };
+        // Past the map edge lies open sea.
+        let inflow_x = upwave_x.map_or(d.x.abs(), |a| {
+            flux[a] * (direction[a].x * d.x.signum()).max(0.0)
+        });
+        let inflow_y = upwave_y.map_or(d.y.abs(), |a| {
+            flux[a] * (direction[a].y * d.y.signum()).max(0.0)
+        });
+        flux[i] = (inflow_x + inflow_y) / (d.x.abs() + d.y.abs());
+    }
+    flux
 }
 
 /// Fast sweeping (Zhao 2005) for |∇φ| = k, first order Godunov upwind.

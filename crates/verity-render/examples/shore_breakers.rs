@@ -68,12 +68,15 @@ impl ApplicationHandler for Demo {
             omega: grid.omega,
             time: grid.time,
             lean: grid.lean,
+            groups: grid.groups,
+            across: grid.across,
             phase: grid.phase,
             direction: grid.direction,
             wave_height: grid.wave_height,
             wavenumber: grid.wavenumber,
             depth: grid.depth,
-            breaking: grid.breaking,
+            limit: grid.limit,
+            arrival: grid.arrival,
         };
         let profile = breaker::BreakerProfile {
             horizontal_second_harmonic: profile.horizontal_second_harmonic,

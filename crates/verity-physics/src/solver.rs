@@ -3,11 +3,12 @@
 //! Equation numbers refer to the AVBD paper.
 
 use crate::link::Link;
-use crate::{Collider, PhysicsSettings, collide};
+use crate::{Bounds, Collider, Ground, PhysicsSettings, collide};
 use glam::{BVec4A, Mat3, Mat3A, Mat4, Quat, Vec3, Vec3A, Vec4};
 use rayon::prelude::*;
 use std::collections::HashMap;
 use std::hash::{BuildHasherDefault, Hasher};
+use std::sync::Arc;
 
 /// Fast mixing for solver-owned entity pairs. Indices occupy the upper 32
 /// bits, so fold the product's high bits into HashMap's low bucket bits.
@@ -72,6 +73,8 @@ const PENALTY_MAX: f32 = 1.0e10;
 /// flicker while bodies rest at zero overlap. Stays below the 1 cm gaps of
 /// neighbouring boxes: each such pair would cost a manifold.
 pub(crate) const CONTACT_DISTANCE: f32 = 0.004;
+/// Half the size of a ground body's box, finite so arithmetic on it stays so.
+const UNBOUNDED: f32 = 1.0e30;
 /// Relative motion since a manifold's contacts were generated below which it
 /// reuses them instead of colliding again: resting contacts barely move.
 const REUSE_DISTANCE: f32 = 0.005;
@@ -150,7 +153,7 @@ impl Body {
             // Spinning moves only what sticks out past the inscribed sphere.
             let swing = match self.shape {
                 Collider::Cuboid { half_extents } => self.bound() - half_extents.min_element(),
-                Collider::Sphere { .. } => 0.0,
+                Collider::Sphere { .. } | Collider::Ground => 0.0,
             };
             (
                 self.velocity * dt,
@@ -239,10 +242,11 @@ impl Body {
             || (self.kinematic
                 && (self.velocity != Vec3::ZERO || self.angular_velocity != Vec3::ZERO))
     }
-    fn bound(&self) -> f32 {
+    pub(crate) fn bound(&self) -> f32 {
         match self.shape {
             Collider::Cuboid { half_extents } => half_extents.length(),
             Collider::Sphere { radius } => radius,
+            Collider::Ground => 0.0,
         }
     }
 }
@@ -1158,9 +1162,10 @@ impl Manifold {
         b: usize,
         previous: Option<&Manifold>,
         prepare: Option<&PhysicsSettings>,
+        ground: Option<&dyn Ground>,
     ) -> Option<Self> {
         let (ba, bb) = (&bodies[a], &bodies[b]);
-        let (basis, mut contacts, len) = collide::collide(ba, bb)?;
+        let (basis, mut contacts, len) = collide::collide(ba, bb, ground)?;
         let warm = if let Some(previous) = previous {
             previous.warm(ba, bb, &mut contacts[..len])
         } else {
@@ -1204,7 +1209,12 @@ impl Manifold {
     /// Bring a kept manifold up to this step: reuse its contacts while B
     /// stays near the pose they were made at, else collide again, warm
     /// starting from the old contacts. False once the shapes separate.
-    fn refresh(&mut self, bodies: &[Body], prepare: Option<&PhysicsSettings>) -> bool {
+    fn refresh(
+        &mut self,
+        bodies: &[Body],
+        prepare: Option<&PhysicsSettings>,
+        ground: Option<&dyn Ground>,
+    ) -> bool {
         let (ba, bb) = (&bodies[self.a], &bodies[self.b]);
         let inverse = ba.rotation.conjugate();
         let relative = (inverse * (bb.position - ba.position), inverse * bb.rotation);
@@ -1215,7 +1225,7 @@ impl Manifold {
         let basis = if reusable {
             self.cold.local_basis.map(|v| ba.rotation * v)
         } else {
-            let Some((basis, mut contacts, len)) = collide::collide(ba, bb) else {
+            let Some((basis, mut contacts, len)) = collide::collide(ba, bb, ground) else {
                 return false;
             };
             if len == self.len
@@ -2148,6 +2158,8 @@ impl SweepBlock {
 
 #[derive(Default)]
 pub(crate) struct Solver {
+    /// What [`Collider::Ground`] bodies are.
+    ground: Option<Arc<dyn Ground>>,
     /// The bodies (key, solved) and links (ends, solved) the coloring was
     /// built for, and whether manifolds changed since: unchanged, the
     /// coloring and adjacency are reused.
@@ -2197,6 +2209,30 @@ pub(crate) struct Solver {
 }
 
 impl Solver {
+    pub(crate) fn ground(&self) -> Option<Arc<dyn Ground>> {
+        self.ground.clone()
+    }
+
+    /// Replace the ground. Contacts inside `changed` come from it afresh; ones
+    /// elsewhere stay, as the ground under them is the same.
+    pub(crate) fn set_ground(&mut self, ground: Arc<dyn Ground>, changed: Bounds) {
+        self.ground = Some(ground);
+        let bodies = &self.bodies;
+        for manifold in &mut self.manifolds {
+            let (a, b) = (&bodies[manifold.a], &bodies[manifold.b]);
+            let on_ground = a.shape == Collider::Ground || b.shape == Collider::Ground;
+            let body = if a.shape == Collider::Ground { b } else { a };
+            let reach = Vec3::splat(body.bound());
+            if on_ground
+                && (body.position + reach).cmpge(changed.min).all()
+                && (body.position - reach).cmple(changed.max).all()
+            {
+                // Too far from any pose to reuse.
+                manifold.cold.relative.0 = Vec3::splat(UNBOUNDED);
+            }
+        }
+    }
+
     pub fn contact_count(&self) -> usize {
         let stashed = self.stash.iter().map(|(_, m)| m);
         self.manifolds.iter().chain(stashed).map(|m| m.len).sum()
@@ -2663,6 +2699,8 @@ impl Solver {
                     Vec3::new(abs(m.row(0)), abs(m.row(1)), abs(m.row(2)))
                 }
                 Collider::Sphere { radius } => Vec3::splat(radius),
+                // Everything near it pairs with it; the shape then says what touches.
+                Collider::Ground => Vec3::splat(UNBOUNDED),
             } + (0.5 * CONTACT_DISTANCE + b.reach);
             let flags =
                 u32::from(b.dynamic()) | u32::from(b.active()) << 1 | u32::from(b.asleep) << 2;
@@ -2825,8 +2863,9 @@ impl Solver {
             }
         }
         let bodies = &self.bodies;
+        let ground = self.ground.as_deref();
         let refresh = |m: &mut Manifold| {
-            if m.cold.seen != pass || !m.refresh(bodies, prepare) {
+            if m.cold.seen != pass || !m.refresh(bodies, prepare, ground) {
                 m.len = 0;
             }
         };
@@ -2861,7 +2900,7 @@ impl Solver {
             }
             let key = (bodies[a].key, bodies[b].key);
             let previous = stash_index.get(&key).map(|&i| &stash[i].1);
-            Manifold::create(bodies, a, b, previous, prepare)
+            Manifold::create(bodies, a, b, previous, prepare, ground)
         };
         if serial || rayon::current_num_threads() == 1 || self.fresh.len() < PAIR_BATCH {
             // A failed narrowphase needs no manifold-sized output slot.

@@ -22,13 +22,21 @@ pub struct BreakerGrid<'a> {
     pub omega: f32,
     pub time: f32,
     pub lean: f32,
+    /// Strength of the wave-group envelope in [0, 1].
+    pub groups: f32,
+    /// Group phase along the crests, radians per metre.
+    pub across: Vec2,
     pub phase: &'a [f32],
     pub direction: &'a [Vec2],
+    /// Unbroken height, before the group envelope, in metres.
     pub wave_height: &'a [f32],
     pub wavenumber: &'a [f32],
     /// Signed sea-level-minus-seabed depth in metres.
     pub depth: &'a [f32],
-    pub breaking: &'a [f32],
+    /// Tallest wave the depth can hold, in metres.
+    pub limit: &'a [f32],
+    /// When the group front reaches each cell, in seconds.
+    pub arrival: &'a [f32],
 }
 
 /// Harmonic coefficients of the shared parametric breaking-wave profile.
@@ -100,7 +108,8 @@ impl BreakerPass {
             grid.wave_height.len(),
             grid.wavenumber.len(),
             grid.depth.len(),
-            grid.breaking.len(),
+            grid.limit.len(),
+            grid.arrival.len(),
         ]
         .iter()
         .any(|&len| len != n)
@@ -128,7 +137,12 @@ impl BreakerPass {
                     grid.direction[i].y,
                     grid.wave_height[i],
                 ],
-                medium: [grid.wavenumber[i], grid.depth[i], grid.breaking[i], 0.0],
+                medium: [
+                    grid.wavenumber[i],
+                    grid.depth[i],
+                    grid.limit[i],
+                    grid.arrival[i],
+                ],
             });
         }
         self.surface = Some(Surface {
@@ -141,7 +155,12 @@ impl BreakerPass {
                 grid.lean,
                 profile.horizontal_second_harmonic,
             ],
-            profile: [profile.vertical_second_harmonic, 0.0, 0.0, 0.0],
+            profile: [
+                profile.vertical_second_harmonic,
+                grid.groups,
+                grid.across.x,
+                grid.across.y,
+            ],
             vertex_count,
         });
         self.revision = self.revision.wrapping_add(1);

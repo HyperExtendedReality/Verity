@@ -1,12 +1,12 @@
-//! A Box3D simulation rendered directly from Verity's runtime world.
+//! A physics simulation rendered directly from Verity's runtime world.
 use glam::Vec3;
 use std::{
     error::Error,
     sync::Arc,
     time::{Duration, Instant},
 };
-use verity_box3d::{Collider, PhysicsBody, RigidBody};
 use verity_core::{Entity, Material, PointLight, Transform};
+use verity_physics::{Collider, PhysicsBody, RigidBody};
 use verity_render::Renderer;
 use verity_runtime::Runtime;
 use winit::{
@@ -29,7 +29,7 @@ impl ApplicationHandler for Demo {
             return;
         }
         let window = match event_loop
-            .create_window(Window::default_attributes().with_title("Verity Box3D"))
+            .create_window(Window::default_attributes().with_title("Verity physics"))
         {
             Ok(window) => Arc::new(window),
             Err(error) => {
@@ -93,8 +93,8 @@ fn main() -> Result<(), Box<dyn Error>> {
     let floor = runtime.world.spawn(Entity {
         name: "Floor".into(),
         transform: Transform {
-            translation: [0.0, -0.5, 0.0],
-            scale: [8.0, 1.0, 8.0],
+            translation: [0.0, 0.0, -0.5],
+            scale: [8.0, 8.0, 1.0],
             ..Transform::default()
         },
         material: Material {
@@ -106,7 +106,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     let cube = runtime.world.spawn(Entity {
         name: "Falling cube".into(),
         transform: Transform {
-            translation: [0.0, 3.0, 0.0],
+            translation: [0.0, 0.0, 3.0],
             ..Transform::default()
         },
         material: Material {
@@ -121,7 +121,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         PhysicsBody::new(
             RigidBody::Static,
             Collider::Cuboid {
-                half_extents: Vec3::new(4.0, 0.5, 4.0),
+                half_extents: Vec3::new(4.0, 4.0, 0.5),
             },
         ),
     )?;
@@ -136,7 +136,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         ),
     )?;
     runtime.world.lights.push(PointLight {
-        position: [2.0, 4.0, 3.0],
+        position: [2.0, 3.0, 4.0],
         color: [1.0, 0.95, 0.85],
         intensity: 30.0,
         radius: 15.0,

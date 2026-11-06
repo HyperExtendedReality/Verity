@@ -7,8 +7,11 @@ description = "Split Radiance Cascades global illumination for the Verity render
 publish = false
 
 [dependencies]
+verity-core = { path = "../verity-core" }
+verity-physics = { path = "../verity-physics" }
 verity-render = { path = "../verity-render" }
 glam = { version = "0.29", features = ["bytemuck"] }
+rayon = "1"
 ash = "0.38"
 bytemuck = { version = "1.25.2", features = ["derive"] }
 gpu-allocator = { version = "0.28", default-features = false, features = ["std", "vulkan"] }
@@ -17,5 +20,5 @@ gpu-allocator = { version = "0.28", default-features = false, features = ["std",
 verity-slang = { version = "0.1.0", path = "../verity-slang" }
 
 [dev-dependencies]
-verity-core = { path = "../verity-core" }
+verity-terra = { path = "../verity-terra" }
 winit = "0.30"

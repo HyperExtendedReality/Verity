@@ -2,6 +2,8 @@
 // bound at MATERIAL_SET). Instance word 7.w is the material index. Lux slots:
 // 0 base color, 2 metallic-roughness, 3 normal; others have no texture.
 
+#include "terrain.slang"
+
 Material hitMaterial(Hit hit) { return materials[sceneWord(instanceBase(hit.instance) + 7).w]; }
 // Kept for callers that only need an identity for the hit's material.
 uint materialBase(Hit hit) { return sceneWord(instanceBase(hit.instance) + 7).w; }
@@ -60,6 +62,16 @@ float4 materialSample(Hit hit, uint slot) {
 }
 
 float4 materialBaseColor(Hit hit) {
+#ifndef GI_WARMUP
+    Material material = hitMaterial(hit);
+    if ((material.textures.w & TERRAIN_SURFACE) != 0) {
+        // Retained vertices are in world space.
+        float3 position = hitVertexAttribute(hit, 0).xyz;
+        float3 normal = normalize(hitVertexAttribute(hit, 1).xyz);
+        float2 ground = hitVertexAttribute(hit, 3).xy;
+        return float4(terrain_albedo(position, normal, ground.x, ground.y, material.params.w), 1.0);
+    }
+#endif
     return hitMaterial(hit).base_color * hitVertexAttribute(hit, 4) * materialSample(hit, 0);
 }
 

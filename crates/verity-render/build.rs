@@ -4,6 +4,7 @@ use verity_slang::{SlangCompiler, SlangSettings, SlangStage};
 /// Every pipeline entry point, written to `OUT_DIR/{file}.{entry}.spv`.
 const ENTRY_POINTS: &[(&str, &str, SlangStage)] = &[
     ("clusters", "clusterMain", SlangStage::Compute),
+    ("embedded", "embedMain", SlangStage::Compute),
     ("gpu_culling", "cullMain", SlangStage::Compute),
     ("gpu_culling", "pyramidMain", SlangStage::Compute),
     ("gpu_culling", "occlusionMain", SlangStage::Compute),
@@ -17,6 +18,26 @@ const ENTRY_POINTS: &[(&str, &str, SlangStage)] = &[
     ("shadow", "fragmentMain", SlangStage::Fragment),
     ("breaker", "vertexMain", SlangStage::Vertex),
     ("breaker", "fragmentMain", SlangStage::Fragment),
+    ("matrix_select", "instanceMain", SlangStage::Compute),
+    ("matrix_select", "nodeMain", SlangStage::Compute),
+    ("matrix_clusters", "vertexMain", SlangStage::Vertex),
+    ("matrix_clusters", "fragmentMain", SlangStage::Fragment),
+    ("matrix_clusters_depth", "vertexMain", SlangStage::Vertex),
+    ("matrix_clusters_depth", "fragmentMain", SlangStage::Fragment),
+    ("matrix_clusters_shadow", "vertexMain", SlangStage::Vertex),
+    ("matrix_clusters_shadow", "fragmentMain", SlangStage::Fragment),
+    ("matrix_voxels", "vertexMain", SlangStage::Vertex),
+    ("matrix_voxels", "fragmentMain", SlangStage::Fragment),
+    ("matrix_voxels_depth", "vertexMain", SlangStage::Vertex),
+    ("matrix_voxels_depth", "fragmentMain", SlangStage::Fragment),
+    ("matrix_voxels_shadow", "vertexMain", SlangStage::Vertex),
+    ("matrix_voxels_shadow", "fragmentMain", SlangStage::Fragment),
+    ("matrix_imposters", "vertexMain", SlangStage::Vertex),
+    ("matrix_imposters", "fragmentMain", SlangStage::Fragment),
+    ("matrix_imposters_depth", "vertexMain", SlangStage::Vertex),
+    ("matrix_imposters_depth", "fragmentMain", SlangStage::Fragment),
+    ("matrix_bake", "vertexMain", SlangStage::Vertex),
+    ("matrix_bake", "fragmentMain", SlangStage::Fragment),
 ];
 
 fn main() {

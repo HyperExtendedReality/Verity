@@ -10,17 +10,25 @@
 // Every function here is Vulkan calls; an unsafe fn body is one unsafe context.
 #![allow(unsafe_op_in_unsafe_fn)]
 
-use crate::{
+pub mod scene;
+pub mod settings;
+
+use self::{
     scene::{GiScene, LAYER_MASK},
     settings::*,
 };
+use crate::{
+    GiMethod, GiStatus,
+    shared::{Patch, Res, upload, upload_ranges, write_set},
+};
 use ash::vk;
+use std::ops::Range;
 use bytemuck::{Pod, Zeroable};
 use glam::{Mat4, Vec3};
 use gpu_allocator::MemoryLocation;
 use std::{collections::HashMap, ffi::CString, mem, time::Instant};
 use verity_render::{
-    FrameContext, Gpu, RenderExtension, Targets,
+    FrameContext, Gpu, RenderExtension, RetainedChange, Targets,
     asset::SceneData,
     extension::Result,
     gpu::{self, Buffer, Image},
@@ -140,14 +148,6 @@ struct GiLight {
     source: [u32; 4],
 }
 
-/// What a descriptor points at.
-#[derive(Clone, Copy)]
-enum Res {
-    Buffer(vk::Buffer),
-    /// A view in `GENERAL` layout, or a depth view in `DEPTH_READ_ONLY_OPTIMAL`.
-    View(vk::ImageView, vk::ImageLayout),
-}
-
 struct Pipelines {
     set_layout: vk::DescriptorSetLayout,
     composite_set_layout: vk::DescriptorSetLayout,
@@ -185,19 +185,6 @@ struct View {
     composite_sets: [vk::DescriptorSet; SLOTS],
     /// Images and buffers still need clearing to zero.
     fresh: bool,
-}
-
-/// Where GI is in getting ready to render.
-#[derive(Clone, Debug, PartialEq)]
-pub enum GiStatus {
-    /// The driver is compiling the transport pipelines, in the background.
-    Compiling {
-        since: Instant,
-    },
-    Ready {
-        compile_time: std::time::Duration,
-    },
-    Failed(String),
 }
 
 type CompiledPasses = std::result::Result<Vec<(&'static str, vk::Pipeline)>, String>;
@@ -273,7 +260,7 @@ fn compile_passes(
 /// Split Radiance Cascades GI. Install with `Renderer::set_extension` before
 /// loading scenes. Pipelines compile in the background; until they are ready
 /// the renderer keeps its own ambient lighting.
-pub struct Lux {
+pub struct SplitRadianceCascades {
     pub settings: Settings,
     scene: GiScene,
     geometry: Buffer,
@@ -296,7 +283,7 @@ pub struct Lux {
     pass_limit: Option<usize>,
 }
 
-impl Lux {
+impl SplitRadianceCascades {
     pub fn new(settings: Settings) -> Self {
         Self {
             settings,
@@ -405,7 +392,6 @@ impl Lux {
         device.destroy_descriptor_set_layout(pipelines.composite_set_layout, None);
     }
 
-    /// Replace a device-local buffer's contents through a staging copy.
     unsafe fn upload(
         &mut self,
         gpu: &mut Gpu,
@@ -413,68 +399,44 @@ impl Lux {
         name: &str,
         bytes: &[u8],
     ) -> Result<()> {
-        let device = gpu.device;
-        if self.command_pool == vk::CommandPool::null() {
-            self.command_pool = device.create_command_pool(
-                &vk::CommandPoolCreateInfo::default()
-                    .queue_family_index(gpu.queue_family)
-                    .flags(vk::CommandPoolCreateFlags::TRANSIENT),
-                None,
-            )?;
-        }
-        let size = bytes.len() as u64;
-        let mut staging = gpu::create_buffer(
-            device,
-            gpu.allocator,
-            "gi staging",
-            size,
-            vk::BufferUsageFlags::TRANSFER_SRC,
-            MemoryLocation::CpuToGpu,
-        )?;
-        staging.write(bytes);
-        gpu::destroy_buffer(device, gpu.allocator, mem::take(target));
-        let usage = vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::TRANSFER_DST;
-        *target = gpu::create_buffer(
-            device,
-            gpu.allocator,
-            name,
-            size,
-            usage,
-            MemoryLocation::GpuOnly,
-        )?;
-        let cmd = device.allocate_command_buffers(
-            &vk::CommandBufferAllocateInfo::default()
-                .command_pool(self.command_pool)
-                .level(vk::CommandBufferLevel::PRIMARY)
-                .command_buffer_count(1),
-        )?[0];
-        device.begin_command_buffer(
-            cmd,
-            &vk::CommandBufferBeginInfo::default()
-                .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
-        )?;
-        device.cmd_copy_buffer(
-            cmd,
-            staging.buffer,
-            target.buffer,
-            &[vk::BufferCopy {
-                src_offset: 0,
-                dst_offset: 0,
-                size,
-            }],
-        );
-        device.end_command_buffer(cmd)?;
-        let commands = [cmd];
-        let result = device
-            .queue_submit(
-                gpu.queue,
-                &[vk::SubmitInfo::default().command_buffers(&commands)],
-                vk::Fence::null(),
+        upload(gpu, &mut self.command_pool, target, name, bytes)
+    }
+
+    /// Pack the scene and upload it.
+    unsafe fn upload_scene(&mut self, gpu: &mut Gpu) -> Result<()> {
+        self.scene.pack();
+        self.upload_packed(gpu)
+    }
+
+    /// Move the packed scene into new buffers and point every descriptor set at them.
+    unsafe fn upload_packed(&mut self, gpu: &mut Gpu) -> Result<()> {
+        let mut scene = mem::take(&mut self.scene);
+        let words = scene.words();
+        self.instances = words.instances;
+        let mut geometry = mem::take(&mut self.geometry);
+        let mut scene_words = mem::take(&mut self.words);
+        let result = self
+            .upload(
+                gpu,
+                &mut geometry,
+                "gi geometry words",
+                bytemuck::cast_slice(&words.geometry_words),
             )
-            .and_then(|()| device.queue_wait_idle(gpu.queue));
-        device.free_command_buffers(self.command_pool, &commands);
-        gpu::destroy_buffer(device, gpu.allocator, staging);
-        Ok(result?)
+            .and_then(|()| {
+                self.upload(
+                    gpu,
+                    &mut scene_words,
+                    "gi scene words",
+                    bytemuck::cast_slice(&words.scene_words),
+                )
+            });
+        (self.geometry, self.words) = (geometry, scene_words);
+        self.scene = mem::take(&mut scene);
+        result?;
+        if let Some(targets) = self.targets {
+            self.write_sets(gpu.device, &targets);
+        }
+        Ok(())
     }
 
     unsafe fn create_view(&self, gpu: &mut Gpu, targets: &Targets) -> Result<View> {
@@ -1195,51 +1157,19 @@ impl Lux {
     }
 }
 
-unsafe fn write_set(
-    device: &ash::Device,
-    set: vk::DescriptorSet,
-    layout: &[(u32, D)],
-    entries: &[(u32, Res)],
-) {
-    let kinds: HashMap<u32, D> = layout.iter().copied().collect();
-    let buffers: Vec<[vk::DescriptorBufferInfo; 1]> = entries
-        .iter()
-        .map(|(_, res)| match res {
-            Res::Buffer(buffer) => [vk::DescriptorBufferInfo::default()
-                .buffer(*buffer)
-                .range(vk::WHOLE_SIZE)],
-            Res::View(..) => [vk::DescriptorBufferInfo::default()],
-        })
-        .collect();
-    let images: Vec<[vk::DescriptorImageInfo; 1]> = entries
-        .iter()
-        .map(|(_, res)| match res {
-            Res::View(view, layout) => [vk::DescriptorImageInfo::default()
-                .image_view(*view)
-                .image_layout(*layout)],
-            Res::Buffer(_) => [vk::DescriptorImageInfo::default()],
-        })
-        .collect();
-    let writes: Vec<_> = entries
-        .iter()
-        .enumerate()
-        .map(|(i, (binding, res))| {
-            let write = vk::WriteDescriptorSet::default()
-                .dst_set(set)
-                .dst_binding(*binding)
-                .descriptor_type(kinds[binding]);
-            match res {
-                Res::Buffer(_) => write.buffer_info(&buffers[i]),
-                Res::View(..) => write.image_info(&images[i]),
-            }
-        })
-        .collect();
-    device.update_descriptor_sets(&writes, &[]);
+impl GiMethod for SplitRadianceCascades {
+    fn status(&self) -> GiStatus {
+        self.status.clone()
+    }
 }
 
-impl RenderExtension for Lux {
+impl RenderExtension for SplitRadianceCascades {
     fn active(&self) -> bool {
         matches!(self.status, GiStatus::Ready { .. })
+    }
+
+    fn sky_reflections(&self) -> bool {
+        self.settings.sky_reflections
     }
 
     fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
@@ -1254,35 +1184,44 @@ impl RenderExtension for Lux {
         _draw_base: u32,
     ) -> Result<()> {
         self.scene.add(scene, material_base);
-        let words = self.scene.pack();
-        self.instances = words.instances;
-        unsafe {
-            let mut geometry = mem::take(&mut self.geometry);
-            let mut scene_words = mem::take(&mut self.words);
-            let result = self
-                .upload(
-                    gpu,
-                    &mut geometry,
-                    "gi geometry words",
-                    bytemuck::cast_slice(&words.geometry_words),
-                )
-                .and_then(|()| {
-                    self.upload(
-                        gpu,
-                        &mut scene_words,
-                        "gi scene words",
-                        bytemuck::cast_slice(&words.scene_words),
-                    )
-                });
-            (self.geometry, self.words) = (geometry, scene_words);
-            result?;
-        }
         self.scene_changed = true;
-        // New buffers: every descriptor set must point at them.
-        if let Some(targets) = self.targets {
-            unsafe { self.write_sets(gpu.device, &targets) };
+        unsafe { self.upload_scene(gpu) }
+    }
+
+    fn retained_changed(
+        &mut self,
+        gpu: &mut Gpu,
+        changes: &[RetainedChange],
+        material: u32,
+    ) -> Result<()> {
+        self.scene.set_retained(changes, material);
+        // History stays: it refines toward the new geometry, where dropping it
+        // would flash the whole view on every brush stroke.
+        let Some(ranges) = self.scene.refresh() else {
+            return unsafe { self.upload_packed(gpu) };
+        };
+        let words = self.scene.words();
+        self.instances = words.instances;
+        let bytes = mem::size_of::<glam::UVec4>();
+        let in_bytes = |range: &Range<usize>| range.start * bytes..range.end * bytes;
+        unsafe {
+            upload_ranges(
+                gpu,
+                &mut self.command_pool,
+                &[
+                    Patch {
+                        target: &self.geometry,
+                        source: bytemuck::cast_slice(&words.geometry_words),
+                        ranges: ranges.geometry.iter().map(in_bytes).collect(),
+                    },
+                    Patch {
+                        target: &self.words,
+                        source: bytemuck::cast_slice(&words.scene_words),
+                        ranges: ranges.scene.iter().map(in_bytes).collect(),
+                    },
+                ],
+            )
         }
-        Ok(())
     }
 
     fn targets_changed(&mut self, gpu: &mut Gpu, targets: &Targets) -> Result<()> {
@@ -1303,7 +1242,8 @@ impl RenderExtension for Lux {
                 // Bindings need buffers before a scene arrives.
                 let mut geometry = mem::take(&mut self.geometry);
                 let mut words = mem::take(&mut self.words);
-                let empty = crate::scene::GiScene::default().pack();
+                let mut empty = GiScene::default();
+                let empty = empty.pack();
                 self.upload(
                     gpu,
                     &mut geometry,

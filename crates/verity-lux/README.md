@@ -1,15 +1,105 @@
 # Verity Lux
 
-`verity-lux` is the optional Split Radiance Cascades global-illumination
-extension for Verity's Vulkan renderer. Direct lighting, shadow maps, and the
-fallback hemisphere ambient belong to `verity-render`; they do not require Lux.
-Install `Lux::new(Settings::default())` using `Renderer::set_extension` before
-loading the geometry that should participate in GI.
+`verity-lux` is Verity's global illumination: several methods behind one
+extension, chosen per scene. Direct lighting, shadow maps, and the fallback
+hemisphere ambient belong to `verity-render`; they do not require Lux.
+
+| Method | Module | Traces |
+| --- | --- | --- |
+| Split Radiance Cascades | `cascades` | A GI scene of its own |
+| PXTGI | `pxtgi` | The physics scene |
+
+Install `Lux` with `Renderer::set_extension` before loading the geometry that
+should take part:
+
+```rust
+use verity_lux::{Lux, Method, cascades::settings::Settings};
+
+let method = Method::SplitRadianceCascades(Settings::budgeted());
+renderer.set_extension(Box::new(Lux::new(method)))?;
+renderer.load_gltf(path, 512)?;
+
+// Each frame, after stepping physics. Methods that do not need it ignore it.
+renderer.extension_mut::<Lux>().unwrap().sync(&physics, &world);
+renderer.draw_world(&world)?;
+```
+
+`Lux::for_lighting` takes a scene's `LightingMethod` instead. In the editor, pick
+a method under **Scene lighting**: models reload behind the change, because a
+method only learns about geometry loaded after it starts. Reach what only one
+method offers through `Lux::method_mut`.
+
+To add a method, implement `GiMethod`, add a `Method` variant and a row in
+`METHODS`, and give it a `LightingMethod` so scenes can name it. The editor lists
+whatever `METHODS` holds. Follow terrain through
+`RenderExtension::retained_changed`.
+
+Both methods trace retained meshes such as `verity-terra` chunks, which may be
+set before or after the extension is installed. See the Terra section of the
+root README.
 
 The Verity Sponza example runs without GI by default. Its source documents a
 known first-frame GPU hang when the experimental GI extension is enabled with
-`--gi`; the notes below describe the older Bevy implementation retained in
-`legacy/`, not the current Verity API or its supported features.
+`--gi`; the notes after the PXTGI section describe the older Bevy implementation
+retained in `legacy/`, not the current Verity API or its supported features.
+
+## PXTGI
+
+PXTGI traces the physics scene rather than a GI scene of its own, and runs none
+of the cascade passes. `Lux::sync` keeps it following the physics world.
+
+Rays run against a `verity_physics::RayScene`: rigid colliders, the surfaces of
+soft bodies, and loaded glTF meshes as static trace geometry. The same scene
+answers CPU rays with `RayScene::ray`. A ray follows what is on screen first,
+taking its light from the previous frame's lit image, then continues against
+the scene, where a hashed radiance cache carries further bounces.
+
+Physics supplies more than geometry:
+
+- A resting scene costs one pose comparison per body. Nothing is refit or
+  uploaded, so sleeping bodies are free on the GPU side.
+- Moving bodies report the region they disturbed. For 16 frames the GI keeps
+  less history and refreshes its cache there; the rest of the view stays
+  converged.
+- Trees refit as bodies move and rebuild every 15 refits, or when bodies come
+  and go.
+
+When a light's power changes, everything remembered scales with it for one
+frame. Light is linear in its sources, and without this, stale light feeds back
+through last frame's image and fades only over seconds. The scaling is exact when
+one source or all of them change; with several, it estimates each source's share
+from its power, and the short history after a change corrects the rest.
+
+Limits to know about:
+
+- Static glTF meshes answer rays only. They make no contacts, so bodies fall
+  through them; give level geometry colliders as well.
+- A hit's albedo is its material's mean colour (the texture's last mip), since
+  rays carry no texture coordinates. Alpha-masked surfaces count as solid, and
+  alpha-blended ones are not traced.
+- Motion vectors are camera-only, so history on a moving body is kept or dropped
+  by depth rather than reprojected.
+- Soft bodies trace as neutral grey, and materials have no emission.
+
+Entities without a body trace as the cubes they are drawn as, so walls need no
+colliders. In the editor, select **Scene & Lighting** and pick the method under
+**Scene Lighting**; PXTGI follows the scene while editing and the simulation in
+play mode.
+
+`examples/pxtgi_room.rs` is a physics room with flags for capture and for each
+measurement below, taken on an RTX 4070 Laptop GPU:
+
+| Measurement | Result |
+| --- | --- |
+| GPU time, the room at 1600×900 | 1.5 ms |
+| GPU time, the room plus Sponza's main scene | 5 to 7 ms |
+| Bounce light against a CPU path tracer on the same scene (`--reference`) | 7% mean error |
+| Light left one frame after it goes out (`--extinction`) | 0.0% (the Bevy build: 68.4% after 100 ms) |
+| Light dimmed to half (`--extinction=half`) | 50.4% on the first frame |
+| Residual 10 frames after a wall panel moves | 13%, against 29% without moved regions |
+
+The reference is Lambertian with the renderer's diffuse share, so it leaves out
+specular interreflection. These are one scene and one device, not a certification.
 
 # bevy_lux
 

@@ -1,6 +1,7 @@
 use crate::fft::{Fft2, cis, conj, mul, negated, signed, times_i};
 use crate::{
-    GRAVITY, Rng, Water, WaterSample, angular_frequency, bilinear, group_velocity, undisplace,
+    GRAIN, GRAVITY, Rng, Water, WaterSample, angular_frequency, bilinear, group_velocity,
+    undisplace,
 };
 use glam::{Vec2, Vec3};
 use rayon::prelude::*;
@@ -144,7 +145,9 @@ pub struct OceanSettings {
     /// Horizontal displacement λ: 0 gives rounded crests, 1 the sharp
     /// physical ones; above 1 crests fold over.
     pub choppiness: f32,
-    /// Surface compression (Jacobian) below which whitecaps form.
+    /// Surface compression (Jacobian) of a single cascade below which whitecaps
+    /// form. The default tracks the coverage Monahan & Muircheartaigh 1980
+    /// measured against wind speed, within a factor of about three.
     pub foam_threshold: f32,
     /// Seconds for whitecaps to fade to 1/e.
     pub foam_lifetime: f32,
@@ -169,7 +172,7 @@ impl Default for OceanSettings {
                 },
             ],
             choppiness: 0.9,
-            foam_threshold: 0.4,
+            foam_threshold: 0.745,
             foam_lifetime: 2.0,
             seed: 1,
         }
@@ -192,13 +195,82 @@ pub struct Cascade {
     k: Vec<Vec2>,
     omega: Vec<f32>,
     h0: Vec<Vec2>,
+    /// conj(h0(−k)), the mirror term of h(k, t).
+    h0_negated: Vec<Vec2>,
+    scratch: [Vec<Vec2>; 4],
+}
+
+/// Jacobian drop below the threshold that takes whitecaps to full strength.
+const FOAM_RAMP: f32 = 0.2;
+
+impl Cascade {
+    fn update(&mut self, fft: &Fft2, time: f32, lambda: f32, fade: f32, threshold: f32) {
+        let [a, b, s, j] = &mut self.scratch;
+        // Whole turns go first, in f64: at f32 the phase of the shortest
+        // waves turns to noise within hours of `time`.
+        let turns = f64::from(time) / std::f64::consts::TAU;
+        (
+            &mut *a,
+            &mut *b,
+            &mut *s,
+            &mut *j,
+            &self.k,
+            &self.omega,
+            &self.h0,
+            &self.h0_negated,
+        )
+            .into_par_iter()
+            .with_min_len(GRAIN)
+            .for_each(|(a, b, s, j, &k, &omega, &h0, &h0_negated)| {
+                // The inverse FFT uses exp(+i k·x), so exp(-i ωt)
+                // propagates the directional spectrum along +k.
+                let phase = f64::from(omega) * turns;
+                let e = cis(-((phase - phase.floor()) as f32) * TAU);
+                let h = mul(h0, e) + mul(h0_negated, conj(e));
+                let kl = k.length().max(f32::MIN_POSITIVE);
+                // Choppy displacement D = i k/|k| h pulls surface points toward crests.
+                let ih = times_i(h);
+                let (dx, dy) = (ih * (k.x / kl), ih * (k.y / kl));
+                let (jxx, jyy, jxy) = (
+                    h * (-k.x * k.x / kl),
+                    h * (-k.y * k.y / kl),
+                    h * (-k.x * k.y / kl),
+                );
+                // Real fields packed in pairs: F(A + iB) = F(A) + i F(B).
+                *a = dx + times_i(dy);
+                *b = h + times_i(jxy);
+                *s = ih * k.x + times_i(ih * k.y);
+                *j = jxx + times_i(jyy);
+            });
+        [&mut *a, &mut *b, &mut *s, &mut *j]
+            .into_par_iter()
+            .for_each(|field| fft.run(field, true));
+        std::mem::swap(&mut self.previous, &mut self.displacement);
+        (
+            &mut self.displacement,
+            &mut self.slope,
+            &mut self.foam,
+            &*a,
+            &*b,
+            &*s,
+            &*j,
+        )
+            .into_par_iter()
+            .with_min_len(GRAIN)
+            .for_each(|(displacement, slope, foam, a, b, s, j)| {
+                *displacement = Vec3::new(lambda * a.x, lambda * a.y, b.x);
+                *slope = *s;
+                let jacobian = (1.0 + lambda * j.x) * (1.0 + lambda * j.y) - (lambda * b.y).powi(2);
+                *foam = (*foam * fade).max(((threshold - jacobian) / FOAM_RAMP).clamp(0.0, 1.0));
+            });
+    }
 }
 
 pub struct Ocean {
     settings: OceanSettings,
     fft: Fft2,
     cascades: Vec<Cascade>,
-    scratch: [Vec<Vec2>; 4],
+    significant_height: f32,
     time: f32,
     dt: f32,
 }
@@ -220,14 +292,17 @@ impl Ocean {
         );
         let fft = Fft2::new(n);
         let mut rng = Rng(settings.seed);
-        let cascades = sizes
+        let cascades: Vec<Cascade> = sizes
             .iter()
             .enumerate()
             .map(|(c, &size)| {
                 let lo = if c == 0 { 0.0 } else { BAND * TAU / size };
-                let hi = sizes.get(c + 1).map_or(f32::INFINITY, |next| BAND * TAU / next);
+                // Stopping at the Nyquist circle keeps the spectrum isotropic, and
+                // drops the Nyquist bins, whose k has no −k to stay Hermitian with.
+                let nyquist = PI * n as f32 / size;
+                let hi = sizes.get(c + 1).map_or(nyquist, |next| BAND * TAU / next);
                 assert!(
-                    hi.is_infinite() || hi < PI * n as f32 / size,
+                    hi <= nyquist,
                     "cascade {c} cannot resolve the next cascade's band: raise resolution or bring sizes closer"
                 );
                 let dk = TAU / size;
@@ -235,10 +310,11 @@ impl Ocean {
                     .map(|i| Vec2::new(signed(i % n, n), signed(i / n, n)) * dk)
                     .collect();
                 // E|h0|² = S Δk² / 2, so h(k, t) carries S Δk² and the field variance is ∫S.
-                let h0 = k
-                    .iter()
-                    .map(|&k| {
-                        let xi = rng.gaussian2();
+                let noise: Vec<Vec2> = (0..n * n).map(|_| rng.gaussian2()).collect();
+                let h0: Vec<Vec2> = k
+                    .par_iter()
+                    .zip(&noise)
+                    .map(|(&k, &xi)| {
                         let kl = k.length();
                         if kl < lo || kl >= hi {
                             return Vec2::ZERO;
@@ -255,14 +331,22 @@ impl Ocean {
                     previous: vec![Vec3::ZERO; n * n],
                     omega: k.iter().map(|k| angular_frequency(k.length(), settings.depth)).collect(),
                     k,
+                    h0_negated: (0..n * n).map(|i| conj(h0[negated(i, n)])).collect(),
                     h0,
+                    scratch: std::array::from_fn(|_| vec![Vec2::ZERO; n * n]),
                 }
             })
             .collect();
+        // Each bin contributes |h0(k)|² + |h0(−k)|² of height variance.
+        let variance: f32 = cascades
+            .iter()
+            .flat_map(|c| c.h0.iter().chain(&c.h0_negated))
+            .map(|h| h.length_squared())
+            .sum();
         let mut ocean = Self {
             fft,
             cascades,
-            scratch: std::array::from_fn(|_| vec![Vec2::ZERO; n * n]),
+            significant_height: 4.0 * variance.sqrt(),
             time: 0.0,
             dt: 0.0,
             settings,
@@ -284,51 +368,22 @@ impl Ocean {
         self.time
     }
 
+    /// Mean height of the highest third of the waves, m: four standard
+    /// deviations of the surface.
+    pub fn significant_height(&self) -> f32 {
+        self.significant_height
+    }
+
     /// Evaluate the surface at absolute `time` in seconds.
     pub fn update(&mut self, time: f32) {
-        let n = self.settings.resolution;
         let lambda = self.settings.choppiness;
         let dt = time - self.time;
         let fade = (-dt.abs() / self.settings.foam_lifetime).exp();
         let threshold = self.settings.foam_threshold;
-        for c in &mut self.cascades {
-            let [a, b, s, j] = &mut self.scratch;
-            (&mut *a, &mut *b, &mut *s, &mut *j, 0..n * n)
-                .into_par_iter()
-                .for_each(|(a, b, s, j, i)| {
-                    // The inverse FFT uses exp(+i k·x), so exp(-i ωt)
-                    // propagates the directional spectrum along +k.
-                    let e = cis(-c.omega[i] * time);
-                    let h = mul(c.h0[i], e) + mul(conj(c.h0[negated(i, n)]), conj(e));
-                    let k = c.k[i];
-                    let kl = k.length().max(f32::MIN_POSITIVE);
-                    // Choppy displacement D = i k/|k| h pulls surface points toward crests.
-                    let ih = times_i(h);
-                    let (dx, dy) = (ih * (k.x / kl), ih * (k.y / kl));
-                    let (jxx, jyy, jxy) = (
-                        h * (-k.x * k.x / kl),
-                        h * (-k.y * k.y / kl),
-                        h * (-k.x * k.y / kl),
-                    );
-                    // Real fields packed in pairs: F(A + iB) = F(A) + i F(B).
-                    *a = dx + times_i(dy);
-                    *b = h + times_i(jxy);
-                    *s = ih * k.x + times_i(ih * k.y);
-                    *j = jxx + times_i(jyy);
-                });
-            for field in [&mut *a, &mut *b, &mut *s, &mut *j] {
-                self.fft.run(field, true);
-            }
-            std::mem::swap(&mut c.previous, &mut c.displacement);
-            for i in 0..n * n {
-                c.displacement[i] = Vec3::new(lambda * a[i].x, lambda * a[i].y, b[i].x);
-                c.slope[i] = s[i];
-                let jacobian =
-                    (1.0 + lambda * j[i].x) * (1.0 + lambda * j[i].y) - (lambda * b[i].y).powi(2);
-                c.foam[i] =
-                    (c.foam[i] * fade).max(((threshold - jacobian) / threshold).clamp(0.0, 1.0));
-            }
-        }
+        let fft = &self.fft;
+        self.cascades
+            .par_iter_mut()
+            .for_each(|c| c.update(fft, time, lambda, fade, threshold));
         self.dt = dt;
         self.time = time;
     }
@@ -389,6 +444,7 @@ mod tests {
         // A single +X wave makes direction observable without statistical
         // variation from the random spectrum.
         ocean.cascades[0].h0[1] = Vec2::new(0.5, 0.0);
+        ocean.cascades[0].h0_negated[15] = Vec2::new(0.5, 0.0);
         let quarter_period = PI / (2.0 * ocean.cascades[0].omega[1]);
         ocean.update(quarter_period);
         let heights = &ocean.cascades[0].displacement;
@@ -402,5 +458,43 @@ mod tests {
             "trough should travel toward +X: {}",
             heights[12].z
         );
+    }
+
+    #[test]
+    fn shortest_waves_keep_their_phase_after_a_day() {
+        let n = 16;
+        let mut ocean = Ocean::new(OceanSettings {
+            resolution: n,
+            cascades: vec![1.0],
+            spectra: vec![],
+            choppiness: 0.0,
+            ..OceanSettings::default()
+        });
+        let bin = n / 2 - 1;
+        ocean.cascades[0].h0[bin] = Vec2::new(0.5, 0.0);
+        ocean.cascades[0].h0_negated[n - bin] = Vec2::new(0.5, 0.0);
+        let time = 86_400.0f32;
+        ocean.update(time);
+        let omega = f64::from(ocean.cascades[0].omega[bin]);
+        let expected = (omega * f64::from(time)).cos() as f32;
+        let got = ocean.cascades[0].displacement[0].z;
+        assert!((got - expected).abs() < 1e-3, "{got} vs {expected}");
+    }
+
+    #[test]
+    fn spectrum_stops_at_the_nyquist_circle() {
+        let ocean = Ocean::new(OceanSettings {
+            resolution: 32,
+            cascades: vec![10.0],
+            ..OceanSettings::default()
+        });
+        let c = &ocean.cascades[0];
+        let nyquist = PI * 32.0 / c.size;
+        assert!(
+            c.k.iter()
+                .zip(&c.h0)
+                .all(|(k, h)| k.length() < nyquist || *h == Vec2::ZERO)
+        );
+        assert!(c.h0.iter().any(|h| *h != Vec2::ZERO));
     }
 }

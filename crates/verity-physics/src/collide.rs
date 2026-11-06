@@ -1,9 +1,10 @@
-//! Contact generation for cuboids and spheres. Cuboid pairs use the separating
-//! axis test with reference-face clipping, ported from the AVBD 3D demo.
+//! Contact generation for cuboids, spheres and ground. Cuboid pairs use the
+//! separating axis test with reference-face clipping, ported from the AVBD 3D
+//! demo. Ground is a field, so a body asks it about points on its own surface.
 
-use crate::Collider;
 use crate::solver::{Body, CONTACT_DISTANCE, Contact};
-use glam::Vec3;
+use crate::{Collider, Ground};
+use glam::{Quat, Vec3};
 
 /// A face manifold keeps four points spanning the largest area, enough for a
 /// stable support polygon at half the solver work of the full clip.
@@ -21,10 +22,32 @@ const FACE_A: u32 = 0;
 const FACE_B: u32 = 1;
 const EDGE: u32 = 2;
 
+/// The widest gap between points tested on a cuboid against ground, in metres:
+/// a ridge narrower than this can reach into a face.
+const GROUND_SPACING: f32 = 0.75;
+/// Divisions of a cuboid's edge, at most. Longer edges test further apart.
+const GROUND_DIVISIONS: usize = 4;
+/// Metres across a cuboid worth giving up per metre of depth when choosing its
+/// contacts: a bump a few centimetres proud of the rest gets one, noise does not.
+const GROUND_DEPTH_WEIGHT: f32 = 25.0;
+/// Most points on a cuboid's surface.
+const GROUND_POINTS: usize = 98;
+/// How far off the ground a cuboid's points still count as contacts. Contacts
+/// with a gap do nothing until it closes, but a body on a bump then has the
+/// corner it tips towards ready to stop it, instead of rocking between two sets.
+const GROUND_SKIN: f32 = 0.05;
+
 /// Whether A, moved by `shift`, comes within `margin` of B.
-fn touches(a: &Body, b: &Body, shift: Vec3, margin: f32) -> bool {
+fn touches(a: &Body, b: &Body, shift: Vec3, margin: f32, ground: Option<&dyn Ground>) -> bool {
     let center = a.position + shift;
     match (a.shape, b.shape) {
+        (Collider::Ground, Collider::Ground) => false,
+        (Collider::Ground, _) => {
+            ground.is_some_and(|g| body_touches(g, (center, a.rotation), b, Vec3::ZERO, margin))
+        }
+        (_, Collider::Ground) => {
+            ground.is_some_and(|g| body_touches(g, (b.position, b.rotation), a, shift, margin))
+        }
         (Collider::Sphere { radius: ra }, Collider::Sphere { radius: rb }) => {
             let reach = ra + rb + margin;
             center.distance_squared(b.position) <= reach * reach
@@ -46,7 +69,7 @@ fn touches(a: &Body, b: &Body, shift: Vec3, margin: f32) -> bool {
 /// passes clear. Contacts come from that pose, not this one: a contact plane
 /// from here would stop a body flying past a corner, and catch a box sliding
 /// over a seam on the far tile's side.
-fn predicted_hit(a: &Body, b: &Body, margin: f32) -> Option<Vec3> {
+fn predicted_hit(a: &Body, b: &Body, margin: f32, ground: Option<&dyn Ground>) -> Option<Vec3> {
     let travel = a.travel - b.travel;
     if travel.length_squared() < CONTACT_DISTANCE * CONTACT_DISTANCE * 0.01 {
         return Some(Vec3::ZERO);
@@ -54,6 +77,7 @@ fn predicted_hit(a: &Body, b: &Body, margin: f32) -> Option<Vec3> {
     let thickness = |shape| match shape {
         Collider::Cuboid { half_extents } => half_extents.min_element(),
         Collider::Sphere { radius } => radius,
+        Collider::Ground => 0.0,
     };
     let spacing = 0.5 * (thickness(a.shape) + thickness(b.shape));
     let samples = ((travel.length() / spacing).ceil() as usize).clamp(1, MAX_SAMPLES);
@@ -61,8 +85,8 @@ fn predicted_hit(a: &Body, b: &Body, margin: f32) -> Option<Vec3> {
         // The contact generator makes this one test itself.
         return Some(travel);
     }
-    let hit =
-        (1..=samples).find(|&i| touches(a, b, travel * (i as f32 / samples as f32), margin))?;
+    let touching = |t: f32| touches(a, b, travel * t, margin, ground);
+    let hit = (1..=samples).find(|&i| touching(i as f32 / samples as f32))?;
     // A deep first sample could lie past a thin wall's middle, which would
     // push the body through, so find first touch more closely.
     let (mut low, mut high) = (
@@ -71,7 +95,7 @@ fn predicted_hit(a: &Body, b: &Body, margin: f32) -> Option<Vec3> {
     );
     for _ in 0..REFINEMENTS {
         let middle = 0.5 * (low + high);
-        if touches(a, b, travel * middle, margin) {
+        if touching(middle) {
             high = middle;
         } else {
             low = middle;
@@ -84,12 +108,25 @@ fn predicted_hit(a: &Body, b: &Body, margin: f32) -> Option<Vec3> {
 /// in each body's frame; `None` when the shapes do not meet this step. Shapes
 /// about to meet get speculative contacts, whose gap stays in the constraint,
 /// so a fast body stops at the surface, not inside it.
-pub(crate) fn collide(a: &Body, b: &Body) -> Option<([Vec3; 3], [Contact; MAX_CONTACTS], usize)> {
+pub(crate) fn collide(
+    a: &Body,
+    b: &Body,
+    ground: Option<&dyn Ground>,
+) -> Option<([Vec3; 3], [Contact; MAX_CONTACTS], usize)> {
     let mut points = Points::default();
     let margin = CONTACT_DISTANCE + a.reach + b.reach;
-    let shift = predicted_hit(a, b, margin)?;
+    let shift = predicted_hit(a, b, margin, ground)?;
     let center = a.position + shift;
     let normal = match (a.shape, b.shape) {
+        (Collider::Ground, Collider::Ground) => return None,
+        (Collider::Ground, _) => {
+            let frame = (center, a.rotation);
+            -ground_contacts(ground?, frame, b, Vec3::ZERO, margin, true, &mut points)?
+        }
+        (_, Collider::Ground) => {
+            let frame = (b.position, b.rotation);
+            ground_contacts(ground?, frame, a, shift, margin, false, &mut points)?
+        }
         (Collider::Sphere { radius: ra }, Collider::Sphere { radius: rb }) => {
             let d = center - b.position;
             let distance_squared = d.length_squared();
@@ -138,6 +175,182 @@ pub(crate) fn collide(a: &Body, b: &Body) -> Option<([Vec3; 3], [Contact; MAX_CO
         *contact = Contact::new(feature, ia * ra, ib * rb);
     }
     Some(([normal, t1, t2], contacts, points.len))
+}
+
+/// Where a body's own points lie for a ground test, and which feature each is.
+struct BodyPoints {
+    points: [(Vec3, u32); GROUND_POINTS],
+    len: usize,
+}
+
+/// Points on a cuboid's surface: a lattice over it, in the ground's frame.
+fn cuboid_points(box_: &Obb, to_ground: impl Fn(Vec3) -> Vec3) -> BodyPoints {
+    let divisions = box_
+        .half
+        .to_array()
+        .map(|half| ((2.0 * half / GROUND_SPACING).ceil() as usize).clamp(2, GROUND_DIVISIONS));
+    let mut out = BodyPoints {
+        points: [(Vec3::ZERO, 0); GROUND_POINTS],
+        len: 0,
+    };
+    let at = |i: usize, axis: usize| (2 * i) as f32 / divisions[axis] as f32 - 1.0;
+    for x in 0..=divisions[0] {
+        for y in 0..=divisions[1] {
+            for z in 0..=divisions[2] {
+                let outside = x == 0
+                    || y == 0
+                    || z == 0
+                    || x == divisions[0]
+                    || y == divisions[1]
+                    || z == divisions[2];
+                if !outside {
+                    continue;
+                }
+                let local = Vec3::new(at(x, 0), at(y, 1), at(z, 2)) * box_.half;
+                let world = box_.center
+                    + box_.axis[0] * local.x
+                    + box_.axis[1] * local.y
+                    + box_.axis[2] * local.z;
+                // Stable across steps, so contacts warm start by feature.
+                let feature = ((x * 8 + y) * 8 + z) as u32;
+                out.points[out.len] = (to_ground(world), feature);
+                out.len += 1;
+            }
+        }
+    }
+    out
+}
+
+/// Whether a body, moved by `shift`, comes within `margin` of the ground.
+fn body_touches(
+    ground: &dyn Ground,
+    (position, rotation): (Vec3, Quat),
+    body: &Body,
+    shift: Vec3,
+    margin: f32,
+) -> bool {
+    let inverse = rotation.conjugate();
+    let to_ground = |p: Vec3| inverse * (p - position);
+    match body.shape {
+        Collider::Sphere { radius } => {
+            ground.distance(to_ground(body.position + shift)) <= radius + margin
+        }
+        Collider::Cuboid { half_extents } => {
+            let box_ = moved_obb(body, half_extents, shift);
+            let points = cuboid_points(&box_, to_ground);
+            (points.points[..points.len].iter()).any(|(p, _)| ground.distance(*p) <= margin)
+        }
+        Collider::Ground => false,
+    }
+}
+
+/// Contacts of a body, moved by `shift`, on the ground placed at `frame`; the
+/// normal, from ground to body, if they meet. Contacts share one normal, as
+/// every manifold does: where the ground bends under a body, the mean of the
+/// normals at its contacts, weighted by how deep each is.
+fn ground_contacts(
+    ground: &dyn Ground,
+    (position, rotation): (Vec3, Quat),
+    body: &Body,
+    shift: Vec3,
+    margin: f32,
+    ground_is_a: bool,
+    out: &mut Points,
+) -> Option<Vec3> {
+    let inverse = rotation.conjugate();
+    let to_ground = |p: Vec3| inverse * (p - position);
+    let to_world = |p: Vec3| position + rotation * p;
+    let mut push = |on_body: Vec3, on_ground: Vec3, feature: u32| {
+        let (body_point, ground_point) = (to_world(on_body), to_world(on_ground));
+        if ground_is_a {
+            out.push(ground_point, body_point, feature);
+        } else {
+            out.push(body_point, ground_point, feature);
+        }
+    };
+    let center = to_ground(body.position + shift);
+    match body.shape {
+        Collider::Sphere { radius } => {
+            let distance = ground.distance(center);
+            // The estimate reads up to twice the truth.
+            if distance > 2.0 * (radius + margin) {
+                return None;
+            }
+            // Project onto the surface, twice, as distances are only estimates.
+            let surface = center - ground.normal(center) * distance;
+            let surface = surface - ground.normal(surface) * ground.distance(surface);
+            let normal = ground.normal(surface);
+            let gap = (center - surface).dot(normal) - radius;
+            if gap > margin {
+                return None;
+            }
+            push(center - normal * radius, surface, 0);
+            Some(rotation * normal)
+        }
+        Collider::Cuboid { half_extents } => {
+            if ground.distance(center) > 2.0 * (half_extents.length() + margin) {
+                return None;
+            }
+            let box_ = moved_obb(body, half_extents, shift);
+            let points = cuboid_points(&box_, to_ground);
+            let mut near = [(Vec3::ZERO, 0.0f32, 0u32); GROUND_POINTS];
+            let mut count = 0;
+            let margin = margin + GROUND_SKIN;
+            for &(point, feature) in &points.points[..points.len] {
+                let distance = ground.distance(point);
+                if distance <= margin {
+                    near[count] = (point, distance, feature);
+                    count += 1;
+                }
+            }
+            // The two axes lying most along the ground, unit length for the score.
+            let up = ground.normal(center);
+            let mut axes = box_.axis.map(|axis| inverse * axis);
+            axes.sort_by(|a, b| a.dot(up).abs().total_cmp(&b.dot(up).abs()));
+            let chosen = spread(&near[..count], center, axes[0], axes[1]);
+            let mut normal = Vec3::ZERO;
+            for &(point, distance, _) in chosen.iter().flatten() {
+                normal += ground.normal(point) * (margin - distance + 1.0e-3);
+            }
+            let normal = normal.try_normalize()?;
+            for &(point, distance, feature) in chosen.iter().flatten() {
+                push(point, point - normal * distance, feature);
+            }
+            Some(rotation * normal)
+        }
+        Collider::Ground => None,
+    }
+}
+
+/// Up to four points that hold a body up: for each corner of the plane of `u`
+/// and `v`, the point furthest that way, unless another is much deeper. Choosing
+/// this way changes smoothly: picking by depth alone lets a millimetre swap the
+/// whole set each time contacts refresh, and the body rocks for ever.
+fn spread(
+    points: &[(Vec3, f32, u32)],
+    center: Vec3,
+    u: Vec3,
+    v: Vec3,
+) -> [Option<(Vec3, f32, u32)>; MAX_CONTACTS] {
+    let mut chosen = [None; MAX_CONTACTS];
+    for (slot, (su, sv)) in [(1.0, 1.0), (-1.0, 1.0), (-1.0, -1.0), (1.0, -1.0)]
+        .into_iter()
+        .enumerate()
+    {
+        let score = |&(point, distance, _): &(Vec3, f32, u32)| {
+            let offset = point - center;
+            su * offset.dot(u) + sv * offset.dot(v) - GROUND_DEPTH_WEIGHT * distance
+        };
+        let best = (points.iter()).max_by(|a, b| score(a).total_cmp(&score(b)));
+        let fresh = |p: &&(Vec3, f32, u32)| {
+            !chosen
+                .iter()
+                .flatten()
+                .any(|c: &(Vec3, f32, u32)| c.2 == p.2)
+        };
+        chosen[slot] = best.filter(fresh).copied();
+    }
+    chosen
 }
 
 #[derive(Default)]

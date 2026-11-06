@@ -2,6 +2,7 @@
 // Non-indexed draws use primitive-local firstVertex for meshlet ranges, so
 // VertexID / 3 remains the original triangle ID without PrimitiveID (which
 // requires a geometry-shader capability many mobile GPUs lack).
+// SV_VertexID would subtract firstVertex again: this needs the raw index.
 
 #include "lib/common.slang"
 
@@ -18,7 +19,7 @@ struct VertexOutput {
 };
 
 [shader("vertex")]
-VertexOutput vertexMain(uint vertex: SV_VertexID) {
+VertexOutput vertexMain(uint vertex: SV_VulkanVertexID) {
     Instance instance = instances[draw.instance];
     Vertex v = instance_vertex(instance, vertex);
     VertexOutput output;

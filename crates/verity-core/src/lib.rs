@@ -112,6 +112,8 @@ pub enum LightingMethod {
     DirectAndHemisphere,
     /// Split Radiance Cascades GI; the hemisphere lights the scene until it is ready.
     SplitRadianceCascades,
+    /// PXTGI: GI traced against the physics scene.
+    Pxtgi,
 }
 
 /// Scene-wide ambient lighting, expressed as linear RGB radiance.
@@ -135,10 +137,11 @@ impl Default for Lighting {
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum PhysicsEngine {
-    #[default]
+    /// Only so scenes that name it still load: they simulate with Verity.
     Box3d,
     // Scenes saved before the engine was renamed.
     #[serde(alias = "Hyperon")]
+    #[default]
     Verity,
 }
 
@@ -154,7 +157,7 @@ pub struct ScenePhysics {
 impl Default for ScenePhysics {
     fn default() -> Self {
         Self {
-            engine: PhysicsEngine::Box3d,
+            engine: PhysicsEngine::Verity,
             gravity: [0.0, 0.0, -9.81],
             iterations: 6,
             substeps: 4,

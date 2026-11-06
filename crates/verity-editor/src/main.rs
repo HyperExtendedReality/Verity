@@ -11,11 +11,9 @@ use std::{
 
 use ui::{Action, PlayState, Selection, WindowCommand};
 use verity_core::EntityHandle;
-use verity_core::{Entity, LightingMethod, Material, PointLight, Scene, Transform};
-use verity_lux::{
-    gi::{GiStatus, Lux},
-    settings::{Sampling, Settings},
-};
+use verity_core::{Entity, LightingMethod, Material, PointLight, Scene, Transform, World};
+use verity_lux::Lux;
+use verity_physics::PhysicsWorld;
 use verity_render::{Renderer, UiFrame};
 use verity_runtime::Runtime;
 use winit::{
@@ -41,6 +39,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 struct Editor {
+    /// The lighting method the renderer has installed, which the scene's lags
+    /// behind while models reload.
+    installed_method: LightingMethod,
+    /// The scene as PXTGI sees it outside play mode, when nothing simulates it.
+    trace_world: World,
+    /// Stands in for a physics world outside play mode.
+    no_physics: PhysicsWorld,
     window: Option<Arc<Window>>,
     renderer: Option<Renderer>,
     context: egui::Context,
@@ -91,6 +96,24 @@ struct Play {
     last: Instant,
 }
 
+/// Keep `mirror` holding `scene`'s entities, in its order, keeping their
+/// handles while the count stands so PXTGI sees moves and not new entities.
+fn mirror_scene(scene: &Scene, mirror: &mut World) {
+    if mirror.len() != scene.entities.len() {
+        *mirror = World::new();
+        for entity in &scene.entities {
+            mirror.spawn(Entity {
+                components: Default::default(),
+                ..entity.clone()
+            });
+        }
+    }
+    for (found, entity) in mirror.iter_mut().zip(&scene.entities) {
+        *found.transform = entity.transform.clone();
+        *found.material = entity.material.clone();
+    }
+}
+
 /// The simulation's soft bodies as meshes, in their entities' materials.
 fn soft_meshes(play: Option<&Play>) -> Vec<verity_render::DeformingMesh> {
     let Some(play) = play else {
@@ -115,6 +138,9 @@ impl Editor {
             context,
             egui_state: None,
             next_repaint: None,
+            installed_method: LightingMethod::default(),
+            trace_world: World::new(),
+            no_physics: PhysicsWorld::default(),
             scene: Scene::default(),
             path: None,
             selected: Selection::Entity(0),
@@ -214,19 +240,9 @@ impl Editor {
         // renderer cannot clear models under an extension: reinstall it each time.
         renderer.remove_extension().map_err(|e| e.to_string())?;
         renderer.clear_gltf().map_err(|e| e.to_string())?;
-        if method == LightingMethod::SplitRadianceCascades {
-            let settings = Settings {
-                sampling: Sampling {
-                    // Lux's benchmarked budget and a ~300 MB world cache, as in sponza_gi.
-                    max_cache_entries: 262_144,
-                    max_updates_per_frame: 512,
-                    max_traversal_queries: 16_384,
-                    ..Sampling::default()
-                },
-                ..Settings::default()
-            };
+        if let Some(lux) = Lux::for_lighting(method) {
             renderer
-                .set_extension(Box::new(Lux::new(settings)))
+                .set_extension(Box::new(lux))
                 .map_err(|e| e.to_string())?;
         }
         let mut count = scene_lights;
@@ -263,8 +279,14 @@ impl Editor {
             return done(self, Err("Renderer is not available".to_owned()));
         };
         let previous = self.scene.assets.clone();
-        let (previous_lights, previous_method) =
-            (self.scene.lights.len(), self.scene.lighting.method);
+        let (previous_lights, previous_method) = (self.scene.lights.len(), self.installed_method);
+        self.installed_method = method;
+        let done = move |editor: &mut Self, result: Result<(), String>| {
+            if result.is_err() {
+                editor.installed_method = previous_method;
+            }
+            done(editor, result);
+        };
         let context = self.context.clone();
         let thread = std::thread::spawn(move || {
             let (imported, result) =
@@ -294,6 +316,28 @@ impl Editor {
             done: Box::new(done),
         });
         self.title();
+    }
+
+    /// Follow the scene's lighting method. GI only learns about models loaded
+    /// after it is installed, so changing it reloads them, on a worker thread.
+    fn apply_lighting_method(&mut self) {
+        let (method, installed) = (self.scene.lighting.method, self.installed_method);
+        if method == installed || self.play.is_some() || self.renderer.is_none() {
+            return;
+        }
+        let uses_gi = |method| verity_lux::method_info(method).is_some();
+        if !uses_gi(method) && !uses_gi(installed) {
+            self.installed_method = method;
+            return;
+        }
+        let (assets, lights) = (self.scene.assets.clone(), self.scene.lights.len());
+        self.replace_assets(assets, lights, method, move |editor, result| {
+            if let Err(error) = result {
+                editor.scene.lighting.method = installed;
+                Self::error(format!("Cannot change the lighting method: {error}"));
+            }
+            editor.redraw();
+        });
     }
 
     fn import_model(&mut self, path: PathBuf) {
@@ -879,29 +923,34 @@ impl Editor {
         if let Some(renderer) = &mut self.renderer {
             let camera = &self.tools.camera;
             renderer.set_camera(camera.eye, camera.target, camera.vertical_fov);
-            renderer.set_strata_enabled(self.tools.strata_enabled);
-            renderer.set_strata_debug(self.tools.strata_enabled && self.tools.strata_debug);
+            renderer.set_matrix_enabled(self.tools.matrix_enabled);
+            renderer.set_matrix_debug(self.tools.matrix_enabled && self.tools.matrix_debug);
+            renderer.set_uncapped(self.tools.uncapped);
             renderer.set_deforming_meshes(soft_meshes(self.play.as_ref()));
+            if let Some(lux) = renderer.extension_mut::<Lux>()
+                && lux.follows_physics()
+            {
+                match &self.play {
+                    Some(play) => lux.sync(&play.runtime.physics, &play.runtime.world),
+                    None => {
+                        mirror_scene(&self.scene, &mut self.trace_world);
+                        lux.sync(&self.no_physics, &self.trace_world);
+                    }
+                }
+            }
             let render_start = Instant::now();
             renderer.draw_ui(&self.scene, frame)?;
             self.tools.profiler.record(ui_time, render_start.elapsed());
             self.tools.gi_status = renderer
                 .extension_mut::<Lux>()
-                .map(|lux| match lux.status() {
-                    GiStatus::Compiling { since } => format!(
-                        "GI compiling pipelines… {}s (hemisphere until ready)",
-                        since.elapsed().as_secs()
-                    ),
-                    GiStatus::Ready { compile_time } => {
-                        format!("GI active (compiled in {:.1}s)", compile_time.as_secs_f32())
-                    }
-                    GiStatus::Failed(error) => format!("GI failed: {error}"),
-                });
+                .map(|lux| lux.status_line());
             // GI polls its compile and converges over frames, and play mode
-            // simulates, so keep drawing; an open profiler measures continuous frames.
+            // simulates, so keep drawing; an open profiler measures continuous
+            // frames, and uncapped means drawing whether or not anything changed.
             if self.tools.gi_status.is_some()
                 || self.tools.play == PlayState::Playing
                 || self.tools.profiler.open
+                || self.tools.uncapped
             {
                 window.request_redraw();
             }
@@ -974,6 +1023,7 @@ impl Editor {
         if !self.context.input(|i| i.pointer.any_down()) && !self.context.text_edit_focused() {
             self.commit();
         }
+        self.apply_lighting_method();
         Ok(())
     }
 }
@@ -1140,15 +1190,6 @@ mod tests {
         // Validate before invoking play, which reports errors in a dialog.
         Runtime::from_scene(&scene).unwrap();
         editor.play();
-        assert!(
-            editor
-                .play
-                .as_ref()
-                .unwrap()
-                .runtime
-                .verity_physics
-                .is_some()
-        );
         editor.play.as_mut().unwrap().paused = true;
         for _ in 0..10 {
             editor.tick(true);
@@ -1211,10 +1252,17 @@ mod tests {
         let meshes = soft_meshes(editor.play.as_ref());
         assert_eq!(meshes.len(), 5);
         for mesh in &meshes {
-            assert!(mesh.vertices.iter().all(|v| v.position.iter().all(|p| p.is_finite())));
+            assert!(
+                mesh.vertices
+                    .iter()
+                    .all(|v| v.position.iter().all(|p| p.is_finite()))
+            );
         }
         // The heavy ball tore the trampoline, which duplicates vertices.
-        let torn = meshes.iter().zip(&start).any(|(m, s)| m.vertices.len() > s.vertices.len());
+        let torn = meshes
+            .iter()
+            .zip(&start)
+            .any(|(m, s)| m.vertices.len() > s.vertices.len());
         assert!(torn, "something tore");
         let hidden = editor.scene.entities[index("Curtain")].transform.scale;
         assert_eq!(hidden, [0.0; 3], "the entity's cube makes way for its mesh");
@@ -1224,12 +1272,29 @@ mod tests {
     }
 
     #[test]
+    fn play_uses_verity_physics_for_a_scene_that_names_box3d_and_leaves_it_saved_so() {
+        let mut editor = Editor::new(egui::Context::default());
+        editor.scene.physics.engine = verity_core::PhysicsEngine::Box3d;
+        editor.scene.entities[0]
+            .components
+            .insert("Rigid Body".into(), serde_json::json!({}));
+        editor.play();
+        let runtime = &editor.play.as_ref().unwrap().runtime;
+        assert_eq!(runtime.physics.body_count(), 1);
+        editor.stop();
+        assert_eq!(
+            editor.scene.physics.engine,
+            verity_core::PhysicsEngine::Box3d
+        );
+    }
+
+    #[test]
     fn play_simulates_locks_edits_and_stop_restores() {
         let mut editor = Editor::new(egui::Context::default());
         editor.scene.entities[0].transform.translation = [0.0, 0.0, 5.0];
         editor.scene.entities[0].components.insert(
             "Rigid Body".into(),
-            serde_json::to_value(verity_box3d::RigidBodyComponent::default()).unwrap(),
+            serde_json::json!({}),
         );
         editor.dirty = true;
         let authored = editor.scene.clone();

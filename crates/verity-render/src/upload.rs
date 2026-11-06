@@ -9,7 +9,9 @@ use crate::{
 };
 use ash::vk;
 use gpu_allocator::MemoryLocation;
+use rayon::prelude::*;
 use std::{mem, path::Path};
+use verity_matrix::cluster_lod::{ClusterLod, Source, SurfaceSample};
 
 /// What a [`Renderer::load_gltf`] call added.
 #[derive(Clone, Copy, Debug, Default)]
@@ -18,6 +20,70 @@ pub struct SceneStats {
     pub triangles: usize,
     pub textures: usize,
     pub lights: usize,
+}
+
+/// Build each primitive's Matrix LOD. Hidden materials never draw.
+fn cook_primitives(loaded: &asset::SceneData, positions: &[[f32; 3]]) -> Vec<Option<ClusterLod>> {
+    let normals: Vec<_> = loaded
+        .vertices
+        .iter()
+        .map(|v| [v.normal[0], v.normal[1], v.normal[2]])
+        .collect();
+    let uvs: Vec<_> = loaded
+        .vertices
+        .iter()
+        .map(|v| [v.position[3], v.normal[3]])
+        .collect();
+    (0..loaded.primitives.len())
+        .into_par_iter()
+        .map(|index| {
+            let primitive = &loaded.primitives[index];
+            let material = &loaded.materials[primitive.material as usize];
+            if material.alpha_mode == AlphaMode::Blend {
+                return None;
+            }
+            let start = primitive.first_index as usize;
+            let end = start + primitive.index_count as usize;
+            let vertices = primitive.base_vertex as usize
+                ..loaded
+                    .primitives
+                    .get(index + 1)
+                    .map_or(positions.len(), |next| next.base_vertex as usize);
+            let indices = &loaded.indices[start..end];
+            let local = &positions[vertices.clone()];
+            let masked = material.alpha_mode == AlphaMode::Mask;
+            let preview = material
+                .base_color_texture
+                .and_then(|t| loaded.textures[t as usize].preview.as_ref());
+            let colors = &loaded.vertices[vertices.clone()];
+            let surface = |triangle: [u32; 3], weights: [f32; 3]| {
+                let mix = |value: &dyn Fn(usize) -> f32| {
+                    (0..3)
+                        .map(|corner| value(triangle[corner] as usize) * weights[corner])
+                        .sum::<f32>()
+                };
+                let vertex = [0, 1, 2, 3].map(|c| mix(&|v| colors[v].color[c]));
+                let uv = [mix(&|v| colors[v].position[3]), mix(&|v| colors[v].normal[3])];
+                let texel = preview.map_or([1.0; 4], |preview| preview.sample(uv));
+                let alpha = material.base_color[3] * vertex[3] * texel[3];
+                SurfaceSample {
+                    color: [0, 1, 2].map(|c| material.base_color[c] * vertex[c] * texel[c]),
+                    coverage: if !masked || alpha >= material.alpha_cutoff {
+                        1.0
+                    } else {
+                        0.0
+                    },
+                }
+            };
+            let source = Source {
+                positions: local,
+                normals: &normals[vertices.clone()],
+                uvs: &uvs[vertices],
+                indices,
+            };
+            ClusterLod::cook(source, surface)
+        })
+        .collect()
 }
 
 impl Renderer {
@@ -34,6 +100,10 @@ impl Renderer {
             self.device.device_wait_idle()?;
             let counts = (self.vertex_count, self.index_total);
             self.deforming_capacity = 0;
+            self.retained.clear();
+            if let Some(embedded) = &mut self.embedded {
+                embedded.clear();
+            }
             self.vertex_count = 0;
             self.index_total = 0;
             let (vertices, indices) = scene::cube();
@@ -47,7 +117,10 @@ impl Renderer {
             }
             self.primitives.truncate(1);
             self.primitive_meshlets.truncate(1);
-            self.virtual_geometry.truncate(1);
+            self.matrix.clear();
+            self.matrix
+                .destroy_bake_targets(&self.device, self.allocator.as_mut().unwrap());
+            self.upload_matrix()?;
             self.source_indices.clear();
             self.source_indices.extend_from_slice(&indices);
             self.frame_indices.clear();
@@ -78,6 +151,12 @@ impl Renderer {
         };
         let loaded =
             asset::load_gltf(path.as_ref(), options).map_err(|e| failure(e.to_string()))?;
+        self.add_scene(loaded)
+    }
+
+    /// Draw a scene built or loaded elsewhere every frame from now on, as
+    /// [`Renderer::load_gltf`] does.
+    pub fn add_scene(&mut self, loaded: asset::SceneData) -> Result<SceneStats> {
         if self.textures.len() + loaded.textures.len() > scene::MAX_TEXTURES as usize {
             return Err(failure(format!(
                 "more than {} textures loaded",
@@ -89,34 +168,7 @@ impl Renderer {
             .iter()
             .map(|v| [v.position[0], v.position[1], v.position[2]])
             .collect();
-        let virtual_geometry: Vec<_> = loaded
-            .primitives
-            .iter()
-            .enumerate()
-            .map(|(primitive_index, p)| {
-                let start = p.first_index as usize;
-                let end = start + p.index_count as usize;
-                let indices = &loaded.indices[start..end];
-                let budget = indices.len().saturating_mul(8).max(12);
-                let vertex_start = p.base_vertex as usize;
-                let vertex_end = loaded
-                    .primitives
-                    .get(primitive_index + 1)
-                    .map_or(positions.len(), |next| next.base_vertex as usize);
-                verity_strata::virtual_geometry::VirtualGeometry::cook(
-                    &positions[vertex_start..vertex_end],
-                    indices,
-                    verity_strata::lod::LodOptions {
-                        max_levels: 5,
-                        triangle_ratio: 0.5,
-                        max_step_error: 0.02,
-                    },
-                    12 * 1024,
-                    budget,
-                )
-                .ok()
-            })
-            .collect();
+        let cooked = cook_primitives(&loaded, &positions);
         let (material_base, draw_base) = unsafe {
             // Frames in flight read the buffers this replaces.
             self.device.device_wait_idle()?;
@@ -161,7 +213,9 @@ impl Renderer {
                     material: material_base + p.material,
                     ..*p
                 }));
-            self.virtual_geometry.extend(virtual_geometry);
+            for lod in cooked {
+                self.matrix.add_primitive(lod);
+            }
             self.primitive_meshlets
                 .extend(loaded.primitives.iter().map(|p| {
                     let start = p.first_index as usize;
@@ -177,6 +231,16 @@ impl Renderer {
                     primitive: primitive_base + d.primitive,
                     ..*d
                 }));
+            for (index, draw) in loaded.draws.iter().enumerate() {
+                self.add_matrix_instance(
+                    asset::Draw {
+                        primitive: primitive_base + draw.primitive,
+                        ..*draw
+                    },
+                    draw_base + index as u32,
+                );
+            }
+            self.upload_matrix()?;
             (material_base, draw_base)
         };
         if let Some(mut extension) = self.extension.take() {

@@ -11,6 +11,7 @@ static const uint MAX_TEXTURES = 1024;
 /// Material flag bits.
 static const uint ALPHA_MASK = 1;
 static const uint ALPHA_BLEND = 2;
+static const uint TERRAIN_SURFACE = 4;
 
 struct Material {
     float4 base_color;

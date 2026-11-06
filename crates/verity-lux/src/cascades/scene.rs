@@ -11,12 +11,18 @@
 //! [`INSTANCE_WORDS`] words per instance. Nodes take two words, `(min,
 //! first)` and `(max, count)`: a leaf (count > 0) spans `count` elements from
 //! `first`; an inner node's children are nodes `first` and `first + 1`, in
-//! the combined TLAS + BLAS node array. After the instances comes one
+//! the combined TLAS + BLAS node array, the TLAS with room for its largest
+//! tree so the BLASes stay put when it is rebuilt. After the instances comes one
 //! render-layer mask word: Verity has a single layer (bit 0), and lux's
 //! traversal only hits instances whose mask meets the view's (see `LAYER_MASK`).
 
 use glam::{Affine3A, Mat4, UVec3, UVec4, Vec3};
-use verity_render::asset::{AlphaMode, SceneData};
+use rayon::prelude::*;
+use std::{collections::BTreeMap, mem, ops::Range};
+use verity_render::{
+    RetainedChange, RetainedMesh, Vertex,
+    asset::{AlphaMode, SceneData},
+};
 
 pub const VERTEX_WORDS: u32 = 5;
 pub const INSTANCE_WORDS: usize = 9;
@@ -59,15 +65,137 @@ struct Instance {
     material: u32,
 }
 
+/// One retained mesh's BLAS, with its indices and nodes relative to itself, so
+/// it can be replaced without touching the others.
+struct RetainedBlas {
+    triangles: Vec<Triangle>,
+    nodes: Vec<BvhNode>,
+    vertex_words: Vec<UVec4>,
+    slot: Option<Slot>,
+}
+
+/// Where a retained mesh sits in the packed words, with room to change: edits
+/// then rewrite only its own words, not tens of megabytes of scene. A mesh that
+/// outgrows its slot moves to the [`Tail`].
+#[derive(Clone, Copy)]
+struct Slot {
+    triangles: u32,
+    triangle_room: u32,
+    vertices: u32,
+    vertex_room: u32,
+    nodes: u32,
+    node_room: u32,
+}
+
+/// Free space after the slots: next free element and the end, per section.
+#[derive(Clone, Copy, Default)]
+struct Tail {
+    triangles: [u32; 2],
+    vertices: [u32; 2],
+    nodes: [u32; 2],
+}
+
+impl Tail {
+    /// Room for a mesh and for it to double, if there is any left.
+    fn place(&mut self, blas: &RetainedBlas) -> Option<Slot> {
+        let take = |section: &[u32; 2], used: usize| {
+            let room = 2 * used as u32 + 8;
+            (section[0] + room <= section[1]).then_some(room)
+        };
+        let triangle_room = take(&self.triangles, blas.triangles.len())?;
+        let vertex_room = take(
+            &self.vertices,
+            blas.vertex_words.len() / VERTEX_WORDS as usize,
+        )?;
+        let node_room = take(&self.nodes, blas.nodes.len())?;
+        let slot = Slot {
+            triangles: self.triangles[0],
+            triangle_room,
+            vertices: self.vertices[0],
+            vertex_room,
+            nodes: self.nodes[0],
+            node_room,
+        };
+        self.triangles[0] += triangle_room;
+        self.vertices[0] += vertex_room;
+        self.nodes[0] += node_room;
+        Some(slot)
+    }
+}
+
+impl Slot {
+    fn holds(&self, blas: &RetainedBlas) -> bool {
+        blas.triangles.len() <= self.triangle_room as usize
+            && blas.vertex_words.len() <= (self.vertex_room * VERTEX_WORDS) as usize
+            && blas.nodes.len() <= self.node_room as usize
+    }
+}
+
+impl RetainedBlas {
+    fn new(mesh: &RetainedMesh) -> Self {
+        let position = |i: u32| {
+            let [x, y, z, _] = mesh.vertices[i as usize].position;
+            Vec3::new(x, y, z)
+        };
+        let mut triangles: Vec<Triangle> = (mesh.indices.as_chunks::<3>().0.iter())
+            .filter_map(|&[a, b, c]| {
+                let [pa, pb, pc] = [a, b, c].map(position);
+                let cross = (pb - pa).cross(pc - pa);
+                // Degenerate triangles can never be hit.
+                (cross.is_finite() && cross != Vec3::ZERO).then(|| Triangle {
+                    indices: UVec3::new(a, b, c),
+                    min: pa.min(pb).min(pc),
+                    max: pa.max(pb).max(pc),
+                })
+            })
+            .collect();
+        let nodes = build_tree(&mut triangles, |t| (t.min, t.max));
+        let mut vertex_words = Vec::with_capacity(mesh.vertices.len() * VERTEX_WORDS as usize);
+        mesh.vertices
+            .iter()
+            .for_each(|v| push_vertex(&mut vertex_words, v));
+        Self {
+            triangles,
+            nodes,
+            vertex_words,
+            slot: None,
+        }
+    }
+}
+
 /// A growing GI scene: [`GiScene::add`] appends a loaded scene's BLASes,
-/// triangles and vertices; [`GiScene::pack`] rebuilds the TLAS over every
-/// instance and returns the word buffers.
+/// triangles and vertices, [`GiScene::set_retained`] follows meshes that change,
+/// and [`GiScene::pack`] rebuilds the TLAS over every instance and returns the
+/// word buffers.
 #[derive(Default)]
 pub struct GiScene {
     triangles: Vec<Triangle>,
     blas: Vec<BvhNode>,
     vertex_words: Vec<UVec4>,
     instances: Vec<Instance>,
+    retained: BTreeMap<u64, RetainedBlas>,
+    retained_material: u32,
+    /// Instances the words can hold, and nodes reserved for a TLAS over them, so
+    /// BLAS and instance addresses survive it being rebuilt.
+    instance_room: u32,
+    tlas_room: u32,
+    tail: Tail,
+    packed: GiWords,
+    dirty: Vec<u64>,
+}
+
+/// Word ranges of [`GiWords`] that changed.
+#[derive(Debug, Default)]
+pub struct GiRanges {
+    pub geometry: Vec<Range<usize>>,
+    pub scene: Vec<Range<usize>>,
+}
+
+impl GiRanges {
+    fn merge(&mut self, other: Self) {
+        self.geometry.extend(other.geometry);
+        self.scene.extend(other.scene);
+    }
 }
 
 /// The packed buffers and what they hold.
@@ -84,7 +212,8 @@ impl GiScene {
     pub fn build(scene: &SceneData, material_base: u32) -> GiWords {
         let mut gi = Self::default();
         gi.add(scene, material_base);
-        gi.pack()
+        gi.pack();
+        gi.packed
     }
 
     /// Append one BLAS per primitive and an instance per draw. Instance
@@ -161,70 +290,247 @@ impl GiScene {
             })
         }));
 
-        let bits = |v: [f32; 4]| UVec4::from_array(v.map(f32::to_bits));
         for vertex in &scene.vertices {
-            let [x, y, z, u] = vertex.position;
-            let [nx, ny, nz, v] = vertex.normal;
-            self.vertex_words.extend([
-                bits([x, y, z, 0.0]),
-                bits([nx, ny, nz, 0.0]),
-                bits(vertex.tangent),
-                bits([u, v, 0.0, 0.0]),
-                bits(vertex.color),
-            ]);
+            push_vertex(&mut self.vertex_words, vertex);
         }
     }
 
-    /// Rebuild the TLAS and pack every word.
-    pub fn pack(&mut self) -> GiWords {
-        let tlas = build_tree(&mut self.instances, |i| (i.min, i.max));
-        let instances = &self.instances;
-        let base = 1 + 2 * (tlas.len() + self.blas.len());
-        let mut scene_words = Vec::with_capacity(base + instances.len() * INSTANCE_WORDS + 1);
-        scene_words.push(UVec4::new(
-            (base + instances.len() * INSTANCE_WORDS) as u32,
-            base as u32,
-            instances.len() as u32,
-            INSTANCE_WORDS as u32,
-        ));
-        scene_words.extend(node_words(&tlas, 0));
-        scene_words.extend(node_words(&self.blas, tlas.len() as u32));
+    /// Follow changed retained meshes, rebuilding only their BLASes. Call
+    /// [`GiScene::refresh`] after.
+    pub fn set_retained(&mut self, changes: &[RetainedChange], material: u32) {
+        let built: Vec<_> = changes
+            .par_iter()
+            .map(|change| (change.key, change.mesh.map(RetainedBlas::new)))
+            .collect();
+        for (key, blas) in built {
+            let old = self.retained.remove(&key);
+            if let Some(mut blas) = blas.filter(|blas| !blas.triangles.is_empty()) {
+                blas.slot = old
+                    .and_then(|old| old.slot)
+                    .filter(|slot| slot.holds(&blas));
+                self.retained.insert(key, blas);
+                self.dirty.push(key);
+            }
+        }
+        self.retained_material = material;
+    }
+
+    /// Bring the packed words up to date: in place, returning the ranges to
+    /// upload, unless the free space ran out and all of it changed.
+    pub fn refresh(&mut self) -> Option<GiRanges> {
+        let count = self.instances.len() + self.retained.len();
+        if self.packed.scene_words.is_empty() || count > self.instance_room as usize {
+            self.pack();
+            return None;
+        }
+        for key in &self.dirty {
+            let Some(blas) = self.retained.get_mut(key) else {
+                continue;
+            };
+            if blas.slot.is_none() {
+                blas.slot = self.tail.place(blas);
+                if blas.slot.is_none() {
+                    self.pack();
+                    return None;
+                }
+            }
+        }
+        let mut ranges = GiRanges::default();
+        for key in mem::take(&mut self.dirty) {
+            if let Some(blas) = self.retained.get(&key) {
+                let slot = blas.slot.expect("placed above");
+                ranges.merge(write_blas(&mut self.packed, self.tlas_room, blas, slot));
+            }
+        }
+        ranges.scene.extend(self.write_top());
+        self.packed.triangles = self.triangle_count();
+        Some(ranges)
+    }
+
+    /// The words as of the last [`GiScene::pack`] or [`GiScene::refresh`].
+    pub fn words(&self) -> &GiWords {
+        &self.packed
+    }
+
+    fn triangle_count(&self) -> u32 {
+        let retained = self.retained.values().map(|b| b.triangles.len());
+        (self.triangles.len() + retained.sum::<usize>()) as u32
+    }
+
+    /// Lay out every word, leaving each retained mesh room to change.
+    pub fn pack(&mut self) -> &GiWords {
+        let (mut triangles, mut nodes) = (self.triangles.len() as u32, self.blas.len() as u32);
+        let mut vertices = (self.vertex_words.len() / VERTEX_WORDS as usize) as u32;
+        for blas in self.retained.values_mut() {
+            let room = |used: usize| used as u32 + used as u32 / 4 + 8;
+            let slot = Slot {
+                triangles,
+                triangle_room: room(blas.triangles.len()),
+                vertices,
+                vertex_room: room(blas.vertex_words.len() / VERTEX_WORDS as usize),
+                nodes,
+                node_room: room(blas.nodes.len()),
+            };
+            triangles += slot.triangle_room;
+            vertices += slot.vertex_room;
+            nodes += slot.node_room;
+            blas.slot = Some(slot);
+        }
+        // Free space for meshes that grow or appear, in proportion to the scene.
+        let free = |used: u32| used / 4 + 8192;
+        self.tail = Tail {
+            triangles: [triangles, triangles + free(triangles)],
+            vertices: [vertices, vertices + free(vertices)],
+            nodes: [nodes, nodes + free(nodes)],
+        };
+        (triangles, vertices, nodes) = (
+            self.tail.triangles[1],
+            self.tail.vertices[1],
+            self.tail.nodes[1],
+        );
+        let count = self.instances.len() + self.retained.len();
+        self.instance_room = count as u32 + count as u32 / 4 + 64;
+        self.tlas_room = 2 * self.instance_room;
+        let base = 1 + 2 * (self.tlas_room + nodes);
+        let mask = base + self.instance_room * INSTANCE_WORDS as u32;
+        let mut scene_words = vec![UVec4::ZERO; mask as usize + 1];
+        scene_words[0] = UVec4::new(mask, base, 0, INSTANCE_WORDS as u32);
+        let blas_words = node_words(&self.blas, self.tlas_room);
+        for (word, value) in (1 + 2 * self.tlas_room as usize..).zip(blas_words) {
+            scene_words[word] = value;
+        }
+        *scene_words.last_mut().expect("holds the layer mask") = LAYER_MASK;
+
+        let vertex_base = (1 + triangles).next_multiple_of(VERTEX_WORDS);
+        let mut geometry_words =
+            vec![UVec4::ZERO; (vertex_base + vertices * VERTEX_WORDS) as usize];
+        geometry_words[0] = UVec4::new(1, vertex_base, VERTEX_WORDS, vertices);
+        for (word, triangle) in geometry_words[1..].iter_mut().zip(&self.triangles) {
+            *word = triangle.indices.extend(0);
+        }
+        let first_vertex = vertex_base as usize;
+        geometry_words[first_vertex..first_vertex + self.vertex_words.len()]
+            .copy_from_slice(&self.vertex_words);
+
+        self.packed = GiWords {
+            geometry_words,
+            scene_words,
+            triangles: 0,
+            instances: count as u32,
+        };
+        for blas in self.retained.values() {
+            let slot = blas.slot.expect("laid out above");
+            write_blas(&mut self.packed, self.tlas_room, blas, slot);
+        }
+        self.write_top();
+        self.packed.triangles = self.triangle_count();
+        self.dirty.clear();
+        &self.packed
+    }
+
+    /// The TLAS and every instance, which are small enough to rewrite whole.
+    /// Returns the ranges of `scene_words` written.
+    fn write_top(&mut self) -> [Range<usize>; 2] {
+        let mut instances = self.instances.clone();
+        instances.extend(self.retained.values().map(|blas| {
+            let slot = blas.slot.expect("laid out by pack");
+            let top = blas.nodes[0];
+            // Retained vertices are in world space.
+            Instance {
+                world_from_local: Affine3A::IDENTITY,
+                local_from_world: Affine3A::IDENTITY,
+                min: top.min,
+                max: top.max,
+                root: slot.nodes,
+                first: slot.triangles,
+                count: blas.triangles.len() as u32,
+                flags: FLAG_CULL_BACK,
+                material: self.retained_material,
+            }
+        }));
+        let tlas = build_tree(&mut instances, |i| (i.min, i.max));
+        self.packed.instances = instances.len() as u32;
+        let words = &mut self.packed.scene_words;
+        words[0].z = instances.len() as u32;
+        let [mask, base, _, _] = words[0].to_array();
+        let base = base as usize;
+        for (word, value) in (1..).zip(node_words(&tlas, 0)) {
+            words[word] = value;
+        }
         // Every instance shares the layer-mask word after the instances.
-        let mask = (base + instances.len() * INSTANCE_WORDS) as u32;
+        let mut word = base;
+        let mut push = |value: UVec4| {
+            words[word] = value;
+            word += 1;
+        };
         for (index, instance) in instances.iter().enumerate() {
             for transform in [instance.local_from_world, instance.world_from_local] {
                 let rows = Mat4::from(transform).transpose();
                 for row in [rows.x_axis, rows.y_axis, rows.z_axis] {
-                    scene_words.push(UVec4::from_array(row.to_array().map(f32::to_bits)));
+                    push(UVec4::from_array(row.to_array().map(f32::to_bits)));
                 }
             }
             // No hardware-opaque hint yet.
-            scene_words.push(UVec4::new(mask, 1, 0, instance.flags));
-            scene_words.push(UVec4::new(index as u32, 0, 0, instance.material));
-            scene_words.push(UVec4::new(
-                tlas.len() as u32 + instance.root,
+            push(UVec4::new(mask, 1, 0, instance.flags));
+            push(UVec4::new(index as u32, 0, 0, instance.material));
+            push(UVec4::new(
+                self.tlas_room + instance.root,
                 instance.first,
                 instance.count,
                 0,
             ));
         }
-        scene_words.push(LAYER_MASK);
-
-        let vertex_base = (1 + self.triangles.len() as u32).next_multiple_of(VERTEX_WORDS);
-        let vertex_count = (self.vertex_words.len() / VERTEX_WORDS as usize) as u32;
-        let mut geometry_words = Vec::with_capacity(vertex_base as usize + self.vertex_words.len());
-        geometry_words.push(UVec4::new(1, vertex_base, VERTEX_WORDS, vertex_count));
-        geometry_words.extend(self.triangles.iter().map(|t| t.indices.extend(0)));
-        geometry_words.resize(vertex_base as usize, UVec4::ZERO);
-        geometry_words.extend_from_slice(&self.vertex_words);
-
-        GiWords {
-            geometry_words,
-            scene_words,
-            triangles: self.triangles.len() as u32,
-            instances: instances.len() as u32,
-        }
+        let end = base + instances.len() * INSTANCE_WORDS;
+        [0..1 + 2 * tlas.len(), base..end]
     }
+}
+
+/// One retained mesh's triangles, vertices and nodes, into its slot. Returns the
+/// ranges written.
+fn write_blas(packed: &mut GiWords, tlas_room: u32, blas: &RetainedBlas, slot: Slot) -> GiRanges {
+    let geometry = &mut packed.geometry_words;
+    let vertex_base = geometry[0].y as usize;
+    let triangles = 1 + slot.triangles as usize;
+    for (word, triangle) in geometry[triangles..].iter_mut().zip(&blas.triangles) {
+        *word = (triangle.indices + slot.vertices).extend(0);
+    }
+    let vertices = vertex_base + (slot.vertices * VERTEX_WORDS) as usize;
+    geometry[vertices..vertices + blas.vertex_words.len()].copy_from_slice(&blas.vertex_words);
+    let nodes = 1 + 2 * (tlas_room + slot.nodes) as usize;
+    let relocated: Vec<_> = (blas.nodes.iter())
+        .map(|node| BvhNode {
+            first: node.first
+                + if node.count == 0 {
+                    slot.nodes
+                } else {
+                    slot.triangles
+                },
+            ..*node
+        })
+        .collect();
+    for (word, value) in (nodes..).zip(node_words(&relocated, tlas_room)) {
+        packed.scene_words[word] = value;
+    }
+    GiRanges {
+        geometry: vec![
+            triangles..triangles + blas.triangles.len(),
+            vertices..vertices + blas.vertex_words.len(),
+        ],
+        scene: std::iter::once(nodes..nodes + 2 * blas.nodes.len()).collect(),
+    }
+}
+
+fn push_vertex(words: &mut Vec<UVec4>, vertex: &Vertex) {
+    let bits = |v: [f32; 4]| UVec4::from_array(v.map(f32::to_bits));
+    let [x, y, z, u] = vertex.position;
+    let [nx, ny, nz, v] = vertex.normal;
+    words.extend([
+        bits([x, y, z, 0.0]),
+        bits([nx, ny, nz, 0.0]),
+        bits(vertex.tangent),
+        bits([u, v, 0.0, 0.0]),
+        bits(vertex.color),
+    ]);
 }
 
 fn transformed_bounds(transform: Mat4, min: Vec3, max: Vec3) -> (Vec3, Vec3) {
@@ -668,10 +974,7 @@ mod tests {
                     })
                 })
                 .min_by(f32::total_cmp);
-            match (
-                expected,
-                trace_words(&words, origin, direction).map(|h| h.0),
-            ) {
+            match (expected, trace_words(words, origin, direction).map(|h| h.0)) {
                 (Some(e), Some(f)) => {
                     assert!((e - f).abs() < 1e-3 * e.max(1.0), "{e} vs {f}");
                     hits += 1;

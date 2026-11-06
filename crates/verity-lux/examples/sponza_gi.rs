@@ -6,10 +6,7 @@
 use glam::Vec3;
 use std::{path::Path, sync::Arc, time::Instant};
 use verity_core::World;
-use verity_lux::{
-    gi::Lux,
-    settings::{Sampling, Settings},
-};
+use verity_lux::{Lux, Method, cascades::settings::Settings};
 use verity_render::{Renderer, Sun};
 use winit::{
     application::ApplicationHandler,
@@ -38,18 +35,8 @@ impl ApplicationHandler for Viewer {
         let window = Arc::new(event_loop.create_window(attributes).expect("window"));
         let result = Renderer::new(window.clone()).and_then(|mut renderer| {
             if std::env::args().any(|a| a == "--gi") {
-                let settings = Settings {
-                    sampling: Sampling {
-                        // About 300 MB of world cache instead of the uncapped default.
-                        max_cache_entries: 262_144,
-                        // Lux's benchmarked budget: 512 updates, 16,384 queries a frame.
-                        max_updates_per_frame: 512,
-                        max_traversal_queries: 16_384,
-                        ..Sampling::default()
-                    },
-                    ..Settings::default()
-                };
-                renderer.set_extension(Box::new(Lux::new(settings)))?;
+                let method = Method::SplitRadianceCascades(Settings::budgeted());
+                renderer.set_extension(Box::new(Lux::new(method)))?;
             }
             let packed = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../assets/packed");
             for scene in ["NewSponza_Main.glb", "NewSponza_Curtains.glb"] {
@@ -106,9 +93,7 @@ impl ApplicationHandler for Viewer {
                 }
                 self.frames += 1;
                 if self.frames.is_multiple_of(120) {
-                    let status = renderer
-                        .extension_mut::<Lux>()
-                        .map(|lux| lux.status().clone());
+                    let status = renderer.extension_mut::<Lux>().map(|lux| lux.status());
                     println!(
                         "{:.2} ms/frame, GI {status:?}",
                         self.timer.elapsed().as_secs_f64() * 1000.0 / 120.0

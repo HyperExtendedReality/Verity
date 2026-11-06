@@ -2,14 +2,14 @@
 members = [
     "crates/verity-core",
     "crates/verity-render",
-    "crates/verity-strata",
+    "crates/verity-matrix",
     "crates/verity-editor",
     "crates/verity-runtime",
     "crates/verity-box3d",
     "crates/verity-physics",
     "crates/verity-ocean",
     "crates/verity-lux",
-    "crates/verity-slang",
+    "crates/verity-slang", "crates/verity-terra",
 ]
 resolver = "2"
 

@@ -2,7 +2,7 @@
 //! written direct lighting and the thin G-buffer, before tonemapping. Global
 //! illumination (verity-lux) is one.
 
-use crate::{asset::SceneData, Sun};
+use crate::{asset::SceneData, RetainedMesh, Sun};
 use ash::vk;
 use glam::{Mat4, Vec3};
 use gpu_allocator::vulkan::Allocator;
@@ -60,6 +60,20 @@ pub struct FrameContext<'a> {
     pub previous_view_proj: Mat4,
     pub sun: Option<Sun>,
     pub lights: &'a [PointLight],
+    /// Radiance of the ambient hemisphere from straight up and straight down,
+    /// which the resolve leaves out while an extension is [`active`](RenderExtension::active).
+    pub sky: Vec3,
+    pub ground: Vec3,
+    /// The camera's near plane: with reverse-Z infinite depth, view depth is
+    /// `near / device depth`.
+    pub near: f32,
+}
+
+/// A retained mesh that appeared, changed or, with no `mesh`, went away.
+#[derive(Clone, Copy)]
+pub struct RetainedChange<'a> {
+    pub key: u64,
+    pub mesh: Option<&'a RetainedMesh>,
 }
 
 pub trait RenderExtension: Send {
@@ -73,6 +87,21 @@ pub trait RenderExtension: Send {
         material_base: u32,
         draw_base: u32,
     ) -> Result<()>;
+
+    /// Retained meshes changed, such as terrain being dug. A method that traces
+    /// the scene follows them here, or it will not see them. `material` indexes
+    /// the renderer's material buffer. Changes arrive batched, a few times a
+    /// second at most, and the first call holds every mesh. Vertices are in
+    /// world space; a material flagged `TERRAIN_SURFACE` takes its color from
+    /// `terrain_albedo` in `shaders/lib/terrain.slang`. The GPU is idle.
+    fn retained_changed(
+        &mut self,
+        _gpu: &mut Gpu,
+        _changes: &[RetainedChange],
+        _material: u32,
+    ) -> Result<()> {
+        Ok(())
+    }
 
     /// The render targets were (re)created. The GPU is idle.
     fn targets_changed(&mut self, gpu: &mut Gpu, targets: &Targets) -> Result<()>;
@@ -89,6 +118,13 @@ pub trait RenderExtension: Send {
     /// example once GI pipelines finish compiling.
     fn active(&self) -> bool {
         true
+    }
+
+    /// Whether the resolve keeps the sky's specular reflection while this
+    /// extension is [`active`](RenderExtension::active), for one that only adds
+    /// diffuse light. The reflection ignores occlusion, so it suits open ground.
+    fn sky_reflections(&self) -> bool {
+        false
     }
 
     /// For [`crate::Renderer::extension_mut`].

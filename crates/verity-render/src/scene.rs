@@ -17,6 +17,8 @@ pub const NO_TEXTURE: u32 = u32::MAX;
 /// Material flag bits.
 pub const ALPHA_MASK: u32 = 1;
 pub const ALPHA_BLEND: u32 = 2;
+/// Shade with `shaders/lib/terrain.slang`, not the material's factors.
+pub const TERRAIN_SURFACE: u32 = 4;
 /// Sun shadow cascades, their square resolution and how far they reach.
 pub const CASCADES: usize = 4;
 pub const SHADOW_SIZE: u32 = 2048;
@@ -88,14 +90,14 @@ pub struct Cascades {
 /// Fit sun cascades to the camera frustum: practical splits, one bounding
 /// sphere per slice (stable under rotation) and texel-snapped centers
 /// (stable under translation).
-pub fn cascades(camera: &Camera, aspect: f32, sun_direction: Vec3) -> Cascades {
+pub fn cascades(camera: &Camera, aspect: f32, sun_direction: Vec3, distance: f32) -> Cascades {
     let world_from_view = Mat4::look_at_rh(camera.eye, camera.target, UP).inverse();
     let tan_y = (camera.vertical_fov * 0.5).tan();
     let tan_x = tan_y * aspect;
     let splits: [f32; CASCADES] = std::array::from_fn(|i| {
         let t = (i + 1) as f32 / CASCADES as f32;
-        let logarithmic = NEAR * (SHADOW_DISTANCE / NEAR).powf(t);
-        let uniform = NEAR + (SHADOW_DISTANCE - NEAR) * t;
+        let logarithmic = NEAR * (distance / NEAR).powf(t);
+        let uniform = NEAR + (distance - NEAR) * t;
         SPLIT_LAMBDA * logarithmic + (1.0 - SPLIT_LAMBDA) * uniform
     });
     let direction = sun_direction.normalize();
@@ -165,6 +167,8 @@ pub struct Lighting<'a> {
     pub sun: Option<&'a crate::asset::Sun>,
     pub sky: Vec3,
     pub ground: Vec3,
+    /// How far from the camera the sun casts shadows.
+    pub shadow_distance: f32,
 }
 
 /// One draw: a primitive's index range, its placement and its material.
@@ -198,6 +202,17 @@ impl GpuMaterial {
             textures: [NO_TEXTURE, NO_TEXTURE, NO_TEXTURE, 0],
         }
     }
+
+    /// Procedural ground for meshes whose texture coordinates hold the original
+    /// surface height and the wetness. `detail` scales the bump mapping; sand
+    /// gathers around `sea_level`, so a dry world passes a level below its ground.
+    pub fn terrain(detail: f32, sea_level: f32) -> Self {
+        Self {
+            base_color: [1.0; 4],
+            params: [0.0, 1.0, detail, sea_level],
+            textures: [NO_TEXTURE, NO_TEXTURE, NO_TEXTURE, TERRAIN_SURFACE],
+        }
+    }
 }
 
 #[repr(C)]
@@ -226,6 +241,8 @@ pub struct DeformingMesh {
     pub vertices: Vec<Vertex>,
     pub indices: Vec<u32>,
     pub material: Material,
+    /// Used in place of `material` if set, for one with textures.
+    pub textured: Option<GpuMaterial>,
 }
 
 impl DeformingMesh {
@@ -254,8 +271,34 @@ impl DeformingMesh {
             vertices,
             indices,
             material,
+            textured: None,
         }
     }
+
+    /// Give each vertex texture coordinates, such as `SoftBody::uvs`, which keep
+    /// a pattern in place across a tear.
+    pub fn with_uvs(mut self, uvs: &[glam::Vec2]) -> Self {
+        for (vertex, uv) in self.vertices.iter_mut().zip(uvs) {
+            vertex.position[3] = uv.x;
+            vertex.normal[3] = uv.y;
+        }
+        self
+    }
+}
+
+/// The camera's view and reverse-Z, infinite-far projection for a viewport.
+fn view_projection(camera: &Camera, viewport: [u32; 4]) -> (Mat4, Mat4) {
+    let view = Mat4::look_at_rh(camera.eye, camera.target, UP);
+    let aspect = viewport[2].max(1) as f32 / viewport[3].max(1) as f32;
+    let mut projection = Mat4::perspective_infinite_reverse_rh(camera.vertical_fov, aspect, NEAR);
+    projection.y_axis.y *= -1.0;
+    (view, projection)
+}
+
+/// World to clip space for a viewport.
+pub fn view_proj(camera: &Camera, viewport: [u32; 4]) -> Mat4 {
+    let (view, projection) = view_projection(camera, viewport);
+    projection * view
 }
 
 /// Camera and frame constants for a scene viewport `[x, y, width, height]` in pixels.
@@ -267,14 +310,17 @@ pub fn globals(
     previous_view_proj: Option<Mat4>,
     srgb: bool,
 ) -> Globals {
-    let view = Mat4::look_at_rh(camera.eye, camera.target, UP);
-    let aspect = viewport[2].max(1) as f32 / viewport[3].max(1) as f32;
     // Reverse-Z with an infinite far plane for even depth precision.
-    let mut projection = Mat4::perspective_infinite_reverse_rh(camera.vertical_fov, aspect, NEAR);
-    projection.y_axis.y *= -1.0;
+    let (view, projection) = view_projection(camera, viewport);
+    let aspect = viewport[2].max(1) as f32 / viewport[3].max(1) as f32;
     let view_proj = projection * view;
     let sun = lighting.sun;
-    let shadows = cascades(camera, aspect, sun.map_or(-UP, |s| s.direction));
+    let shadows = cascades(
+        camera,
+        aspect,
+        sun.map_or(-UP, |s| s.direction),
+        lighting.shadow_distance,
+    );
     let (sun_direction, sun_color) = sun.map_or(([0.0; 4], [0.0; 4]), |sun| {
         (
             sun.direction.normalize().extend(1.0).to_array(),
@@ -346,61 +392,6 @@ pub fn entity_matrix(transform: &Transform) -> Option<Mat4> {
         rotation,
         Vec3::from_array(transform.translation),
     ))
-}
-
-/// Conservative perspective magnification for an entire transformed bound.
-/// Uncertain or near-plane-crossing inputs force the original level.
-pub fn lod_projection_scale(
-    camera: &Camera,
-    viewport: [u32; 4],
-    model: Mat4,
-    bounds: verity_strata::Bounds,
-) -> f64 {
-    if viewport[2] == 0
-        || viewport[3] == 0
-        || !model.is_finite()
-        || !camera.eye.is_finite()
-        || !camera.target.is_finite()
-        || !camera.vertical_fov.is_finite()
-        || !(0.0..std::f32::consts::PI).contains(&camera.vertical_fov)
-        || (0..3).any(|i| {
-            !bounds.min[i].is_finite()
-                || !bounds.max[i].is_finite()
-                || bounds.min[i] > bounds.max[i]
-        })
-    {
-        return f64::INFINITY;
-    }
-    let forward = (camera.target - camera.eye).normalize_or_zero();
-    if forward == Vec3::ZERO {
-        return f64::INFINITY;
-    }
-    let min = Vec3::from_array(bounds.min);
-    let max = Vec3::from_array(bounds.max);
-    let center = model.transform_point3((min + max) * 0.5);
-    let linear = Mat3::from_mat4(model);
-    // Frobenius norm bounds the largest singular value, including shear.
-    let stretch = (linear.x_axis.length_squared()
-        + linear.y_axis.length_squared()
-        + linear.z_axis.length_squared())
-    .sqrt();
-    let radius = (max - min).length() * 0.5 * stretch;
-    let delta = center - camera.eye;
-    let nearest = forward.dot(delta) - radius;
-    if !nearest.is_finite() || nearest <= NEAR || !stretch.is_finite() {
-        return f64::INFINITY;
-    }
-    let focal = viewport[3] as f64 / (2.0 * (camera.vertical_fov as f64 * 0.5).tan());
-    let nearest = nearest as f64;
-    // Both projection coordinates have the same pixel focal length. The
-    // off-axis term bounds the perspective derivative in either direction.
-    let scale =
-        2.0 * focal * stretch as f64 / nearest * (1.0 + (delta.length() + radius) as f64 / nearest);
-    if scale.is_finite() {
-        scale
-    } else {
-        f64::INFINITY
-    }
 }
 
 /// GPU draw record for a model matrix, index range and material.
@@ -495,6 +486,15 @@ pub fn brdf_lut() -> Vec<[f32; 2]> {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn deforming_meshes_carry_texture_coordinates() {
+        let positions = [Vec3::ZERO, Vec3::X, Vec3::Y];
+        let mesh = DeformingMesh::from_triangles(&positions, vec![0, 1, 2], Material::default())
+            .with_uvs(&[glam::Vec2::ZERO, glam::Vec2::X, glam::Vec2::new(0.25, 0.75)]);
+        assert_eq!(mesh.vertices[2].position[3], 0.25);
+        assert_eq!(mesh.vertices[2].normal[3], 0.75);
+    }
+
+    #[test]
     fn deforming_meshes_get_smooth_normals_and_keep_their_triangles() {
         // Two triangles in a roof shape share an edge along Y.
         let positions = [
@@ -513,33 +513,6 @@ mod tests {
     }
 
     use super::*;
-
-    #[test]
-    fn lod_scale_falls_back_at_near_plane_and_for_invalid_bounds() {
-        let camera = Camera {
-            eye: Vec3::ZERO,
-            target: Vec3::Y,
-            vertical_fov: 1.0,
-        };
-        let bounds = verity_strata::Bounds {
-            min: [-1.0; 3],
-            max: [1.0; 3],
-        };
-        let viewport = [0, 0, 1280, 720];
-        assert!(lod_projection_scale(&camera, viewport, Mat4::IDENTITY, bounds).is_infinite());
-        let far = Mat4::from_translation(Vec3::Y * 100.0);
-        let near = Mat4::from_translation(Vec3::Y * 10.0);
-        assert!(
-            lod_projection_scale(&camera, viewport, far, bounds)
-                < lod_projection_scale(&camera, viewport, near, bounds)
-        );
-        let invalid = verity_strata::Bounds {
-            min: [f32::NAN; 3],
-            max: [1.0; 3],
-        };
-        assert!(lod_projection_scale(&camera, viewport, far, invalid).is_infinite());
-        assert!(lod_projection_scale(&camera, [0; 4], far, bounds).is_infinite());
-    }
 
     #[test]
     fn point_shadow_faces_cover_axes_and_light_range() {
@@ -598,11 +571,13 @@ mod tests {
         // A tangent on the +X face stays perpendicular to its transformed normal.
         let tangent = model.transform_vector3(Vec3::new(0.0, 1.0, 1.0));
         assert!((normal * Vec3::X).dot(tangent).abs() < 1e-5);
-        assert!(entity_matrix(&Transform {
-            scale: [0.0, 1.0, 1.0],
-            ..Transform::default()
-        })
-        .is_none());
+        assert!(
+            entity_matrix(&Transform {
+                scale: [0.0, 1.0, 1.0],
+                ..Transform::default()
+            })
+            .is_none()
+        );
     }
 
     #[test]
@@ -616,7 +591,7 @@ mod tests {
     fn cascades_cover_their_frustum_slices() {
         let camera = Camera::default();
         let aspect = 16.0 / 9.0;
-        let c = cascades(&camera, aspect, Vec3::new(-0.3, -1.0, 0.2));
+        let c = cascades(&camera, aspect, Vec3::new(-0.3, -1.0, 0.2), SHADOW_DISTANCE);
         assert!(c.splits.windows(2).all(|w| w[0] < w[1]));
         assert!((c.splits[CASCADES - 1] - SHADOW_DISTANCE).abs() < 1e-3);
         let world_from_view = Mat4::look_at_rh(camera.eye, camera.target, UP).inverse();
@@ -651,7 +626,8 @@ mod tests {
                 target: shift,
                 ..Camera::default()
             };
-            for m in cascades(&camera, 16.0 / 9.0, Vec3::new(-0.3, -1.0, 0.2)).view_proj {
+            let direction = Vec3::new(-0.3, -1.0, 0.2);
+            for m in cascades(&camera, 16.0 / 9.0, direction, SHADOW_DISTANCE).view_proj {
                 let texel = m.project_point3(Vec3::ZERO).truncate() * half;
                 assert!(
                     (texel - texel.round()).abs().max_element() < 1e-2,
@@ -668,6 +644,7 @@ mod tests {
             sun: None,
             sky: Vec3::ZERO,
             ground: Vec3::ZERO,
+            shadow_distance: SHADOW_DISTANCE,
         };
         let g = globals(
             &camera,

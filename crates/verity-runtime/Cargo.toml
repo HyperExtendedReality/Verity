@@ -6,7 +6,6 @@ license.workspace = true
 
 [dependencies]
 verity-core = { path = "../verity-core" }
-verity-box3d = { path = "../verity-box3d" }
 glam = "0.29"
 verity-physics = { version = "0.1.0", path = "../verity-physics" }
 
