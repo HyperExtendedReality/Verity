@@ -29,7 +29,7 @@ use verity_render::{
 
 const SLOTS: usize = 2;
 /// Cells along each side of the grid.
-const GRID: u32 = 128;
+const GRID: u32 = 256;
 
 macro_rules! spirv {
     ($entry:literal) => {
@@ -87,7 +87,7 @@ impl Default for ScreenVoxelSettings {
         Self {
             max_distance: 8.0,
             world_ray_distance: 30.0,
-            rays_per_texel: 2,
+            rays_per_texel: 4,
             intensity: 1.0,
         }
     }
@@ -117,9 +117,25 @@ fn pack_normal(n: Vec3) -> u32 {
     byte(n.x) | byte(n.y) << 8 | byte(n.z) << 16
 }
 
-/// Mark every cell the triangles touch, in a cubic grid of `grid` cells a side
+/// A cell this full of surface always counts as solid.
+const SOLID_COVER: f32 = 1.0;
+
+/// A fixed number in 0..1 for a cell.
+fn cell_noise(cell: u32) -> f32 {
+    let mut x = cell.wrapping_mul(0x9e37_79b9);
+    x ^= x >> 16;
+    x = x.wrapping_mul(0x7feb_352d);
+    x ^= x >> 15;
+    (x >> 8) as f32 / 16_777_216.0
+}
+
+/// Mark the cells the triangles fill, in a cubic grid of `grid` cells a side
 /// around them. A voxel takes the mean normal of what fell in it, or the first
 /// normal where they cancel, and the first material.
+///
+/// A cell a surface barely clips stays solid only sometimes, in proportion to the
+/// surface in it, by a fixed hash so it does not shimmer. Marking all of them
+/// fattens everything by up to a cell and plugs railings and narrow openings.
 pub fn voxelize(triangles: &[Triangle], grid: u32) -> Voxels {
     let (lo, hi) = triangles
         .iter()
@@ -141,7 +157,7 @@ pub fn voxelize(triangles: &[Triangle], grid: u32) -> Voxels {
         let c = c.clamp(glam::IVec3::ZERO, glam::IVec3::splat(grid as i32 - 1));
         (c.z as u32 * grid + c.y as u32) * grid + c.x as u32
     };
-    let mut hits: Vec<(u32, Vec3, u32)> = triangles
+    let mut hits: Vec<(u32, Vec3, u32, f32)> = triangles
         .par_iter()
         .flat_map_iter(|t| {
             let [a, b, c] = t.corners;
@@ -156,18 +172,25 @@ pub fn voxelize(triangles: &[Triangle], grid: u32) -> Voxels {
                     touched.push(index(a + (b - a) * u + (c - a) * v));
                 }
             }
+            // Each sample stands for an equal share of the triangle's area.
+            let share = 0.5 * (b - a).cross(c - a).length() / touched.len() as f32;
             touched.sort_unstable();
-            touched.dedup();
-            touched
-                .into_iter()
-                .map(move |cell| (cell, normal, t.material))
+            let mut cells = Vec::new();
+            for group in touched.chunk_by(|a, b| a == b) {
+                cells.push((group[0], normal, t.material, share * group.len() as f32));
+            }
+            cells
         })
         .collect();
     hits.par_sort_by_key(|hit| hit.0);
     let mut cells = vec![0; (grid as usize).pow(3)];
     let mut voxels = Vec::new();
     for group in hits.chunk_by(|a, b| a.0 == b.0) {
-        let (at, first, material) = group[0];
+        let (at, first, material, _) = group[0];
+        let cover: f32 = group.iter().map(|hit| hit.3).sum::<f32>() / (cell * cell);
+        if cell_noise(at) * SOLID_COVER >= cover {
+            continue;
+        }
         let sum: Vec3 = group.iter().map(|hit| hit.1).sum();
         let normal = sum
             .try_normalize()
@@ -302,7 +325,7 @@ impl ScreenVoxel {
             "voxels",
             bytemuck::cast_slice(voxels),
         )?;
-        let dark = vec![0u8; voxels.len() * 32];
+        let dark = vec![0u8; voxels.len() * 64];
         upload(gpu, pool, &mut self.radiance, "voxel radiance", &dark)?;
         if self.view.is_some() {
             for slot in 0..SLOTS {
@@ -974,7 +997,8 @@ mod tests {
     #[test]
     fn a_floor_fills_one_layer_of_cells() {
         let grid = voxelize(&floor(1.0, 3), 16);
-        assert_eq!(grid.voxels.len(), 16 * 16);
+        // Every whole cell; the rim holds only part of one.
+        assert!(grid.voxels.len() >= 14 * 14, "{}", grid.voxels.len());
         let layers: std::collections::HashSet<u32> =
             grid.voxels.iter().map(|v| v[0] / (16 * 16)).collect();
         assert_eq!(layers.len(), 1);
@@ -997,6 +1021,27 @@ mod tests {
         }
         let grid = voxelize(&triangles, 16);
         assert!(grid.voxels.iter().all(|v| v[2] != 0));
+    }
+
+    #[test]
+    fn a_cell_barely_clipped_is_often_left_open() {
+        // A sliver through many cells: each holds a tiny area of surface.
+        let (a, b) = (Vec3::ZERO, Vec3::new(8.0, 0.0, 0.0));
+        let sliver = Triangle {
+            corners: [a, b, Vec3::new(8.0, 0.01, 0.0)],
+            material: 0,
+        };
+        let wide = Triangle {
+            corners: [
+                Vec3::new(0.0, 0.0, 8.0),
+                Vec3::new(8.0, 8.0, 8.0),
+                Vec3::new(0.0, 8.0, 8.0),
+            ],
+            material: 0,
+        };
+        let grid = voxelize(&[sliver, wide], 16);
+        let open = grid.voxels.iter().filter(|v| v[0] / (16 * 16) < 8).count();
+        assert!(open < 8, "{open} cells of 16 kept");
     }
 
     #[test]

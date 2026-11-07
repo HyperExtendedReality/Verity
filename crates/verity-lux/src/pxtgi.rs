@@ -193,7 +193,7 @@ impl Default for PxtgiSettings {
         Self {
             max_distance: 8.0,
             world_ray_distance: 30.0,
-            rays_per_texel: 4,
+            rays_per_texel: 2,
             multi_bounce: true,
             reflections: PxtgiReflections::Traced,
             reflection_roughness_cutoff: 0.5,

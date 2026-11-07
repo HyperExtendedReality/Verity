@@ -63,30 +63,51 @@ screen, stay at one bounce.
 
 `examples/sponza_gi.rs --bench=DIR` prints GPU time per pass and saves frames as
 PFM. In code, `SplitRadianceCascades::profile` and `request_capture` do the same.
-Sponza's atrium from `--eye=8,0,2 --target=-6,0,4` at 1280×720 on an RTX 4070
-Laptop GPU, 300 frames after starting:
+`Settings::budgeted` spends its budget on a cache that keeps probes: a 4-pixel
+candidate grid and half-size resolve lost nothing on Sponza, and what they save
+buys 2048 updates a frame and about a million cached entries. The cache is what
+sets its accuracy.
 
-| Build | Updates | GI, still | GI, moving | Bounced light, mean | Median |
+## Measuring against a reference
+
+`examples/sponza_gi.rs --bench=DIR` prints GPU time per pass and saves frames as
+PFM, and `--reference` saves a path-traced image of the same view:
+`PxtgiDebug::Reference` traces diffuse light with no cache or filter, and hits
+take mean colours as PXTGI's do. `--pxtgi` leaves reflections off to compare
+diffuse with diffuse; add `--reflections` for what PXTGI normally costs.
+
+Sponza at 1280×720 on an RTX 4070 Laptop GPU, 300 frames after starting, against
+that reference. Error is the mean absolute difference over 8×8 pixel blocks, as a
+fraction of the reference's mean bounced light, and flicker is the mean change
+between frames as a fraction of it. Running 2400 frames changed neither view's
+error by much, so what remains is bias rather than slow convergence.
+
+| View | Method | GPU time | Mean bounced light | Error | Flicker |
 | --- | --- | --- | --- | --- | --- |
-| Before | 512 | 14.5 ms | 16.6 ms | 0.658 | 0.123 |
-| `Settings::budgeted` | 1024 | 11.0 ms | 11.5 ms | 0.679 | 0.147 |
-| Before, `Settings::default` | 131,072 | 72.7 ms | not recorded | 0.715 | 0.227 |
-| `Settings::default` | 131,072 | 38.5 ms | 48.5 ms | 0.788 | 0.262 |
+| Atrium | Split | 11.7 ms | 0.93× | 0.36 | 0.002 |
+| Atrium | PXTGI | 3.8 ms | 1.13× | 0.28 | 0.006 |
+| Atrium | Screen and voxel | 1.8 ms | 1.17× | 0.29 | 0.004 |
+| Corridor | Split | 5.7 ms | 1.01× | 0.20 | 0.002 |
+| Corridor | PXTGI | 3.2 ms | 0.98× | 0.07 | 0.013 |
+| Corridor | Screen and voxel | 1.6 ms | 0.74× | 0.30 | 0.010 |
 
-Bounced light is added luminance × 10⁻³. PXTGI reads 0.835 and 0.417 here, but it
-is not a reference for this scene, so these show change rather than error.
+The atrium is `--eye=8,0,2 --target=-6,0,4` and the corridor the default view.
+PXTGI takes 4.1 ms in the atrium with reflections. These are two views of one
+scene on one device. The reference shares PXTGI's geometry and mean colours, which
+favours it slightly, and a screen ray's light includes the renderer's Hammon
+diffuse where the reference is Lambertian.
 
 ## Screen and voxel GI
 
 A ray follows the depth buffer and takes its light from last frame's image. Past
-what the screen shows, it walks a 128³ grid of voxels fitted to the loaded scenes.
-Each frame a quarter of the voxels update their direct light and send one bounce
+what the screen shows, it walks a 256³ grid of voxels fitted to the loaded scenes.
+Each frame a quarter of the voxels update one side's direct light and send a bounce
 ray, so light bounces further over time. History and filtering are PXTGI's, shared
 through `shaders/screen_gi.slang`.
 
-Sponza's atrium from the view above: 0.71 ms, against 11.0 ms for Split and 6.2 ms
-for PXTGI, with bounced light of 0.574 mean and 0.266 median. That is one view on
-one device, and no reference has been compared yet.
+A cell a surface barely clips stays solid only in proportion to the surface in it.
+Marking them all plugs narrow openings: in Sponza's corridor that left 0.60 of the
+reference's light rather than 0.74, and keeping too few leaks (1.83).
 
 This is a first version, and these are its limits:
 
@@ -94,8 +115,10 @@ This is a first version, and these are its limits:
   scene loaded.
 - Terrain and other retained meshes are not voxelized, and neither are moving
   bodies, so they appear only through the screen rays.
-- One grid covers everything, so cells grow with the scene: about a quarter metre
-  in Sponza, and too coarse for a landscape. There are no clipmaps yet.
+- One grid covers everything, so cells grow with the scene, and it is too coarse
+  for a landscape. There are no clipmaps yet.
+- Light reaching deep into a scene through small openings comes up short, as the
+  corridor above shows.
 - A voxel's colour is its material's mean colour, and materials have no emission.
 - History does not react when a light changes, so light that has bounced more
   than once catches up over a few seconds.
@@ -148,12 +171,16 @@ measurement below, taken on an RTX 4070 Laptop GPU:
 
 | Measurement | Result |
 | --- | --- |
-| GPU time, the room at 1600×900 | 1.5 ms |
+| GPU time, the room at 1600×900 | 1.3 ms |
 | GPU time, the room plus Sponza's main scene | 5 to 7 ms |
-| Bounce light against a CPU path tracer on the same scene (`--reference`) | 7% mean error |
+| Bounce light against a CPU path tracer on the same scene (`--reference`) | 9.6% mean error |
 | Light left one frame after it goes out (`--extinction`) | 0.0% (the Bevy build: 68.4% after 100 ms) |
-| Light dimmed to half (`--extinction=half`) | 50.4% on the first frame |
+| Light dimmed to half (`--extinction=half`) | 50.8% after three frames |
 | Residual 10 frames after a wall panel moves | 13%, against 29% without moved regions |
+
+History runs to 48 frames while the camera is still, for steadier light. That is
+what took the room's error from 8.8% to 9.6%: at 32 frames Sponza flickers half as
+much again.
 
 The reference is Lambertian with the renderer's diffuse share, so it leaves out
 specular interreflection. These are one scene and one device, not a certification.

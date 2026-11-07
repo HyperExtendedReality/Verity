@@ -790,7 +790,7 @@ void composite(uint3 id : SV_DispatchThreadID) {
     // A debug view replaces what is shown, not what next frame's rays see.
     float4 shown = debugView(fp, p, gi, reflection);
     hdr[at] = shown.w > 0.5 ? float4(shown.rgb, lit.a) : result;
-    colorOut.Store(at, result);
+    colorOut.Store(at, float4(diffuseLit(lit.rgb, brdf, rough, n, view) + diffuse * brdf.diffuse_color, lit.a));
 }
 
 // Plain path tracing for `PxtgiDebug::Reference`: a running mean over frames in

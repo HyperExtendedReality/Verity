@@ -175,6 +175,15 @@ impl ApplicationHandler for Viewer {
                     settings.sampling.max_traversal_queries =
                         settings.sampling.max_updates_per_frame * 32;
                 }
+                if let Some(divisor) = arg("grid") {
+                    settings.sampling.grid_divisor = divisor.parse().expect("--grid=N");
+                }
+                if let Some(scale) = arg("resolve") {
+                    settings.sampling.resolve_scale = scale.parse().expect("--resolve=N");
+                }
+                if let Some(entries) = arg("cache") {
+                    settings.sampling.max_cache_entries = entries.parse().expect("--cache=N");
+                }
                 if flag("--no-gi-light") {
                     settings.intensity = 0.0;
                 }
@@ -187,6 +196,7 @@ impl ApplicationHandler for Viewer {
                     })
                 } else if flag("--pxtgi") {
                     Method::Pxtgi(PxtgiSettings {
+                        rays_per_texel: arg("rays").map_or(2, |r| r.parse().expect("--rays=N")),
                         reflections: if flag("--reflections") {
                             PxtgiReflections::Traced
                         } else {
@@ -197,6 +207,7 @@ impl ApplicationHandler for Viewer {
                 } else if flag("--voxel") {
                     Method::ScreenVoxel(ScreenVoxelSettings {
                         max_distance: if flag("--no-screen") { 0.0 } else { 8.0 },
+                        rays_per_texel: arg("rays").map_or(4, |r| r.parse().expect("--rays=N")),
                         ..ScreenVoxelSettings::default()
                     })
                 } else {

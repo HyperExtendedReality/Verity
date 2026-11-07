@@ -220,6 +220,22 @@ float3 meanAlbedo(Material m) {
     return base * (1.0 - metallic);
 }
 
+// What of a lit pixel a diffuse ray should see. A sun glint is for this view
+// alone, and left in, it brightens what bounces off every shiny surface.
+float3 diffuseLit(float3 lit, Brdf b, float roughness, float3 n, float3 view) {
+    float3 sun = f.sunDirection.xyz;
+    if (f.sunDirection.w < 0.5 || dot(n, sun) <= 0.0) return lit;
+    float3 full = brdf_value(b, n, view, sun);
+    return lit * saturate(b.diffuse_color * hammon_diffuse(n, view, sun, roughness) / max(full, 1e-6));
+}
+
+bool cameraStill() {
+    return all(f.clipFromWorld[0] == f.prevClipFromWorld[0])
+        && all(f.clipFromWorld[1] == f.prevClipFromWorld[1])
+        && all(f.clipFromWorld[2] == f.prevClipFromWorld[2])
+        && all(f.clipFromWorld[3] == f.prevClipFromWorld[3]);
+}
+
 // The a-trous kernel's taps, by distance from the centre.
 float kernelTap(int i) { return i == 0 ? 0.375 : (i == 1 ? 0.25 : 0.0625); }
 
@@ -309,7 +325,10 @@ void temporal(uint3 id : SV_DispatchThreadID) {
         float3 pp = project(f.prevClipFromWorld, p);
         if (onScreen(pp.xy)) {
             // Depth nearest, light and moments bilinear, as Godot samples them.
-            float2 at = pp.xy * float2(size) / frameSize();
+            // A texel's light belongs to the pixel at its centre, so a still view
+            // lands exactly on it. Scaling the pixel's position instead lands an
+            // eighth of a texel off, which drags history across the image.
+            float2 at = (pp.xy - 0.5) * float2(size) / frameSize();
             int2 tp = clamp(int2(at), 0, size - 1);
             float was = in2.Load(int3(tp, 0)).r;
             if (abs(was - pp.z) < 0.05 * pp.z) {
@@ -320,9 +339,11 @@ void temporal(uint3 id : SV_DispatchThreadID) {
                     wasLight.rgb *= f.fade.rgb;
                     wasM.xy *= float2(fade, fade * fade);
                     // A surface just uncovered takes its first frames at full weight.
-                    float limit = f.extra.y > 0.0 ? f.extra.y : (movedNear(p) ? 4.0 : 32.0);
+                    // A still camera has nothing to smear, so it can average longer.
+                    float steady = cameraStill() ? 48.0 : 32.0;
+                    float limit = f.extra.y > 0.0 ? f.extra.y : (movedNear(p) ? 4.0 : steady);
                     float frames = min(wasM.z + 1.0, limit);
-                    float alpha = max(1.0 / frames, 0.05);
+                    float alpha = 1.0 / frames;
                     result = lerp(wasLight, now, alpha);
                     m = float3(lerp(wasM.xy, float2(l, l * l), alpha), frames);
                 }
@@ -401,7 +422,7 @@ void atrous4(uint3 id : SV_DispatchThreadID) { atrous(int2(id.xy), 4); }
 // rays that hit, a that fraction.
 float4 upsampleGi(int2 fp, float3 n, float d) {
     int2 size = traceSize();
-    float2 tc = (float2(fp) + 0.5) * float2(size) / frameSize() - 0.5;
+    float2 tc = float2(fp) * float2(size) / frameSize() - 0.5;
     int2 base = int2(floor(tc));
     float4 sum = 0.0;
     float weights = 0.0;

@@ -9,13 +9,15 @@
 #include "brdf.slang"
 #include "screen_gi.slang"
 
-static const int MAX_VOXEL_STEPS = 256;
+static const int MAX_VOXEL_STEPS = 512;
+static const int MAX_START_CELLS = 3;
 
 // Per cell of the grid: 0 when empty, else its voxel's index + 1.
 [[vk::binding(4, 0)]] StructuredBuffer<uint> cells;
 // Per voxel: cell, material, normal as signed bytes, unused.
 [[vk::binding(5, 0)]] StructuredBuffer<uint4> voxels;
-// Per voxel: the light leaving it, then the mean bounce light arriving (w frames).
+// Per voxel, for the side its normal faces and then the other: the light leaving
+// that side and the mean bounce light arriving (w frames).
 [[vk::binding(6, 0)]] RWStructuredBuffer<float4> radiance;
 
 float3 gridOrigin() { return f.reflection.xyz; }
@@ -42,9 +44,13 @@ uint walk(float3 o, float3 d, float reach) {
     int3 step = select(d >= 0.0, int3(1), int3(-1));
     float3 next = (float3(c) + select(d >= 0.0, float3(1.0), float3(0.0)) - p) * inv;
     float3 delta = abs(inv);
+    // Rays start beside a surface, which at this size can be inside the next
+    // voxel over. Solid cells before the first empty one don't stop them.
+    bool clear = false;
     [loop] for (int i = 0; i < MAX_VOXEL_STEPS; i++) {
         uint found = cells[(c.z * size + c.y) * size + c.x];
-        if (found != 0u) return found;
+        if (found != 0u && (clear || i >= MAX_START_CELLS)) return found;
+        clear = clear || found == 0u;
         if (next.x <= next.y && next.x <= next.z) {
             t = next.x; next.x += delta.x; c.x += step.x;
         } else if (next.y <= next.z) {
@@ -57,12 +63,12 @@ uint walk(float3 o, float3 d, float reach) {
     return 0u;
 }
 
-// The light a ray along d gets from a voxel. Back faces are dark, so a wall one
-// voxel thick does not pass light through it.
+// The light a ray along d gets from a voxel, from the side it arrives at. Sides
+// light separately, so a wall one voxel thick does not pass light through it.
 float3 voxelSeen(uint found, float3 d) {
     uint index = found - 1u;
-    if (dot(voxelNormal(voxels[index].z), d) > 0.0) return 0.0;
-    return radiance[index * 2u].rgb;
+    uint side = dot(voxelNormal(voxels[index].z), d) > 0.0 ? 1u : 0u;
+    return radiance[index * 4u + side * 2u].rgb;
 }
 
 // Irradiance / pi from the sun and point lights, shadowed by the voxels.
@@ -84,7 +90,7 @@ float3 voxelDirect(float3 x, float3 n, float3 o) {
     return light;
 }
 
-// A quarter of the voxels a frame: their direct light and one bounce ray.
+// A quarter of the voxels a frame, one side at a time: direct light and a bounce ray.
 [shader("compute")]
 [numthreads(64, 1, 1)]
 void inject(uint3 id : SV_DispatchThreadID) {
@@ -95,8 +101,10 @@ void inject(uint3 id : SV_DispatchThreadID) {
     uint size = uint(gridSize());
     uint3 cell = uint3(voxel.x % size, (voxel.x / size) % size, voxel.x / (size * size));
     float3 x = gridOrigin() + (float3(cell) + 0.5) * cellSize();
-    float3 n = voxelNormal(voxel.z);
+    uint side = (frame >> 2u) & 1u;
+    float3 n = voxelNormal(voxel.z) * (side == 0u ? 1.0 : -1.0);
     float3 o = x + n * (1.5 * cellSize());
+    uint slot = index * 4u + side * 2u;
 
     uint seed = hashU(index ^ hashU(frame));
     float u = float(seed >> 8u) / 16777216.0;
@@ -105,12 +113,12 @@ void inject(uint3 id : SV_DispatchThreadID) {
     uint found = walk(o, dir, f.sky.w);
     float3 seen = found != 0u ? voxelSeen(found, dir) : background(dir);
 
-    float4 arriving = radiance[index * 2u + 1u];
+    float4 arriving = radiance[slot + 1u];
     float frames = min(arriving.w + 1.0, 64.0);
     arriving = float4(lerp(arriving.rgb, seen, 1.0 / frames), frames);
-    radiance[index * 2u + 1u] = bad(arriving) ? float4(0.0) : arriving;
+    radiance[slot + 1u] = bad(arriving) ? float4(0.0) : arriving;
     float3 leaving = meanAlbedo(materials[voxel.y]) * (voxelDirect(x, n, o) + arriving.rgb);
-    radiance[index * 2u] = float4(leaving, 1.0);
+    radiance[slot] = float4(leaving, 1.0);
 }
 
 // Rays from a quarter-size texel: writes the light they found / rays and the
@@ -186,5 +194,5 @@ void composite(uint3 id : SV_DispatchThreadID) {
     float4 result = float4(lit.rgb + diffuse * brdf.diffuse_color
         + specular * specular_albedo(brdf.f0, dfg), lit.a);
     hdr[at] = result;
-    colorOut.Store(at, result);
+    colorOut.Store(at, float4(diffuseLit(lit.rgb, brdf, rough, n, view) + diffuse * brdf.diffuse_color, lit.a));
 }

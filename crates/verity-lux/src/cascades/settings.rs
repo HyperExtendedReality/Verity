@@ -95,14 +95,18 @@ impl Settings {
         }
     }
 
-    /// The benchmarked budget for a frame, with about 300 MB of world cache in
-    /// place of the uncapped default.
+    /// The benchmarked budget for a frame, with about 800 MB of world cache in
+    /// place of the uncapped default. On Sponza a coarser grid and half-size
+    /// resolve lost nothing, and what they save buys a cache that keeps probes:
+    /// against a path-traced reference, a smaller one is what costs accuracy.
     pub fn budgeted() -> Self {
         Self {
             sampling: Sampling {
-                max_cache_entries: 262_144,
-                max_updates_per_frame: 1024,
-                max_traversal_queries: 32_768,
+                grid_divisor: 4,
+                resolve_scale: 2,
+                max_cache_entries: 1_048_576,
+                max_updates_per_frame: 2048,
+                max_traversal_queries: 65_536,
                 ..Sampling::default()
             },
             ..Self::default()
