@@ -167,10 +167,7 @@ void resolveMain(uint3 id: SV_DispatchThreadID) {
         level = 3;
     } else if (kind == MATRIX_IMPOSTER) {
         MatrixAsset asset = matrix_assets[matrix_instance.info.x];
-        float distance = length(matrix_instance.sphere.xyz - eye);
-        float pixels = 2.0 * matrix_instance.sphere.w * abs(globals.projection.y) * 0.5 * viewport.w
-            / max(distance, globals.projection.z);
-        ImposterHit imposter = imposter_sample(matrix_instance, asset, eye, direction, pixels);
+        ImposterHit imposter = imposter_sample(matrix_instance, asset, eye, direction, matrix_pixels(matrix_instance));
         float3 origin = mul(matrix_instance.inverse, float4(eye, 1.0)).xyz;
         float3 ray = normalize(mul(matrix_instance.inverse, float4(direction, 0.0)).xyz);
         s.position = mul(instance.model, float4(origin + ray * imposter.distance, 1.0)).xyz;

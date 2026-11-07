@@ -32,8 +32,6 @@ static const uint ITEM_INSTANCE = ITEM_COARSE - 1;
 
 /// Largest allowed projected error, in pixels.
 static const float ERROR_PIXELS = 1.0;
-/// Below this diameter an object is its imposter.
-static const float IMPOSTER_PIXELS = 64.0;
 static const float COARSE_THRESHOLD = 1.0e30;
 
 float pixels_per_unit(float distance) {
@@ -47,9 +45,8 @@ float projected_error(MatrixInstance instance, float4 sphere, float error) {
     return error * scale * pixels_per_unit(distance);
 }
 
-/// Inside the side planes of the view; the projection has no far plane.
-bool sphere_visible(float3 center, float radius) {
-    float4x4 m = globals.view_proj;
+/// Inside the side planes of a projection; ours have no useful far plane.
+bool sphere_inside(float4x4 m, float3 center, float radius) {
     float4 point = float4(center, 1.0);
     float4 planes[4] = { m[3] + m[0], m[3] - m[0], m[3] + m[1], m[3] - m[1] };
     for (uint i = 0; i < 4; ++i) {
@@ -57,6 +54,10 @@ bool sphere_visible(float3 center, float radius) {
             return false;
     }
     return true;
+}
+
+bool sphere_visible(float3 center, float radius) {
+    return sphere_inside(globals.view_proj, center, radius);
 }
 
 void push_item(uint pass, uint2 item) {
@@ -79,6 +80,38 @@ void push_entries(uint list, uint2 entry, uint count) {
         matrix_entries[base + i] = uint2(entry.x, entry.y + i - slot);
 }
 
+void push_layer(uint layer, uint instance, uint cluster, uint first_brick, uint brick_count, bool triangles) {
+    uint list = MATRIX_LIST_LAYERS + layer * 2;
+    if (triangles)
+        push_entries(list, uint2(instance, cluster), 1);
+    if (brick_count > 0)
+        push_entries(list + 1, uint2(instance, first_brick), brick_count);
+}
+
+/// Add a cluster to the lists of every shadow layer it can reach. `sphere` is in
+/// world space. Without this every layer would draw every caster.
+void push_shadow_layers(uint instance, uint cluster, uint first_brick, uint brick_count, bool triangles, float4 sphere) {
+    if (globals.sun_direction.w > 0.0) {
+        for (uint cascade = 0; cascade < CASCADES; ++cascade) {
+            if (sphere_inside(globals.shadow_view_proj[cascade], sphere.xyz, sphere.w))
+                push_layer(cascade, instance, cluster, first_brick, brick_count, triangles);
+        }
+    }
+    uint lit = min(globals.counts.x, MAX_POINT_SHADOWS);
+    for (uint light = 0; light < lit; ++light) {
+        float4 reach = lights[light].position_radius;
+        float3 offset = sphere.xyz - reach.xyz;
+        float range = reach.w + sphere.w;
+        if (reach.w <= 0.0 || dot(offset, offset) > range * range)
+            continue;
+        for (uint face = 0; face < POINT_SHADOW_FACES; ++face) {
+            uint layer = light * POINT_SHADOW_FACES + face;
+            if (sphere_inside(globals.point_shadow_view_proj[layer], sphere.xyz, sphere.w))
+                push_layer(CASCADES + layer, instance, cluster, first_brick, brick_count, triangles);
+        }
+    }
+}
+
 [shader("compute")]
 [numthreads(64, 1, 1)]
 void instanceMain(uint3 id: SV_DispatchThreadID) {
@@ -96,10 +129,10 @@ void instanceMain(uint3 id: SV_DispatchThreadID) {
         flags |= ITEM_SHADOW;
     if (flags == 0)
         return;
-    float pixels = 2.0 * radius * pixels_per_unit(distance);
-    if (asset.imposter_albedo != NO_TEXTURE && pixels < IMPOSTER_PIXELS) {
-        if ((flags & ITEM_VISIBLE) != 0)
-            push_entries(MATRIX_LIST_IMPOSTER, uint2(id.x, 0), 1);
+    float fade = imposter_fade(instance);
+    if (fade > 0.0 && (flags & ITEM_VISIBLE) != 0)
+        push_entries(MATRIX_LIST_IMPOSTER, uint2(id.x, 0), 1);
+    if (fade >= 1.0) {
         flags = (flags & ~ITEM_VISIBLE) | ITEM_COARSE;
         if ((flags & ITEM_SHADOW) == 0)
             return;
@@ -141,23 +174,16 @@ void nodeMain(uint3 id: SV_DispatchThreadID) {
             if (refined_error > threshold)
                 continue;
         }
-        bool visible = (item.x & ITEM_VISIBLE) != 0;
-        if (visible) {
-            float3 center = mul(instance.base.model, float4(cluster.sphere.xyz, 1.0)).xyz;
-            visible = sphere_visible(center, cluster.sphere.w * asfloat(instance.info.z));
-        }
-        bool shadow = (item.x & ITEM_SHADOW) != 0;
-        if (cluster.triangle_count > 0) {
-            if (visible)
+        float3 center = mul(instance.base.model, float4(cluster.sphere.xyz, 1.0)).xyz;
+        float radius = cluster.sphere.w * asfloat(instance.info.z);
+        if ((item.x & ITEM_VISIBLE) != 0 && sphere_visible(center, radius)) {
+            if (cluster.triangle_count > 0)
                 push_entries(two_sided ? MATRIX_LIST_TWO_SIDED : MATRIX_LIST_ONE_SIDED, uint2(index, cluster_index), 1);
-            if (shadow)
-                push_entries(MATRIX_LIST_SHADOW, uint2(index, cluster_index), 1);
-        }
-        if (cluster.brick_count > 0) {
-            if (visible)
+            if (cluster.brick_count > 0)
                 push_entries(MATRIX_LIST_VOXELS, uint2(index, cluster.first_brick), cluster.brick_count);
-            if (shadow)
-                push_entries(MATRIX_LIST_SHADOW_VOXELS, uint2(index, cluster.first_brick), cluster.brick_count);
         }
+        if ((item.x & ITEM_SHADOW) != 0)
+            push_shadow_layers(index, cluster_index, cluster.first_brick, cluster.brick_count,
+                cluster.triangle_count > 0, float4(center, radius));
     }
 }

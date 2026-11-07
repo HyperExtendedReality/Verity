@@ -8,14 +8,15 @@
 //! prints each pass's mean GPU time, saves consecutive frames to `DIR` as PFM,
 //! then does the same along a moving camera. `--size=WxH`, `--warm=N`,
 //! `--eye=X,Y,Z`, `--target=X,Y,Z`, `--updates=N` and `--uncapped` adjust it, `--no-gi-light`
-//! saves direct light alone, and `--pxtgi` and `--voxel` run those methods instead.
+//! saves direct light alone, and `--pxtgi` (diffuse only without `--reflections`),
+//! `--voxel` and `--reference` run those instead. `--reference` needs a high `--warm`.
 use glam::Vec3;
 use std::{collections::HashMap, path::Path, sync::Arc, time::Instant};
 use verity_core::World;
 use verity_lux::{
     Lux, Method,
-    cascades::{SplitRadianceCascades, settings::Settings},
-    pxtgi::{Capture, PxtgiSettings},
+    cascades::settings::Settings,
+    pxtgi::{Capture, PxtgiDebug, PxtgiReflections, PxtgiSettings},
     voxel::ScreenVoxelSettings,
 };
 use verity_render::{Renderer, Sun};
@@ -177,17 +178,31 @@ impl ApplicationHandler for Viewer {
                 if flag("--no-gi-light") {
                     settings.intensity = 0.0;
                 }
-                let mut lux = Lux::new(if flag("--pxtgi") {
-                    Method::Pxtgi(PxtgiSettings::default())
+                let lux = Lux::new(if flag("--reference") {
+                    Method::Pxtgi(PxtgiSettings {
+                        debug: PxtgiDebug::Reference,
+                        reflections: PxtgiReflections::Off,
+                        world_ray_distance: 200.0,
+                        ..PxtgiSettings::default()
+                    })
+                } else if flag("--pxtgi") {
+                    Method::Pxtgi(PxtgiSettings {
+                        reflections: if flag("--reflections") {
+                            PxtgiReflections::Traced
+                        } else {
+                            PxtgiReflections::Off
+                        },
+                        ..PxtgiSettings::default()
+                    })
                 } else if flag("--voxel") {
-                    Method::ScreenVoxel(ScreenVoxelSettings::default())
+                    Method::ScreenVoxel(ScreenVoxelSettings {
+                        max_distance: if flag("--no-screen") { 0.0 } else { 8.0 },
+                        ..ScreenVoxelSettings::default()
+                    })
                 } else {
                     Method::SplitRadianceCascades(settings)
                 });
                 if self.bench.is_some() {
-                    if let Some(cascades) = lux.method_mut::<SplitRadianceCascades>() {
-                        cascades.profile();
-                    }
                     renderer.set_uncapped(true);
                 }
                 renderer.set_extension(Box::new(lux))?;
@@ -253,11 +268,7 @@ impl ApplicationHandler for Viewer {
                 if let Some(bench) = &mut self.bench {
                     let lux = renderer.extension_mut::<Lux>().expect("GI is installed");
                     let finished = lux.take_capture();
-                    let time = lux.gpu_time().map(|t| ("all", t.as_secs_f32() * 1e3));
-                    let times = match lux.method_mut::<SplitRadianceCascades>() {
-                        Some(cascades) => cascades.pass_times().to_vec(),
-                        None => time.into_iter().collect(),
-                    };
+                    let times = lux.pass_times().to_vec();
                     let (done, capture) = bench.advance(&times, finished);
                     if capture {
                         lux.request_capture();

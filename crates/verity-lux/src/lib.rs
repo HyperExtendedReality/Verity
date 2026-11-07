@@ -65,6 +65,11 @@ pub trait GiMethod: RenderExtension {
         None
     }
 
+    /// Milliseconds per pass in a recent frame, in frame order, if it measures that.
+    fn pass_times(&self) -> &[(&'static str, f32)] {
+        &[]
+    }
+
     /// Read back the next frame's HDR image, if the method can.
     fn request_capture(&mut self) {}
 
@@ -158,6 +163,11 @@ impl Lux {
 
     pub fn gpu_time(&self) -> Option<Duration> {
         self.method.gpu_time()
+    }
+
+    /// Milliseconds per pass in a recent frame, in frame order.
+    pub fn pass_times(&self) -> &[(&'static str, f32)] {
+        self.method.pass_times()
     }
 
     /// Read back the next frame's HDR image, if the method can.

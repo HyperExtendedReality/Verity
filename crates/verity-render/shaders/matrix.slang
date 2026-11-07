@@ -38,6 +38,7 @@ struct VertexOutput {
     float2 uv: TEXCOORD0;
     float alpha: TEXCOORD1;
     nointerpolation uint2 id: ID;
+    nointerpolation float fade: FADE;
 };
 
 [shader("vertex")]
@@ -49,6 +50,7 @@ VertexOutput vertexMain(uint vertex: SV_VertexID, uint entry: SV_InstanceID) {
     VertexOutput output;
     output.uv = 0.0;
     output.alpha = 1.0;
+    output.fade = imposter_fade(instance);
     output.id = uint2(item.x, MATRIX_TRIANGLE << MATRIX_KIND_SHIFT | item.y << MATRIX_TRIANGLE_BITS | triangle);
     if (triangle >= cluster.triangle_count) {
         // Every corner of a padding triangle lands on one point, so it is culled.
@@ -63,6 +65,10 @@ VertexOutput vertexMain(uint vertex: SV_VertexID, uint entry: SV_InstanceID) {
 }
 
 void alphaTest(VertexOutput input) {
+#if MATRIX_TARGET != TARGET_SHADOW
+    if (imposter_pixel(input.position.xy, input.fade))
+        discard;
+#endif
     Material material = materials[matrix_instances[input.id.x].base.draw.z];
     if ((material.textures.w & ALPHA_MASK) != 0) {
         float alpha = material.base_color.a * input.alpha;
@@ -92,6 +98,7 @@ struct VertexOutput {
     float4 position: SV_Position;
     float3 object: TEXCOORD0;
     nointerpolation uint2 item: ID;
+    nointerpolation float fade: FADE;
 };
 
 /// Direction of the ray arriving at a world point: from the camera, or a light.
@@ -128,6 +135,7 @@ VertexOutput vertexMain(uint vertex: SV_VertexID, uint entry: SV_InstanceID) {
     VertexOutput output;
     output.object = object;
     output.item = item;
+    output.fade = imposter_fade(instance);
     output.position = dot(ray, toward) < 0.0 ? to_clip(float4(world, 1.0)) : float4(0.0, 0.0, 0.0, 1.0);
     return output;
 }
@@ -141,6 +149,10 @@ bool voxelHit(VertexOutput input, out float depth, out uint id) {
     float distance;
     depth = 0.0;
     id = 0;
+#if MATRIX_TARGET != TARGET_SHADOW
+    if (imposter_pixel(input.position.xy, input.fade))
+        return false;
+#endif
     if (!brick_march(brick, input.object, ray, bit, distance))
         return false;
 #if MATRIX_TARGET == TARGET_SHADOW
@@ -195,6 +207,7 @@ struct VertexOutput {
     float3 world: TEXCOORD0;
     float pixels: TEXCOORD1;
     nointerpolation uint instance: ID;
+    nointerpolation float fade: FADE;
 };
 
 [shader("vertex")]
@@ -215,17 +228,20 @@ VertexOutput vertexMain(uint vertex: SV_VertexID, uint entry: SV_InstanceID) {
     VertexOutput output;
     output.position = mul(globals.view_proj, float4(world, 1.0));
     output.world = world;
-    output.pixels = 2.0 * radius * abs(globals.projection.y) * 0.5 * globals.viewport.w / max(distance, globals.projection.z);
+    output.pixels = matrix_pixels(instance);
     output.instance = index;
+    output.fade = imposter_fade(instance);
     return output;
 }
 
 bool imposterHit(VertexOutput input, out float depth) {
+    depth = 0.0;
+    if (!imposter_pixel(input.position.xy, input.fade))
+        return false;
     MatrixInstance instance = matrix_instances[input.instance];
     MatrixAsset asset = matrix_assets[instance.info.x];
     float3 direction = normalize(input.world - globals.eye.xyz);
     ImposterHit hit = imposter_sample(instance, asset, globals.eye.xyz, direction, input.pixels);
-    depth = 0.0;
     if (hit.alpha < IMPOSTER_ALPHA)
         return false;
     float3 origin = mul(instance.inverse, float4(globals.eye.xyz, 1.0)).xyz;

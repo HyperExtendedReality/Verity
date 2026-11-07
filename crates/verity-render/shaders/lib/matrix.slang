@@ -20,6 +20,9 @@ static const float IMPOSTER_FRAME = 96.0;
 /// Coverage below this is a hole; blended mips dilute thin canopies.
 static const float IMPOSTER_ALPHA = 0.33;
 static const float IMPOSTER_MAX_LOD = 3.0;
+/// Diameters over which geometry dissolves into its imposter.
+static const float IMPOSTER_PIXELS = 64.0;
+static const float IMPOSTER_FADE_PIXELS = 80.0;
 
 struct MatrixInstance {
     Instance base;
@@ -84,6 +87,26 @@ struct MatrixBrick {
 [[vk::binding(24)]] StructuredBuffer<uint> matrix_indices;
 [[vk::binding(25)]] StructuredBuffer<MatrixBrick> matrix_bricks;
 [[vk::binding(26)]] StructuredBuffer<uint2> matrix_voxels;
+
+float matrix_pixels(MatrixInstance instance) {
+    float distance = length(instance.sphere.xyz - globals.eye.xyz);
+    return instance.sphere.w * abs(globals.projection.y) * globals.viewport.w
+        / max(distance, globals.projection.z);
+}
+
+/// How far an instance has dissolved into its imposter, 0 to 1.
+float imposter_fade(MatrixInstance instance) {
+    if (matrix_assets[instance.info.x].imposter_albedo == NO_TEXTURE)
+        return 0.0;
+    return saturate((IMPOSTER_FADE_PIXELS - matrix_pixels(instance)) / (IMPOSTER_FADE_PIXELS - IMPOSTER_PIXELS));
+}
+
+/// Whether a pixel shows the imposter. Geometry and imposter take complementary
+/// pixels, so nothing is drawn twice and no hole opens between them.
+bool imposter_pixel(float2 pixel, float fade) {
+    float noise = frac(52.9829189 * frac(dot(floor(pixel), float2(0.06711056, 0.00583715))));
+    return noise < fade;
+}
 
 Vertex matrix_vertex(MatrixInstance instance, uint first_index, uint corner) {
     return vertices[matrix_indices[first_index + corner] + instance.base.draw.y];

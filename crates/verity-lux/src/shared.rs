@@ -216,3 +216,95 @@ pub(crate) unsafe fn upload(
     gpu::destroy_buffer(device, gpu.allocator, staging);
     Ok(result?)
 }
+
+/// Timestamps a frame slot can hold: one per pass and one to start from.
+const TIMESTAMPS: u32 = 128;
+
+/// GPU time per pass, from a timestamp after each.
+pub(crate) struct PassTimer {
+    pool: vk::QueryPool,
+    period: f32,
+    /// The passes each slot's last frame stamped, in order.
+    stamped: [Vec<&'static str>; 2],
+    /// Milliseconds per pass in the latest finished frame, repeats summed.
+    pub times: Vec<(&'static str, f32)>,
+}
+
+impl PassTimer {
+    pub unsafe fn new(gpu: &Gpu) -> Result<Self> {
+        let pool = gpu.device.create_query_pool(
+            &vk::QueryPoolCreateInfo::default()
+                .query_type(vk::QueryType::TIMESTAMP)
+                .query_count(2 * TIMESTAMPS),
+            None,
+        )?;
+        let properties = gpu.instance.get_physical_device_properties(gpu.physical);
+        Ok(Self {
+            pool,
+            period: properties.limits.timestamp_period,
+            stamped: Default::default(),
+            times: Vec::new(),
+        })
+    }
+
+    /// Read this slot's finished frame and start timing its next. The slot's
+    /// last frame must be done.
+    pub unsafe fn begin(
+        &mut self,
+        device: &ash::Device,
+        cmd: vk::CommandBuffer,
+        slot: usize,
+    ) -> Result<()> {
+        let first = slot as u32 * TIMESTAMPS;
+        let stamped = mem::take(&mut self.stamped[slot]);
+        if !stamped.is_empty() {
+            let mut ticks = vec![0u64; stamped.len() + 1];
+            device.get_query_pool_results(
+                self.pool,
+                first,
+                &mut ticks,
+                vk::QueryResultFlags::TYPE_64,
+            )?;
+            self.times.clear();
+            for (name, pair) in stamped.iter().zip(ticks.windows(2)) {
+                let ms = pair[1].saturating_sub(pair[0]) as f32 * self.period * 1e-6;
+                match self.times.iter_mut().find(|(n, _)| n == name) {
+                    Some((_, total)) => *total += ms,
+                    None => self.times.push((name, ms)),
+                }
+            }
+        }
+        device.cmd_reset_query_pool(cmd, self.pool, first, TIMESTAMPS);
+        device.cmd_write_timestamp2(cmd, vk::PipelineStageFlags2::ALL_COMMANDS, self.pool, first);
+        Ok(())
+    }
+
+    /// Note that a pass just finished.
+    pub unsafe fn stamp(
+        &mut self,
+        device: &ash::Device,
+        cmd: vk::CommandBuffer,
+        slot: usize,
+        name: &'static str,
+    ) {
+        let stamped = &mut self.stamped[slot];
+        stamped.push(name);
+        debug_assert!((stamped.len() as u32) < TIMESTAMPS);
+        device.cmd_write_timestamp2(
+            cmd,
+            vk::PipelineStageFlags2::ALL_COMMANDS,
+            self.pool,
+            slot as u32 * TIMESTAMPS + stamped.len() as u32,
+        );
+    }
+
+    /// The latest frame's whole time, once there is one.
+    pub fn total(&self) -> Option<std::time::Duration> {
+        let total: f32 = self.times.iter().map(|(_, ms)| ms).sum();
+        (total > 0.0).then(|| std::time::Duration::from_secs_f32(total * 1e-3))
+    }
+
+    pub unsafe fn destroy(self, device: &ash::Device) {
+        device.destroy_query_pool(self.pool, None);
+    }
+}

@@ -207,6 +207,19 @@ float3 cosineDir(float3 n, float u, float phi) {
 // Interleaved gradient noise, stepped along an R2 sequence per frame and ray.
 float ign(float2 p) { return frac(52.9829189 * frac(dot(p, float2(0.06711056, 0.00583715)))); }
 
+// A material's diffuse colour averaged over its surface, for hits that carry no
+// texture coordinates. Metallic comes from the texture too: glTF's factor is
+// usually 1, scaling a texture that says where the metal is.
+float3 meanAlbedo(Material m) {
+    float3 base = m.base_color.rgb;
+    float metallic = m.params.x;
+    if (m.textures.x != NO_TEXTURE)
+        base *= textures[NonUniformResourceIndex(m.textures.x)].SampleLevel(material_sampler, float2(0.5), 16.0).rgb;
+    if (m.textures.y != NO_TEXTURE)
+        metallic *= textures[NonUniformResourceIndex(m.textures.y)].SampleLevel(material_sampler, float2(0.5), 16.0).b;
+    return base * (1.0 - metallic);
+}
+
 // The a-trous kernel's taps, by distance from the centre.
 float kernelTap(int i) { return i == 0 ? 0.375 : (i == 1 ? 0.25 : 0.0625); }
 

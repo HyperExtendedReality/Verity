@@ -37,6 +37,8 @@ pub const BRICK_SIZE: i32 = 4;
 pub const MAX_CLUSTER_BRICKS: usize = 128;
 /// No refined group: original geometry.
 pub const NO_GROUP: u32 = u32::MAX;
+/// Bump when cooking changes, so older cached results are not reused.
+pub const COOK_VERSION: u32 = 1;
 
 const NODE_WIDTH: usize = 8;
 /// A mesh is an aggregate if its coarsest cut keeps less than this of its area.
@@ -81,7 +83,7 @@ pub struct SurfaceSample {
 
 /// Sphere bounds with a simplification error, in object space.
 #[repr(C)]
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct Bounds {
     pub center: [f32; 3],
     pub radius: f32,
@@ -98,7 +100,8 @@ impl From<ClodBounds> for Bounds {
     }
 }
 
-#[derive(Clone, Copy, Debug)]
+#[repr(C)]
+#[derive(Clone, Copy, Debug, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct Group {
     /// Bounds and error of what simplifying this group produced;
     /// the error is `f32::MAX` for terminal groups.
@@ -108,7 +111,8 @@ pub struct Group {
     pub depth: u32,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[repr(C)]
+#[derive(Clone, Copy, Debug, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct Cluster {
     pub bounds: Bounds,
     /// The group whose simplification produced this cluster, or [`NO_GROUP`].
@@ -144,7 +148,8 @@ pub struct Voxel {
 }
 
 /// Spatial tree over groups; `group` is [`NO_GROUP`] for inner nodes.
-#[derive(Clone, Copy, Debug)]
+#[repr(C)]
+#[derive(Clone, Copy, Debug, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct Node {
     pub bounds: Bounds,
     pub group: u32,
@@ -305,6 +310,97 @@ impl ClusterLod {
     /// Whether any cluster is drawn as voxels.
     pub fn has_voxels(&self) -> bool {
         !self.bricks.is_empty()
+    }
+
+    /// The whole LOD as bytes, for [`ClusterLod::from_bytes`] in the same build.
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let header = [
+            COOK_VERSION,
+            self.groups.len() as u32,
+            self.clusters.len() as u32,
+            self.indices.len() as u32,
+            self.bricks.len() as u32,
+            self.voxels.len() as u32,
+            self.nodes.len() as u32,
+            self.root_count,
+            self.tree_depth,
+            self.center[0].to_bits(),
+            self.center[1].to_bits(),
+            self.center[2].to_bits(),
+            self.radius.to_bits(),
+        ];
+        let mut bytes = bytemuck::cast_slice(&header).to_vec();
+        bytes.extend_from_slice(bytemuck::cast_slice(&self.groups));
+        bytes.extend_from_slice(bytemuck::cast_slice(&self.clusters));
+        bytes.extend_from_slice(bytemuck::cast_slice(&self.indices));
+        bytes.extend_from_slice(bytemuck::cast_slice(&self.bricks));
+        bytes.extend_from_slice(bytemuck::cast_slice(&self.voxels));
+        bytes.extend_from_slice(bytemuck::cast_slice(&self.nodes));
+        bytes
+    }
+
+    /// Read [`ClusterLod::to_bytes`] for geometry of `vertex_count` vertices.
+    /// `None` unless every index and range is in bounds, because shaders index
+    /// with these values unchecked.
+    pub fn from_bytes(bytes: &[u8], vertex_count: usize) -> Option<Self> {
+        fn take<T: bytemuck::Pod>(bytes: &mut &[u8], count: usize) -> Option<Vec<T>> {
+            let size = count.checked_mul(size_of::<T>())?;
+            let (head, tail) = bytes.split_at_checked(size)?;
+            *bytes = tail;
+            Some(bytemuck::pod_collect_to_vec(head))
+        }
+        let mut rest = bytes;
+        let header: Vec<u32> = take(&mut rest, 13)?;
+        if header[0] != COOK_VERSION {
+            return None;
+        }
+        let count = |index: usize| header[index] as usize;
+        let lod = Self {
+            groups: take(&mut rest, count(1))?,
+            clusters: take(&mut rest, count(2))?,
+            indices: take(&mut rest, count(3))?,
+            bricks: take(&mut rest, count(4))?,
+            voxels: take(&mut rest, count(5))?,
+            nodes: take(&mut rest, count(6))?,
+            root_count: header[7],
+            tree_depth: header[8],
+            center: [header[9], header[10], header[11]].map(f32::from_bits),
+            radius: f32::from_bits(header[12]),
+        };
+        (rest.is_empty() && lod.is_valid(vertex_count)).then_some(lod)
+    }
+
+    fn is_valid(&self, vertex_count: usize) -> bool {
+        let within = |first: u32, count: u32, length: usize| {
+            first
+                .checked_add(count)
+                .is_some_and(|end| end as usize <= length)
+        };
+        let group = |id: u32| id == NO_GROUP || (id as usize) < self.groups.len();
+        let brick_voxels = |b: &Brick| b.mask[0].count_ones() + b.mask[1].count_ones();
+        self.indices.iter().all(|&i| (i as usize) < vertex_count)
+            && self
+                .groups
+                .iter()
+                .all(|g| within(g.first_cluster, g.cluster_count, self.clusters.len()))
+            && self.clusters.iter().all(|c| {
+                group(c.refined)
+                    && c.triangle_count as usize <= MAX_CLUSTER_TRIANGLES
+                    && c.first_index
+                        .checked_add(c.triangle_count * 3)
+                        .is_some_and(|end| end as usize <= self.indices.len())
+                    && within(c.first_brick, c.brick_count, self.bricks.len())
+            })
+            && self
+                .bricks
+                .iter()
+                .all(|b| within(b.first_voxel, brick_voxels(b), self.voxels.len()))
+            && self
+                .nodes
+                .iter()
+                .all(|n| group(n.group) && within(n.first_child, n.child_count, self.nodes.len()))
+            && self.root_count as usize <= self.nodes.len()
+            && self.root_count > 0
     }
 }
 
@@ -1048,6 +1144,37 @@ mod tests {
         })
         .unwrap();
         assert!(cut_out.voxels.len() * 10 < lod.voxels.len().max(10));
+    }
+
+    #[test]
+    fn bytes_round_trip_and_bad_data_is_refused() {
+        let mesh = canopy(2000, 5.0, 0.15);
+        let vertices = mesh.positions.len();
+        let lod = ClusterLod::cook(mesh.source(), solid).unwrap();
+        assert!(lod.has_voxels());
+        let bytes = lod.to_bytes();
+        let read = ClusterLod::from_bytes(&bytes, vertices).unwrap();
+        assert_eq!(read.to_bytes(), bytes);
+
+        assert!(ClusterLod::from_bytes(&bytes[..bytes.len() - 1], vertices).is_none());
+        assert!(ClusterLod::from_bytes(&[], vertices).is_none());
+        assert!(
+            ClusterLod::from_bytes(&bytes, 3).is_none(),
+            "other vertices"
+        );
+
+        let mut stale = bytes.clone();
+        stale[0] ^= 1;
+        assert!(ClusterLod::from_bytes(&stale, vertices).is_none());
+
+        // A cluster pointing past the index data must not reach a shader.
+        let mut bad = lod.clone();
+        bad.clusters[0].first_index = bad.indices.len() as u32;
+        bad.clusters[0].triangle_count = 1;
+        assert!(ClusterLod::from_bytes(&bad.to_bytes(), vertices).is_none());
+        let mut bad = lod.clone();
+        bad.nodes[0].first_child = u32::MAX;
+        assert!(ClusterLod::from_bytes(&bad.to_bytes(), vertices).is_none());
     }
 
     #[test]

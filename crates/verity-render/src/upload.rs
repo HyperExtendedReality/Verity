@@ -10,8 +10,17 @@ use crate::{
 use ash::vk;
 use gpu_allocator::MemoryLocation;
 use rayon::prelude::*;
-use std::{mem, path::Path};
-use verity_matrix::cluster_lod::{ClusterLod, Source, SurfaceSample};
+use std::{
+    collections::hash_map::DefaultHasher,
+    fs,
+    hash::{Hash, Hasher},
+    mem,
+    path::Path,
+};
+use verity_matrix::cluster_lod::{ClusterLod, Source, SurfaceSample, COOK_VERSION};
+
+/// Smaller primitives cook faster than a cached file repays.
+const CACHED_TRIANGLES: usize = 100_000;
 
 /// What a [`Renderer::load_gltf`] call added.
 #[derive(Clone, Copy, Debug, Default)]
@@ -81,9 +90,50 @@ fn cook_primitives(loaded: &asset::SceneData, positions: &[[f32; 3]]) -> Vec<Opt
                 uvs: &uvs[vertices],
                 indices,
             };
-            ClusterLod::cook(source, surface)
+            let cook = || ClusterLod::cook(source, surface);
+            if indices.len() / 3 < CACHED_TRIANGLES {
+                return cook();
+            }
+            let mut key = DefaultHasher::new();
+            COOK_VERSION.hash(&mut key);
+            bytemuck::cast_slice::<_, u8>(colors).hash(&mut key);
+            bytemuck::cast_slice::<_, u8>(indices).hash(&mut key);
+            bytemuck::cast_slice::<_, u8>(&material.base_color).hash(&mut key);
+            masked.hash(&mut key);
+            material.alpha_cutoff.to_bits().hash(&mut key);
+            if let Some(preview) = preview {
+                preview.rgba.hash(&mut key);
+            }
+            cached(key.finish(), local.len(), cook)
         })
         .collect()
+}
+
+/// The result of `cook`, reusing an earlier run's for the same key. The cache is
+/// only a speedup: any failure to read or write it just cooks.
+fn cached(
+    key: u64,
+    vertex_count: usize,
+    cook: impl FnOnce() -> Option<ClusterLod>,
+) -> Option<ClusterLod> {
+    let directory = std::env::temp_dir().join("verity-matrix");
+    let path = directory.join(format!("{key:016x}.lod"));
+    if let Some(lod) = fs::read(&path)
+        .ok()
+        .and_then(|bytes| ClusterLod::from_bytes(&bytes, vertex_count))
+    {
+        return Some(lod);
+    }
+    let lod = cook()?;
+    // Renamed into place, so a reader never sees half a file.
+    let partial = path.with_extension(format!("{}.tmp", std::process::id()));
+    let written = fs::create_dir_all(&directory)
+        .and_then(|()| fs::write(&partial, lod.to_bytes()))
+        .and_then(|()| fs::rename(&partial, &path));
+    if written.is_err() {
+        let _ = fs::remove_file(&partial);
+    }
+    Some(lod)
 }
 
 impl Renderer {

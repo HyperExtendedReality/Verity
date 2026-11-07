@@ -11,7 +11,7 @@
 use crate::{
     GiMethod, GiStatus,
     pxtgi::{Capture, FrameData, GpuLight, IO_BINDINGS, Readback},
-    shared::{Res, upload, write_set},
+    shared::{PassTimer, Res, upload, write_set},
 };
 use ash::vk;
 use glam::{Mat4, Vec3};
@@ -239,9 +239,7 @@ pub struct ScreenVoxel {
     view: Option<View>,
     targets: Option<Targets>,
     command_pool: vk::CommandPool,
-    timestamps: vk::QueryPool,
-    timestamp_period: f32,
-    gpu_time: Option<Duration>,
+    timer: Option<PassTimer>,
     last_frame: Option<u64>,
     last_viewport: [u32; 4],
     frame: u32,
@@ -267,9 +265,7 @@ impl ScreenVoxel {
             view: None,
             targets: None,
             command_pool: vk::CommandPool::null(),
-            timestamps: vk::QueryPool::null(),
-            timestamp_period: 0.0,
-            gpu_time: None,
+            timer: None,
             last_frame: None,
             last_viewport: [0; 4],
             frame: 1,
@@ -665,22 +661,6 @@ impl ScreenVoxel {
         let device = gpu.device;
         let slot = (frame.frame_number & 1) as usize;
         self.tend_capture(gpu, frame, slot)?;
-        // This slot's last frame is done, so its timestamps are in.
-        let first = slot as u32 * 2;
-        if self.last_frame.is_some_and(|f| f > 0) {
-            let mut ticks = [0u64; 2];
-            let read = device.get_query_pool_results(
-                self.timestamps,
-                first,
-                &mut ticks,
-                vk::QueryResultFlags::TYPE_64,
-            );
-            if read.is_ok() {
-                let nanos =
-                    ticks[1].saturating_sub(ticks[0]) as f64 * f64::from(self.timestamp_period);
-                self.gpu_time = Some(Duration::from_nanos(nanos as u64));
-            }
-        }
         let lights: Vec<_> = frame
             .lights
             .iter()
@@ -750,8 +730,8 @@ impl ScreenVoxel {
 
         use vk::{AccessFlags2 as A, PipelineStageFlags2 as S};
         let cmd = frame.cmd;
-        device.cmd_reset_query_pool(cmd, self.timestamps, first, 2);
-        device.cmd_write_timestamp2(cmd, S::ALL_COMMANDS, self.timestamps, first);
+        let timer = std::cell::RefCell::new(self.timer.as_mut().unwrap());
+        timer.borrow_mut().begin(device, cmd, slot)?;
         let barrier = || {
             let barrier = [vk::MemoryBarrier2::default()
                 .src_stage_mask(S::COMPUTE_SHADER)
@@ -787,7 +767,7 @@ impl ScreenVoxel {
         }
         barrier();
 
-        let dispatch = |name: &str, set: vk::DescriptorSet, [x, y]: [u32; 2]| {
+        let dispatch = |name: &'static str, set: vk::DescriptorSet, [x, y]: [u32; 2]| {
             device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, pipelines.passes[name]);
             device.cmd_bind_descriptor_sets(
                 cmd,
@@ -799,6 +779,7 @@ impl ScreenVoxel {
             );
             device.cmd_dispatch(cmd, x.max(1), y.max(1), 1);
             barrier();
+            timer.borrow_mut().stamp(device, cmd, slot, name);
         };
         let groups = |[x, y]: [u32; 2]| [x.div_ceil(8), y.div_ceil(8)];
         let sets = view.io_sets[slot];
@@ -822,7 +803,6 @@ impl ScreenVoxel {
             device
                 .cmd_pipeline_barrier2(cmd, &vk::DependencyInfo::default().memory_barriers(&host));
         }
-        device.cmd_write_timestamp2(cmd, S::ALL_COMMANDS, self.timestamps, first + 1);
         Ok(())
     }
 }
@@ -840,7 +820,11 @@ impl GiMethod for ScreenVoxel {
     }
 
     fn gpu_time(&self) -> Option<Duration> {
-        self.gpu_time
+        self.timer.as_ref().and_then(PassTimer::total)
+    }
+
+    fn pass_times(&self) -> &[(&'static str, f32)] {
+        self.timer.as_ref().map_or(&[], |t| &t.times)
     }
 
     fn request_capture(&mut self) {
@@ -900,14 +884,7 @@ impl RenderExtension for ScreenVoxel {
         unsafe {
             if self.pipelines.is_none() {
                 self.pipelines = Some(Self::create_pipelines(gpu)?);
-                self.timestamps = gpu.device.create_query_pool(
-                    &vk::QueryPoolCreateInfo::default()
-                        .query_type(vk::QueryType::TIMESTAMP)
-                        .query_count(SLOTS as u32 * 2),
-                    None,
-                )?;
-                let properties = gpu.instance.get_physical_device_properties(gpu.physical);
-                self.timestamp_period = properties.limits.timestamp_period;
+                self.timer = Some(PassTimer::new(gpu)?);
                 self.no_capture = gpu::create_buffer(
                     gpu.device,
                     gpu.allocator,
@@ -966,8 +943,9 @@ impl RenderExtension for ScreenVoxel {
                 device.destroy_descriptor_set_layout(pipelines.scene_layout, None);
                 device.destroy_descriptor_set_layout(pipelines.io_layout, None);
             }
-            device.destroy_query_pool(self.timestamps, None);
-            self.timestamps = vk::QueryPool::null();
+            if let Some(timer) = self.timer.take() {
+                timer.destroy(device);
+            }
             device.destroy_command_pool(self.command_pool, None);
             self.command_pool = vk::CommandPool::null();
         }

@@ -65,16 +65,6 @@ float3 voxelSeen(uint found, float3 d) {
     return radiance[index * 2u].rgb;
 }
 
-// A material's mean colour: voxels hold no texture coordinates.
-float3 voxelAlbedo(uint index) {
-    Material m = materials[index];
-    float3 base = m.base_color.rgb;
-    if (m.textures.x != NO_TEXTURE) {
-        base *= textures[NonUniformResourceIndex(m.textures.x)].SampleLevel(material_sampler, float2(0.5), 16.0).rgb;
-    }
-    return base * (1.0 - m.params.x);
-}
-
 // Irradiance / pi from the sun and point lights, shadowed by the voxels.
 float3 voxelDirect(float3 x, float3 n, float3 o) {
     float3 light = 0.0;
@@ -119,7 +109,7 @@ void inject(uint3 id : SV_DispatchThreadID) {
     float frames = min(arriving.w + 1.0, 64.0);
     arriving = float4(lerp(arriving.rgb, seen, 1.0 / frames), frames);
     radiance[index * 2u + 1u] = bad(arriving) ? float4(0.0) : arriving;
-    float3 leaving = voxelAlbedo(voxel.y) * (voxelDirect(x, n, o) + arriving.rgb);
+    float3 leaving = meanAlbedo(materials[voxel.y]) * (voxelDirect(x, n, o) + arriving.rgb);
     radiance[index * 2u] = float4(leaving, 1.0);
 }
 

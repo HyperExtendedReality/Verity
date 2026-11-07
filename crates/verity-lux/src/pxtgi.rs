@@ -21,7 +21,7 @@
 
 use crate::{
     GiMethod, GiStatus,
-    shared::{Patch, Res, upload, upload_ranges, write_set},
+    shared::{PassTimer, Patch, Res, upload, upload_ranges, write_set},
 };
 use ash::vk;
 use bytemuck::{Pod, Zeroable};
@@ -94,6 +94,7 @@ const PASSES: &[(&str, &[u8])] = &[
     spirv!("reflect_filter2"),
     spirv!("composite"),
     spirv!("capture"),
+    spirv!("reference"),
 ];
 
 use vk::DescriptorType as D;
@@ -159,6 +160,10 @@ pub enum PxtgiDebug {
     /// The bounce light, before albedo.
     BounceLight = 5,
     Reflections = 6,
+    /// Diffuse bounce light by plain path tracing, converging for as long as the
+    /// camera stays still, to measure methods against. Scene hits use the same
+    /// mean colours as PXTGI, and no cache or filter is involved.
+    Reference = 7,
 }
 
 /// PXTGI controls. Distances are in metres.
@@ -370,10 +375,10 @@ pub struct Pxtgi {
     capture_requested: bool,
     readback: Option<Readback>,
     capture: Option<Capture>,
-    /// Start and end timestamps of each slot's frame.
-    timestamps: vk::QueryPool,
-    timestamp_period: f32,
-    gpu_time: Option<std::time::Duration>,
+    timer: Option<PassTimer>,
+    /// Frames of the path-traced reference so far, and the view they are of.
+    reference_frames: u32,
+    reference_view: Option<Mat4>,
     previous_lights: Vec<u8>,
     previous_power: Vec3,
     /// Frames since a light last changed, while that still matters.
@@ -411,9 +416,9 @@ impl Pxtgi {
             capture_requested: false,
             readback: None,
             capture: None,
-            timestamps: vk::QueryPool::null(),
-            timestamp_period: 0.0,
-            gpu_time: None,
+            timer: None,
+            reference_frames: 0,
+            reference_view: None,
             previous_lights: Vec::new(),
             previous_power: Vec3::ZERO,
             light_age: None,
@@ -476,7 +481,7 @@ impl Pxtgi {
 
     /// How long the GPU took over PXTGI's passes in a recent frame.
     pub fn gpu_time(&self) -> Option<std::time::Duration> {
-        self.gpu_time
+        self.timer.as_ref().and_then(PassTimer::total)
     }
 
     /// Read back the next frame drawn; see [`Self::take_capture`].
@@ -1074,22 +1079,6 @@ impl Pxtgi {
         let slot = (frame.frame_number & 1) as usize;
         self.publish(gpu, slot)?;
         self.tend_capture(gpu, frame, slot)?;
-        // This slot's last frame is done, so its timestamps are in.
-        let first = slot as u32 * 2;
-        if self.last_frame.is_some_and(|f| f > 0) {
-            let mut ticks = [0u64; 2];
-            let read = device.get_query_pool_results(
-                self.timestamps,
-                first,
-                &mut ticks,
-                vk::QueryResultFlags::TYPE_64,
-            );
-            if read.is_ok() {
-                let nanos =
-                    ticks[1].saturating_sub(ticks[0]) as f64 * f64::from(self.timestamp_period);
-                self.gpu_time = Some(std::time::Duration::from_nanos(nanos as u64));
-            }
-        }
         let lights = self.frame_lights(frame);
         let fade = self.power_change(frame);
         let moved = self.moved_regions();
@@ -1132,7 +1121,14 @@ impl Pxtgi {
             PxtgiReflections::Screen => 1.0,
             PxtgiReflections::Traced => 2.0,
         };
-        let cache_on = settings.multi_bounce && primitives > 0;
+        let reference = settings.debug == PxtgiDebug::Reference;
+        let cache_on = settings.multi_bounce && primitives > 0 && !reference;
+        if self.reference_view != Some(clip) {
+            self.reference_view = Some(clip);
+            self.reference_frames = 0;
+        }
+        let reference_frames = self.reference_frames;
+        self.reference_frames += 1;
         let data = FrameData {
             clip_from_world: clip.to_cols_array_2d(),
             world_from_clip: clip.inverse().to_cols_array_2d(),
@@ -1177,7 +1173,7 @@ impl Pxtgi {
             reflection: [
                 mode,
                 settings.reflection_roughness_cutoff.clamp(0.0, 1.0),
-                0.0,
+                reference_frames as f32,
                 0.0,
             ],
             fade: fade.extend(1.0).to_array(),
@@ -1192,8 +1188,8 @@ impl Pxtgi {
 
         use vk::{AccessFlags2 as A, PipelineStageFlags2 as S};
         let cmd = frame.cmd;
-        device.cmd_reset_query_pool(cmd, self.timestamps, first, 2);
-        device.cmd_write_timestamp2(cmd, S::ALL_COMMANDS, self.timestamps, first);
+        let timer = std::cell::RefCell::new(self.timer.as_mut().unwrap());
+        timer.borrow_mut().begin(device, cmd, slot)?;
         let barrier = || {
             let barrier = [vk::MemoryBarrier2::default()
                 .src_stage_mask(S::COMPUTE_SHADER | S::TRANSFER)
@@ -1231,7 +1227,7 @@ impl Pxtgi {
         }
         barrier();
 
-        let dispatch = |name: &str, set: vk::DescriptorSet, [x, y]: [u32; 2]| {
+        let dispatch = |name: &'static str, set: vk::DescriptorSet, [x, y]: [u32; 2]| {
             device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, pipelines.passes[name]);
             device.cmd_bind_descriptor_sets(
                 cmd,
@@ -1243,6 +1239,7 @@ impl Pxtgi {
             );
             device.cmd_dispatch(cmd, x.max(1), y.max(1), 1);
             barrier();
+            timer.borrow_mut().stamp(device, cmd, slot, name);
         };
         let groups = |[x, y]: [u32; 2]| [x.div_ceil(8), y.div_ceil(8)];
         let sets = view.io_sets[slot];
@@ -1253,10 +1250,16 @@ impl Pxtgi {
             dispatch("cache_shade", sets[0], cells);
         }
         let diffuse = ["trace", "temporal", "atrous1", "atrous2", "atrous4"];
-        for (name, &set) in diffuse.into_iter().zip(&sets) {
-            dispatch(name, set, groups(trace));
+        if reference {
+            // The composite's light is the depth of `temporal`, then this mean.
+            dispatch("temporal", sets[1], groups(trace));
+            dispatch("reference", sets[2], groups(trace));
+        } else {
+            for (name, &set) in diffuse.into_iter().zip(&sets) {
+                dispatch(name, set, groups(trace));
+            }
         }
-        if settings.reflections != PxtgiReflections::Off {
+        if settings.reflections != PxtgiReflections::Off && !reference {
             let passes = [
                 "reflect_trace",
                 "reflect_temporal",
@@ -1280,7 +1283,6 @@ impl Pxtgi {
             device
                 .cmd_pipeline_barrier2(cmd, &vk::DependencyInfo::default().memory_barriers(&host));
         }
-        device.cmd_write_timestamp2(cmd, S::ALL_COMMANDS, self.timestamps, first + 1);
         Ok(())
     }
 }
@@ -1335,7 +1337,11 @@ impl GiMethod for Pxtgi {
     }
 
     fn gpu_time(&self) -> Option<std::time::Duration> {
-        self.gpu_time
+        Pxtgi::gpu_time(self)
+    }
+
+    fn pass_times(&self) -> &[(&'static str, f32)] {
+        self.timer.as_ref().map_or(&[], |t| &t.times)
     }
 
     fn request_capture(&mut self) {
@@ -1531,14 +1537,7 @@ impl RenderExtension for Pxtgi {
         unsafe {
             if self.pipelines.is_none() {
                 self.pipelines = Some(Self::create_pipelines(gpu)?);
-                self.timestamps = gpu.device.create_query_pool(
-                    &vk::QueryPoolCreateInfo::default()
-                        .query_type(vk::QueryType::TIMESTAMP)
-                        .query_count(SLOTS as u32 * 2),
-                    None,
-                )?;
-                let properties = gpu.instance.get_physical_device_properties(gpu.physical);
-                self.timestamp_period = properties.limits.timestamp_period;
+                self.timer = Some(PassTimer::new(gpu)?);
             }
             let storage = vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::TRANSFER_DST;
             let device = gpu.device;
@@ -1624,8 +1623,9 @@ impl RenderExtension for Pxtgi {
             for buffer in buffers {
                 gpu::destroy_buffer(device, gpu.allocator, buffer);
             }
-            device.destroy_query_pool(self.timestamps, None);
-            self.timestamps = vk::QueryPool::null();
+            if let Some(timer) = self.timer.take() {
+                timer.destroy(device);
+            }
             device.destroy_command_pool(self.command_pool, None);
             self.command_pool = vk::CommandPool::null();
         }

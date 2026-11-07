@@ -41,6 +41,7 @@ const PXTGI_ENTRIES: &[&str] = &[
     "reflect_filter2",
     "composite",
     "capture",
+    "reference",
 ];
 
 /// The screen and voxel method's compute passes, all in `voxel.slang`.

@@ -20,7 +20,7 @@ use self::{
 use crate::{
     GiMethod, GiStatus,
     pxtgi::{Capture, Readback},
-    shared::{Patch, Res, upload, upload_ranges, write_set},
+    shared::{PassTimer, Patch, Res, upload, upload_ranges, write_set},
 };
 use ash::vk;
 use bytemuck::{Pod, Zeroable};
@@ -150,19 +150,6 @@ struct GiLight {
     edge1: [f32; 4],
     edge2: [f32; 4],
     source: [u32; 4],
-}
-
-/// Timestamps a frame slot can hold: one per pass and one to start from.
-const TIMESTAMPS: u32 = 128;
-
-/// GPU time per pass, from a timestamp after each.
-struct PassTimer {
-    pool: vk::QueryPool,
-    period: f32,
-    /// The passes each slot's last frame stamped, in order.
-    stamped: [Vec<&'static str>; SLOTS],
-    /// Milliseconds per pass in the latest finished frame, repeats summed.
-    times: Vec<(&'static str, f32)>,
 }
 
 struct Pipelines {
@@ -300,7 +287,6 @@ pub struct SplitRadianceCascades {
     /// `n` passes of each frame, to bisect GPU faults.
     pass_limit: Option<usize>,
     timer: Option<PassTimer>,
-    profile: bool,
     capture_requested: bool,
     readback: Option<Readback>,
     capture: Option<Capture>,
@@ -332,21 +318,10 @@ impl SplitRadianceCascades {
                 .ok()
                 .and_then(|v| v.parse().ok()),
             timer: None,
-            profile: false,
             capture_requested: false,
             readback: None,
             capture: None,
         }
-    }
-
-    /// Time each pass on the GPU from the next frame on; see [`Self::pass_times`].
-    pub fn profile(&mut self) {
-        self.profile = true;
-    }
-
-    /// Milliseconds per pass in a recent frame, in frame order.
-    pub fn pass_times(&self) -> &[(&'static str, f32)] {
-        self.timer.as_ref().map_or(&[], |t| &t.times)
     }
 
     /// Read back the next frame's HDR image; see [`Self::take_capture`].
@@ -357,57 +332,6 @@ impl SplitRadianceCascades {
     /// The capture asked for, once the GPU has finished it.
     pub fn take_capture(&mut self) -> Option<Capture> {
         self.capture.take()
-    }
-
-    /// Read this slot's finished timestamps and start its next frame's.
-    unsafe fn tend_timer(&mut self, gpu: &Gpu, cmd: vk::CommandBuffer, slot: usize) -> Result<()> {
-        if !self.profile {
-            return Ok(());
-        }
-        if self.timer.is_none() {
-            let pool = gpu.device.create_query_pool(
-                &vk::QueryPoolCreateInfo::default()
-                    .query_type(vk::QueryType::TIMESTAMP)
-                    .query_count(SLOTS as u32 * TIMESTAMPS),
-                None,
-            )?;
-            let properties = gpu.instance.get_physical_device_properties(gpu.physical);
-            self.timer = Some(PassTimer {
-                pool,
-                period: properties.limits.timestamp_period,
-                stamped: Default::default(),
-                times: Vec::new(),
-            });
-        }
-        let timer = self.timer.as_mut().unwrap();
-        let first = slot as u32 * TIMESTAMPS;
-        let stamped = mem::take(&mut timer.stamped[slot]);
-        if !stamped.is_empty() {
-            let mut ticks = vec![0u64; stamped.len() + 1];
-            gpu.device.get_query_pool_results(
-                timer.pool,
-                first,
-                &mut ticks,
-                vk::QueryResultFlags::TYPE_64,
-            )?;
-            timer.times.clear();
-            for (name, pair) in stamped.iter().zip(ticks.windows(2)) {
-                let ms = pair[1].saturating_sub(pair[0]) as f32 * timer.period * 1e-6;
-                match timer.times.iter_mut().find(|(n, _)| n == name) {
-                    Some((_, total)) => *total += ms,
-                    None => timer.times.push((name, ms)),
-                }
-            }
-        }
-        gpu.device
-            .cmd_reset_query_pool(cmd, timer.pool, first, TIMESTAMPS);
-        gpu.device.cmd_write_timestamp2(
-            cmd,
-            vk::PipelineStageFlags2::ALL_COMMANDS,
-            timer.pool,
-            first,
-        );
-        Ok(())
     }
 
     /// Finish a capture whose frame the GPU is done with, then start any
@@ -1010,7 +934,10 @@ impl SplitRadianceCascades {
     unsafe fn record_frame(&mut self, gpu: &mut Gpu, frame: &FrameContext) -> Result<()> {
         let cmd = frame.cmd;
         let slot = (frame.frame_number & 1) as usize;
-        self.tend_timer(gpu, cmd, slot)?;
+        if self.timer.is_none() {
+            self.timer = Some(PassTimer::new(gpu)?);
+        }
+        self.timer.as_mut().unwrap().begin(gpu.device, cmd, slot)?;
         self.tend_capture(gpu, frame, slot)?;
         let device = gpu.device;
         let settings = self.settings;
@@ -1202,20 +1129,8 @@ impl SplitRadianceCascades {
         };
         let passes = std::cell::Cell::new(0usize);
         let limit = self.pass_limit.unwrap_or(usize::MAX);
-        let timer = std::cell::RefCell::new(self.timer.as_mut());
-        let stamp = |name: &'static str| {
-            if let Some(timer) = timer.borrow_mut().as_mut() {
-                let stamped = &mut timer.stamped[slot];
-                stamped.push(name);
-                debug_assert!((stamped.len() as u32) < TIMESTAMPS);
-                device.cmd_write_timestamp2(
-                    cmd,
-                    S::ALL_COMMANDS,
-                    timer.pool,
-                    slot as u32 * TIMESTAMPS + stamped.len() as u32,
-                );
-            }
-        };
+        let timer = std::cell::RefCell::new(self.timer.as_mut().unwrap());
+        let stamp = |name: &'static str| timer.borrow_mut().stamp(device, cmd, slot, name);
         let dispatch = |name: &'static str, set: vk::DescriptorSet, x: u32, y: u32| {
             passes.set(passes.get() + 1);
             if passes.get() > limit {
@@ -1376,8 +1291,11 @@ impl GiMethod for SplitRadianceCascades {
     }
 
     fn gpu_time(&self) -> Option<std::time::Duration> {
-        let total: f32 = self.pass_times().iter().map(|(_, ms)| ms).sum();
-        (total > 0.0).then(|| std::time::Duration::from_secs_f32(total * 1e-3))
+        self.timer.as_ref().and_then(PassTimer::total)
+    }
+
+    fn pass_times(&self) -> &[(&'static str, f32)] {
+        self.timer.as_ref().map_or(&[], |t| &t.times)
     }
 
     fn request_capture(&mut self) {
@@ -1517,7 +1435,7 @@ impl RenderExtension for SplitRadianceCascades {
                 Self::destroy_view(gpu.device, gpu.allocator, view);
             }
             if let Some(timer) = self.timer.take() {
-                gpu.device.destroy_query_pool(timer.pool, None);
+                timer.destroy(gpu.device);
             }
             if let Some(readback) = self.readback.take() {
                 gpu::destroy_buffer(gpu.device, gpu.allocator, readback.buffer);

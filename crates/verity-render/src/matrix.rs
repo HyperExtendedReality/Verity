@@ -28,19 +28,35 @@ const LIST_ONE_SIDED: usize = 0;
 const LIST_TWO_SIDED: usize = 1;
 const LIST_VOXELS: usize = 2;
 const LIST_IMPOSTER: usize = 3;
-const LIST_SHADOW: usize = 4;
-const LIST_SHADOW_VOXELS: usize = 5;
-const LISTS: usize = 6;
+const LIST_LAYERS: usize = 4;
+const SHADOW_LAYERS: usize = scene::CASCADES + scene::MAX_POINT_SHADOWS * scene::POINT_SHADOW_FACES;
+const LISTS: usize = LIST_LAYERS + SHADOW_LAYERS * 2;
 const QUEUE: u64 = 1 << 20;
 const CLUSTER_LIST: u32 = 1 << 19;
 const BRICK_LIST: u32 = 1 << 21;
+const CASCADE_CLUSTERS: u32 = 1 << 17;
+const CASCADE_BRICKS: u32 = 1 << 19;
+const FACE_CLUSTERS: u32 = 1 << 15;
+const FACE_BRICKS: u32 = 1 << 16;
 const PASS_WORDS: usize = LISTS * 4;
 /// Enough for 8^16 groups; the tree depth is checked at load.
 const MAX_PASSES: usize = 16;
 const COUNTER_WORDS: usize = PASS_WORDS + (MAX_PASSES + 1) * 4;
 
-/// Vertices per list entry: a padded cluster, a brick's faces, a card.
-const LIST_VERTICES: [u32; LISTS] = [128 * 3, 128 * 3, 36, 6, 128 * 3, 36];
+/// Vertices per entry of a padded cluster and of a brick's faces.
+const CLUSTER_VERTICES: u32 = 128 * 3;
+const BRICK_VERTICES: u32 = 36;
+const CARD_VERTICES: u32 = 6;
+
+fn list_vertices(list: usize) -> u32 {
+    match list {
+        LIST_ONE_SIDED | LIST_TWO_SIDED => CLUSTER_VERTICES,
+        LIST_VOXELS => BRICK_VERTICES,
+        LIST_IMPOSTER => CARD_VERTICES,
+        _ if list.is_multiple_of(2) => CLUSTER_VERTICES,
+        _ => BRICK_VERTICES,
+    }
+}
 
 /// Mirrors `lib/matrix.slang`.
 const IMPOSTER_GRID: u32 = 12;
@@ -52,10 +68,19 @@ const ALBEDO_FORMAT: vk::Format = vk::Format::R8G8B8A8_SRGB;
 const SURFACE_FORMAT: vk::Format = vk::Format::R8G8B8A8_UNORM;
 
 fn list_capacity(list: usize) -> u32 {
-    if list == LIST_VOXELS || list == LIST_SHADOW_VOXELS {
-        BRICK_LIST
-    } else {
-        CLUSTER_LIST
+    let bricks = list % 2 == 1;
+    match list {
+        LIST_VOXELS => BRICK_LIST,
+        _ if list < LIST_LAYERS => CLUSTER_LIST,
+        _ if (list - LIST_LAYERS) / 2 < scene::CASCADES => {
+            if bricks {
+                CASCADE_BRICKS
+            } else {
+                CASCADE_CLUSTERS
+            }
+        }
+        _ if bricks => FACE_BRICKS,
+        _ => FACE_CLUSTERS,
     }
 }
 
@@ -574,12 +599,13 @@ impl Matrix {
     pub(crate) fn read_stats(&mut self, frame: usize) {
         let words: &[u32] = bytemuck::cast_slice(self.readback[frame].read());
         let count = |list: usize| words[list * 4 + 1];
+        let layers = |first: usize| (first..LISTS).step_by(2).map(count).sum();
         self.stats = MatrixStats {
             clusters: count(LIST_ONE_SIDED) + count(LIST_TWO_SIDED),
             bricks: count(LIST_VOXELS),
             imposters: count(LIST_IMPOSTER),
-            shadow_clusters: count(LIST_SHADOW),
-            shadow_bricks: count(LIST_SHADOW_VOXELS),
+            shadow_clusters: layers(LIST_LAYERS),
+            shadow_bricks: layers(LIST_LAYERS + 1),
         };
     }
 
@@ -619,8 +645,8 @@ impl Matrix {
             A::TRANSFER_WRITE | A::SHADER_STORAGE_WRITE,
         );
         let mut reset = [0u32; COUNTER_WORDS];
-        for (list, vertices) in LIST_VERTICES.into_iter().enumerate() {
-            reset[list * 4] = vertices;
+        for list in 0..LISTS {
+            reset[list * 4] = list_vertices(list);
         }
         for pass in 0..=MAX_PASSES {
             let arguments = PASS_WORDS + pass * 4;
@@ -735,22 +761,9 @@ impl Matrix {
         if !self.active {
             return;
         }
-        self.draw_list(
-            device,
-            cmd,
-            layout,
-            self.clusters_shadow,
-            LIST_SHADOW,
-            layer,
-        );
-        self.draw_list(
-            device,
-            cmd,
-            layout,
-            self.voxels_shadow,
-            LIST_SHADOW_VOXELS,
-            layer,
-        );
+        let list = LIST_LAYERS + layer as usize * 2;
+        self.draw_list(device, cmd, layout, self.clusters_shadow, list, layer);
+        self.draw_list(device, cmd, layout, self.voxels_shadow, list + 1, layer);
     }
 }
 
@@ -1113,7 +1126,7 @@ impl Renderer {
                     0,
                     bytemuck::cast_slice(&[bake.instance, frame]),
                 );
-                device.cmd_draw(cmd, 128 * 3, bake.cluster_count, 0, 0);
+                device.cmd_draw(cmd, CLUSTER_VERTICES, bake.cluster_count, 0, 0);
             }
             device.cmd_end_rendering(cmd);
             for image in images {

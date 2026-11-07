@@ -304,11 +304,7 @@ float3 hitAlbedo(int hit, float3 x, float3 n) {
         }
         return terrain_albedo(x, n, height / 3.0, wet / 3.0, m.params.w);
     }
-    float3 base = m.base_color.rgb;
-    if (m.textures.x != NO_TEXTURE) {
-        base *= textures[NonUniformResourceIndex(m.textures.x)].SampleLevel(material_sampler, float2(0.5), 16.0).rgb;
-    }
-    return base * (1.0 - m.params.x);
+    return meanAlbedo(m);
 }
 
 // ---------------------------------------------------------------- radiance cache
@@ -795,4 +791,54 @@ void composite(uint3 id : SV_DispatchThreadID) {
     float4 shown = debugView(fp, p, gi, reflection);
     hdr[at] = shown.w > 0.5 ? float4(shown.rgb, lit.a) : result;
     colorOut.Store(at, result);
+}
+
+// Plain path tracing for `PxtgiDebug::Reference`: a running mean over frames in
+// the image the composite reads, through direct light at each bounce.
+static const int REFERENCE_PATHS = 16;
+static const int REFERENCE_BOUNCES = 8;
+
+[shader("compute")]
+[numthreads(8, 8, 1)]
+void reference(uint3 id : SV_DispatchThreadID) {
+    int2 px = int2(id.xy);
+    if (any(px >= traceSize())) return;
+    int2 fp = framePixel(px, traceSize());
+    float depth = loadDepth(fp);
+    uint4 g = loadGbuffer(fp);
+    if (!receives(depth, g)) {
+        out0.Store(px, 0.0);
+        return;
+    }
+    float3 start = worldFromPixel(float2(fp) + 0.5, depth);
+    float3 startNormal = gbufferNormal(g);
+    float3 light = 0.0;
+    uint seed = hashU(uint(px.x) + uint(px.y) * 4099u + uint(f.reflection.z) * 16777619u);
+    [loop] for (int path = 0; path < REFERENCE_PATHS; path++) {
+        float3 x = start + startNormal * 0.02;
+        float3 n = startNormal;
+        float3 weight = 1.0;
+        [loop] for (int bounce = 0; bounce < REFERENCE_BOUNCES; bounce++) {
+            seed = hashU(seed);
+            float u = float(seed >> 8u) / 16777216.0;
+            seed = hashU(seed);
+            float3 dir = cosineDir(n, u, 6.2831853 * float(seed >> 8u) / 16777216.0);
+            float t = f.sky.w;
+            float3 hitNormal;
+            int hit = walkWorld(x, dir, t, hitNormal, false);
+            if (hit < 0) {
+                light += weight * background(dir);
+                break;
+            }
+            float3 at = x + dir * t;
+            n = dot(hitNormal, dir) > 0.0 ? -hitNormal : hitNormal;
+            weight *= hitAlbedo(hit, at, n);
+            light += weight * directLight(at, n);
+            x = at + n * 0.02;
+        }
+    }
+    float4 now = float4(light / float(REFERENCE_PATHS), 1.0);
+    if (bad(now)) now = float4(0.0, 0.0, 0.0, 1.0);
+    float frames = f.reflection.z;
+    out0.Store(px, frames < 0.5 ? now : lerp(giLight.Load(int3(px, 0)), now, 1.0 / (frames + 1.0)));
 }

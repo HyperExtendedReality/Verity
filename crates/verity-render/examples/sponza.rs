@@ -4,6 +4,7 @@
 //! `cargo run --release -p verity-render --example sponza [max texture size]`
 //!
 //! `--matrix` draws through Matrix; `--matrix-debug` also colors by tier.
+//! `--uncapped` ignores vsync, for timing.
 use glam::Vec3;
 use std::{
     error::Error,
@@ -54,6 +55,7 @@ impl Viewer {
         let debug = args.iter().any(|a| a == "--matrix-debug");
         renderer.set_matrix_enabled(debug || args.iter().any(|a| a == "--matrix"));
         renderer.set_matrix_debug(debug);
+        renderer.set_uncapped(args.iter().any(|a| a == "--uncapped"));
         // Until GI: a blue sky above, warm stone bouncing up from below.
         renderer.set_ambient(Vec3::new(0.25, 0.3, 0.4), Vec3::new(0.12, 0.1, 0.08));
         renderer.set_sun(Some(Sun {
@@ -133,10 +135,11 @@ impl ApplicationHandler for Viewer {
                 self.frames.0 += 1;
                 let elapsed = self.frames.1.elapsed();
                 if elapsed >= Duration::from_secs(5) {
-                    // FIFO present: this is capped at the display's refresh rate.
+                    // Without `--uncapped` this is capped at the display's refresh rate.
                     println!(
-                        "{:.2} ms/frame",
-                        elapsed.as_secs_f64() * 1000.0 / self.frames.0 as f64
+                        "{:.2} ms/frame {:?}",
+                        elapsed.as_secs_f64() * 1000.0 / self.frames.0 as f64,
+                        renderer.matrix_stats()
                     );
                     self.frames = (0, Instant::now());
                 }
