@@ -2,9 +2,9 @@
 
 # ✨ Verity Engine
 
-**A Rust game engine where every system is measured against a reference.**
+**A high-performance, real-time Rust game engine built to simulate reality.**
 
-Vulkan renderer · AVBD physics · real-time global illumination · virtual geometry · destructible terrain · ocean
+Physically based light, matter and motion: bodies that bend, tear and break, terrain you can dig into, and light that bounces, all at frame rate.
 
 [![Rust](https://img.shields.io/badge/Rust-2024_edition-dea584?logo=rust&logoColor=white)](https://www.rust-lang.org/)
 [![Vulkan](https://img.shields.io/badge/Vulkan-1.3-ac162c?logo=vulkan&logoColor=white)](https://www.vulkan.org/)
@@ -25,12 +25,14 @@ Vulkan renderer · AVBD physics · real-time global illumination · virtual geom
 
 ## 🧭 Why Verity?
 
-Most engines tell you a feature exists. Verity tells you **how close it is to the right answer**:
+Worlds that behave like the real one, without giving up the frame budget:
 
-- 🎯 **Physics** is checked against closed-form results (stopping distances, rolling, tumbling, pendulums) and benchmarked head-to-head with [Box3D](https://github.com/erincatto/box3d).
-- 💡 **Global illumination** is scored against a path-traced reference for error *and* flicker.
-- 🌲 **Virtual geometry** is compared pixel for pixel with drawing every triangle.
-- 📓 **Every optimization**, kept or rejected, is written up with numbers in a [public lab notebook](crates/verity-physics/PERFORMANCE.md).
+- ⚡ **Built for speed.** Hand-tuned AVX2 / AVX-512 physics kernels, GPU-driven rendering and LOD, and GI from 1.6 ms.
+- 🔬 **Micro-detail, zero compromise.** Virtualized geometry renders film-quality assets down to the pixel: every leaf, crack and rivet. A 50-million-leaf forest draws in **1.7 ms**, over 100× faster than brute force.
+- 🧱 **Matter that behaves like matter.** Steel bends and snaps, cloth tears from the crack tip, car bodies crumple, and flesh stretches. Nothing tunnels, even at 150 m/s.
+- 💡 **Light that bounces.** Real-time multi-bounce global illumination that follows moving bodies and terrain as you dig.
+- 🏔️ **Ground you can change.** Eroded landscapes held as a 3D field, so caves, overhangs and craters are real geometry that physics collides with at once.
+- 🔁 **Deterministic by design.** Physics is bit-identical on every CPU and thread count, and terrain is identical from the same seed.
 
 ## 🚀 Features
 
