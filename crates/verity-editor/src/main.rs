@@ -649,6 +649,40 @@ impl Editor {
         }
     }
 
+    fn copy(&self) {
+        if let Selection::Entity(index) = self.selected
+            && let Some(entity) = self.scene.entities.get(index)
+        {
+            let result = serde_json::to_string(entity)
+                .map_err(|e| e.to_string())
+                .and_then(|text| {
+                    arboard::Clipboard::new()
+                        .and_then(|mut c| c.set_text(text))
+                        .map_err(|e| e.to_string())
+                });
+            if let Err(error) = result {
+                Self::error(format!("Cannot copy entity: {error}"));
+            }
+        }
+    }
+
+    fn paste(&mut self) {
+        let result = arboard::Clipboard::new()
+            .and_then(|mut c| c.get_text())
+            .map_err(|e| e.to_string())
+            .and_then(|text| serde_json::from_str::<Entity>(&text).map_err(|e| e.to_string()));
+        match result {
+            Ok(mut entity) => {
+                entity.name.push_str(" copy");
+                entity.transform.translation[0] += 1.0;
+                self.scene.entities.push(entity);
+                self.selected = Selection::Entity(self.scene.entities.len() - 1);
+                self.changed();
+            }
+            Err(error) => Self::error(format!("Cannot paste entity: {error}")),
+        }
+    }
+
     fn key(&mut self, key: &Key) {
         let ctrl = self.modifiers.control_key() || self.modifiers.super_key();
         let character = |c: &str| matches!(key, Key::Character(k) if k.eq_ignore_ascii_case(c));
@@ -677,40 +711,9 @@ impl Editor {
                     "z" if self.modifiers.shift_key() => self.travel(true),
                     "z" => self.travel(false),
                     "y" => self.travel(true),
-                    "c" => {
-                        if let Selection::Entity(index) = self.selected
-                            && let Some(entity) = self.scene.entities.get(index)
-                        {
-                            let result = serde_json::to_string(entity)
-                                .map_err(|e| e.to_string())
-                                .and_then(|text| {
-                                    arboard::Clipboard::new()
-                                        .and_then(|mut c| c.set_text(text))
-                                        .map_err(|e| e.to_string())
-                                });
-                            if let Err(error) = result {
-                                Self::error(format!("Cannot copy entity: {error}"));
-                            }
-                        }
-                    }
-                    "v" => {
-                        let result = arboard::Clipboard::new()
-                            .and_then(|mut c| c.get_text())
-                            .map_err(|e| e.to_string())
-                            .and_then(|text| {
-                                serde_json::from_str::<Entity>(&text).map_err(|e| e.to_string())
-                            });
-                        match result {
-                            Ok(mut entity) => {
-                                entity.name.push_str(" copy");
-                                entity.transform.translation[0] += 1.0;
-                                self.scene.entities.push(entity);
-                                self.selected = Selection::Entity(self.scene.entities.len() - 1);
-                                self.changed();
-                            }
-                            Err(error) => Self::error(format!("Cannot paste entity: {error}")),
-                        }
-                    }
+                    "c" => self.copy(),
+                    "v" => self.paste(),
+                    "d" if ui::duplicate(&mut self.scene, &mut self.selected) => self.changed(),
                     _ => {}
                 }
             }
@@ -1007,6 +1010,8 @@ impl Editor {
             Some(Action::Open) => self.open(),
             Some(Action::Save) => self.save(false),
             Some(Action::SaveAs) => self.save(true),
+            Some(Action::Copy) => self.copy(),
+            Some(Action::Paste) => self.paste(),
             None => {}
         }
         if let Some(index) = response.asset_remove {

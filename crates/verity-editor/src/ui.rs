@@ -34,6 +34,8 @@ pub enum Action {
     Stop,
     Undo,
     Redo,
+    Copy,
+    Paste,
 }
 
 /// Whether the scene is being edited or simulated.
@@ -111,6 +113,8 @@ pub struct Tools {
     /// Whether the editor has steps to undo and redo.
     pub can_undo: bool,
     pub can_redo: bool,
+    /// The hierarchy's search text.
+    pub filter: String,
 }
 
 impl Default for Tools {
@@ -139,24 +143,26 @@ impl Default for Tools {
             play: PlayState::Editing,
             can_undo: false,
             can_redo: false,
+            filter: String::new(),
         }
     }
 }
 
-// Neutral dark grays; hacker green for focus, synthwave neons for kinds of thing.
-pub(crate) const BACKGROUND: Color32 = Color32::from_rgb(22, 22, 22);
-pub(crate) const PANEL: Color32 = Color32::from_rgb(31, 32, 34);
+// Cyberpunk: blue-black chrome, hacker green for focus, magenta and cyan neons
+// for kinds of thing.
+pub(crate) const BACKGROUND: Color32 = Color32::from_rgb(7, 8, 13);
+pub(crate) const PANEL: Color32 = Color32::from_rgb(12, 14, 22);
 pub(crate) const BAR: Color32 = BACKGROUND;
-pub(crate) const SURFACE: Color32 = Color32::from_rgb(42, 43, 46);
-pub(crate) const HOVER: Color32 = Color32::from_rgb(52, 54, 58);
-pub(crate) const BORDER: Color32 = Color32::from_rgb(46, 48, 52);
-pub(crate) const TEXT: Color32 = Color32::from_rgb(228, 231, 233);
-pub(crate) const MUTED: Color32 = Color32::from_rgb(138, 144, 150);
+pub(crate) const SURFACE: Color32 = Color32::from_rgb(20, 24, 37);
+pub(crate) const HOVER: Color32 = Color32::from_rgb(30, 36, 56);
+pub(crate) const BORDER: Color32 = Color32::from_rgb(34, 42, 66);
+pub(crate) const TEXT: Color32 = Color32::from_rgb(218, 238, 244);
+pub(crate) const MUTED: Color32 = Color32::from_rgb(112, 132, 158);
 pub(crate) const ACCENT: Color32 = Color32::from_rgb(57, 255, 136);
-pub(crate) const ACCENT_DARK: Color32 = Color32::from_rgb(22, 56, 38);
-pub(crate) const PINK: Color32 = Color32::from_rgb(255, 61, 172);
-pub(crate) const CYAN: Color32 = Color32::from_rgb(38, 214, 255);
-pub(crate) const AMBER: Color32 = Color32::from_rgb(255, 196, 64);
+pub(crate) const ACCENT_DARK: Color32 = Color32::from_rgb(10, 50, 36);
+pub(crate) const PINK: Color32 = Color32::from_rgb(255, 46, 200);
+pub(crate) const CYAN: Color32 = Color32::from_rgb(0, 234, 255);
+pub(crate) const AMBER: Color32 = Color32::from_rgb(255, 204, 0);
 const RADIUS: u8 = 10;
 const CLOSE_HOVER: Color32 = Color32::from_rgb(214, 38, 90);
 const TITLE_HEIGHT: f32 = 36.0;
@@ -170,6 +176,17 @@ fn panel_frame(color: Color32) -> Frame {
         .corner_radius(RADIUS)
         .inner_margin(Margin::symmetric(12, 10))
         .outer_margin(Margin::same(4))
+        .shadow(glow(CYAN, 0.10))
+}
+
+/// A soft neon halo around a frame.
+fn glow(color: Color32, strength: f32) -> egui::Shadow {
+    egui::Shadow {
+        offset: [0, 0],
+        blur: 14,
+        spread: 0,
+        color: color.gamma_multiply(strength),
+    }
 }
 
 /// The pink-to-cyan-to-green synthwave rule under the title bar.
@@ -222,19 +239,32 @@ fn round_corners(painter: &egui::Painter, rect: Rect, radius: f32) {
 
 fn section(ui: &mut egui::Ui, title: &str) {
     ui.add_space(10.0);
-    ui.label(RichText::new(title).size(10.0).strong().color(MUTED));
+    ui.label(
+        RichText::new(format!("// {title}"))
+            .monospace()
+            .size(10.0)
+            .color(CYAN.gamma_multiply(0.75)),
+    );
     ui.add_space(4.0);
 }
 
 fn panel_heading(ui: &mut egui::Ui, title: &str, detail: &str) {
     ui.horizontal(|ui| {
-        ui.label(RichText::new(title).size(12.5).strong().color(TEXT));
+        ui.label(
+            RichText::new(title.to_uppercase())
+                .monospace()
+                .size(12.0)
+                .strong()
+                .color(TEXT),
+        );
         ui.label(RichText::new(detail).size(10.5).color(MUTED));
     });
     ui.add_space(6.0);
     let rect = ui.available_rect_before_wrap();
-    ui.painter()
-        .hline(rect.x_range(), rect.top(), Stroke::new(1.0, BORDER));
+    neon_rule(
+        ui.painter(),
+        Rect::from_min_size(rect.min, egui::vec2(rect.width(), 1.0)),
+    );
     ui.add_space(2.0);
 }
 
@@ -253,12 +283,25 @@ fn brand_mark(ui: &mut egui::Ui) {
     );
 }
 
-fn hierarchy_row(ui: &mut egui::Ui, name: &str, selected: bool, light: bool) -> bool {
+#[derive(Clone, Copy, PartialEq)]
+enum Icon {
+    Entity,
+    Light,
+    Camera,
+}
+
+fn hierarchy_row(ui: &mut egui::Ui, name: &str, selected: bool, kind: Icon) -> egui::Response {
     let (rect, response) =
         ui.allocate_exact_size(egui::vec2(ui.available_width(), 26.0), Sense::click());
     let painter = ui.painter();
     if selected {
         painter.rect_filled(rect, 6, ACCENT_DARK);
+        painter.rect_stroke(
+            rect,
+            6,
+            Stroke::new(1.0, ACCENT.gamma_multiply(0.35)),
+            egui::StrokeKind::Inside,
+        );
         painter.rect_filled(
             Rect::from_min_size(rect.min, egui::vec2(2.0, rect.height())),
             1,
@@ -268,13 +311,25 @@ fn hierarchy_row(ui: &mut egui::Ui, name: &str, selected: bool, light: bool) -> 
         painter.rect_filled(rect, 6, HOVER);
     }
     let icon = rect.left_center() + egui::vec2(14.0, 0.0);
-    let color = if light { PINK } else { CYAN };
-    if light {
-        painter.circle_stroke(icon, 4.0, Stroke::new(1.2, color));
-        painter.circle_filled(icon, 1.3, color);
-    } else {
-        let cube = Rect::from_center_size(icon, egui::vec2(8.0, 8.0));
-        painter.rect_stroke(cube, 1, Stroke::new(1.2, color), egui::StrokeKind::Inside);
+    match kind {
+        Icon::Light => {
+            painter.circle_stroke(icon, 4.0, Stroke::new(1.2, PINK));
+            painter.circle_filled(icon, 1.3, PINK);
+        }
+        Icon::Entity => {
+            let cube = Rect::from_center_size(icon, egui::vec2(8.0, 8.0));
+            painter.rect_stroke(cube, 1, Stroke::new(1.2, CYAN), egui::StrokeKind::Inside);
+        }
+        Icon::Camera => {
+            let body = Rect::from_center_size(icon - egui::vec2(1.5, 0.0), egui::vec2(7.0, 6.0));
+            painter.rect_stroke(body, 1, Stroke::new(1.2, AMBER), egui::StrokeKind::Inside);
+            let lens = vec![
+                icon + egui::vec2(2.0, 0.0),
+                icon + egui::vec2(5.0, -3.0),
+                icon + egui::vec2(5.0, 3.0),
+            ];
+            painter.add(egui::Shape::closed_line(lens, Stroke::new(1.2, AMBER)));
+        }
     }
     let galley = painter.layout_no_wrap(
         name.to_owned(),
@@ -294,10 +349,19 @@ fn hierarchy_row(ui: &mut egui::Ui, name: &str, selected: bool, light: bool) -> 
         galley,
         TEXT,
     );
-    response.clicked()
+    response
 }
 
 fn vector<const N: usize>(ui: &mut egui::Ui, label: &str, values: &mut [f32; N]) -> bool {
+    vector_speed(ui, label, values, 0.02)
+}
+
+fn vector_speed<const N: usize>(
+    ui: &mut egui::Ui,
+    label: &str,
+    values: &mut [f32; N],
+    speed: f32,
+) -> bool {
     let mut changed = false;
     ui.label(RichText::new(label).size(11.5).color(MUTED));
     ui.horizontal(|ui| {
@@ -316,7 +380,8 @@ fn vector<const N: usize>(ui: &mut egui::Ui, label: &str, values: &mut [f32; N])
             let field = ui.add_sized(
                 [width, 22.0],
                 DragValue::new(value)
-                    .speed(0.02)
+                    .speed(speed)
+                    .max_decimals(3)
                     .prefix(format!("{prefix}  ")),
             );
             ui.painter().vline(
@@ -809,10 +874,18 @@ pub fn show(
     }
     visuals.widgets.noninteractive.bg_stroke = Stroke::new(1.0, BORDER);
     visuals.widgets.inactive.bg_stroke = Stroke::NONE;
-    visuals.widgets.hovered.bg_stroke = Stroke::new(1.0, Color32::from_gray(80));
+    visuals.widgets.hovered.bg_stroke = Stroke::new(1.0, CYAN.gamma_multiply(0.6));
     visuals.widgets.active.bg_stroke = Stroke::new(1.0, ACCENT);
+    visuals.widgets.open.bg_stroke = Stroke::new(1.0, CYAN.gamma_multiply(0.6));
     visuals.selection.bg_fill = ACCENT_DARK;
     visuals.selection.stroke = Stroke::new(1.0, ACCENT);
+    visuals.text_cursor.stroke = Stroke::new(2.0, ACCENT);
+    visuals.hyperlink_color = CYAN;
+    visuals.warn_fg_color = AMBER;
+    visuals.error_fg_color = PINK;
+    visuals.window_stroke = Stroke::new(1.0, CYAN.gamma_multiply(0.35));
+    visuals.window_shadow = glow(CYAN, 0.25);
+    visuals.popup_shadow = glow(PINK, 0.25);
     ui.style_mut().visuals = visuals;
     ui.spacing_mut().item_spacing = egui::vec2(6.0, 5.0);
     ui.spacing_mut().button_padding = egui::vec2(8.0, 4.0);
@@ -862,8 +935,11 @@ pub fn show(
         }
     }
 
-    // Q W E R pick tools, like other engine editors.
+    // Q W E R pick tools and F frames the selection, like other engine editors.
     if !tools.flying && !ui.ctx().egui_wants_keyboard_input() {
+        if ui.input(|i| i.key_pressed(egui::Key::F) && !i.modifiers.any()) {
+            focus(scene, *selected, tools);
+        }
         for (key, mode) in [
             (egui::Key::Q, Mode::Select),
             (egui::Key::W, Mode::Translate),
@@ -938,19 +1014,42 @@ pub fn show(
                                     }
                                 }
                                 ui.separator();
-                                ui.add_enabled(
-                                    false,
-                                    egui::Button::new("Copy entity").shortcut_text("Ctrl+C"),
-                                );
-                                ui.add_enabled(
-                                    false,
-                                    egui::Button::new("Paste entity").shortcut_text("Ctrl+V"),
-                                );
-                                ui.label(
-                                    RichText::new("Use the shortcuts in the viewport")
-                                        .size(10.5)
-                                        .color(MUTED),
-                                );
+                                let entity = matches!(*selected, Selection::Entity(_));
+                                for (enabled, label, shortcut, choice) in [
+                                    (entity, "Copy entity", "Ctrl+C", Action::Copy),
+                                    (true, "Paste entity", "Ctrl+V", Action::Paste),
+                                ] {
+                                    if ui
+                                        .add_enabled(
+                                            editing && enabled,
+                                            egui::Button::new(label).shortcut_text(shortcut),
+                                        )
+                                        .clicked()
+                                    {
+                                        action = Some(choice);
+                                        ui.close();
+                                    }
+                                }
+                                if ui
+                                    .add_enabled(
+                                        editing && entity,
+                                        egui::Button::new("Duplicate").shortcut_text("Ctrl+D"),
+                                    )
+                                    .clicked()
+                                {
+                                    changed |= duplicate(scene, selected);
+                                    ui.close();
+                                }
+                                if ui
+                                    .add_enabled(
+                                        *selected != Selection::None,
+                                        egui::Button::new("Frame selected").shortcut_text("F"),
+                                    )
+                                    .clicked()
+                                {
+                                    focus(scene, *selected, tools);
+                                    ui.close();
+                                }
                             }
                             _ => {
                                 if tools.play != PlayState::Editing {
@@ -1007,12 +1106,12 @@ pub fn show(
                 } else if drag.drag_started() {
                     window = Some(WindowCommand::Drag);
                 }
-                let title = format!("{filename}{}", if dirty { "  •" } else { "" });
+                let title = format!("VERITY // {filename}{}", if dirty { " *" } else { "" });
                 ui.painter().text(
                     free.center(),
                     egui::Align2::CENTER_CENTER,
                     title,
-                    egui::FontId::proportional(12.5),
+                    egui::FontId::monospace(12.0),
                     if dirty { TEXT } else { MUTED },
                 );
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -1143,12 +1242,21 @@ pub fn show(
         )
         .show(ui, |ui| {
             ui.horizontal_centered(|ui| {
+                ui.style_mut().override_font_id = Some(egui::FontId::monospace(10.5));
+                let playing = tools.play != PlayState::Editing;
+                let state = if playing {
+                    PINK
+                } else if dirty {
+                    AMBER
+                } else {
+                    ACCENT
+                };
                 let (dot, _) = ui.allocate_exact_size(egui::vec2(8.0, 8.0), Sense::hover());
-                ui.painter()
-                    .circle_filled(dot.center(), 3.0, if dirty { PINK } else { ACCENT });
+                ui.painter().circle_filled(dot.center(), 5.0, state.gamma_multiply(0.25));
+                ui.painter().circle_filled(dot.center(), 3.0, state);
                 ui.label(
-                    RichText::new(if tools.play != PlayState::Editing {
-                        "Playing · changes are discarded on Stop"
+                    RichText::new(if playing {
+                        "PLAYING · changes are discarded on Stop"
                     } else if dirty {
                         "Unsaved changes"
                     } else if path.is_none() {
@@ -1156,8 +1264,7 @@ pub fn show(
                     } else {
                         "Saved"
                     })
-                    .size(11.0)
-                    .color(MUTED),
+                    .color(if playing { PINK } else { MUTED }),
                 );
                 ui.label(RichText::new("·").color(MUTED));
                 ui.label(
@@ -1184,6 +1291,7 @@ pub fn show(
             });
         });
 
+    let mut delete = false;
     egui::Panel::left("editor_hierarchy")
         .resizable(true)
         .default_size(250.0)
@@ -1199,20 +1307,40 @@ pub fn show(
                     scene.entities.len() + scene.lights.len() + scene.cameras.len()
                 ),
             );
+            ui.add(
+                egui::TextEdit::singleline(&mut tools.filter)
+                    .hint_text("🔍 Search…")
+                    .desired_width(f32::INFINITY),
+            );
+            let filter = tools.filter.to_lowercase();
+            let shown = |name: &str| name.to_lowercase().contains(&filter);
+            let editing = tools.play == PlayState::Editing;
+            let mut pending = None;
+            let mut menu = |row: egui::Response, item: Selection| {
+                if row.clicked() || row.secondary_clicked() {
+                    pending = Some((item, None));
+                }
+                if let Some(chosen) = row_menu(&row, item, editing) {
+                    pending = Some((item, Some(chosen)));
+                }
+            };
             egui::ScrollArea::vertical().show(ui, |ui| {
                 section(ui, "ENTITIES");
                 if scene.entities.is_empty() {
                     ui.label(RichText::new("No entities").color(MUTED).italics());
                 }
-                for (index, entity) in scene.entities.iter().enumerate() {
+                for index in 0..scene.entities.len() {
+                    let entity = &scene.entities[index];
                     let name = if entity.name.is_empty() {
-                        "Unnamed entity"
+                        "Unnamed entity".to_owned()
                     } else {
-                        &entity.name
+                        entity.name.clone()
                     };
-                    if hierarchy_row(ui, name, *selected == Selection::Entity(index), false) {
-                        *selected = Selection::Entity(index);
+                    if !shown(&name) {
+                        continue;
                     }
+                    let item = Selection::Entity(index);
+                    menu(hierarchy_row(ui, &name, *selected == item, Icon::Entity), item);
                 }
                 section(ui, "IMPORTED MODELS");
                 if scene.assets.is_empty() {
@@ -1257,33 +1385,39 @@ pub fn show(
                     } else {
                         &camera.name
                     };
-                    if hierarchy_row(ui, name, *selected == Selection::Camera(index), false) {
-                        *selected = Selection::Camera(index);
+                    if shown(name) {
+                        let item = Selection::Camera(index);
+                        menu(hierarchy_row(ui, name, *selected == item, Icon::Camera), item);
                     }
                 }
                 section(ui, "SCENE & LIGHTING");
-                if hierarchy_row(
-                    ui,
-                    "Environment & Physics",
-                    *selected == Selection::Lighting,
-                    true,
-                ) {
-                    *selected = Selection::Lighting;
-                }
-                if hierarchy_row(ui, "Sun", *selected == Selection::Sun, true) {
-                    *selected = Selection::Sun;
+                for (name, item) in [
+                    ("Environment & Physics", Selection::Lighting),
+                    ("Sun", Selection::Sun),
+                ] {
+                    if shown(name)
+                        && hierarchy_row(ui, name, *selected == item, Icon::Light).clicked()
+                    {
+                        *selected = item;
+                    }
                 }
                 for index in 0..scene.lights.len() {
-                    if hierarchy_row(
-                        ui,
-                        &format!("Point light {}", index + 1),
-                        *selected == Selection::Light(index),
-                        true,
-                    ) {
-                        *selected = Selection::Light(index);
+                    let name = format!("Point light {}", index + 1);
+                    if shown(&name) {
+                        let item = Selection::Light(index);
+                        menu(hierarchy_row(ui, &name, *selected == item, Icon::Light), item);
                     }
                 }
             });
+            if let Some((item, chosen)) = pending {
+                *selected = item;
+                match chosen {
+                    Some(RowAction::Frame) => focus(scene, item, tools),
+                    Some(RowAction::Duplicate) => changed |= duplicate(scene, selected),
+                    Some(RowAction::Delete) => delete = true,
+                    None => {}
+                }
+            }
         });
 
     egui::Panel::right("editor_inspector")
@@ -1297,7 +1431,7 @@ pub fn show(
             if tools.play != PlayState::Editing {
                 ui.disable();
             }
-            let mut delete = false;
+
             egui::ScrollArea::vertical().show(ui, |ui| match *selected {
                 Selection::Entity(index) => {
                     let names: Vec<_> = (scene.entities.iter().enumerate())
@@ -1321,7 +1455,7 @@ pub fn show(
                     }
                     section(ui, "TRANSFORM");
                     changed |= vector(ui, "Position", &mut entity.transform.translation);
-                    changed |= vector(ui, "Rotation · quaternion", &mut entity.transform.rotation);
+                    changed |= euler(ui, &mut entity.transform.rotation);
                     changed |= vector(ui, "Scale", &mut entity.transform.scale);
                     changed |= components(
                         ui,
@@ -1347,7 +1481,7 @@ pub fn show(
                         0.01,
                     );
                     ui.add_space(14.0);
-                    delete = ui.button("Delete entity").clicked();
+                    delete |= ui.button(RichText::new("Delete entity").color(PINK)).clicked();
                 }
                 Selection::Light(index) => {
                     let light = &mut scene.lights[index];
@@ -1358,7 +1492,7 @@ pub fn show(
                     changed |= scalar(ui, "Intensity", &mut light.intensity, 0.0..=f32::MAX, 0.1);
                     changed |= scalar(ui, "Radius", &mut light.radius, 0.0..=f32::MAX, 0.1);
                     ui.add_space(14.0);
-                    delete = ui.button("Delete light").clicked();
+                    delete |= ui.button(RichText::new("Delete light").color(PINK)).clicked();
                 }
                 Selection::Camera(index) => {
                     let camera = &mut scene.cameras[index];
@@ -1398,7 +1532,7 @@ pub fn show(
                         }
                     });
                     ui.add_space(14.0);
-                    delete = ui.button("Delete camera").clicked();
+                    delete |= ui.button(RichText::new("Delete camera").color(PINK)).clicked();
                 }
                 Selection::Sun => {
                     section(ui, "SUN · DIRECTIONAL LIGHT");
@@ -1540,6 +1674,30 @@ pub fn show(
         .show(ui, |ui| {
             viewport = ui.available_rect_before_wrap();
             round_corners(&ui.painter_at(viewport), viewport, RADIUS as f32);
+            // A neon frame while simulating, so play mode is never mistaken for editing.
+            if tools.play != PlayState::Editing {
+                let painter = ui.painter_at(viewport);
+                for (width, alpha) in [(6.0, 0.12), (3.0, 0.3), (1.5, 1.0)] {
+                    painter.rect_stroke(
+                        viewport,
+                        RADIUS,
+                        Stroke::new(width, PINK.gamma_multiply(alpha)),
+                        egui::StrokeKind::Inside,
+                    );
+                }
+                let label = if tools.play == PlayState::Paused {
+                    "❚❚ PAUSED"
+                } else {
+                    "▶ PLAYING"
+                };
+                painter.text(
+                    viewport.center_top() + egui::vec2(0.0, 16.0),
+                    egui::Align2::CENTER_CENTER,
+                    label,
+                    egui::FontId::monospace(11.0),
+                    PINK,
+                );
+            }
             navigate(ui, viewport, tools);
             orientation(ui, viewport, &tools.fly);
             tools.profiler.badge(ui, viewport);
@@ -1584,6 +1742,85 @@ pub fn show(
         changed,
         viewport,
     }
+}
+
+#[derive(Clone, Copy)]
+enum RowAction {
+    Frame,
+    Duplicate,
+    Delete,
+}
+
+/// A hierarchy row's right-click menu.
+fn row_menu(row: &egui::Response, item: Selection, editing: bool) -> Option<RowAction> {
+    let mut chosen = None;
+    row.context_menu(|ui| {
+        for (action, label, shortcut, enabled) in [
+            (RowAction::Frame, "Frame", "F", true),
+            (
+                RowAction::Duplicate,
+                "Duplicate",
+                "Ctrl+D",
+                editing && matches!(item, Selection::Entity(_)),
+            ),
+            (RowAction::Delete, "Delete", "Del", editing),
+        ] {
+            let button = egui::Button::new(label).shortcut_text(shortcut);
+            if ui.add_enabled(enabled, button).clicked() {
+                chosen = Some(action);
+                ui.close();
+            }
+        }
+    });
+    chosen
+}
+
+/// Rotation as XYZ Euler degrees, like other engine editors; stored as a quaternion.
+fn euler(ui: &mut egui::Ui, rotation: &mut [f32; 4]) -> bool {
+    let quat = glam::Vec4::from_array(*rotation)
+        .try_normalize()
+        .map_or(glam::Quat::IDENTITY, glam::Quat::from_vec4);
+    let (x, y, z) = quat.to_euler(glam::EulerRot::XYZ);
+    // + 0.0 turns -0 into 0 so the fields do not read "-0.0".
+    let mut degrees = [x, y, z].map(|r| r.to_degrees() + 0.0);
+    let changed = vector_speed(ui, "Rotation °", &mut degrees, 0.5);
+    if changed {
+        let [x, y, z] = degrees.map(f32::to_radians);
+        *rotation = glam::Quat::from_euler(glam::EulerRot::XYZ, x, y, z).to_array();
+    }
+    changed
+}
+
+/// Move the view to look at the selection along the current view direction.
+fn focus(scene: &Scene, selected: Selection, tools: &mut Tools) {
+    let target = match selected {
+        Selection::Entity(i) => scene.entities.get(i).map(|e| {
+            let size = Vec3::from(e.transform.scale).abs().max_element();
+            (Vec3::from(e.transform.translation), size)
+        }),
+        Selection::Light(i) => scene.lights.get(i).map(|l| (Vec3::from(l.position), 1.0)),
+        Selection::Camera(i) => scene.cameras.get(i).map(|c| (Vec3::from(c.position), 1.0)),
+        _ => None,
+    };
+    if let Some((center, size)) = target {
+        tools.camera.eye = center - tools.fly.forward() * (size * 2.5 + 1.5);
+        tools.camera.target = center;
+    }
+}
+
+/// Copy the selected entity beside itself and select the copy.
+pub(crate) fn duplicate(scene: &mut Scene, selected: &mut Selection) -> bool {
+    let Selection::Entity(index) = *selected else {
+        return false;
+    };
+    let Some(mut copy) = scene.entities.get(index).cloned() else {
+        return false;
+    };
+    copy.name.push_str(" copy");
+    copy.transform.translation[0] += 1.0;
+    scene.entities.push(copy);
+    *selected = Selection::Entity(scene.entities.len() - 1);
+    true
 }
 
 fn add_cube(scene: &mut Scene, selected: &mut Selection) {
@@ -1660,6 +1897,21 @@ mod tests {
             egui::Shape::Vec(shapes) => shapes.iter().find_map(|s| text_position(s, label)),
             _ => None,
         }
+    }
+
+    #[test]
+    fn duplicate_selects_an_offset_copy_of_entities_only() {
+        let mut scene = Scene::default();
+        add_cube(&mut scene, &mut Selection::None);
+        let last = scene.entities.len() - 1;
+        let mut selected = Selection::Entity(last);
+        assert!(duplicate(&mut scene, &mut selected));
+        assert_eq!(selected, Selection::Entity(last + 1));
+        let (a, b) = (&scene.entities[last], &scene.entities[last + 1]);
+        assert_eq!(b.name, format!("{} copy", a.name));
+        assert_eq!(b.transform.translation[0], a.transform.translation[0] + 1.0);
+        assert!(!duplicate(&mut scene, &mut Selection::Sun));
+        assert_eq!(scene.entities.len(), last + 2);
     }
 
     #[test]
