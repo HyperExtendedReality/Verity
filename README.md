@@ -114,25 +114,29 @@ the CPU records a fixed number of indirect draws however large the scene:
 - **Imposters.** `Renderer::place_copies` plants copies of a model. An aggregate
   placed this way gets a 12x12 hemi-octahedral atlas of color, normal and depth,
   baked on the GPU, and below 64 pixels across each copy is one card blending three
-  frames with parallax. The atlas stores a mean normal, so lighting uses the average
+  frames with parallax. Between 80 and 64 pixels geometry dissolves into the card
+  through a stable dither, each tier taking complementary pixels. The atlas stores a mean normal, so lighting uses the average
   a spread of facets would give (`Surface::agreement`) rather than a cosine of the
   mean.
 
 All tiers write the same visibility buffer, with the tier in the top bits of the
 ID, so resolve, shadows and the G-buffer treat them alike. Shadows use the same
-selection, except that a copy drawn as an imposter casts its coarsest cut.
+selection, except that a copy drawn as an imposter casts its coarsest cut, and each
+cascade and point-light face draws only the clusters that reach it.
 
 `cargo run --release -p verity-render --example forest -- --debug` shows the tiers.
 On an RTX 4070 Laptop at 1600x900, 2500 trees of 20000 leaves take 1.7 ms against
-209 ms drawing every triangle, and New Sponza 20 ms against 63 ms, within 0.3/255
+209 ms drawing every triangle, and New Sponza 8 ms against 63 ms, within 0.3/255
 of the exact image.
 
-Limits: geometry is static and fully resident, with no streaming or wind. Cooking
-runs at load and is not cached: about 29 s for the 4.9M-triangle ivy. Voxels and
-imposters use a material's scalar roughness and no normal map, so distant textured
-foliage reads somewhat darker than exact. Tiers swap in one frame, with no
-crossfade. Clusters are frustum culled but not occlusion culled. Selection lists
-have fixed capacities; `Renderer::matrix_stats` shows how full they run.
+Cooking runs at load, about 40 s for New Sponza. Primitives of 100000 triangles or
+more are cached in the system temp folder, keyed by content, which cuts that to
+5 s; bump `COOK_VERSION` when cooking changes.
+
+Limits: geometry is static and fully resident, with no streaming or wind. Voxels
+and imposters use a material's scalar roughness and no normal map. Clusters are
+frustum culled but not occlusion culled. Selection lists have fixed capacities;
+`Renderer::matrix_stats` shows how much was drawn.
 
 The renderer uses GPU frustum culling and, when supported, a current-frame
 reverse-Z minimum-depth pyramid for occlusion. The depth prepass draws all
