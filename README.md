@@ -1,6 +1,134 @@
 # Verity Engine
 
-Verity, also known as Verity Engine, is a Rust game engine.
+Verity is a game engine written in Rust, with a Vulkan renderer, its own
+physics engine, three global-illumination methods, virtual geometry,
+destructible terrain and an FFT ocean. Each part is measured against a
+reference: physics against closed-form results and [Box3D](https://github.com/erincatto/box3d),
+GI against a path tracer, and virtual geometry against drawing every triangle.
+
+| Crate | What it does |
+| --- | --- |
+| `verity-physics` | AVBD rigid bodies, speculative contacts, breakable joints with muscles, FEM cloth and solids that tear, dent and crack |
+| `verity-render` | Vulkan renderer on Slang shaders: visibility buffer, 1024 point lights, cascaded sun shadows, GPU culling |
+| `verity-lux` | Global illumination: Split Radiance Cascades, PXTGI (traces the physics scene), screen and voxel GI |
+| `verity-matrix` | Virtual geometry: cluster LOD DAG, voxelized foliage and octahedral imposters, chosen on the GPU |
+| `verity-terra` | Eroded landforms as an editable density field, meshed with Surface Nets |
+| `verity-ocean` | FFT ocean cascades, ripples, shallow water and shore breakers |
+| `verity-editor` | Scene editor with gizmos, inspector, asset browser and play mode |
+
+## Highlights
+
+### Physics against Box3D
+
+`verity-physics` is written from scratch around **Augmented Vertex Block
+Descent** (AVBD): each body is solved as a small Newton system against its
+contacts and joints, colored so independent bodies solve in parallel, with
+penalties that grow toward hard constraints. Box3D is used only as a yardstick;
+nothing in Verity depends on it.
+
+Speed, single thread on a Ryzen 7 8845HS, as Box3D's time divided by Verity's
+(higher is faster than Box3D). *Active* is the first 60 steps while everything
+moves; *full* is all 300 steps, including settling and sleep.
+
+| Scene | Active | Full |
+| --- | --- | --- |
+| Pyramid, 210 boxes | **1.30x** | **1.67x** |
+| Pyramid, 820 boxes | **1.14x** | **1.99x** |
+| Rain, 512 bodies | **1.39x** | 1.01x |
+| Rain, 2,744 bodies | **1.43x** | 0.96x |
+
+AVX-512 builds of the same kernels are a further 1–5% faster. Results are
+bit-identical across AVX-512, AVX2 and the scalar fallback, and across 1, 4
+and 8 threads.
+
+Accuracy, from `examples/quality.rs` (depths in metres, lower is better):
+
+| Measure | Reference | Verity | Box3D |
+| --- | --- | --- | --- |
+| Cube dropped 5 m, peak penetration | 0 | **0.0000** | 0.0906 |
+| Head-on at 20 m/s each, peak overlap | 0 | **0.0000** | 0.3333 |
+| Pile, peak floor penetration (8 seeds) | 0 | **0.0202** | 0.1113 |
+| Pile, late body overlap (8 seeds) | 0 | **0.0048** | 0.0327 |
+| Stack of 20, top height | 19.5 m | **19.467** | 19.394 |
+| Tumbling slab, energy ratio | 1 | **1.0000** | 0.9830 |
+| Box sliding over floor tiles | within 5% of theory | yes | catches on seams |
+| Slide stop at 5 m/s | 2.1237 m | -2.5% | **-0.5%** |
+| Momentum kept by a 20 m/s strike | 20 | 19.73 | **20** (exact) |
+
+A cube at 20–150 m/s no longer tunnels through a 10 cm wall, and a pendulum
+keeps 98.6% of its swing after 30 s. Every row, with where Box3D is still
+ahead and the ideas that were tried and rejected, is in the
+[physics log](crates/verity-physics/PERFORMANCE.md). Reproduce with:
+
+```bash
+cargo run --release -p verity-physics --example compare
+```
+
+```bash
+cargo run --release -p verity-physics --example quality
+```
+
+Methods used:
+
+- **Solver:** AVBD with fused dual updates, post-stabilization from the
+  reference solver, and contact forces carried whole between steps for warm
+  starting.
+- **Contacts:** box SAT and sphere tests, speculative contacts built at the
+  predicted first touch, four contacts per manifold.
+- **Integration:** an exact inverse rotation map, an energy-capped gyroscopic
+  term, and SHAKE-style joint forces so swinging joints keep their energy.
+- **SIMD:** eight-body SIMD LDLᵀ batches, contact manifolds stamped two at a
+  time in 256-bit halves, runtime-selected AVX2 or AVX-512, four-wide SIMD
+  broadphase.
+- **Joints:** steel, wood, rubber, bone and ligament presets that yield,
+  harden and break; per-axis rotation limits; Hill muscles.
+- **Soft bodies:** FEM cloth in an implicit global solve that tears from crack
+  tips along its threads; stable neo-Hookean tetrahedra for flesh; plastic
+  lattices for car bodies, deformed on the GPU and calibrated to crash tests.
+- **Terrain:** bodies collide with the terrain density field directly, so digging
+  takes effect at once and nothing tunnels.
+
+### Global illumination against a path tracer
+
+Sponza at 1280×720 on an RTX 4070 Laptop GPU. Error is the mean absolute
+difference from a path-traced reference, as a fraction of its bounced light.
+
+| View | Method | GPU time | Error | Flicker |
+| --- | --- | --- | --- | --- |
+| Atrium | Split Radiance Cascades | 11.7 ms | 0.36 | 0.002 |
+| Atrium | PXTGI | 3.8 ms | 0.28 | 0.006 |
+| Atrium | Screen and voxel | 1.8 ms | 0.29 | 0.004 |
+| Corridor | Split Radiance Cascades | 5.7 ms | 0.20 | 0.002 |
+| Corridor | PXTGI | 3.2 ms | 0.07 | 0.013 |
+| Corridor | Screen and voxel | 1.6 ms | 0.30 | 0.010 |
+
+- **Split Radiance Cascades** trace a budget of receivers into a world cache,
+  merge cascades far to near, and bounce light through last frame's probes.
+- **PXTGI** traces the physics world itself (rigid colliders, soft-body
+  surfaces, static meshes) with screen rays first and a hashed radiance cache
+  after. Sleeping bodies cost nothing, and moving ones refresh only the region
+  they disturbed.
+- **Screen and voxel GI** march the depth buffer, then a 256³ voxel grid that
+  gains a bounce every few frames.
+
+Details in the [Lux README](crates/verity-lux/README.md).
+
+### Virtual geometry
+
+On an RTX 4070 Laptop at 1600×900, 2,500 trees of 20,000 leaves draw in
+**1.7 ms** against 209 ms for every triangle, and New Sponza in **8 ms** against
+63 ms, within 0.3/255 of the exact image. Three tiers share one visibility
+buffer: meshoptimizer cluster LOD, 4³ voxel bricks for foliage that
+simplification would erase, and hemi-octahedral imposters for distant copies.
+See [Matrix virtual geometry](#matrix-virtual-geometry).
+
+### Terrain
+
+Landforms eroded by stream-power river incision, droplets and thermal
+slumping, reproducible from a seed on any thread count, held as a 3D density
+field so digging makes real caves and overhangs. See [Terra terrain](#terra-terrain).
+
+## Rendering
 
 `verity-render` provides the Vulkan renderer, including direct lighting and
 shadow maps. Scene point lights and directional sunlight are usable without a
