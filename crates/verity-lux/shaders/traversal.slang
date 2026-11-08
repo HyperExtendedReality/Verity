@@ -564,133 +564,76 @@ Hit traceInstance(float3 origin, float3 direction, uint instance, Hit hit, bool 
     }
     return hit;
 }
-#ifdef PENUMBRA_HARDWARE_RAY_QUERY
-// Hardware ray queries replace only the BVH walk. Slang's WGSL target has no
-// ray-query types, and naga requires each query to be a local of the function
-// that drives it, so render.rs prepends the two query loops in WGSL
-// (`ray_query_source`). Every BLAS is non-opaque: the loops call the candidate
-// callbacks below, which re-test each proposed triangle with the software
-// tests. Accepted hits keep the software distance, barycentrics, culling,
-// layer and alpha-coverage decisions.
-static float3 hardwareOrigin;
-static float3 hardwareDirection;
-static float hardwareLimit;
-static float hardwareConeWidth;
-static float hardwareConeSpread;
-static uint4 hardwareGeometryHeader;
-static Hit hardwareHit;
+#ifdef GI_RAY_QUERY
+// Hardware ray queries replace only the BVH walk. Every BLAS is non-opaque, so
+// each proposed triangle comes back as a candidate and is re-tested with the
+// software tests below: accepted hits keep the software distance,
+// barycentrics, culling, layer and alpha-coverage decisions. The TLAS custom
+// index is the packed instance index, and each BLAS covers that instance's
+// contiguous triangle range in order (`src/rt.rs`).
+[[vk::binding(49, 0)]] RaytracingAccelerationStructure sceneTlas;
 
-// TLAS instance mask bits: 1 for hardware-opaque instances, which carry only
-// the default render layer, and 2 for the rest. A view without layer 0 skips
-// bit 1; the shader's layer test still filters the rest.
-uint hardwareRayMask() {
-    return params.layers.w == 0u ? 0xffu : params.layers.w;
-}
-// Runs the closest-hit loop; always returns true.
-bool hardwareQueryClosest(float3 origin, float3 direction, float limit, bool anyHit, uint mask) {
-    __target_switch { case wgsl: __intrinsic_asm "penumbraRayQueryClosest($0, $1, $2, $3, $4)"; }
-}
-// Runs the occlusion loop; returns 1 when blocked and 0 otherwise.
-uint hardwareQueryOccluded(float3 origin, float3 direction, float limit, uint mask) {
-    __target_switch { case wgsl: __intrinsic_asm "penumbraRayQueryOccluded($0, $1, $2, $3)"; }
-}
-
-// The TLAS custom data is the packed instance index, and each BLAS covers that
-// instance's contiguous triangle range in order.
 [ForceInline]
-uint hardwareTriangle(uint instance, uint primitive, out uint base, out uint4 record,
+uint hardwareTriangle(uint instance, uint primitive, float3 origin, float3 direction,
+                      out uint base, out uint4 record,
                       out float3 localOrigin, out float3 localDirection) {
     base = instanceBase(instance);
     record = sceneWord(base + 6);
     float4 row0 = asfloat(sceneWord(base));
     float4 row1 = asfloat(sceneWord(base + 1));
     float4 row2 = asfloat(sceneWord(base + 2));
-    float4 point = float4(hardwareOrigin, 1);
-    float4 vector = float4(hardwareDirection, 0);
+    float4 point = float4(origin, 1);
+    float4 vector = float4(direction, 0);
     localOrigin = float3(dot(row0, point), dot(row1, point), dot(row2, point));
     // Unnormalized, as in traceInstance, so local distances stay world distances.
     localDirection = float3(dot(row0, vector), dot(row1, vector), dot(row2, vector));
     return sceneWord(base + 8).y + primitive;
 }
 
-// Called by the WGSL closest-hit loop; true confirms the candidate.
-[noinline]
-bool hardwareClosestCandidate(uint instance, uint primitive) {
-    if (instance == EMPTY) return false;
-    uint base;
-    uint4 record;
-    float3 localOrigin, localDirection;
-    uint triangle = hardwareTriangle(instance, primitive, base, record,
-                                     localOrigin, localDirection);
-    if (!instanceVisibleRecord(record)) return false;
-    Hit candidate = traceTriangle(localOrigin, localDirection, triangleRay(localDirection),
-        hardwareDirection, hardwareConeWidth, hardwareConeSpread, triangle, instance, base,
-        record.w, hardwareGeometryHeader, hardwareHit);
-    // traceTriangle returns its input unchanged unless it accepts a closer hit.
-    if (!(candidate.distance < hardwareHit.distance)) return false;
-    hardwareHit = candidate;
-    return true;
-}
-
-// Called by the WGSL closest-hit loop on its committed hit with the
-// hardware's distance and barycentrics, so a hardware-opaque hit, which
-// commits without the candidate test, still gets a hit record. Opaque
-// instances need no material test, and calling the full candidate test a
-// second time here cost the driver up to a minute per closest-hit kernel.
-[noinline]
-void hardwareCommittedHit(uint instance, uint primitive, float distance, float2 barycentric) {
-    if (instance == EMPTY) return;
-    uint triangle = sceneWord(instanceBase(instance) + 8).y + primitive;
-    // Already confirmed by the candidate test.
-    if (hardwareHit.triangle == triangle && hardwareHit.instance == instance) return;
-    hardwareHit.distance = distance;
-    hardwareHit.triangle = triangle;
-    hardwareHit.instance = instance;
-    hardwareHit.barycentric = float3(1 - barycentric.x - barycentric.y, barycentric);
-    hardwareHit.footprint = 0;
-}
-
-// Called by the WGSL occlusion loop; true ends the query as blocked.
-[noinline]
-bool hardwareOccludedCandidate(uint instance, uint primitive) {
-    if (instance == EMPTY) return false;
-    uint base;
-    uint4 record;
-    float3 localOrigin, localDirection;
-    uint triangle = hardwareTriangle(instance, primitive, base, record,
-                                     localOrigin, localDirection);
-    if (!instanceVisibleRecord(record)) return false;
-    return occludedTriangle(localOrigin, localDirection, triangleRay(localDirection),
-                            triangle, instance, record.w, hardwareLimit,
-                            hardwareGeometryHeader);
-}
-
 Hit hardwareClosestHit(float3 origin, float3 direction, Hit hit, bool anyHit,
                        float coneWidth, float coneSpread, uint4 geometryHeader) {
-    hardwareOrigin = origin;
-    hardwareDirection = direction;
-    hardwareConeWidth = coneWidth;
-    hardwareConeSpread = coneSpread;
-    hardwareGeometryHeader = geometryHeader;
-    hardwareHit = hit;
-    // The query always returns true. The guarded call keeps the callback in
-    // the emitted module, where only the WGSL loop calls it.
-    if (!hardwareQueryClosest(origin, direction, hit.distance, anyHit, hardwareRayMask())) {
-        hardwareClosestCandidate(EMPTY, 0u);
-        hardwareCommittedHit(EMPTY, 0u, 0.0, 0.0);
+    RayDesc ray;
+    ray.Origin = origin; ray.Direction = direction;
+    ray.TMin = 0.0; ray.TMax = hit.distance;
+    RayQuery<RAY_FLAG_NONE> query;
+    query.TraceRayInline(sceneTlas, RAY_FLAG_NONE, 0xffu, ray);
+    [loop] while (query.Proceed()) {
+        if (query.CandidateType() != CANDIDATE_NON_OPAQUE_TRIANGLE) continue;
+        uint instance = query.CandidateInstanceID();
+        uint base; uint4 record; float3 localOrigin, localDirection;
+        uint triangle = hardwareTriangle(instance, query.CandidatePrimitiveIndex(), origin,
+            direction, base, record, localOrigin, localDirection);
+        if (!instanceVisibleRecord(record)) continue;
+        Hit candidate = traceTriangle(localOrigin, localDirection, triangleRay(localDirection),
+            direction, coneWidth, coneSpread, triangle, instance, base, record.w,
+            geometryHeader, hit);
+        // traceTriangle returns its input unchanged unless it accepts a closer hit.
+        if (!(candidate.distance < hit.distance)) continue;
+        hit = candidate;
+        query.CommitNonOpaqueTriangleHit();
+        if (anyHit) query.Abort();
     }
-    return hardwareHit;
+    return hit;
 }
 
 bool hardwareOccluded(float3 origin, float3 direction, float limit, uint4 geometryHeader) {
-    hardwareOrigin = origin;
-    hardwareDirection = direction;
-    hardwareLimit = limit;
-    hardwareGeometryHeader = geometryHeader;
-    uint blocked = hardwareQueryOccluded(origin, direction, limit, hardwareRayMask());
-    // Never above one; the guarded call keeps the callback in the module.
-    if (blocked > 1u) hardwareOccludedCandidate(EMPTY, 0u);
-    return blocked != 0u;
+    RayDesc ray;
+    ray.Origin = origin; ray.Direction = direction;
+    ray.TMin = 0.0; ray.TMax = limit;
+    RayQuery<RAY_FLAG_NONE> query;
+    query.TraceRayInline(sceneTlas, RAY_FLAG_NONE, 0xffu, ray);
+    [loop] while (query.Proceed()) {
+        if (query.CandidateType() != CANDIDATE_NON_OPAQUE_TRIANGLE) continue;
+        uint instance = query.CandidateInstanceID();
+        uint base; uint4 record; float3 localOrigin, localDirection;
+        uint triangle = hardwareTriangle(instance, query.CandidatePrimitiveIndex(), origin,
+            direction, base, record, localOrigin, localDirection);
+        if (!instanceVisibleRecord(record)) continue;
+        if (occludedTriangle(localOrigin, localDirection, triangleRay(localDirection),
+                             triangle, instance, record.w, limit, geometryHeader))
+            return true;
+    }
+    return false;
 }
 #endif
 Hit traceRayTracked(float3 origin, float3 direction, float limit,
@@ -720,7 +663,7 @@ Hit traceRayTracked(float3 origin, float3 direction, float limit,
     uint4 geometryHeader = geometryWord(0);
     dependencyStart = max(rootEntry, 0.0);
     dependencyDistance = min(limit, rootExit);
-#ifdef PENUMBRA_HARDWARE_RAY_QUERY
+#ifdef GI_RAY_QUERY
     hit = hardwareClosestHit(origin, direction, hit, anyHit, coneWidth, coneSpread,
                              geometryHeader);
 #else
@@ -969,7 +912,7 @@ bool traceOccluded(float3 origin, float3 direction, float limit,
     bool currentNodeReady = intersectsRoot && rootEntry >= 0.0;
     if (!currentNodeReady) return false;
     uint4 geometryHeader = geometryWord(0);
-#ifdef PENUMBRA_HARDWARE_RAY_QUERY
+#ifdef GI_RAY_QUERY
     // Hardware traversal is never truncated, so every admitted query is complete.
     return hardwareOccluded(origin, direction, limit, geometryHeader);
 #else

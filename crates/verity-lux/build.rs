@@ -50,7 +50,9 @@ const VOXEL_ENTRIES: &[&str] = &[
 ];
 
 /// Writes `OUT_DIR/{file}.{entry}.spv` for each entry point, compiling in
-/// parallel; the transport shaders are large.
+/// parallel; the transport shaders are large. The cascades passes also get
+/// `cascades.{entry}.rq.spv`, built with `GI_RAY_QUERY` to trace with hardware
+/// ray queries, which they pick when the GPU supports them.
 fn main() {
     println!("cargo:rerun-if-changed=shaders");
     println!("cargo:rerun-if-changed=../verity-render/shaders/lib");
@@ -58,37 +60,35 @@ fn main() {
     let out = PathBuf::from(env::var_os("OUT_DIR").unwrap());
     let library = PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").unwrap())
         .join("../verity-render/shaders/lib");
-    let mut jobs: Vec<(&str, &str, SlangStage)> = CASCADE_ENTRIES
-        .iter()
-        .map(|&entry| ("cascades", entry, SlangStage::Compute))
-        .collect();
+    let mut jobs: Vec<(&str, &str, bool)> = Vec::new();
+    for ray_query in [false, true] {
+        jobs.extend(CASCADE_ENTRIES.iter().map(|&e| ("cascades", e, ray_query)));
+    }
+    // PXTGI traces the physics scene (verity-physics' `RayScene`), never hardware.
+    jobs.extend(PXTGI_ENTRIES.iter().map(|&e| ("pxtgi", e, false)));
     jobs.extend([
-        ("composite", "compositeAnchors", SlangStage::Compute),
-        ("composite", "compositeCompute", SlangStage::Compute),
-        ("composite", "compositeCapture", SlangStage::Compute),
-        ("debug_surface", "debugSurface", SlangStage::Compute),
+        ("composite", "compositeAnchors", false),
+        ("composite", "compositeCompute", false),
+        ("composite", "compositeCapture", false),
+        ("debug_surface", "debugSurface", false),
     ]);
-    jobs.extend(
-        PXTGI_ENTRIES
-            .iter()
-            .map(|&entry| ("pxtgi", entry, SlangStage::Compute)),
-    );
-    jobs.extend(
-        VOXEL_ENTRIES
-            .iter()
-            .map(|&entry| ("voxel", entry, SlangStage::Compute)),
-    );
+    jobs.extend(VOXEL_ENTRIES.iter().map(|&e| ("voxel", e, false)));
     let compiler = SlangCompiler::default().with_source_root("shaders");
     let failures: Vec<String> = thread::scope(|scope| {
         let handles: Vec<_> = jobs
             .iter()
-            .map(|&(file, entry, stage)| {
+            .map(|&(file, entry, ray_query)| {
                 let (compiler, library, out) = (&compiler, &library, &out);
                 scope.spawn(move || {
                     let settings = SlangSettings {
                         entry_points: vec![entry.into()],
-                        stage: Some(stage),
+                        stage: Some(SlangStage::Compute),
                         include_paths: vec![library.clone()],
+                        defines: if ray_query {
+                            vec!["GI_RAY_QUERY".into()]
+                        } else {
+                            Vec::new()
+                        },
                         ..SlangSettings::default()
                     };
                     let shader = compiler
@@ -96,7 +96,8 @@ fn main() {
                         .map_err(|e| format!("{file}.slang:{entry}: {e}"))?;
                     let bytes: Vec<u8> =
                         shader.words.iter().flat_map(|w| w.to_le_bytes()).collect();
-                    fs::write(out.join(format!("{file}.{entry}.spv")), bytes)
+                    let variant = if ray_query { ".rq" } else { "" };
+                    fs::write(out.join(format!("{file}.{entry}{variant}.spv")), bytes)
                         .map_err(|e| e.to_string())
                 })
             })
