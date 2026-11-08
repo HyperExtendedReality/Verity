@@ -79,11 +79,14 @@ impl Bench {
     fn report(&mut self) {
         let label = if self.moving { "moving" } else { "still" };
         let mut total = 0.0;
+        // Per frame timed, as some passes run only on some frames.
+        let frames = self.sums.values().map(|s| s.0).max().unwrap_or(1);
         for name in &self.order {
             let (n, sum, peak) = self.sums[name];
-            let mean = sum / n as f32;
+            let mean = sum / frames as f32;
             total += mean;
-            println!("{label} {name:<20} {mean:8.3} ms  peak {peak:8.3}");
+            let ran = if n < frames { format!("  in {n} of {frames} frames") } else { String::new() };
+            println!("{label} {name:<20} {mean:8.3} ms  peak {peak:8.3}{ran}");
         }
         println!("{label} {:<20} {total:8.3} ms", "TOTAL");
         self.sums.clear();

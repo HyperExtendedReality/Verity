@@ -122,9 +122,15 @@ impl Default for ScreenVoxelSettings {
 /// one's w the material and the second's the terrain ground.
 type GpuTriangle = [[f32; 4]; 3];
 
-/// Where a level of `cell`-sized cells starts, in cells, to centre on `eye`.
+/// Cells a level moves by at least. Voxelizing a slab costs a pass over every
+/// triangle, so fewer, thicker slabs are cheaper.
+const STEP: i32 = 8;
+
+/// Where a level of `cell`-sized cells starts, in cells, to centre on `eye`
+/// within a `STEP`.
 fn level_origin(eye: Vec3, cell: f32) -> IVec3 {
-    (eye / cell).floor().as_ivec3() - IVec3::splat(GRID / 2)
+    let at = (eye / cell).floor().as_ivec3();
+    at.div_euclid(IVec3::splat(STEP)) * STEP - IVec3::splat(GRID / 2)
 }
 
 /// A box of cells: low corner, and high corner exclusive.
@@ -354,7 +360,7 @@ impl ScreenVoxel {
         let changed = self.changed.take();
         let mut lows = [[0; 4]; MAX_LEVELS];
         let mut jobs = Vec::new();
-        for level in 0..levels {
+        for (level, low) in lows.iter_mut().enumerate().take(levels) {
             let size = cell * (1 << level) as f32;
             let new = level_origin(eye, size);
             let mut boxes = match self.origins[level] {
@@ -370,7 +376,7 @@ impl ScreenVoxel {
                 };
             }
             self.origins[level] = Some(new);
-            lows[level] = new.extend(0).to_array();
+            *low = new.extend(0).to_array();
             for (low, high) in boxes {
                 let cells = (high - low).element_product();
                 jobs.push([low.extend(level as i32).to_array(), high.extend(cells).to_array()]);
@@ -1137,8 +1143,13 @@ mod tests {
 
     #[test]
     fn levels_centre_on_the_camera() {
-        let origin = level_origin(Vec3::new(1.0, -1.0, 0.0), 0.5);
-        assert_eq!(origin, IVec3::new(2, -2, 0) - GRID / 2);
+        for eye in [Vec3::new(1.0, -1.0, 0.0), Vec3::splat(-100.3), Vec3::splat(77.7)] {
+            let origin = level_origin(eye, 0.5);
+            assert_eq!(origin % STEP, IVec3::ZERO);
+            let at = (eye / 0.5).floor().as_ivec3() - origin;
+            assert!(at.cmpge(IVec3::splat(GRID / 2)).all(), "{eye}");
+            assert!(at.cmplt(IVec3::splat(GRID / 2 + STEP)).all(), "{eye}");
+        }
     }
 
     #[test]

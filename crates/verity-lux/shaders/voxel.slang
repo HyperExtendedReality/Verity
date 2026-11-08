@@ -264,6 +264,40 @@ void clear(uint3 id : SV_DispatchThreadID) {
     cells[at] = 0u;
 }
 
+// The bounds of the part of triangle abc inside the box lo..hi, or false when
+// none is. Bounding the whole triangle instead, one that crosses a thin slab
+// would visit every cell face it spans.
+bool clippedBounds(float3 a, float3 b, float3 c, float3 lo, float3 hi, out float3 low, out float3 high) {
+    float3 points[9];
+    float3 kept[9];
+    points[0] = a;
+    points[1] = b;
+    points[2] = c;
+    int count = 3;
+    [unroll] for (int plane = 0; plane < 6; plane++) {
+        int axis = plane % 3;
+        float side = plane < 3 ? 1.0 : -1.0;
+        float bound = plane < 3 ? lo[axis] : hi[axis];
+        int n = 0;
+        for (int i = 0; i < count; i++) {
+            float3 p = points[i];
+            float3 q = points[(i + 1) % count];
+            float dp = (p[axis] - bound) * side, dq = (q[axis] - bound) * side;
+            if (dp >= 0.0) kept[n++] = p;
+            if ((dp >= 0.0) != (dq >= 0.0)) kept[n++] = lerp(p, q, dp / (dp - dq));
+        }
+        count = n;
+        for (int i = 0; i < count; i++) points[i] = kept[i];
+    }
+    low = 1e30;
+    high = -1e30;
+    for (int i = 0; i < count; i++) {
+        low = min(low, points[i]);
+        high = max(high, points[i]);
+    }
+    return count > 0;
+}
+
 // Visits a triangle's samples in the jobs' cells: rows of SAMPLES by SAMPLES
 // across each cell face it covers seen down its steepest axis, each standing for
 // an equal share of its area. Claiming gives a cell a voxel; otherwise each
@@ -293,6 +327,16 @@ void rasterize(uint triangle, bool claiming) {
         int3 from = max(int3(floor(lowest / cell)), low.xyz);
         int3 to = min(int3(floor(highest / cell)), high.xyz - 1);
         if (any(from > to)) continue;
+        // Big triangles only: the part inside the job may be much smaller.
+        int3 span = to - from;
+        if (span[u] * span[v] > 16) {
+            float3 clippedLow, clippedHigh;
+            float3 box = float3(low.xyz) * cell;
+            if (!clippedBounds(a, b, c, box, float3(high.xyz) * cell, clippedLow, clippedHigh)) continue;
+            from = max(from, int3(floor(clippedLow / cell)));
+            to = min(to, int3(floor(clippedHigh / cell)));
+            if (any(from > to)) continue;
+        }
         [loop] for (int cu = from[u]; cu <= to[u]; cu++) {
             [loop] for (int cv = from[v]; cv <= to[v]; cv++) {
                 [loop] for (int s = 0; s < SAMPLES * SAMPLES; s++) {
