@@ -3,33 +3,41 @@
 //! scene, which keeps its own lighting and bounces. It needs no GI scene or
 //! physics, and costs the same however many triangles the scene has.
 //!
-//! Scenes voxelize on the CPU as they load, into one grid fitted to everything
-//! loaded so far.
+//! The voxels are a clipmap around the camera, voxelized on the GPU from the
+//! loaded scenes' and the renderer's retained meshes' triangles: nested levels
+//! of `GRID` cells a side, each twice the size of the last. As the camera moves
+//! a level shifts by whole cells and rebuilds only the slabs that came in.
 
 #![allow(unsafe_op_in_unsafe_fn)]
 
 use crate::{
     GiMethod, GiStatus,
-    pxtgi::{Capture, FrameData, GpuLight, IO_BINDINGS, Readback},
+    pxtgi::{Capture, FrameData, GpuLight, IO_BINDINGS, Readback, pack_ground},
     shared::{PassTimer, Res, upload, write_set},
 };
 use ash::vk;
-use glam::{Mat4, Vec3};
+use glam::{IVec3, Mat4, Vec3};
 use gpu_allocator::MemoryLocation;
 use rayon::prelude::*;
 use std::{
     collections::HashMap, f32::consts::PI, ffi::CString, mem, time::Duration, time::Instant,
 };
 use verity_render::{
-    FrameContext, Gpu, RenderExtension, Targets,
+    FrameContext, Gpu, RenderExtension, RetainedChange, Targets,
     asset::{AlphaMode, SceneData},
     extension::Result,
     gpu::{self, Buffer, Image},
 };
 
 const SLOTS: usize = 2;
-/// Cells along each side of the grid.
-const GRID: u32 = 256;
+/// Cells along each side of a clipmap level. A power of two.
+const GRID: i32 = 128;
+/// Clipmap levels at most; `MAX_LEVELS` in voxel.slang.
+const MAX_LEVELS: usize = 8;
+/// Boxes of cells voxelized in a frame at most: three slabs a level.
+const MAX_JOBS: usize = 3 * MAX_LEVELS;
+/// Voxels the levels share.
+const POOL: u32 = 1 << 20;
 
 macro_rules! spirv {
     ($entry:literal) => {
@@ -41,6 +49,11 @@ macro_rules! spirv {
 }
 
 const PASSES: &[(&str, &[u8])] = &[
+    spirv!("reset"),
+    spirv!("clear"),
+    spirv!("claim"),
+    spirv!("accumulate"),
+    spirv!("finalize"),
     spirv!("inject"),
     spirv!("trace"),
     spirv!("temporal"),
@@ -61,10 +74,14 @@ const SCENE_BINDINGS: &[(u32, D)] = &[
     (4, D::STORAGE_BUFFER),
     (5, D::STORAGE_BUFFER),
     (6, D::STORAGE_BUFFER),
+    (7, D::STORAGE_BUFFER),
+    (8, D::STORAGE_BUFFER),
+    (9, D::STORAGE_BUFFER),
     (10, D::STORAGE_BUFFER),
     (11, D::STORAGE_IMAGE),
     (12, D::STORAGE_IMAGE),
     (13, D::STORAGE_BUFFER),
+    (14, D::STORAGE_BUFFER),
 ];
 /// Per slot: trace, temporal, three a-trous, composite.
 const IO_SETS: usize = 6;
@@ -80,6 +97,11 @@ pub struct ScreenVoxelSettings {
     pub rays_per_texel: u32,
     /// Scale of the bounce light.
     pub intensity: f32,
+    /// Voxel levels around the camera, 1..=8, each twice the size of the last.
+    /// Read when the GI is installed.
+    pub levels: u32,
+    /// The finest level's cell. A level spans 128 cells.
+    pub cell_size: f32,
 }
 
 impl Default for ScreenVoxelSettings {
@@ -89,122 +111,58 @@ impl Default for ScreenVoxelSettings {
             world_ray_distance: 30.0,
             rays_per_texel: 4,
             intensity: 1.0,
+            levels: 5,
+            cell_size: 0.125,
         }
     }
 }
 
-/// A triangle in world space and the material it wears.
-#[derive(Clone, Copy, Debug)]
-pub struct Triangle {
-    pub corners: [Vec3; 3],
-    pub material: u32,
+/// A triangle as the voxelizer reads it: three world-space corners, the first
+/// one's w the material and the second's the terrain ground.
+type GpuTriangle = [[f32; 4]; 3];
+
+/// Where a level of `cell`-sized cells starts, in cells, to centre on `eye`.
+fn level_origin(eye: Vec3, cell: f32) -> IVec3 {
+    (eye / cell).floor().as_ivec3() - IVec3::splat(GRID / 2)
 }
 
-/// A scene as the shaders walk it.
-#[derive(Debug)]
-pub struct Voxels {
-    /// The grid's low corner.
-    pub origin: Vec3,
-    pub cell: f32,
-    /// Per cell, x fastest: 0 when empty, else an index into `voxels` + 1.
-    pub cells: Vec<u32>,
-    /// Cell, material, normal as signed bytes, unused.
-    pub voxels: Vec<[u32; 4]>,
-}
+/// A box of cells: low corner, and high corner exclusive.
+type CellBox = (IVec3, IVec3);
 
-fn pack_normal(n: Vec3) -> u32 {
-    let byte = |v: f32| ((v * 127.0).round() as i32 & 255) as u32;
-    byte(n.x) | byte(n.y) << 8 | byte(n.z) << 16
-}
-
-/// A cell this full of surface always counts as solid.
-const SOLID_COVER: f32 = 1.0;
-
-/// A fixed number in 0..1 for a cell.
-fn cell_noise(cell: u32) -> f32 {
-    let mut x = cell.wrapping_mul(0x9e37_79b9);
-    x ^= x >> 16;
-    x = x.wrapping_mul(0x7feb_352d);
-    x ^= x >> 15;
-    (x >> 8) as f32 / 16_777_216.0
-}
-
-/// Mark the cells the triangles fill, in a cubic grid of `grid` cells a side
-/// around them. A voxel takes the mean normal of what fell in it, or the first
-/// normal where they cancel, and the first material.
-///
-/// A cell a surface barely clips stays solid only sometimes, in proportion to the
-/// surface in it, by a fixed hash so it does not shimmer. Marking all of them
-/// fattens everything by up to a cell and plugs railings and narrow openings.
-pub fn voxelize(triangles: &[Triangle], grid: u32) -> Voxels {
-    let (lo, hi) = triangles
-        .iter()
-        .flat_map(|t| t.corners)
-        .fold((Vec3::MAX, Vec3::MIN), |(lo, hi), p| (lo.min(p), hi.max(p)));
-    if triangles.is_empty() {
-        return Voxels {
-            origin: Vec3::ZERO,
-            cell: 1.0,
-            cells: vec![0; (grid as usize).pow(3)],
-            voxels: Vec::new(),
-        };
+/// The cells a level moving from `old` to `new` takes in, as boxes that do not
+/// overlap: a slab for each axis it moved along.
+fn scrolled(old: IVec3, new: IVec3) -> Vec<CellBox> {
+    let moved = new - old;
+    let (mut low, mut high) = (new, new + GRID);
+    if moved.abs().max_element() >= GRID {
+        return vec![(low, high)];
     }
-    let cell = ((hi - lo).max_element() / grid as f32).max(1e-3) * 1.001;
-    // Centred, so geometry stays clear of the grid's edges on the shorter axes.
-    let origin = (lo + hi) * 0.5 - Vec3::splat(cell * grid as f32 * 0.5);
-    let index = |p: Vec3| {
-        let c = ((p - origin) / cell).floor().as_ivec3();
-        let c = c.clamp(glam::IVec3::ZERO, glam::IVec3::splat(grid as i32 - 1));
-        (c.z as u32 * grid + c.y as u32) * grid + c.x as u32
-    };
-    let mut hits: Vec<(u32, Vec3, u32, f32)> = triangles
-        .par_iter()
-        .flat_map_iter(|t| {
-            let [a, b, c] = t.corners;
-            let normal = (b - a).cross(c - a).normalize_or_zero();
-            // Half-cell steps across the triangle reach every cell it crosses.
-            let longest = (b - a).length().max((c - a).length()).max((c - b).length());
-            let steps = (longest / (cell * 0.5)).ceil().max(1.0) as u32;
-            let mut touched = Vec::new();
-            for i in 0..=steps {
-                for j in 0..=steps - i {
-                    let (u, v) = (i as f32 / steps as f32, j as f32 / steps as f32);
-                    touched.push(index(a + (b - a) * u + (c - a) * v));
-                }
-            }
-            // Each sample stands for an equal share of the triangle's area.
-            let share = 0.5 * (b - a).cross(c - a).length() / touched.len() as f32;
-            touched.sort_unstable();
-            let mut cells = Vec::new();
-            for group in touched.chunk_by(|a, b| a == b) {
-                cells.push((group[0], normal, t.material, share * group.len() as f32));
-            }
-            cells
-        })
-        .collect();
-    hits.par_sort_by_key(|hit| hit.0);
-    let mut cells = vec![0; (grid as usize).pow(3)];
-    let mut voxels = Vec::new();
-    for group in hits.chunk_by(|a, b| a.0 == b.0) {
-        let (at, first, material, _) = group[0];
-        let cover: f32 = group.iter().map(|hit| hit.3).sum::<f32>() / (cell * cell);
-        if cell_noise(at) * SOLID_COVER >= cover {
+    let mut slabs = Vec::new();
+    for axis in 0..3 {
+        let (mut slab_low, mut slab_high) = (low, high);
+        if moved[axis] > 0 {
+            slab_low[axis] = high[axis] - moved[axis];
+            high[axis] = slab_low[axis];
+        } else if moved[axis] < 0 {
+            slab_high[axis] = low[axis] - moved[axis];
+            low[axis] = slab_high[axis];
+        } else {
             continue;
         }
-        let sum: Vec3 = group.iter().map(|hit| hit.1).sum();
-        let normal = sum
-            .try_normalize()
-            .filter(|_| sum.length() > 0.1)
-            .unwrap_or(first);
-        voxels.push([at, material, pack_normal(normal), 0]);
-        cells[at as usize] = voxels.len() as u32;
+        slabs.push((slab_low, slab_high));
     }
-    Voxels {
-        origin,
-        cell,
-        cells,
-        voxels,
-    }
+    slabs
+}
+
+/// The cells of a level at `origin` that a world box touches, grown by a cell.
+fn touched(origin: IVec3, cell: f32, (lo, hi): (Vec3, Vec3)) -> Option<CellBox> {
+    let low = ((lo / cell).floor().as_ivec3() - 1).max(origin);
+    let high = ((hi / cell).floor().as_ivec3() + 2).min(origin + GRID);
+    low.cmplt(high).all().then_some((low, high))
+}
+
+fn grow(bounds: &mut Option<(Vec3, Vec3)>, (lo, hi): (Vec3, Vec3)) {
+    *bounds = Some(bounds.map_or((lo, hi), |(a, b)| (a.min(lo), b.max(hi))));
 }
 
 struct Pipelines {
@@ -226,6 +184,8 @@ struct View {
     prev_color: Image,
     frame: [Buffer; SLOTS],
     lights: [Buffer; SLOTS],
+    /// Per slot: `clip` in voxel.slang.
+    clip: [Buffer; SLOTS],
     pool: vk::DescriptorPool,
     scene_sets: [vk::DescriptorSet; SLOTS],
     io_sets: [[vk::DescriptorSet; IO_SETS]; SLOTS],
@@ -246,17 +206,28 @@ impl View {
 
 /// Screen and voxel GI. Install with `Renderer::set_extension` before loading
 /// scenes.
-// shortcut: retained meshes and moving bodies are not voxelized, so terrain and
-// physics only appear on screen. Follow `retained_changed` and `Lux::sync` to add them.
+// shortcut: moving physics bodies are not voxelized, so they only appear on
+// screen. Follow `Lux::sync` to add them.
 pub struct ScreenVoxel {
     pub settings: ScreenVoxelSettings,
-    triangles: Vec<Triangle>,
-    origin: Vec3,
-    cell: f32,
-    count: u32,
+    /// Loaded scenes' triangles, then each retained mesh's and its bounds.
+    triangles: Vec<GpuTriangle>,
+    retained: HashMap<u64, (Vec<GpuTriangle>, (Vec3, Vec3))>,
+    triangle_count: u32,
+    /// Each level's low cell as last voxelized; none to voxelize it whole.
+    origins: [Option<IVec3>; MAX_LEVELS],
+    /// The finest cell and the levels the voxels were built with.
+    built: (f32, usize),
+    /// Where the triangles changed since the last voxelizing.
+    changed: Option<(Vec3, Vec3)>,
+    /// Whether the voxel pool needs setting up.
+    reset: bool,
+    triangle_buffer: Buffer,
     cells: Buffer,
     voxels: Buffer,
     radiance: Buffer,
+    build: Buffer,
+    free: Buffer,
     no_capture: Buffer,
     pipelines: Option<Pipelines>,
     view: Option<View>,
@@ -277,12 +248,18 @@ impl ScreenVoxel {
         Self {
             settings,
             triangles: Vec::new(),
-            origin: Vec3::ZERO,
-            cell: 1.0,
-            count: 0,
+            retained: HashMap::new(),
+            triangle_count: 0,
+            origins: [None; MAX_LEVELS],
+            built: (0.0, 0),
+            changed: None,
+            reset: true,
+            triangle_buffer: Buffer::default(),
             cells: Buffer::default(),
             voxels: Buffer::default(),
             radiance: Buffer::default(),
+            build: Buffer::default(),
+            free: Buffer::default(),
             no_capture: Buffer::default(),
             pipelines: None,
             view: None,
@@ -299,40 +276,92 @@ impl ScreenVoxel {
         }
     }
 
-    /// Voxelize what has loaded and upload it.
-    unsafe fn upload_voxels(&mut self, gpu: &mut Gpu) -> Result<()> {
-        let grid = voxelize(&self.triangles, GRID);
-        (self.origin, self.cell) = (grid.origin, grid.cell);
-        self.count = grid.voxels.len() as u32;
-        let pool = &mut self.command_pool;
-        upload(
-            gpu,
-            pool,
-            &mut self.cells,
-            "voxel cells",
-            bytemuck::cast_slice(&grid.cells),
-        )?;
+    /// The levels this GI keeps.
+    fn levels(&self) -> usize {
+        (self.settings.levels as usize).clamp(1, MAX_LEVELS)
+    }
+
+    /// Upload every triangle for the voxelizer to read.
+    unsafe fn upload_triangles(&mut self, gpu: &mut Gpu) -> Result<()> {
+        let retained = self.retained.values().flat_map(|(t, _)| t);
+        let mut all: Vec<GpuTriangle> = self.triangles.iter().chain(retained).copied().collect();
+        self.triangle_count = all.len() as u32;
         // A buffer may not be empty.
-        let voxels: &[[u32; 4]] = if grid.voxels.is_empty() {
-            &[[0; 4]]
-        } else {
-            &grid.voxels
-        };
-        upload(
-            gpu,
-            pool,
-            &mut self.voxels,
-            "voxels",
-            bytemuck::cast_slice(voxels),
-        )?;
-        let dark = vec![0u8; voxels.len() * 64];
-        upload(gpu, pool, &mut self.radiance, "voxel radiance", &dark)?;
+        if all.is_empty() {
+            all.push([[0.0; 4]; 3]);
+        }
+        // shortcut: every change uploads every triangle; upload only the changed
+        // meshes' if digging terrain stalls.
+        let bytes = bytemuck::cast_slice(&all);
+        upload(gpu, &mut self.command_pool, &mut self.triangle_buffer, "voxel triangles", bytes)?;
         if self.view.is_some() {
             for slot in 0..SLOTS {
                 self.write_scene_set(gpu.device, slot, self.no_capture.buffer);
             }
         }
         Ok(())
+    }
+
+    /// The cells of every level and the voxels they share, set up by the first
+    /// frame's `reset` pass.
+    unsafe fn create_voxels(&mut self, gpu: &mut Gpu) -> Result<()> {
+        let levels = self.levels();
+        let cells = levels as u64 * (GRID as u64).pow(3) * 4;
+        let pool = u64::from(POOL);
+        let usage = vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::TRANSFER_DST;
+        for (buffer, name, size) in [
+            (&mut self.cells, "voxel cells", cells),
+            (&mut self.voxels, "voxels", pool * 16),
+            (&mut self.radiance, "voxel radiance", pool * 64),
+            (&mut self.build, "voxel build", pool * 16),
+            (&mut self.free, "free voxels", (pool + 1) * 4),
+        ] {
+            gpu::destroy_buffer(gpu.device, gpu.allocator, mem::take(buffer));
+            *buffer = gpu::create_buffer(
+                gpu.device,
+                gpu.allocator,
+                name,
+                size,
+                usage,
+                MemoryLocation::GpuOnly,
+            )?;
+        }
+        self.built = (self.settings.cell_size.max(1e-3), levels);
+        self.origins = [None; MAX_LEVELS];
+        self.reset = true;
+        Ok(())
+    }
+
+    /// Each level's low cell for a camera at `eye`, and the boxes of cells to
+    /// voxelize: what scrolled in, what changed, or all of a level not yet built.
+    fn plan(&mut self, eye: Vec3) -> ([[i32; 4]; MAX_LEVELS], Vec<[[i32; 4]; 2]>) {
+        let (cell, levels) = self.built;
+        let changed = self.changed.take();
+        let mut lows = [[0; 4]; MAX_LEVELS];
+        let mut jobs = Vec::new();
+        for level in 0..levels {
+            let size = cell * (1 << level) as f32;
+            let new = level_origin(eye, size);
+            let mut boxes = match self.origins[level] {
+                Some(old) => scrolled(old, new),
+                None => vec![(new, new + GRID)],
+            };
+            if let Some(touched) = changed.and_then(|c| touched(new, size, c)) {
+                // Boxes must not overlap, or cells would count triangles twice.
+                boxes = if boxes.is_empty() {
+                    vec![touched]
+                } else {
+                    vec![(new, new + GRID)]
+                };
+            }
+            self.origins[level] = Some(new);
+            lows[level] = new.extend(0).to_array();
+            for (low, high) in boxes {
+                let cells = (high - low).element_product();
+                jobs.push([low.extend(level as i32).to_array(), high.extend(cells).to_array()]);
+            }
+        }
+        (lows, jobs)
     }
 
     unsafe fn create_pipelines(gpu: &mut Gpu) -> Result<Pipelines> {
@@ -447,6 +476,11 @@ impl ScreenVoxel {
             host("voxel gi lights", light_bytes, storage)?,
             host("voxel gi lights", light_bytes, storage)?,
         ];
+        let clip_bytes = (MAX_LEVELS + 2 * MAX_JOBS) * 16;
+        let clip = [
+            host("voxel gi clipmap", clip_bytes, storage)?,
+            host("voxel gi clipmap", clip_bytes, storage)?,
+        ];
 
         let count =
             |list: &[(u32, D)], kind: D| list.iter().filter(|(_, k)| *k == kind).count() as u32;
@@ -499,6 +533,7 @@ impl ScreenVoxel {
             prev_color,
             frame,
             lights,
+            clip,
             pool,
             scene_sets,
             io_sets,
@@ -525,10 +560,14 @@ impl ScreenVoxel {
                 (4, Res::Buffer(self.cells.buffer)),
                 (5, Res::Buffer(self.voxels.buffer)),
                 (6, Res::Buffer(self.radiance.buffer)),
+                (7, Res::Buffer(view.clip[slot].buffer)),
+                (8, Res::Buffer(self.triangle_buffer.buffer)),
+                (9, Res::Buffer(self.build.buffer)),
                 (10, Res::Buffer(view.lights[slot].buffer)),
                 (11, Res::View(targets.hdr, general)),
                 (12, color),
                 (13, Res::Buffer(capture)),
+                (14, Res::Buffer(self.free.buffer)),
             ],
         );
     }
@@ -631,7 +670,7 @@ impl ScreenVoxel {
         for image in images {
             gpu::destroy_image(device, allocator, image);
         }
-        for buffer in view.frame.into_iter().chain(view.lights) {
+        for buffer in view.frame.into_iter().chain(view.lights).chain(view.clip) {
             gpu::destroy_buffer(device, allocator, buffer);
         }
     }
@@ -707,6 +746,12 @@ impl ScreenVoxel {
             && self.last_viewport == frame.viewport;
         self.last_frame = Some(frame.frame_number);
         self.last_viewport = frame.viewport;
+        if self.built.0 != settings.cell_size.max(1e-3) {
+            // Another cell size: build every level afresh.
+            self.built.0 = settings.cell_size.max(1e-3);
+            self.origins = [None; MAX_LEVELS];
+        }
+        let (lows, jobs) = self.plan(frame.eye);
         let view = self.view.as_mut().unwrap();
         let pipelines = self.pipelines.as_ref().unwrap();
 
@@ -740,15 +785,23 @@ impl ScreenVoxel {
             .extend(settings.world_ray_distance.max(0.1))
             .to_array();
         data.ground = frame.ground.extend(0.0).to_array();
-        data.counts = [self.count, GRID, lights.len() as u32, 0];
-        data.cache = [self.frame, 0, 0, settings.rays_per_texel.clamp(1, 4)];
+        data.counts = [POOL, GRID as u32, lights.len() as u32, 0];
+        data.cache = [
+            self.frame,
+            jobs.len() as u32,
+            self.triangle_count,
+            settings.rays_per_texel.clamp(1, 4),
+        ];
         data.extra = [0.0, 0.0, f32::from(u8::from(unbroken)), 0.0];
-        data.reflection = self.origin.extend(self.cell).to_array();
+        data.reflection = [0.0, 0.0, self.built.1 as f32, self.built.0];
         data.fade = [1.0; 4];
         view.frame[slot].write(bytemuck::bytes_of(&data));
         if !lights.is_empty() {
             view.lights[slot].write(bytemuck::cast_slice(&lights));
         }
+        let mut clip = lows.to_vec();
+        clip.extend(jobs.iter().flatten());
+        view.clip[slot].write(bytemuck::cast_slice(&clip));
         self.frame = self.frame.wrapping_add(1).max(1);
 
         use vk::{AccessFlags2 as A, PipelineStageFlags2 as S};
@@ -806,9 +859,32 @@ impl ScreenVoxel {
         };
         let groups = |[x, y]: [u32; 2]| [x.div_ceil(8), y.div_ceil(8)];
         let sets = view.io_sets[slot];
-        if self.count > 0 {
-            dispatch("inject", sets[0], [self.count.div_ceil(4 * 64), 1]);
+        if self.reset {
+            device.cmd_fill_buffer(cmd, self.cells.buffer, 0, vk::WHOLE_SIZE, 0);
+            let filled = [vk::MemoryBarrier2::default()
+                .src_stage_mask(S::ALL_TRANSFER)
+                .src_access_mask(A::TRANSFER_WRITE)
+                .dst_stage_mask(S::COMPUTE_SHADER)
+                .dst_access_mask(A::SHADER_READ | A::SHADER_WRITE)];
+            device.cmd_pipeline_barrier2(
+                cmd,
+                &vk::DependencyInfo::default().memory_barriers(&filled),
+            );
+            dispatch("reset", sets[0], [POOL.div_ceil(64), 1]);
+            self.reset = false;
         }
+        if let Some(most) = jobs.iter().map(|job| job[1][3] as u32).max() {
+            let cells = [most.div_ceil(64), jobs.len() as u32];
+            // More than a row of groups loop round; see `TRIANGLE_STRIDE`.
+            let triangles = [self.triangle_count.div_ceil(64).min(65535), 1];
+            dispatch("clear", sets[0], cells);
+            if self.triangle_count > 0 {
+                dispatch("claim", sets[0], triangles);
+                dispatch("accumulate", sets[0], triangles);
+            }
+            dispatch("finalize", sets[0], cells);
+        }
+        dispatch("inject", sets[0], [POOL.div_ceil(4 * 64), 1]);
         let passes = ["trace", "temporal", "atrous1", "atrous2", "atrous4"];
         for (name, &set) in passes.into_iter().zip(&sets) {
             dispatch(name, set, groups(trace));
@@ -888,19 +964,53 @@ impl RenderExtension for ScreenVoxel {
             scene.indices[first..first + count]
                 .chunks_exact(3)
                 .map(move |corners| {
-                    let corner = |i: usize| {
+                    let corner = |i: usize, w: u32| {
                         let [x, y, z, _] =
                             scene.vertices[(corners[i] + primitive.base_vertex) as usize].position;
-                        draw.transform.transform_point3(Vec3::new(x, y, z))
+                        let p = draw.transform.transform_point3(Vec3::new(x, y, z));
+                        p.extend(f32::from_bits(w)).to_array()
                     };
-                    Triangle {
-                        corners: [corner(0), corner(1), corner(2)],
-                        material: material_base + primitive.material,
-                    }
+                    let material = material_base + primitive.material;
+                    [corner(0, material), corner(1, 0), corner(2, 0)]
                 })
         });
         self.triangles.par_extend(placed);
-        unsafe { self.upload_voxels(gpu) }
+        self.origins = [None; MAX_LEVELS];
+        unsafe { self.upload_triangles(gpu) }
+    }
+
+    fn retained_changed(
+        &mut self,
+        gpu: &mut Gpu,
+        changes: &[RetainedChange],
+        material: u32,
+    ) -> Result<()> {
+        for change in changes {
+            if let Some((_, bounds)) = self.retained.remove(&change.key) {
+                grow(&mut self.changed, bounds);
+            }
+            let Some(mesh) = change.mesh else { continue };
+            grow(&mut self.changed, mesh.bounds);
+            let triangles = mesh
+                .indices
+                .par_chunks_exact(3)
+                .map(|corners| {
+                    let corner = |i: usize, w: f32| {
+                        let v = &mesh.vertices[corners[i] as usize];
+                        [v.position[0], v.position[1], v.position[2], w]
+                    };
+                    let first = &mesh.vertices[corners[0] as usize];
+                    let ground = pack_ground(first.position[3], first.normal[3]);
+                    [
+                        corner(0, f32::from_bits(material)),
+                        corner(1, ground),
+                        corner(2, 0.0),
+                    ]
+                })
+                .collect();
+            self.retained.insert(change.key, (triangles, mesh.bounds));
+        }
+        unsafe { self.upload_triangles(gpu) }
     }
 
     fn targets_changed(&mut self, gpu: &mut Gpu, targets: &Targets) -> Result<()> {
@@ -918,7 +1028,10 @@ impl RenderExtension for ScreenVoxel {
                 )?;
             }
             if self.cells.buffer == vk::Buffer::null() {
-                self.upload_voxels(gpu)?;
+                self.create_voxels(gpu)?;
+            }
+            if self.triangle_buffer.buffer == vk::Buffer::null() {
+                self.upload_triangles(gpu)?;
             }
             if let Some(view) = self.view.take() {
                 Self::destroy_view(gpu.device, gpu.allocator, view);
@@ -951,9 +1064,12 @@ impl RenderExtension for ScreenVoxel {
                 gpu::destroy_buffer(device, gpu.allocator, readback.buffer);
             }
             for buffer in [
+                &mut self.triangle_buffer,
                 &mut self.cells,
                 &mut self.voxels,
                 &mut self.radiance,
+                &mut self.build,
+                &mut self.free,
                 &mut self.no_capture,
             ] {
                 gpu::destroy_buffer(device, gpu.allocator, mem::take(buffer));
@@ -979,81 +1095,41 @@ impl RenderExtension for ScreenVoxel {
 mod tests {
     use super::*;
 
-    fn floor(z: f32, material: u32) -> [Triangle; 2] {
-        let (a, b) = (Vec3::new(0.0, 0.0, z), Vec3::new(8.0, 0.0, z));
-        let (c, d) = (Vec3::new(8.0, 8.0, z), Vec3::new(0.0, 8.0, z));
-        [
-            Triangle {
-                corners: [a, b, c],
-                material,
-            },
-            Triangle {
-                corners: [a, c, d],
-                material,
-            },
-        ]
+    #[test]
+    fn levels_centre_on_the_camera() {
+        let origin = level_origin(Vec3::new(1.0, -1.0, 0.0), 0.5);
+        assert_eq!(origin, IVec3::new(2, -2, 0) - GRID / 2);
     }
 
     #[test]
-    fn a_floor_fills_one_layer_of_cells() {
-        let grid = voxelize(&floor(1.0, 3), 16);
-        // Every whole cell; the rim holds only part of one.
-        assert!(grid.voxels.len() >= 14 * 14, "{}", grid.voxels.len());
-        let layers: std::collections::HashSet<u32> =
-            grid.voxels.iter().map(|v| v[0] / (16 * 16)).collect();
-        assert_eq!(layers.len(), 1);
-        for (i, voxel) in grid.voxels.iter().enumerate() {
-            assert_eq!(grid.cells[voxel[0] as usize] as usize, i + 1);
-            assert_eq!(voxel[1], 3);
-            assert_eq!(voxel[2], pack_normal(Vec3::Z));
+    fn a_still_level_rebuilds_nothing() {
+        assert!(scrolled(IVec3::ONE, IVec3::ONE).is_empty());
+    }
+
+    #[test]
+    fn scrolled_slabs_cover_the_new_cells_once() {
+        let old = IVec3::new(0, 0, 0);
+        for new in [IVec3::new(3, 0, 0), IVec3::new(-2, 5, 1), IVec3::new(200, 0, 0)] {
+            let slabs = scrolled(old, new);
+            let volume: i32 = slabs.iter().map(|(l, h)| (*h - *l).element_product()).sum();
+            // Cells in the new box and not the old one.
+            let kept = (old + GRID).min(new + GRID) - old.max(new);
+            let overlap = kept.max(IVec3::ZERO).element_product();
+            assert_eq!(volume, GRID.pow(3) - overlap, "{new}");
+            for (low, high) in &slabs {
+                assert!(low.cmpge(new).all() && high.cmple(new + GRID).all());
+                // None of a slab was in the old box.
+                let inside = (*high).min(old + GRID) - (*low).max(old);
+                assert!(inside.cmple(IVec3::ZERO).any(), "{new}: {low} {high}");
+            }
         }
     }
 
     #[test]
-    fn opposite_faces_in_a_cell_keep_a_normal() {
-        let mut triangles = floor(1.0, 0).to_vec();
-        for t in floor(1.0, 0) {
-            let [a, b, c] = t.corners;
-            triangles.push(Triangle {
-                corners: [a, c, b],
-                material: 0,
-            });
-        }
-        let grid = voxelize(&triangles, 16);
-        assert!(grid.voxels.iter().all(|v| v[2] != 0));
-    }
-
-    #[test]
-    fn a_cell_barely_clipped_is_often_left_open() {
-        // A sliver through many cells: each holds a tiny area of surface.
-        let (a, b) = (Vec3::ZERO, Vec3::new(8.0, 0.0, 0.0));
-        let sliver = Triangle {
-            corners: [a, b, Vec3::new(8.0, 0.01, 0.0)],
-            material: 0,
-        };
-        let wide = Triangle {
-            corners: [
-                Vec3::new(0.0, 0.0, 8.0),
-                Vec3::new(8.0, 8.0, 8.0),
-                Vec3::new(0.0, 8.0, 8.0),
-            ],
-            material: 0,
-        };
-        let grid = voxelize(&[sliver, wide], 16);
-        let open = grid.voxels.iter().filter(|v| v[0] / (16 * 16) < 8).count();
-        assert!(open < 8, "{open} cells of 16 kept");
-    }
-
-    #[test]
-    fn nothing_gives_an_empty_grid() {
-        let grid = voxelize(&[], 8);
-        assert!(grid.voxels.is_empty());
-        assert_eq!(grid.cells.len(), 512);
-    }
-
-    #[test]
-    fn normals_pack_as_signed_bytes() {
-        assert_eq!(pack_normal(Vec3::X), 127);
-        assert_eq!(pack_normal(-Vec3::Y), 129 << 8);
+    fn a_change_touches_only_its_cells() {
+        let origin = IVec3::splat(-64);
+        let (low, high) = touched(origin, 1.0, (Vec3::splat(0.5), Vec3::splat(2.5))).unwrap();
+        assert_eq!((low, high), (IVec3::splat(-1), IVec3::splat(4)));
+        assert!(touched(origin, 1.0, (Vec3::splat(500.0), Vec3::splat(501.0))).is_none());
     }
 }

@@ -1290,7 +1290,7 @@ impl Pxtgi {
 /// A mesh as the shaders walk it: its nodes, then its triangles.
 /// A terrain vertex's original ground height, in sixteenths of a metre within
 /// ±2 km, and its wetness, as bits for a triangle corner's spare w.
-fn pack_ground(height: f32, wet: f32) -> f32 {
+pub(crate) fn pack_ground(height: f32, wet: f32) -> f32 {
     let height = ((height + 2048.0) * 16.0).clamp(0.0, 65535.0) as u32;
     let wet = (wet.clamp(0.0, 1.0) * 65535.0) as u32;
     f32::from_bits(height | wet << 16)

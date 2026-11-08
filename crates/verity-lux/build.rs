@@ -46,7 +46,8 @@ const PXTGI_ENTRIES: &[&str] = &[
 
 /// The screen and voxel method's compute passes, all in `voxel.slang`.
 const VOXEL_ENTRIES: &[&str] = &[
-    "inject", "trace", "temporal", "atrous1", "atrous2", "atrous4", "composite", "capture",
+    "reset", "clear", "claim", "accumulate", "finalize", "inject", "trace", "temporal", "atrous1",
+    "atrous2", "atrous4", "composite", "capture",
 ];
 
 /// Writes `OUT_DIR/{file}.{entry}.spv` for each entry point, compiling in
