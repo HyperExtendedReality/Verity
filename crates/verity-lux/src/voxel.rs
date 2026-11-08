@@ -38,6 +38,8 @@ const MAX_LEVELS: usize = 8;
 const MAX_JOBS: usize = 3 * MAX_LEVELS;
 /// Voxels the levels share.
 const POOL: u32 = 1 << 20;
+/// Entries of the big triangles' work list; `MAX_LARGE` in voxel.slang.
+const MAX_LARGE: u64 = 65535;
 
 macro_rules! spirv {
     ($entry:literal) => {
@@ -52,7 +54,10 @@ const PASSES: &[(&str, &[u8])] = &[
     spirv!("reset"),
     spirv!("clear"),
     spirv!("claim"),
+    spirv!("capLarge"),
+    spirv!("claimLarge"),
     spirv!("accumulate"),
+    spirv!("accumulateLarge"),
     spirv!("finalize"),
     spirv!("inject"),
     spirv!("trace"),
@@ -83,6 +88,8 @@ const SCENE_BINDINGS: &[(u32, D)] = &[
     (13, D::STORAGE_BUFFER),
     (14, D::STORAGE_BUFFER),
     (15, D::STORAGE_BUFFER),
+    (16, D::STORAGE_BUFFER),
+    (17, D::STORAGE_BUFFER),
 ];
 /// Per slot: trace, temporal, three a-trous, composite.
 const IO_SETS: usize = 6;
@@ -168,6 +175,19 @@ fn touched(origin: IVec3, cell: f32, (lo, hi): (Vec3, Vec3)) -> Option<CellBox> 
     low.cmplt(high).all().then_some((low, high))
 }
 
+/// The bounds of each run of 64 triangles, as `chunkBounds` in voxel.slang
+/// reads them. Triangles arrive mesh by mesh, so a run is usually small.
+fn chunk_bounds(triangles: &[GpuTriangle]) -> Vec<[[f32; 4]; 2]> {
+    triangles
+        .par_chunks(64)
+        .map(|run| {
+            let corners = run.iter().flatten().map(|c| Vec3::new(c[0], c[1], c[2]));
+            let (lo, hi) = corners.fold((Vec3::MAX, Vec3::MIN), |(lo, hi), p| (lo.min(p), hi.max(p)));
+            [lo.extend(0.0).to_array(), hi.extend(0.0).to_array()]
+        })
+        .collect()
+}
+
 fn grow(bounds: &mut Option<(Vec3, Vec3)>, (lo, hi): (Vec3, Vec3)) {
     *bounds = Some(bounds.map_or((lo, hi), |(a, b)| (a.min(lo), b.max(hi))));
 }
@@ -236,11 +256,14 @@ pub struct ScreenVoxel {
     /// Whether the voxel pool needs setting up.
     reset: bool,
     triangle_buffer: Buffer,
+    chunk_buffer: Buffer,
     cells: Buffer,
     voxels: Buffer,
     radiance: Buffer,
     build: Buffer,
     free: Buffer,
+    /// Big triangles' work, and its indirect dispatch.
+    large: Buffer,
     no_capture: Buffer,
     blue_noise: Buffer,
     pipelines: Option<Pipelines>,
@@ -273,11 +296,13 @@ impl ScreenVoxel {
             changed: None,
             reset: true,
             triangle_buffer: Buffer::default(),
+            chunk_buffer: Buffer::default(),
             cells: Buffer::default(),
             voxels: Buffer::default(),
             radiance: Buffer::default(),
             build: Buffer::default(),
             free: Buffer::default(),
+            large: Buffer::default(),
             no_capture: Buffer::default(),
             blue_noise: Buffer::default(),
             pipelines: None,
@@ -315,6 +340,9 @@ impl ScreenVoxel {
         // meshes' if digging terrain stalls.
         let bytes = bytemuck::cast_slice(&all);
         upload(gpu, &mut self.command_pool, &mut self.triangle_buffer, "voxel triangles", bytes)?;
+        let chunks = chunk_bounds(&all);
+        let bytes = bytemuck::cast_slice(&chunks);
+        upload(gpu, &mut self.command_pool, &mut self.chunk_buffer, "voxel triangle runs", bytes)?;
         if self.view.is_some() {
             for slot in 0..SLOTS {
                 self.write_scene_set(gpu.device, slot, self.no_capture.buffer);
@@ -329,13 +357,16 @@ impl ScreenVoxel {
         let levels = self.levels();
         let cells = levels as u64 * (GRID as u64).pow(3) * 4;
         let pool = u64::from(POOL);
-        let usage = vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::TRANSFER_DST;
+        let usage = vk::BufferUsageFlags::STORAGE_BUFFER
+            | vk::BufferUsageFlags::TRANSFER_DST
+            | vk::BufferUsageFlags::INDIRECT_BUFFER;
         for (buffer, name, size) in [
             (&mut self.cells, "voxel cells", cells),
             (&mut self.voxels, "voxels", pool * 16),
             (&mut self.radiance, "voxel radiance", pool * 64),
             (&mut self.build, "voxel build", pool * 16),
             (&mut self.free, "free voxels", (pool + 1) * 4),
+            (&mut self.large, "voxel large triangles", (MAX_LARGE + 1) * 16),
         ] {
             gpu::destroy_buffer(gpu.device, gpu.allocator, mem::take(buffer));
             *buffer = gpu::create_buffer(
@@ -360,9 +391,24 @@ impl ScreenVoxel {
         let changed = self.changed.take();
         let mut lows = [[0; 4]; MAX_LEVELS];
         let mut jobs = Vec::new();
+        let size = |level: usize| cell * (1 << level) as f32;
+        // One built level moves a frame, the one furthest behind, finest first:
+        // moving several at once stalls the frame. The rest lag a little.
+        let behind = |level: usize| {
+            let old = self.origins[level]?;
+            let moved = (level_origin(eye, size(level)) - old).abs().max_element();
+            (moved > 0).then_some(moved)
+        };
+        let moving = (0..levels)
+            .filter_map(|level| Some((behind(level)?, level)))
+            .max_by_key(|&(moved, level)| (moved, std::cmp::Reverse(level)))
+            .map(|(_, level)| level);
         for (level, low) in lows.iter_mut().enumerate().take(levels) {
-            let size = cell * (1 << level) as f32;
-            let new = level_origin(eye, size);
+            let size = size(level);
+            let new = match self.origins[level] {
+                Some(old) if moving != Some(level) => old,
+                _ => level_origin(eye, size),
+            };
             let mut boxes = match self.origins[level] {
                 Some(old) => scrolled(old, new),
                 None => vec![(new, new + GRID)],
@@ -590,6 +636,8 @@ impl ScreenVoxel {
                 (13, Res::Buffer(capture)),
                 (14, Res::Buffer(self.blue_noise.buffer)),
                 (15, Res::Buffer(self.free.buffer)),
+                (16, Res::Buffer(self.large.buffer)),
+                (17, Res::Buffer(self.chunk_buffer.buffer)),
             ],
         );
     }
@@ -849,8 +897,8 @@ impl ScreenVoxel {
             let barrier = [vk::MemoryBarrier2::default()
                 .src_stage_mask(S::COMPUTE_SHADER)
                 .src_access_mask(A::SHADER_WRITE)
-                .dst_stage_mask(S::COMPUTE_SHADER)
-                .dst_access_mask(A::SHADER_READ | A::SHADER_WRITE)];
+                .dst_stage_mask(S::COMPUTE_SHADER | S::DRAW_INDIRECT)
+                .dst_access_mask(A::SHADER_READ | A::SHADER_WRITE | A::INDIRECT_COMMAND_READ)];
             device.cmd_pipeline_barrier2(
                 cmd,
                 &vk::DependencyInfo::default().memory_barriers(&barrier),
@@ -880,7 +928,8 @@ impl ScreenVoxel {
         }
         barrier();
 
-        let dispatch = |name: &'static str, set: vk::DescriptorSet, [x, y]: [u32; 2]| {
+        // A size, or none to read it from `large`.
+        let launch = |name: &'static str, set: vk::DescriptorSet, size: Option<[u32; 2]>| {
             device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, pipelines.passes[name]);
             device.cmd_bind_descriptor_sets(
                 cmd,
@@ -890,10 +939,14 @@ impl ScreenVoxel {
                 &[view.scene_sets[slot], set, frame.frame_set],
                 &[],
             );
-            device.cmd_dispatch(cmd, x.max(1), y.max(1), 1);
+            match size {
+                Some([x, y]) => device.cmd_dispatch(cmd, x.max(1), y.max(1), 1),
+                None => device.cmd_dispatch_indirect(cmd, self.large.buffer, 0),
+            }
             barrier();
             timer.borrow_mut().stamp(device, cmd, slot, name);
         };
+        let dispatch = |name, set, size| launch(name, set, Some(size));
         let groups = |[x, y]: [u32; 2]| [x.div_ceil(8), y.div_ceil(8)];
         let sets = view.io_sets[slot];
         if self.reset {
@@ -917,7 +970,10 @@ impl ScreenVoxel {
             dispatch("clear", sets[0], cells);
             if self.triangle_count > 0 {
                 dispatch("claim", sets[0], triangles);
+                dispatch("capLarge", sets[0], [1, 1]);
+                launch("claimLarge", sets[0], None);
                 dispatch("accumulate", sets[0], triangles);
+                launch("accumulateLarge", sets[0], None);
             }
             dispatch("finalize", sets[0], cells);
         }
@@ -1110,11 +1166,13 @@ impl RenderExtension for ScreenVoxel {
             }
             for buffer in [
                 &mut self.triangle_buffer,
+                &mut self.chunk_buffer,
                 &mut self.cells,
                 &mut self.voxels,
                 &mut self.radiance,
                 &mut self.build,
                 &mut self.free,
+                &mut self.large,
                 &mut self.no_capture,
                 &mut self.blue_noise,
             ] {
@@ -1150,6 +1208,16 @@ mod tests {
             assert!(at.cmpge(IVec3::splat(GRID / 2)).all(), "{eye}");
             assert!(at.cmplt(IVec3::splat(GRID / 2 + STEP)).all(), "{eye}");
         }
+    }
+
+    #[test]
+    fn runs_of_triangles_are_bounded() {
+        let triangle = |x: f32| [[x, 0.0, 0.0, 0.0], [x + 1.0, 2.0, 0.0, 0.0], [x, 0.0, -3.0, 0.0]];
+        let triangles: Vec<_> = (0..65).map(|i| triangle(i as f32)).collect();
+        let runs = chunk_bounds(&triangles);
+        assert_eq!(runs.len(), 2);
+        assert_eq!(runs[0], [[0.0, 0.0, -3.0, 0.0], [64.0, 2.0, 0.0, 0.0]]);
+        assert_eq!(runs[1], [[64.0, 0.0, -3.0, 0.0], [65.0, 2.0, 0.0, 0.0]]);
     }
 
     #[test]

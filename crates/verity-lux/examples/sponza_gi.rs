@@ -49,6 +49,8 @@ struct Bench {
     moving: bool,
     sums: HashMap<&'static str, (u32, f32, f32)>,
     order: Vec<&'static str>,
+    /// The slowest frame timed: all of its passes.
+    worst: f32,
     /// Advances only while moving, so saved frames repeat between runs.
     pose: f32,
 }
@@ -89,6 +91,8 @@ impl Bench {
             println!("{label} {name:<20} {mean:8.3} ms  peak {peak:8.3}{ran}");
         }
         println!("{label} {:<20} {total:8.3} ms", "TOTAL");
+        println!("{label} {:<20} {:8.3} ms", "WORST FRAME", self.worst);
+        self.worst = 0.0;
         self.sums.clear();
         self.order.clear();
     }
@@ -129,6 +133,7 @@ impl Bench {
                     });
                     *entry = (entry.0 + 1, entry.1 + ms, entry.2.max(ms));
                 }
+                self.worst = self.worst.max(times.iter().map(|(_, ms)| ms).sum());
                 self.stage = Stage::Time(left - 1);
             }
             Stage::Save(_) => {}
@@ -318,6 +323,7 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
             moving: false,
             sums: HashMap::new(),
             order: Vec::new(),
+            worst: 0.0,
             pose: 0.0,
         }
     });

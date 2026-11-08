@@ -44,6 +44,11 @@ static const float COVER_ONE = 4096.0;
 [[vk::binding(9, 0)]] RWStructuredBuffer<int> build;
 // The count of free voxels, then their indices.
 [[vk::binding(15, 0)]] RWStructuredBuffer<int> freeVoxels;
+// Big triangles' work: an indirect dispatch's group count, 1, 1, unused, then
+// per entry the triangle, the job, its first column and nothing.
+[[vk::binding(16, 0)]] RWStructuredBuffer<uint> large;
+// Per run of 64 triangles, its bounds: low corner, then high.
+[[vk::binding(17, 0)]] StructuredBuffer<float4> chunkBounds;
 
 int gridSize() { return int(f.counts.y); }
 int levels() { return int(f.reflection.z); }
@@ -254,6 +259,11 @@ bool jobCell(uint3 id, out int level, out int3 c) {
 [shader("compute")]
 [numthreads(64, 1, 1)]
 void clear(uint3 id : SV_DispatchThreadID) {
+    if (all(id == 0u)) {
+        large[0] = 0u;
+        large[1] = 1u;
+        large[2] = 1u;
+    }
     int level;
     int3 c;
     if (!jobCell(id, level, c)) return;
@@ -298,108 +308,231 @@ bool clippedBounds(float3 a, float3 b, float3 c, float3 lo, float3 hi, out float
     return count > 0;
 }
 
-// Visits a triangle's samples in the jobs' cells: rows of SAMPLES by SAMPLES
-// across each cell face it covers seen down its steepest axis, each standing for
-// an equal share of its area. Claiming gives a cell a voxel; otherwise each
-// sample adds its cover and the triangle's normal.
-void rasterize(uint triangle, bool claiming) {
+// A triangle as the voxelizer rasterizes it: seen down its steepest axis k,
+// across axes u and v.
+struct Raster {
+    float3 a, b, c, n;
+    int k, u, v;
+    float2 pa, pb, pc;
+    float facing;
+    int cover;
+    int3 normal;
+    uint material, ground;
+};
+
+bool rasterSetup(uint triangle, out Raster r) {
     float4 a4 = triangles[triangle * 3u];
     float4 b4 = triangles[triangle * 3u + 1u];
     float4 c4 = triangles[triangle * 3u + 2u];
-    float3 a = a4.xyz, b = b4.xyz, c = c4.xyz;
-    float3 cr = cross(b - a, c - a);
+    r.a = a4.xyz;
+    r.b = b4.xyz;
+    r.c = c4.xyz;
+    r.material = asuint(a4.w);
+    r.ground = asuint(b4.w);
+    float3 cr = cross(r.b - r.a, r.c - r.a);
     float area = length(cr);
-    if (!(area > 1e-12)) return;
-    float3 n = cr / area;
-    float3 an = abs(n);
-    int k = an.x >= an.y && an.x >= an.z ? 0 : (an.y >= an.z ? 1 : 2);
-    int u = (k + 1) % 3, v = (k + 2) % 3;
-    float2 pa = float2(a[u], a[v]), pb = float2(b[u], b[v]), pc = float2(c[u], c[v]);
-    float facing = sign((pb.x - pa.x) * (pc.y - pa.y) - (pb.y - pa.y) * (pc.x - pa.x));
-    float3 lowest = min(a, min(b, c)), highest = max(a, max(b, c));
-    int cover = int(round(COVER_ONE / (float(SAMPLES * SAMPLES) * an[k])));
-    int3 normal = int3(round(n * 127.0));
-    [loop] for (uint j = 0u; j < jobs(); j++) {
-        int4 low = clip[MAX_LEVELS + j * 2u];
-        int4 high = clip[MAX_LEVELS + j * 2u + 1u];
-        int level = low.w;
-        float cell = levelCell(level);
-        int3 from = max(int3(floor(lowest / cell)), low.xyz);
-        int3 to = min(int3(floor(highest / cell)), high.xyz - 1);
-        if (any(from > to)) continue;
-        // Big triangles only: the part inside the job may be much smaller.
-        int3 span = to - from;
-        if (span[u] * span[v] > 16) {
-            float3 clippedLow, clippedHigh;
-            float3 box = float3(low.xyz) * cell;
-            if (!clippedBounds(a, b, c, box, float3(high.xyz) * cell, clippedLow, clippedHigh)) continue;
-            from = max(from, int3(floor(clippedLow / cell)));
-            to = min(to, int3(floor(clippedHigh / cell)));
-            if (any(from > to)) continue;
+    r.n = cr / max(area, 1e-30);
+    float3 an = abs(r.n);
+    r.k = an.x >= an.y && an.x >= an.z ? 0 : (an.y >= an.z ? 1 : 2);
+    r.u = (r.k + 1) % 3;
+    r.v = (r.k + 2) % 3;
+    r.pa = float2(r.a[r.u], r.a[r.v]);
+    r.pb = float2(r.b[r.u], r.b[r.v]);
+    r.pc = float2(r.c[r.u], r.c[r.v]);
+    r.facing = sign((r.pb.x - r.pa.x) * (r.pc.y - r.pa.y) - (r.pb.y - r.pa.y) * (r.pc.x - r.pa.x));
+    r.cover = int(round(COVER_ONE / (float(SAMPLES * SAMPLES) * max(an[r.k], 1e-6))));
+    r.normal = int3(round(r.n * 127.0));
+    return area > 1e-12;
+}
+
+// The cells of job j the triangle may touch, or false when none.
+bool jobSpan(Raster r, uint j, out int level, out int3 from, out int3 to) {
+    int4 low = clip[MAX_LEVELS + j * 2u];
+    int4 high = clip[MAX_LEVELS + j * 2u + 1u];
+    level = low.w;
+    float cell = levelCell(level);
+    from = max(int3(floor(min(r.a, min(r.b, r.c)) / cell)), low.xyz);
+    to = min(int3(floor(max(r.a, max(r.b, r.c)) / cell)), high.xyz - 1);
+    if (any(from > to)) return false;
+    // Big triangles only: the part inside the job may be much smaller.
+    int3 span = to - from;
+    if (span[r.u] * span[r.v] > 16) {
+        float3 clippedLow, clippedHigh;
+        if (!clippedBounds(r.a, r.b, r.c, float3(low.xyz) * cell, float3(high.xyz) * cell, clippedLow, clippedHigh))
+            return false;
+        from = max(from, int3(floor(clippedLow / cell)));
+        to = min(to, int3(floor(clippedHigh / cell)));
+    }
+    return all(from <= to);
+}
+
+// Visits the triangle's samples in one cell face's column: SAMPLES by SAMPLES
+// across it, each standing for an equal share of the triangle's area. Claiming
+// gives a cell a voxel; otherwise each sample adds its cover and the normal.
+// Samples landing in the same cell as the last are merged, saving atomics on
+// coarse levels, where many triangles share a voxel.
+void addSamples(uint index, int samples, Raster r) {
+    uint found = cells[index];
+    if (samples == 0 || found == 0u) return;
+    uint voxel = found - 1u;
+    InterlockedAdd(build[voxel * 4u], r.cover * samples);
+    InterlockedAdd(build[voxel * 4u + 1u], r.normal.x * samples);
+    InterlockedAdd(build[voxel * 4u + 2u], r.normal.y * samples);
+    InterlockedAdd(build[voxel * 4u + 3u], r.normal.z * samples);
+}
+
+void rasterizeColumn(Raster r, int level, int3 from, int3 to, int cu, int cv, bool claiming) {
+    float cell = levelCell(level);
+    uint last = FREE;
+    int samples = 0;
+    [loop] for (int s = 0; s < SAMPLES * SAMPLES; s++) {
+        float2 q = (float2(cu, cv) + (float2(s % SAMPLES, s / SAMPLES) + 0.5) / float(SAMPLES)) * cell;
+        float e0 = (r.pb.x - r.pa.x) * (q.y - r.pa.y) - (r.pb.y - r.pa.y) * (q.x - r.pa.x);
+        float e1 = (r.pc.x - r.pb.x) * (q.y - r.pb.y) - (r.pc.y - r.pb.y) * (q.x - r.pb.x);
+        float e2 = (r.pa.x - r.pc.x) * (q.y - r.pc.y) - (r.pa.y - r.pc.y) * (q.x - r.pc.x);
+        if (min(e0 * r.facing, min(e1 * r.facing, e2 * r.facing)) < 0.0) continue;
+        float depth = r.a[r.k] - (r.n[r.u] * (q.x - r.a[r.u]) + r.n[r.v] * (q.y - r.a[r.v])) / r.n[r.k];
+        int ck = int(floor(depth / cell));
+        if (ck < from[r.k] || ck > to[r.k]) continue;
+        int3 at = 0;
+        at[r.k] = ck;
+        at[r.u] = cu;
+        at[r.v] = cv;
+        uint index = cellIndex(level, at);
+        if (index != last && !claiming) {
+            addSamples(last, samples, r);
+            samples = 0;
         }
-        [loop] for (int cu = from[u]; cu <= to[u]; cu++) {
-            [loop] for (int cv = from[v]; cv <= to[v]; cv++) {
-                [loop] for (int s = 0; s < SAMPLES * SAMPLES; s++) {
-                    float2 q = (float2(cu, cv) + (float2(s % SAMPLES, s / SAMPLES) + 0.5) / float(SAMPLES)) * cell;
-                    float e0 = (pb.x - pa.x) * (q.y - pa.y) - (pb.y - pa.y) * (q.x - pa.x);
-                    float e1 = (pc.x - pb.x) * (q.y - pb.y) - (pc.y - pb.y) * (q.x - pb.x);
-                    float e2 = (pa.x - pc.x) * (q.y - pc.y) - (pa.y - pc.y) * (q.x - pc.x);
-                    if (min(e0 * facing, min(e1 * facing, e2 * facing)) < 0.0) continue;
-                    float depth = a[k] - (n[u] * (q.x - a[u]) + n[v] * (q.y - a[v])) / n[k];
-                    int ck = int(floor(depth / cell));
-                    if (ck < from[k] || ck > to[k]) continue;
-                    int3 at = 0;
-                    at[k] = ck;
-                    at[u] = cu;
-                    at[v] = cv;
-                    uint index = cellIndex(level, at);
-                    if (claiming) {
-                        uint before;
-                        InterlockedCompareExchange(cells[index], 0u, CLAIMING, before);
-                        if (before != 0u) continue;
-                        int count;
-                        InterlockedAdd(freeVoxels[0], -1, count);
-                        if (count <= 0) {
-                            // Out of voxels: the cell stays empty.
-                            InterlockedAdd(freeVoxels[0], 1);
-                            cells[index] = 0u;
-                            continue;
-                        }
-                        uint voxel = uint(freeVoxels[count]);
-                        voxels[voxel] = uint4(index, asuint(a4.w), packNormal(n), asuint(b4.w));
-                        build[voxel * 4u] = 0;
-                        build[voxel * 4u + 1u] = 0;
-                        build[voxel * 4u + 2u] = 0;
-                        build[voxel * 4u + 3u] = 0;
-                        cells[index] = voxel + 1u;
-                    } else {
-                        uint found = cells[index];
-                        if (found == 0u) continue;
-                        uint voxel = found - 1u;
-                        InterlockedAdd(build[voxel * 4u], cover);
-                        InterlockedAdd(build[voxel * 4u + 1u], normal.x);
-                        InterlockedAdd(build[voxel * 4u + 2u], normal.y);
-                        InterlockedAdd(build[voxel * 4u + 3u], normal.z);
-                    }
-                }
+        if (index == last && claiming) continue;
+        last = index;
+        if (claiming) {
+            uint before;
+            InterlockedCompareExchange(cells[index], 0u, CLAIMING, before);
+            if (before != 0u) continue;
+            int count;
+            InterlockedAdd(freeVoxels[0], -1, count);
+            if (count <= 0) {
+                // Out of voxels: the cell stays empty.
+                InterlockedAdd(freeVoxels[0], 1);
+                cells[index] = 0u;
+                continue;
             }
+            uint voxel = uint(freeVoxels[count]);
+            voxels[voxel] = uint4(index, r.material, packNormal(r.n), r.ground);
+            build[voxel * 4u] = 0;
+            build[voxel * 4u + 1u] = 0;
+            build[voxel * 4u + 2u] = 0;
+            build[voxel * 4u + 3u] = 0;
+            cells[index] = voxel + 1u;
+        } else {
+            samples++;
         }
+    }
+    if (!claiming) addSamples(last, samples, r);
+}
+
+// A triangle covering more columns of a job than SMALL goes on `large`, whose
+// entries a whole group shares, CHUNK columns each: one thread walking a wall
+// that lies in a slab would hold up the whole pass.
+static const int SMALL = 8;
+static const int CHUNK = 256;
+static const uint MAX_LARGE = 65535u;
+
+// Rasterizes a triangle's small spans of the jobs; claiming also lists its
+// large ones, which `accumulate` then leaves to `accumulateLarge`.
+void rasterize(uint triangle, bool claiming) {
+    Raster r;
+    if (!rasterSetup(triangle, r)) return;
+    [loop] for (uint j = 0u; j < jobs(); j++) {
+        int level;
+        int3 from, to;
+        if (!jobSpan(r, j, level, from, to)) continue;
+        int width = to[r.u] - from[r.u] + 1;
+        int columns = width * (to[r.v] - from[r.v] + 1);
+        if (columns > SMALL) {
+            if (!claiming) continue;
+            uint chunks = uint((columns + CHUNK - 1) / CHUNK);
+            uint first;
+            InterlockedAdd(large[0], chunks, first);
+            // shortcut: entries past MAX_LARGE in a frame are dropped and their
+            // cells stay empty; raise it if huge rebuilds show holes.
+            for (uint i = 0u; i < chunks && first + i < MAX_LARGE; i++) {
+                uint at = 4u + (first + i) * 4u;
+                large[at] = triangle;
+                large[at + 1u] = j;
+                large[at + 2u] = i * uint(CHUNK);
+            }
+            continue;
+        }
+        [loop] for (int i = 0; i < columns; i++)
+            rasterizeColumn(r, level, from, to, from[r.u] + i % width, from[r.v] + i / width, claiming);
     }
 }
 
 // More triangles than one dispatch row holds loop round.
 static const uint TRIANGLE_STRIDE = 65535u * 64u;
 
+// Whether the run of 64 triangles holding t may reach a job. Most do not, and
+// reading every triangle of a big scene for each slab is what would cost.
+bool chunkNeeded(uint t) {
+    float3 lo = chunkBounds[(t / 64u) * 2u].xyz;
+    float3 hi = chunkBounds[(t / 64u) * 2u + 1u].xyz;
+    [loop] for (uint j = 0u; j < jobs(); j++) {
+        int4 low = clip[MAX_LEVELS + j * 2u];
+        int4 high = clip[MAX_LEVELS + j * 2u + 1u];
+        float cell = levelCell(low.w);
+        if (all(hi >= float3(low.xyz) * cell) && all(lo <= float3(high.xyz) * cell)) return true;
+    }
+    return false;
+}
+
 [shader("compute")]
 [numthreads(64, 1, 1)]
 void claim(uint3 id : SV_DispatchThreadID) {
-    for (uint t = id.x; t < f.cache.z; t += TRIANGLE_STRIDE) rasterize(t, true);
+    for (uint t = id.x; t < f.cache.z; t += TRIANGLE_STRIDE)
+        if (chunkNeeded(t)) rasterize(t, true);
 }
 
 [shader("compute")]
 [numthreads(64, 1, 1)]
 void accumulate(uint3 id : SV_DispatchThreadID) {
-    for (uint t = id.x; t < f.cache.z; t += TRIANGLE_STRIDE) rasterize(t, false);
+    for (uint t = id.x; t < f.cache.z; t += TRIANGLE_STRIDE)
+        if (chunkNeeded(t)) rasterize(t, false);
+}
+
+// The list may have overflowed: dispatch only the entries it holds.
+[shader("compute")]
+[numthreads(1, 1, 1)]
+void capLarge() {
+    large[0] = min(large[0], MAX_LARGE);
+}
+
+// One group per entry of `large`, its threads sharing the entry's columns.
+void rasterizeLarge(uint entry, uint thread, bool claiming) {
+    uint at = 4u + entry * 4u;
+    Raster r;
+    rasterSetup(large[at], r);
+    int level;
+    int3 from, to;
+    if (!jobSpan(r, large[at + 1u], level, from, to)) return;
+    int width = to[r.u] - from[r.u] + 1;
+    int columns = width * (to[r.v] - from[r.v] + 1);
+    int start = int(large[at + 2u]);
+    int end = min(start + CHUNK, columns);
+    [loop] for (int i = start + int(thread); i < end; i += 64)
+        rasterizeColumn(r, level, from, to, from[r.u] + i % width, from[r.v] + i / width, claiming);
+}
+
+[shader("compute")]
+[numthreads(64, 1, 1)]
+void claimLarge(uint3 group : SV_GroupID, uint3 thread : SV_GroupThreadID) {
+    rasterizeLarge(group.x, thread.x, true);
+}
+
+[shader("compute")]
+[numthreads(64, 1, 1)]
+void accumulateLarge(uint3 group : SV_GroupID, uint3 thread : SV_GroupThreadID) {
+    rasterizeLarge(group.x, thread.x, false);
 }
 
 // Keeps a voxel whose cell holds enough surface, with the mean normal of what
