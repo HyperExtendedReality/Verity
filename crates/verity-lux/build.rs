@@ -109,4 +109,124 @@ fn main() {
     if !failures.is_empty() {
         panic!("slangc failed:\n{}", failures.join("\n"));
     }
+    write_blue_noise(&out.join("blue_noise.bin"));
+}
+
+/// Side of the blue-noise tile the GI ray generators index by `pixel & 63`.
+const NOISE: usize = 64;
+
+/// Four independent blue-noise channels, ranks `0..4096` as little-endian u16,
+/// interleaved per texel.
+fn write_blue_noise(path: &std::path::Path) {
+    let n = NOISE * NOISE;
+    let channels: Vec<Vec<u16>> = (1..=4).map(rank_channel).collect();
+    for (c, ranks) in channels.iter().enumerate() {
+        let mut seen = vec![false; n];
+        for &r in ranks {
+            assert!(
+                !seen[r as usize],
+                "blue noise channel {c}: rank {r} repeats"
+            );
+            seen[r as usize] = true;
+        }
+        // Neighbouring ranks of white noise differ by n/3 on average; blue by more.
+        let mut sum = 0.0;
+        for y in 0..NOISE {
+            for x in 0..NOISE {
+                let a = ranks[x + y * NOISE] as f64;
+                sum += (a - ranks[(x + 1) % NOISE + y * NOISE] as f64).abs();
+                sum += (a - ranks[x + (y + 1) % NOISE * NOISE] as f64).abs();
+            }
+        }
+        let diff = sum / (2 * n * n) as f64;
+        assert!(
+            diff > 0.36,
+            "blue noise channel {c}: neighbour difference {diff:.3} is white"
+        );
+    }
+    let bytes: Vec<u8> = (0..n)
+        .flat_map(|i| channels.iter().map(move |c| c[i]))
+        .flat_map(u16::to_le_bytes)
+        .collect();
+    fs::write(path, bytes).unwrap();
+}
+
+/// Void and cluster (Ulichney 1993) on a toroidal tile: each texel's rank in
+/// a sequence of points spread as evenly as possible.
+fn rank_channel(seed: u32) -> Vec<u16> {
+    const R: isize = 6;
+    const SIGMA: f32 = 1.9;
+    let n = NOISE * NOISE;
+    let mut kernel = Vec::new();
+    for dy in -R..=R {
+        for dx in -R..=R {
+            let w = (-((dx * dx + dy * dy) as f32) / (2.0 * SIGMA * SIGMA)).exp();
+            kernel.push((dx, dy, w));
+        }
+    }
+    let splat = |energy: &mut [f32], at: usize, sign: f32| {
+        let (x, y) = ((at % NOISE) as isize, (at / NOISE) as isize);
+        for &(dx, dy, w) in &kernel {
+            let i = (x + dx).rem_euclid(NOISE as isize) as usize
+                + (y + dy).rem_euclid(NOISE as isize) as usize * NOISE;
+            energy[i] += sign * w;
+        }
+    };
+    // The tightest cluster (`want` on, highest energy) or largest void.
+    let pick = |energy: &[f32], on: &[bool], want: bool| {
+        (0..n)
+            .filter(|&i| on[i] == want)
+            .reduce(|a, b| {
+                let better = if want {
+                    energy[b] > energy[a]
+                } else {
+                    energy[b] < energy[a]
+                };
+                if better { b } else { a }
+            })
+            .unwrap()
+    };
+    let mut energy = vec![0.0f32; n];
+    let mut on = vec![false; n];
+    let mut state = seed.wrapping_mul(0x9e37_79b9) | 1;
+    let initial = n / 10;
+    let mut placed = 0;
+    while placed < initial {
+        state ^= state << 13;
+        state ^= state >> 17;
+        state ^= state << 5;
+        let i = state as usize % n;
+        if !on[i] {
+            on[i] = true;
+            splat(&mut energy, i, 1.0);
+            placed += 1;
+        }
+    }
+    // Move the tightest cluster to the largest void until that changes nothing.
+    loop {
+        let cluster = pick(&energy, &on, true);
+        on[cluster] = false;
+        splat(&mut energy, cluster, -1.0);
+        let void = pick(&energy, &on, false);
+        on[void] = true;
+        splat(&mut energy, void, 1.0);
+        if void == cluster {
+            break;
+        }
+    }
+    let mut rank = vec![0u16; n];
+    let (mut e, mut o) = (energy.clone(), on.clone());
+    for r in (0..initial).rev() {
+        let cluster = pick(&e, &o, true);
+        o[cluster] = false;
+        splat(&mut e, cluster, -1.0);
+        rank[cluster] = r as u16;
+    }
+    for r in initial..n {
+        let void = pick(&energy, &on, false);
+        on[void] = true;
+        splat(&mut energy, void, 1.0);
+        rank[void] = r as u16;
+    }
+    rank
 }

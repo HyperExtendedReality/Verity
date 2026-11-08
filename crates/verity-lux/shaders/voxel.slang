@@ -137,8 +137,7 @@ void trace(uint3 id : SV_DispatchThreadID) {
     }
     float3 p = worldFromPixel(float2(fp) + 0.5, depth);
     float3 n = gbufferNormal(g);
-    float2 pf = float2(px);
-    float3 noise = float3(ign(pf), ign(pf + float2(47.0, 17.0)), ign(pf + float2(13.0, 101.0)));
+    float3 noise = blueNoise(px).xyz;
     int rays = clamp(int(f.cache.w), 1, 4);
     float3 light = 0.0;
     float hits = 0.0;

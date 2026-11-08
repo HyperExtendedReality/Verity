@@ -20,6 +20,10 @@ pub(crate) enum Res {
     View(vk::ImageView, vk::ImageLayout),
 }
 
+/// A 64x64 blue-noise tile from `build.rs`: four channels of ranks `0..4096`
+/// as u16 per texel, which the GI ray generators step each frame.
+pub(crate) const BLUE_NOISE: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/blue_noise.bin"));
+
 pub(crate) unsafe fn write_set(
     device: &ash::Device,
     set: vk::DescriptorSet,

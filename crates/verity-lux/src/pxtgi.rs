@@ -21,7 +21,7 @@
 
 use crate::{
     GiMethod, GiStatus,
-    shared::{PassTimer, Patch, Res, upload, upload_ranges, write_set},
+    shared::{BLUE_NOISE, PassTimer, Patch, Res, upload, upload_ranges, write_set},
 };
 use ash::vk;
 use bytemuck::{Pod, Zeroable};
@@ -114,6 +114,7 @@ const SCENE_BINDINGS: &[(u32, D)] = &[
     (11, D::STORAGE_IMAGE),
     (12, D::STORAGE_IMAGE),
     (13, D::STORAGE_BUFFER),
+    (14, D::STORAGE_BUFFER),
 ];
 /// Set 1: one pass's inputs and outputs.
 pub(crate) const IO_BINDINGS: &[(u32, D)] = &[
@@ -364,6 +365,7 @@ pub struct Pxtgi {
     cells: Buffer,
     /// Bound while no capture is, as the shader declares the buffer.
     no_capture: Buffer,
+    blue_noise: Buffer,
     pipelines: Option<Pipelines>,
     view: Option<View>,
     targets: Option<Targets>,
@@ -407,6 +409,7 @@ impl Pxtgi {
             cache_keys: Buffer::default(),
             cells: Buffer::default(),
             no_capture: Buffer::default(),
+            blue_noise: Buffer::default(),
             pipelines: None,
             view: None,
             targets: None,
@@ -740,6 +743,7 @@ impl Pxtgi {
                 (11, Res::View(targets.hdr, general)),
                 (12, color),
                 (13, Res::Buffer(capture)),
+                (14, Res::Buffer(self.blue_noise.buffer)),
             ],
         );
     }
@@ -1555,6 +1559,14 @@ impl RenderExtension for Pxtgi {
                 self.cache_keys = cache("pxtgi cache keys", u64::from(CACHE_SLOTS) * 4)?;
                 self.cells = cache("pxtgi cache cells", u64::from(CACHE_SLOTS) * CELL_BYTES)?;
                 self.no_capture = cache("pxtgi no capture", 256)?;
+                let pool = &mut self.command_pool;
+                upload(
+                    gpu,
+                    pool,
+                    &mut self.blue_noise,
+                    "pxtgi blue noise",
+                    BLUE_NOISE,
+                )?;
                 let empty = [[0.0f32; 4]; 16];
                 let mut buffer = Buffer::default();
                 upload(
@@ -1618,6 +1630,7 @@ impl RenderExtension for Pxtgi {
                     mem::take(&mut self.cache_keys),
                     mem::take(&mut self.cells),
                     mem::take(&mut self.no_capture),
+                    mem::take(&mut self.blue_noise),
                     mem::take(&mut self.geometry_buffer),
                 ]);
             for buffer in buffers {
