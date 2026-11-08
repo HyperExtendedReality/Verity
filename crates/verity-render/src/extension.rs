@@ -19,6 +19,9 @@ pub struct Gpu<'a> {
     pub queue: vk::Queue,
     /// Family of `queue`, for command pools.
     pub queue_family: u32,
+    /// `VK_KHR_acceleration_structure`, `VK_KHR_ray_query` and buffer device
+    /// addresses are enabled, so an extension may trace with ray queries.
+    pub ray_query: bool,
     pub allocator: &'a mut Allocator,
     /// Layout of the renderer's per-frame descriptor set: globals, instances,
     /// lights, geometry, materials, textures and the G-buffer (see

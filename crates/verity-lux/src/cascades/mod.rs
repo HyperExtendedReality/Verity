@@ -10,10 +10,12 @@
 // Every function here is Vulkan calls; an unsafe fn body is one unsafe context.
 #![allow(unsafe_op_in_unsafe_fn)]
 
+mod accel;
 pub mod scene;
 pub mod settings;
 
 use self::{
+    accel::SceneAccel,
     scene::{GiScene, LAYER_MASK},
     settings::*,
 };
@@ -40,41 +42,43 @@ const SOURCE_BACKGROUND: u32 = 1;
 const SOURCE_PUNCTUAL: u32 = 4;
 
 macro_rules! spirv {
-    ($file:literal, $entry:expr) => {
+    ($file:literal, $entry:literal) => {
         include_bytes!(concat!(env!("OUT_DIR"), "/", $file, ".", $entry, ".spv"))
+    };
+    ($file:literal, $entry:literal, rq) => {
+        include_bytes!(concat!(env!("OUT_DIR"), "/", $file, ".", $entry, ".rq.spv"))
     };
 }
 
-/// Every cascades.slang pass this frame dispatches, with its SPIR-V.
-const PASSES: &[(&str, &[u8])] = &[
-    ("clear", spirv!("cascades", "clear")),
-    ("seed", spirv!("cascades", "seed")),
-    ("parents", spirv!("cascades", "parents")),
-    ("rank", spirv!("cascades", "rank")),
-    ("prefix", spirv!("cascades", "prefix")),
-    (
-        "generateDirections",
-        spirv!("cascades", "generateDirections"),
-    ),
-    ("retain", spirv!("cascades", "retain")),
-    ("trace", spirv!("cascades", "trace")),
-    ("reduce", spirv!("cascades", "reduce")),
-    ("merge", spirv!("cascades", "merge")),
-    ("seedProbes", spirv!("cascades", "seedProbes")),
-    ("packProbes", spirv!("cascades", "packProbes")),
-    ("temporal", spirv!("cascades", "temporal")),
-    ("denoise", spirv!("cascades", "denoise")),
-    ("commitCache", spirv!("cascades", "commitCache")),
-    ("remapProbeHeads", spirv!("cascades", "remapProbeHeads")),
-    ("worldResolve", spirv!("cascades", "worldResolve")),
-    ("traceDeferred", spirv!("cascades", "traceDeferred")),
-    ("traceRecord", spirv!("cascades", "traceRecord")),
-    ("traceVisibility", spirv!("cascades", "traceVisibility")),
-    ("traceResolve", spirv!("cascades", "traceResolve")),
-    ("compositeAnchors", spirv!("composite", "compositeAnchors")),
-    ("compositeCompute", spirv!("composite", "compositeCompute")),
-    ("compositeCapture", spirv!("composite", "compositeCapture")),
+/// Every pass this frame dispatches, with its SPIR-V for the software BVH and
+/// for hardware ray queries (`GI_RAY_QUERY`); the composite does not trace.
+const PASSES: &[(&str, &[u8], &[u8])] = &[
+    ("clear", spirv!("cascades", "clear"), spirv!("cascades", "clear", rq)),
+    ("seed", spirv!("cascades", "seed"), spirv!("cascades", "seed", rq)),
+    ("parents", spirv!("cascades", "parents"), spirv!("cascades", "parents", rq)),
+    ("rank", spirv!("cascades", "rank"), spirv!("cascades", "rank", rq)),
+    ("prefix", spirv!("cascades", "prefix"), spirv!("cascades", "prefix", rq)),
+    ("generateDirections", spirv!("cascades", "generateDirections"), spirv!("cascades", "generateDirections", rq)),
+    ("retain", spirv!("cascades", "retain"), spirv!("cascades", "retain", rq)),
+    ("trace", spirv!("cascades", "trace"), spirv!("cascades", "trace", rq)),
+    ("reduce", spirv!("cascades", "reduce"), spirv!("cascades", "reduce", rq)),
+    ("merge", spirv!("cascades", "merge"), spirv!("cascades", "merge", rq)),
+    ("seedProbes", spirv!("cascades", "seedProbes"), spirv!("cascades", "seedProbes", rq)),
+    ("packProbes", spirv!("cascades", "packProbes"), spirv!("cascades", "packProbes", rq)),
+    ("temporal", spirv!("cascades", "temporal"), spirv!("cascades", "temporal", rq)),
+    ("denoise", spirv!("cascades", "denoise"), spirv!("cascades", "denoise", rq)),
+    ("commitCache", spirv!("cascades", "commitCache"), spirv!("cascades", "commitCache", rq)),
+    ("remapProbeHeads", spirv!("cascades", "remapProbeHeads"), spirv!("cascades", "remapProbeHeads", rq)),
+    ("worldResolve", spirv!("cascades", "worldResolve"), spirv!("cascades", "worldResolve", rq)),
+    ("traceDeferred", spirv!("cascades", "traceDeferred"), spirv!("cascades", "traceDeferred", rq)),
+    ("traceRecord", spirv!("cascades", "traceRecord"), spirv!("cascades", "traceRecord", rq)),
+    ("traceVisibility", spirv!("cascades", "traceVisibility"), spirv!("cascades", "traceVisibility", rq)),
+    ("traceResolve", spirv!("cascades", "traceResolve"), spirv!("cascades", "traceResolve", rq)),
+    ("compositeAnchors", spirv!("composite", "compositeAnchors"), spirv!("composite", "compositeAnchors")),
+    ("compositeCompute", spirv!("composite", "compositeCompute"), spirv!("composite", "compositeCompute")),
+    ("compositeCapture", spirv!("composite", "compositeCapture"), spirv!("composite", "compositeCapture")),
 ];
+
 
 use vk::DescriptorType as D;
 /// The cascades' set 0, as `compute_layout` in the legacy renderer (minus the
@@ -115,6 +119,15 @@ const MAIN_BINDINGS: &[(u32, D)] = &[
     (48, D::STORAGE_BUFFER),
     (49, D::STORAGE_BUFFER),
 ];
+/// The scene TLAS, in set 0 only for the `GI_RAY_QUERY` passes.
+const TLAS_BINDING: (u32, D) = (50, D::ACCELERATION_STRUCTURE_KHR);
+
+fn main_bindings(ray_query: bool) -> Vec<(u32, D)> {
+    let mut bindings = MAIN_BINDINGS.to_vec();
+    bindings.extend(ray_query.then_some(TLAS_BINDING));
+    bindings
+}
+
 /// composite.slang's set 0, both passes.
 const COMPOSITE_BINDINGS: &[(u32, D)] = &[
     (0, D::UNIFORM_BUFFER),
@@ -206,6 +219,7 @@ fn compile_passes(
     device: ash::Device,
     layout: vk::PipelineLayout,
     composite_layout: vk::PipelineLayout,
+    ray_query: bool,
 ) -> CompiledPasses {
     let initial = std::fs::read(pipeline_cache_path()).unwrap_or_default();
     let cache = unsafe {
@@ -222,7 +236,8 @@ fn compile_passes(
         let device = &device;
         let handles: Vec<_> = PASSES
             .iter()
-            .map(|&(name, spirv)| {
+            .map(|&(name, software, hardware)| {
+                let spirv = if ray_query { hardware } else { software };
                 scope.spawn(move || {
                     let layout = if name.starts_with("composite") {
                         composite_layout
@@ -272,6 +287,8 @@ pub struct SplitRadianceCascades {
     geometry: Buffer,
     words: Buffer,
     blue_noise: Buffer,
+    /// The scene for hardware ray queries, on GPUs with them.
+    accel: Option<SceneAccel>,
     instances: u32,
     pipelines: Option<Pipelines>,
     compile: Option<std::thread::JoinHandle<CompiledPasses>>,
@@ -302,6 +319,7 @@ impl SplitRadianceCascades {
             geometry: Buffer::default(),
             words: Buffer::default(),
             blue_noise: Buffer::default(),
+            accel: None,
             instances: 0,
             pipelines: None,
             compile: None,
@@ -393,7 +411,7 @@ impl SplitRadianceCascades {
         Ok(())
     }
 
-    unsafe fn pipelines(gpu: &mut Gpu) -> Result<Pipelines> {
+    unsafe fn pipelines(gpu: &mut Gpu, ray_query: bool) -> Result<Pipelines> {
         let device = gpu.device;
         let set_layout = |bindings: &[(u32, D)]| {
             let bindings: Vec<_> = bindings
@@ -411,7 +429,7 @@ impl SplitRadianceCascades {
                 None,
             )
         };
-        let main = set_layout(MAIN_BINDINGS)?;
+        let main = set_layout(&main_bindings(ray_query))?;
         let composite = set_layout(COMPOSITE_BINDINGS)?;
         // Set 1 is the renderer's frame set: materials, textures, DFG table.
         let layout = device.create_pipeline_layout(
@@ -484,6 +502,23 @@ impl SplitRadianceCascades {
         upload(gpu, &mut self.command_pool, target, name, bytes)
     }
 
+    /// Bring the acceleration structures, if any, up to the packed words; see
+    /// [`SceneAccel::update`]. Creates them on the first call on a GPU with
+    /// ray queries.
+    unsafe fn update_accel(
+        &mut self,
+        gpu: &mut Gpu,
+        changed: Option<&[Range<usize>]>,
+    ) -> Result<()> {
+        if gpu.ray_query && self.accel.is_none() {
+            self.accel = Some(SceneAccel::new(gpu));
+        }
+        match &mut self.accel {
+            Some(accel) => accel.update(gpu, &mut self.command_pool, self.scene.words(), changed),
+            None => Ok(()),
+        }
+    }
+
     /// Pack the scene and upload it.
     unsafe fn upload_scene(&mut self, gpu: &mut Gpu) -> Result<()> {
         self.scene.pack();
@@ -515,6 +550,7 @@ impl SplitRadianceCascades {
         (self.geometry, self.words) = (geometry, scene_words);
         self.scene = mem::take(&mut scene);
         result?;
+        self.update_accel(gpu, None)?;
         if let Some(targets) = self.targets {
             self.write_sets(gpu.device, &targets);
         }
@@ -648,19 +684,23 @@ impl SplitRadianceCascades {
 
         let count =
             |list: &[(u32, D)], kind: D| list.iter().filter(|(_, k)| *k == kind).count() as u32;
-        let sizes = [
+        let main = main_bindings(self.accel.is_some());
+        let sizes: Vec<_> = [
             D::UNIFORM_BUFFER,
             D::STORAGE_BUFFER,
             D::SAMPLED_IMAGE,
             D::STORAGE_IMAGE,
+            D::ACCELERATION_STRUCTURE_KHR,
         ]
+        .into_iter()
         .map(|kind| {
             vk::DescriptorPoolSize::default().ty(kind).descriptor_count(
                 SLOTS as u32
-                    * (MAIN_SETS as u32 * count(MAIN_BINDINGS, kind)
-                        + count(COMPOSITE_BINDINGS, kind)),
+                    * (MAIN_SETS as u32 * count(&main, kind) + count(COMPOSITE_BINDINGS, kind)),
             )
-        });
+        })
+        .filter(|size| size.descriptor_count > 0)
+        .collect();
         let pool = device.create_descriptor_pool(
             &vk::DescriptorPoolCreateInfo::default()
                 .max_sets((SLOTS * (MAIN_SETS + 1)) as u32)
@@ -837,8 +877,12 @@ impl SplitRadianceCascades {
                     ],
                 ));
             }
-            for (set, entries) in view.sets[slot].iter().zip(&contents) {
-                write_set(device, *set, MAIN_BINDINGS, entries);
+            let main = main_bindings(self.accel.is_some());
+            for (set, entries) in view.sets[slot].iter().zip(&mut contents) {
+                if let Some(accel) = &self.accel {
+                    entries.push((TLAS_BINDING.0, Res::Accel(accel.tlas())));
+                }
+                write_set(device, *set, &main, entries);
             }
             let display = &irr[composite_display_index(self.settings.spatial_filter_steps, p)];
             let display_history = if self.settings.spatial_filter_steps == 0 {
@@ -1368,18 +1412,30 @@ impl RenderExtension for SplitRadianceCascades {
                         ranges: ranges.scene.iter().map(in_bytes).collect(),
                     },
                 ],
-            )
+            )?;
+            if self.accel.is_some() {
+                self.update_accel(gpu, Some(&ranges.geometry))?;
+                // The TLAS was replaced.
+                if let Some(targets) = self.targets {
+                    self.write_sets(gpu.device, &targets);
+                }
+            }
+            Ok(())
         }
     }
 
     fn targets_changed(&mut self, gpu: &mut Gpu, targets: &Targets) -> Result<()> {
         unsafe {
+            if self.accel.is_none() {
+                self.update_accel(gpu, None)?;
+            }
             if self.pipelines.is_none() {
-                let pipelines = Self::pipelines(gpu)?;
+                let ray_query = self.accel.is_some();
+                let pipelines = Self::pipelines(gpu, ray_query)?;
                 let device = gpu.device.clone();
                 let (layout, composite_layout) = (pipelines.layout, pipelines.composite_layout);
                 self.compile = Some(std::thread::spawn(move || {
-                    compile_passes(device, layout, composite_layout)
+                    compile_passes(device, layout, composite_layout, ray_query)
                 }));
                 self.status = GiStatus::Compiling {
                     since: Instant::now(),
@@ -1455,6 +1511,9 @@ impl RenderExtension for SplitRadianceCascades {
             gpu::destroy_buffer(gpu.device, gpu.allocator, mem::take(&mut self.geometry));
             gpu::destroy_buffer(gpu.device, gpu.allocator, mem::take(&mut self.words));
             gpu::destroy_buffer(gpu.device, gpu.allocator, mem::take(&mut self.blue_noise));
+            if let Some(accel) = self.accel.take() {
+                accel.destroy(gpu);
+            }
             gpu.device.destroy_command_pool(self.command_pool, None);
             self.command_pool = vk::CommandPool::null();
         }
