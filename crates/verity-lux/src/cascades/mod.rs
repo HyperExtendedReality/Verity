@@ -20,7 +20,7 @@ use self::{
 use crate::{
     GiMethod, GiStatus,
     pxtgi::{Capture, Readback},
-    shared::{PassTimer, Patch, Res, upload, upload_ranges, write_set},
+    shared::{BLUE_NOISE, PassTimer, Patch, Res, upload, upload_ranges, write_set},
 };
 use ash::vk;
 use bytemuck::{Pod, Zeroable};
@@ -113,6 +113,7 @@ const MAIN_BINDINGS: &[(u32, D)] = &[
     (46, D::STORAGE_BUFFER),
     (47, D::SAMPLED_IMAGE),
     (48, D::STORAGE_BUFFER),
+    (49, D::STORAGE_BUFFER),
 ];
 /// composite.slang's set 0, both passes.
 const COMPOSITE_BINDINGS: &[(u32, D)] = &[
@@ -270,6 +271,7 @@ pub struct SplitRadianceCascades {
     scene: GiScene,
     geometry: Buffer,
     words: Buffer,
+    blue_noise: Buffer,
     instances: u32,
     pipelines: Option<Pipelines>,
     compile: Option<std::thread::JoinHandle<CompiledPasses>>,
@@ -299,6 +301,7 @@ impl SplitRadianceCascades {
             scene: GiScene::default(),
             geometry: Buffer::default(),
             words: Buffer::default(),
+            blue_noise: Buffer::default(),
             instances: 0,
             pipelines: None,
             compile: None,
@@ -766,6 +769,7 @@ impl SplitRadianceCascades {
                     (46, Res::Buffer(view.rtgi[4].buffer)),
                     (47, placeholder),
                     (48, Res::Buffer(view.merge_list.buffer)),
+                    (49, Res::Buffer(self.blue_noise.buffer)),
                 ]
             };
             let (irr, meta, bg) = (&view.irradiance, &view.metadata, &view.background);
@@ -1402,6 +1406,11 @@ impl RenderExtension for SplitRadianceCascades {
                 )?;
                 (self.geometry, self.words) = (geometry, words);
             }
+            if self.blue_noise.buffer == vk::Buffer::null() {
+                let mut blue_noise = mem::take(&mut self.blue_noise);
+                self.upload(gpu, &mut blue_noise, "gi blue noise", BLUE_NOISE)?;
+                self.blue_noise = blue_noise;
+            }
             if let Some(view) = self.view.take() {
                 Self::destroy_view(gpu.device, gpu.allocator, view);
             }
@@ -1445,6 +1454,7 @@ impl RenderExtension for SplitRadianceCascades {
             }
             gpu::destroy_buffer(gpu.device, gpu.allocator, mem::take(&mut self.geometry));
             gpu::destroy_buffer(gpu.device, gpu.allocator, mem::take(&mut self.words));
+            gpu::destroy_buffer(gpu.device, gpu.allocator, mem::take(&mut self.blue_noise));
             gpu.device.destroy_command_pool(self.command_pool, None);
             self.command_pool = vk::CommandPool::null();
         }

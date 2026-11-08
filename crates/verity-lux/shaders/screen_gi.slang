@@ -51,6 +51,8 @@ struct Light {
 [[vk::binding(10, 0)]] StructuredBuffer<Light> lights;
 [[vk::binding(11, 0)]] [format("rgba16f")] RWTexture2D<float4> hdr;
 [[vk::binding(12, 0)]] [format("rgba16f")] WTexture2D<float4> colorOut;
+// build.rs's 64x64 blue-noise tile: four u16 ranks per texel.
+[[vk::binding(14, 0)]] StructuredBuffer<uint2> blueNoiseRanks;
 
 // Per-pass inputs and outputs.
 [[vk::binding(0, 1)]] Texture2D<float4> in0;
@@ -206,6 +208,13 @@ float3 cosineDir(float3 n, float u, float phi) {
 
 // Interleaved gradient noise, stepped along an R2 sequence per frame and ray.
 float ign(float2 p) { return frac(52.9829189 * frac(dot(p, float2(0.06711056, 0.00583715)))); }
+
+// Four independent blue-noise values in [0, 1) for a pixel, which callers step
+// along golden-ratio sequences per frame and ray.
+float4 blueNoise(int2 px) {
+    uint2 w = blueNoiseRanks[uint(px.x & 63) + uint(px.y & 63) * 64u];
+    return (float4(w.x & 0xffffu, w.x >> 16, w.y & 0xffffu, w.y >> 16) + 0.5) / 4096.0;
+}
 
 // A material's diffuse colour averaged over its surface, for hits that carry no
 // texture coordinates. Metallic comes from the texture too: glTF's factor is

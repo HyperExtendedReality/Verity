@@ -900,6 +900,8 @@ struct RtgiCacheCell {
 [[vk::binding(46, 0)]] RWStructuredBuffer<float4> rtgiField;
 // Last frame's composed HDR image over the viewport, exposure applied.
 [[vk::binding(47, 0)]] Texture2D<float4> rtgiLitHistory;
+// build.rs's 64x64 blue-noise tile: four u16 ranks per texel.
+[[vk::binding(49, 0)]] StructuredBuffer<uint2> blueNoiseRanks;
 #include "rtgi_field.slang"
 
 // Mirror RTGI_CACHE_* in render.rs.
@@ -1332,14 +1334,12 @@ RtgiCacheCell rtgiSnapshotCell(uint slot) {
     return cell;
 }
 
-// Final gather noise: interleaved gradient noise (Jimenez 2014) decorrelates
-// neighbouring samples and the R2 sequence (Roberts 2018) steps it each
-// frame, a cheap stand-in for idTech 8's blue noise.
+// Final gather noise: a void-and-cluster blue-noise tile (Ulichney 1993)
+// decorrelates neighbouring samples and the R2 sequence (Roberts 2018) steps
+// it each frame.
 float2 rtgiGatherNoise(uint2 pixel) {
-    float2 offset = float2(
-        frac(52.9829189 * frac(dot(float2(pixel), float2(0.06711056, 0.00583715)))),
-        frac(52.9829189 * frac(dot(float2(pixel) + float2(47.0, 17.0),
-            float2(0.06711056, 0.00583715)))));
+    uint2 w = blueNoiseRanks[(pixel.x & 63u) + (pixel.y & 63u) * 64u];
+    float2 offset = (float2(w.x & 0xffffu, w.x >> 16) + 0.5) / 4096.0;
     return frac(r2(params.frame.x) + offset);
 }
 

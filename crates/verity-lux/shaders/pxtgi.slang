@@ -544,8 +544,7 @@ void trace(uint3 id : SV_DispatchThreadID) {
     }
     float3 p = worldFromPixel(float2(fp) + 0.5, depth);
     float3 n = gbufferNormal(g);
-    float2 pf = float2(px);
-    float3 noise = float3(ign(pf), ign(pf + float2(47.0, 17.0)), ign(pf + float2(13.0, 101.0)));
+    float3 noise = blueNoise(px).xyz;
     int rays = clamp(int(f.cache.w), 1, 4);
     int debug = int(f.misc.w);
     // The world-only debug views show the scene's light alone: no screen march.
@@ -601,8 +600,8 @@ void reflect_trace(uint3 id : SV_DispatchThreadID) {
     float3 n = gbufferNormal(g);
     float3 p = worldFromPixel(float2(fp) + 0.5, depth);
     float3 v = normalize(p - f.camera.xyz);
-    float2 pf = float2(px);
-    float2 xi = float2(frac(ign(pf) + f.misc.x * 0.7548776662), frac(ign(pf + float2(47.0, 17.0)) + f.misc.x * 0.5698402910));
+    float4 noise = blueNoise(px);
+    float2 xi = frac(noise.xy + f.misc.x * float2(0.7548776662, 0.5698402910));
     float a2 = rough * rough * rough * rough;
     float cosT = sqrt((1.0 - xi.x) / (1.0 + (a2 - 1.0) * xi.x));
     float sinT = sqrt(max(0.0, 1.0 - cosT * cosT));
@@ -611,7 +610,7 @@ void reflect_trace(uint3 id : SV_DispatchThreadID) {
     float3 dir = reflect(v, h);
     if (dot(dir, n) <= 0.0) dir = reflect(v, n);
     float3 origin = p + n * (0.02 + 0.002 * linearDepth(depth));
-    float jitter = frac(ign(pf + float2(13.0, 101.0)) + f.misc.x * 0.6180339887);
+    float jitter = frac(noise.z + f.misc.x * 0.6180339887);
     float4 result = march(origin, dir, 3.0 * f.misc.y, 32, jitter);
     if (result.w < 0.5 && f.reflection.x > 1.5 && f.counts.x > 0u) {
         float far = 60.0;

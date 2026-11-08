@@ -11,7 +11,7 @@
 use crate::{
     GiMethod, GiStatus,
     pxtgi::{Capture, FrameData, GpuLight, IO_BINDINGS, Readback},
-    shared::{PassTimer, Res, upload, write_set},
+    shared::{BLUE_NOISE, PassTimer, Res, upload, write_set},
 };
 use ash::vk;
 use glam::{Mat4, Vec3};
@@ -65,6 +65,7 @@ const SCENE_BINDINGS: &[(u32, D)] = &[
     (11, D::STORAGE_IMAGE),
     (12, D::STORAGE_IMAGE),
     (13, D::STORAGE_BUFFER),
+    (14, D::STORAGE_BUFFER),
 ];
 /// Per slot: trace, temporal, three a-trous, composite.
 const IO_SETS: usize = 6;
@@ -264,6 +265,7 @@ pub struct ScreenVoxel {
     voxels: Buffer,
     radiance: Buffer,
     no_capture: Buffer,
+    blue_noise: Buffer,
     pipelines: Option<Pipelines>,
     view: Option<View>,
     targets: Option<Targets>,
@@ -294,6 +296,7 @@ impl ScreenVoxel {
             voxels: Buffer::default(),
             radiance: Buffer::default(),
             no_capture: Buffer::default(),
+            blue_noise: Buffer::default(),
             pipelines: None,
             view: None,
             targets: None,
@@ -541,6 +544,7 @@ impl ScreenVoxel {
                 (11, Res::View(targets.hdr, general)),
                 (12, color),
                 (13, Res::Buffer(capture)),
+                (14, Res::Buffer(self.blue_noise.buffer)),
             ],
         );
     }
@@ -943,6 +947,14 @@ impl RenderExtension for ScreenVoxel {
                     vk::BufferUsageFlags::STORAGE_BUFFER,
                     MemoryLocation::GpuOnly,
                 )?;
+                let pool = &mut self.command_pool;
+                upload(
+                    gpu,
+                    pool,
+                    &mut self.blue_noise,
+                    "voxel blue noise",
+                    BLUE_NOISE,
+                )?;
             }
             if self.cells.buffer == vk::Buffer::null() {
                 self.upload_voxels(gpu)?;
@@ -982,6 +994,7 @@ impl RenderExtension for ScreenVoxel {
                 &mut self.voxels,
                 &mut self.radiance,
                 &mut self.no_capture,
+                &mut self.blue_noise,
             ] {
                 gpu::destroy_buffer(device, gpu.allocator, mem::take(buffer));
             }
