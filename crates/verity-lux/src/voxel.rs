@@ -207,6 +207,12 @@ pub fn voxelize(triangles: &[Triangle], grid: u32) -> Voxels {
     }
 }
 
+/// How many visits a voxel side's arriving light keeps, `age` frames after the
+/// lights changed: a side is visited every 8 frames.
+fn changed_history(age: u32) -> f32 {
+    (2 + age / 8) as f32
+}
+
 struct Pipelines {
     scene_layout: vk::DescriptorSetLayout,
     io_layout: vk::DescriptorSetLayout,
@@ -266,6 +272,10 @@ pub struct ScreenVoxel {
     last_frame: Option<u64>,
     last_viewport: [u32; 4],
     frame: u32,
+    /// The lights last frame, and frames since they last changed while that
+    /// is recent enough to keep voxel history short.
+    previous_lights: Vec<u8>,
+    light_age: Option<u32>,
     capture_requested: bool,
     readback: Option<Readback>,
     capture: Option<Capture>,
@@ -292,6 +302,8 @@ impl ScreenVoxel {
             last_frame: None,
             last_viewport: [0; 4],
             frame: 1,
+            previous_lights: Vec::new(),
+            light_age: None,
             capture_requested: false,
             readback: None,
             capture: None,
@@ -700,6 +712,16 @@ impl ScreenVoxel {
                     .to_array(),
             })
             .collect();
+        let mut key = bytemuck::cast_slice::<_, u8>(&lights).to_vec();
+        if let Some(sun) = frame.sun {
+            key.extend_from_slice(bytemuck::cast_slice(&[sun.direction, sun.color]));
+        }
+        if key != self.previous_lights {
+            self.previous_lights = key;
+            self.light_age = Some(0);
+        } else {
+            self.light_age = self.light_age.map(|age| age + 1).filter(|&age| changed_history(age) < 64.0);
+        }
         let settings = self.settings;
         let [x, y, width, height] = frame.viewport;
         // History needs the frame right before this one, in the same place.
@@ -742,7 +764,12 @@ impl ScreenVoxel {
         data.ground = frame.ground.extend(0.0).to_array();
         data.counts = [self.count, GRID, lights.len() as u32, 0];
         data.cache = [self.frame, 0, 0, settings.rays_per_texel.clamp(1, 4)];
-        data.extra = [0.0, 0.0, f32::from(u8::from(unbroken)), 0.0];
+        data.extra = [
+            0.0,
+            self.light_age.map_or(0.0, changed_history),
+            f32::from(u8::from(unbroken)),
+            0.0,
+        ];
         data.reflection = self.origin.extend(self.cell).to_array();
         data.fade = [1.0; 4];
         view.frame[slot].write(bytemuck::bytes_of(&data));

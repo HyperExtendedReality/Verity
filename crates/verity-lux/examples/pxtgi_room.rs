@@ -6,7 +6,7 @@
 //! `--sponza` adds the Sponza scene as static trace meshes. For measurements:
 //! `--frames=N` quits after N frames, `--dump=file.pfm` saves the last one,
 //! `--debug=hits|bounce|reflections|world|position|roundtrip` picks a view,
-//! `--no-gi` runs the plain renderer, `--extinction` puts the light out at
+//! `--no-gi` runs the plain renderer, `--lights=N` spreads the light over N, `--extinction` puts the light out at
 //! frame 240 and prints how fast its bounce light goes, and `--reference`
 //! path traces the bounce light on the CPU to compare with `--debug=bounce`.
 use glam::{Quat, Vec3};
@@ -151,12 +151,20 @@ fn room() -> Room {
     );
     let id = room.physics.add_soft_body(cloth);
     (room.physics.soft_body_mut(id).unwrap()).pin(|p| p.z > 4.85, 1.0);
-    room.world.lights.push(PointLight {
-        position: [0.0, -1.0, 4.4],
-        color: [1.0, 0.93, 0.82],
-        intensity: 30.0,
-        radius: 16.0,
-    });
+    // `--lights=N` shares the light's power among N in a grid under the
+    // ceiling, past the 8 PXTGI shades exactly.
+    let count = flag("lights").and_then(|n| n.parse().ok()).unwrap_or(1u32).max(1);
+    let side = (count as f32).sqrt().ceil() as u32;
+    for i in 0..count {
+        let at = |k: u32| (k as f32 + 0.5) / side as f32 * 8.0 - 4.0;
+        let position = if count == 1 { [0.0, -1.0, 4.4] } else { [at(i % side), at(i / side), 4.4] };
+        room.world.lights.push(PointLight {
+            position,
+            color: [1.0, 0.93, 0.82],
+            intensity: 30.0 / count as f32,
+            radius: 16.0,
+        });
+    }
     room
 }
 

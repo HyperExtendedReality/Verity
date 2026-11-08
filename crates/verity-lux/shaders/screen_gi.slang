@@ -249,6 +249,60 @@ uint hashU(uint x) {
     return x;
 }
 
+float random01(inout uint seed) {
+    seed = hashU(seed);
+    return float(seed >> 8u) / 16777216.0;
+}
+
+// Up to this many point lights are all shaded, each with its own shadow ray.
+// Past it, a point is lit by one light picked by resampled importance sampling
+// (Talbot et al. 2005), and callers keep a running mean of what it gives.
+static const uint EXACT_LIGHTS = 8u;
+static const uint LIGHT_CANDIDATES = 16u;
+
+bool sampledLights() { return f.counts.z > EXACT_LIGHTS; }
+
+// Unshadowed irradiance / pi from point light i at x facing n, and the ray
+// that tests its shadow.
+float3 pointLight(uint i, float3 x, float3 n, out float3 l, out float reach) {
+    Light source = lights[i];
+    float3 to = source.position.xyz - x;
+    float d2 = max(dot(to, to), 1e-2);
+    l = to * rsqrt(d2);
+    reach = sqrt(d2);
+    float w = saturate(1.0 - pow(d2 * source.position.w, 2.0));
+    return source.color.rgb * (max(dot(n, l), 0.0) * w * w / d2);
+}
+
+// One point light at x picked from uniform candidates in proportion to its
+// unshadowed luminance, weighted so that, shadowed, it is an unbiased estimate
+// of all of them. 0 when no candidate reaches x.
+float3 pickPointLight(float3 x, float3 n, inout uint seed, out float3 l, out float reach) {
+    uint count = f.counts.z;
+    float total = 0.0, chosenTarget = 0.0;
+    float3 chosen = 0.0;
+    l = n;
+    reach = 0.0;
+    [loop] for (uint k = 0u; k < LIGHT_CANDIDATES; k++) {
+        uint i = min(uint(random01(seed) * float(count)), count - 1u);
+        float3 cl;
+        float cr;
+        float3 c = pointLight(i, x, n, cl, cr);
+        float target = dot(c, float3(0.2126, 0.7152, 0.0722));
+        if (target <= 0.0) continue;
+        total += target;
+        if (random01(seed) * total < target) {
+            chosen = c;
+            chosenTarget = target;
+            l = cl;
+            reach = cr;
+        }
+    }
+    if (chosenTarget <= 0.0) return 0.0;
+    // Candidate weights are target / (1 / count); W = sum / (M * target).
+    return chosen * (total * float(count) / (float(LIGHT_CANDIDATES) * chosenTarget));
+}
+
 // All tracing passes bind the previous diffuse linear depth as in1. Reject
 // previous colour when another surface occupied the projected location.
 bool previousSurface(float3 p, out float2 pc) {

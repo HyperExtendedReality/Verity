@@ -387,8 +387,9 @@ float3 smoothCache(float3 x, float3 n, bool leaving) {
 
 // ---------------------------------------------------------------- lighting
 
-// Irradiance / pi at a surface patch straight from the sun and point lights,
-// shadowed by the scene. Point lights fall off as the resolve's do.
+// Irradiance / pi at a surface patch straight from the sun and, while they are
+// few, the point lights, shadowed by the scene. Point lights fall off as the
+// resolve's do. Many point lights come from `sampledLight` instead.
 float3 directLight(float3 x, float3 n) {
     float3 light = 0.0;
     float3 o = x + n * 0.02;
@@ -396,17 +397,29 @@ float3 directLight(float3 x, float3 n) {
     if (lit > 0.0 && f.sunDirection.w > 0.5 && !blocked(o, f.sunDirection.xyz, 1e6)) {
         light += f.sunColor.rgb * lit;
     }
+    if (sampledLights()) return light;
     [loop] for (uint i = 0u; i < f.counts.z; i++) {
-        Light source = lights[i];
-        float3 to = source.position.xyz - x;
-        float d2 = max(dot(to, to), 1e-2);
-        float3 l = to * rsqrt(d2);
-        float nl = dot(n, l);
-        float w = saturate(1.0 - pow(d2 * source.position.w, 2.0));
-        if (nl <= 0.0 || w <= 0.0 || blocked(o, l, sqrt(d2) - 0.05)) continue;
-        light += source.color.rgb * nl * w * w / d2;
+        float3 l;
+        float reach;
+        float3 c = pointLight(i, x, n, l, reach);
+        if (any(c > 0.0) && !blocked(o, l, reach - 0.05)) light += c;
     }
     return light;
+}
+
+// The point lights `directLight` leaves out: one of them picked and shadowed,
+// an unbiased but noisy estimate for a running mean. 0 while they are few.
+float3 sampledLight(float3 x, float3 n, inout uint seed) {
+    if (!sampledLights()) return 0.0;
+    float3 l;
+    float reach;
+    float3 c = pickPointLight(x, n, seed, l, reach);
+    if (!any(c > 0.0) || blocked(x + n * 0.02, l, reach - 0.05)) return 0.0;
+    return c;
+}
+
+uint positionSeed(float3 x) {
+    return hashU(asuint(x.x) ^ hashU(asuint(x.y) ^ hashU(asuint(x.z) ^ hashU(f.cache.x))));
 }
 
 // How a hit is seen: by a diffuse ray, a glossy reflection, or a mirror.
@@ -448,7 +461,8 @@ float3 worldLight(float3 x, float3 n, int hit, bool fromPixels, uint seenAs) {
             }
         }
     }
-    return albedo * directLight(x, n);
+    uint seed = positionSeed(x);
+    return albedo * (directLight(x, n) + sampledLight(x, n, seed));
 }
 
 // ---------------------------------------------------------------- passes
@@ -490,6 +504,9 @@ void cache_gather(uint3 id : SV_DispatchThreadID) {
     } else if (escapes(origin, dir, f.sky.w)) {
         arriving = background(dir);
     }
+    // Many point lights reach the cell through this mean, one sampled a visit.
+    uint seed = hashU(slot ^ hashU(f.cache.x ^ 0x68bc21ebu));
+    arriving += sampledLight(cell.pos.xyz, n, seed);
     // The last 32 samples; fewer where the light just changed.
     float limit = f.extra.y > 0.0 ? f.extra.y : (movedNear(cell.pos.xyz) ? 4.0 : 32.0);
     float samples = min(cell.normal.w + 1.0, limit);
@@ -833,7 +850,7 @@ void reference(uint3 id : SV_DispatchThreadID) {
             float3 at = x + dir * t;
             n = dot(hitNormal, dir) > 0.0 ? -hitNormal : hitNormal;
             weight *= hitAlbedo(hit, at, n);
-            light += weight * directLight(at, n);
+            light += weight * (directLight(at, n) + sampledLight(at, n, seed));
             x = at + n * 0.02;
         }
     }
