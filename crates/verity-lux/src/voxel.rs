@@ -13,7 +13,7 @@
 use crate::{
     GiMethod, GiStatus,
     pxtgi::{Capture, FrameData, GpuLight, IO_BINDINGS, Readback, pack_ground},
-    shared::{PassTimer, Res, upload, write_set},
+    shared::{BLUE_NOISE, PassTimer, Res, upload, write_set},
 };
 use ash::vk;
 use glam::{IVec3, Mat4, Vec3};
@@ -82,6 +82,7 @@ const SCENE_BINDINGS: &[(u32, D)] = &[
     (12, D::STORAGE_IMAGE),
     (13, D::STORAGE_BUFFER),
     (14, D::STORAGE_BUFFER),
+    (15, D::STORAGE_BUFFER),
 ];
 /// Per slot: trace, temporal, three a-trous, composite.
 const IO_SETS: usize = 6;
@@ -165,6 +166,12 @@ fn grow(bounds: &mut Option<(Vec3, Vec3)>, (lo, hi): (Vec3, Vec3)) {
     *bounds = Some(bounds.map_or((lo, hi), |(a, b)| (a.min(lo), b.max(hi))));
 }
 
+/// How many visits a voxel side's arriving light keeps, `age` frames after the
+/// lights changed: a side is visited every 8 frames.
+fn changed_history(age: u32) -> f32 {
+    (2 + age / 8) as f32
+}
+
 struct Pipelines {
     scene_layout: vk::DescriptorSetLayout,
     io_layout: vk::DescriptorSetLayout,
@@ -229,6 +236,7 @@ pub struct ScreenVoxel {
     build: Buffer,
     free: Buffer,
     no_capture: Buffer,
+    blue_noise: Buffer,
     pipelines: Option<Pipelines>,
     view: Option<View>,
     targets: Option<Targets>,
@@ -237,6 +245,10 @@ pub struct ScreenVoxel {
     last_frame: Option<u64>,
     last_viewport: [u32; 4],
     frame: u32,
+    /// The lights last frame, and frames since they last changed while that
+    /// is recent enough to keep voxel history short.
+    previous_lights: Vec<u8>,
+    light_age: Option<u32>,
     capture_requested: bool,
     readback: Option<Readback>,
     capture: Option<Capture>,
@@ -261,6 +273,7 @@ impl ScreenVoxel {
             build: Buffer::default(),
             free: Buffer::default(),
             no_capture: Buffer::default(),
+            blue_noise: Buffer::default(),
             pipelines: None,
             view: None,
             targets: None,
@@ -269,6 +282,8 @@ impl ScreenVoxel {
             last_frame: None,
             last_viewport: [0; 4],
             frame: 1,
+            previous_lights: Vec::new(),
+            light_age: None,
             capture_requested: false,
             readback: None,
             capture: None,
@@ -567,7 +582,8 @@ impl ScreenVoxel {
                 (11, Res::View(targets.hdr, general)),
                 (12, color),
                 (13, Res::Buffer(capture)),
-                (14, Res::Buffer(self.free.buffer)),
+                (14, Res::Buffer(self.blue_noise.buffer)),
+                (15, Res::Buffer(self.free.buffer)),
             ],
         );
     }
@@ -739,6 +755,16 @@ impl ScreenVoxel {
                     .to_array(),
             })
             .collect();
+        let mut key = bytemuck::cast_slice::<_, u8>(&lights).to_vec();
+        if let Some(sun) = frame.sun {
+            key.extend_from_slice(bytemuck::cast_slice(&[sun.direction, sun.color]));
+        }
+        if key != self.previous_lights {
+            self.previous_lights = key;
+            self.light_age = Some(0);
+        } else {
+            self.light_age = self.light_age.map(|age| age + 1).filter(|&age| changed_history(age) < 64.0);
+        }
         let settings = self.settings;
         let [x, y, width, height] = frame.viewport;
         // History needs the frame right before this one, in the same place.
@@ -792,7 +818,12 @@ impl ScreenVoxel {
             self.triangle_count,
             settings.rays_per_texel.clamp(1, 4),
         ];
-        data.extra = [0.0, 0.0, f32::from(u8::from(unbroken)), 0.0];
+        data.extra = [
+            0.0,
+            self.light_age.map_or(0.0, changed_history),
+            f32::from(u8::from(unbroken)),
+            0.0,
+        ];
         data.reflection = [0.0, 0.0, self.built.1 as f32, self.built.0];
         data.fade = [1.0; 4];
         view.frame[slot].write(bytemuck::bytes_of(&data));
@@ -1026,6 +1057,14 @@ impl RenderExtension for ScreenVoxel {
                     vk::BufferUsageFlags::STORAGE_BUFFER,
                     MemoryLocation::GpuOnly,
                 )?;
+                let pool = &mut self.command_pool;
+                upload(
+                    gpu,
+                    pool,
+                    &mut self.blue_noise,
+                    "voxel blue noise",
+                    BLUE_NOISE,
+                )?;
             }
             if self.cells.buffer == vk::Buffer::null() {
                 self.create_voxels(gpu)?;
@@ -1071,6 +1110,7 @@ impl RenderExtension for ScreenVoxel {
                 &mut self.build,
                 &mut self.free,
                 &mut self.no_capture,
+                &mut self.blue_noise,
             ] {
                 gpu::destroy_buffer(device, gpu.allocator, mem::take(buffer));
             }

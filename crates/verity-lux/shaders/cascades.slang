@@ -130,8 +130,65 @@ float3 emissiveResponseTracked(float3 position, float3 normal, float3 geometricN
     return sum / float(count);
 }
 
+// Up to this many point lights are all shaded, each with its own shadow ray;
+// past it one is picked by resampled importance sampling (Talbot et al. 2005)
+// from uniform candidates, in proportion to its unshadowed light.
+static const uint EXACT_CONVENTIONAL_LIGHTS = 8u;
+static const uint CONVENTIONAL_CANDIDATES = 16u;
+
+float conventionalRandom(inout uint seed) {
+    seed ^= seed >> 16; seed *= 0x7feb352du; seed ^= seed >> 15; seed *= 0x846ca68bu; seed ^= seed >> 16;
+    return float(seed >> 8) / 16777216.0;
+}
+
+// Unshadowed light from a conventional light at a surface, before the BSDF,
+// and the ray that tests its shadow. 0 when it cannot reach the surface.
+float3 conventionalIncident(Light light, float3 position, float3 normal, float3 geometricNormal,
+                            out float3 toLight, out float distance) {
+    toLight = light.position.xyz; distance = 1e20; float attenuation = 1.0;
+    if (conventionalLightIsPunctual(light)) {
+        toLight -= position; distance = length(toLight);
+        if (distance >= light.position.w || distance < params.tuning.z) return 0.0;
+        toLight /= distance;
+        float rangeFade = saturate(1.0 - pow(distance / light.position.w, 4.0));
+        // Match Bevy's diffuse inverse-square falloff; radius is specular.
+        attenuation = rangeFade * rangeFade / max(distance * distance, 0.0001);
+        if (light.direction.w > 0) {
+            float cone = saturate(dot(light.direction.xyz, -toLight) * light.direction.w + light.color.w);
+            attenuation *= cone * cone;
+        }
+    }
+    float cosine = max(0.0, dot(normal, toLight));
+    if (cosine <= 0 || dot(geometricNormal, toLight) <= 0 || attenuation <= 0) return 0.0;
+    return light.color.xyz * (attenuation * cosine);
+}
+
+// One of the first `count` lights, picked by RIS: its unshadowed light over
+// the pick's probability, so that shadowed it estimates all of them. 0 when no
+// candidate reaches the surface.
+float3 pickConventionalLight(float3 position, float3 normal, float3 geometricNormal, uint count,
+                             inout uint seed, out uint picked, out float3 toLight, out float distance) {
+    float total = 0.0, chosenTarget = 0.0;
+    float3 chosen = 0.0;
+    picked = 0u; toLight = normal; distance = 0.0;
+    [loop] for (uint k = 0u; k < CONVENTIONAL_CANDIDATES; ++k) {
+        uint i = min(uint(conventionalRandom(seed) * float(count)), count - 1u);
+        float3 l; float d;
+        float3 c = conventionalIncident(lights[i], position, normal, geometricNormal, l, d);
+        float target = dot(c, float3(0.2126, 0.7152, 0.0722));
+        if (!(target > 0.0)) continue;
+        total += target;
+        if (conventionalRandom(seed) * total < target) {
+            chosen = c; chosenTarget = target; picked = i; toLight = l; distance = d;
+        }
+    }
+    if (chosenTarget <= 0.0) return 0.0;
+    // Candidate weights are target / (1 / count); W = sum / (M * target).
+    return chosen * (total * float(count) / (float(CONVENTIONAL_CANDIDATES) * chosenTarget));
+}
+
 void conventionalLightResponseTracked(float3 position, float3 normal, float3 geometricNormal,
-                       float3 view, float roughness, out float3 background,
+                       float3 view, float roughness, uint sequence, out float3 background,
                        out float3 punctual, out bool querySupported,
                        inout DependencyContext dependency, uint admissionLimit,
                        bool fullBsdf, SurfaceBsdf material, float2 ab) {
@@ -139,35 +196,34 @@ void conventionalLightResponseTracked(float3 position, float3 normal, float3 geo
     background = 0.0;
     punctual = 0.0;
     float3 offset = rayOffset(position, geometricNormal, params.tuning.z);
-    [loop] for (uint i = 0; i < params.frame.w; ++i) {
-        Light light = lights[i];
-        bool finiteLight = conventionalLightIsPunctual(light);
-        float3 toLight = light.position.xyz; float distance = 1e20, attenuation = 1.0;
-        if (finiteLight) {
-            toLight -= position; distance = length(toLight);
-            if (distance >= light.position.w || distance < params.tuning.z) continue;
-            toLight /= distance;
-            float rangeFade = saturate(1.0 - pow(distance / light.position.w, 4.0));
-            // Match Bevy's diffuse inverse-square falloff; radius is specular.
-            attenuation = rangeFade * rangeFade / max(distance * distance, 0.0001);
-            if (light.direction.w > 0) {
-                float cone = saturate(dot(light.direction.xyz, -toLight) * light.direction.w + light.color.w);
-                attenuation *= cone * cone;
-            }
-        }
-        float cosine = max(0.0, dot(normal, toLight));
-        if (cosine > 0 && dot(geometricNormal, toLight) > 0 && attenuation > 0) {
-            bool visibilitySupported;
-            DependencyContext visibilityDependency;
-            bool blocked = traceOccludedTracked(offset, toLight, distance - params.tuning.z,
-                visibilitySupported, visibilityDependency, admissionLimit);
-            dependencyUnion(dependency, visibilityDependency);
-            if (!visibilitySupported) { querySupported = false; return; }
-            if (!blocked) {
-                float3 contribution = light.color.xyz * (attenuation * cosine
-                    * scatteringResponse(normal, view, toLight, roughness, fullBsdf, material, ab));
-                addConventionalLightRadiance(background, punctual, finiteLight, contribution);
-            }
+    // Point lights come first, then the sun if there is one.
+    uint count = params.frame.w;
+    uint finiteCount = count > 0u && !conventionalLightIsPunctual(lights[count - 1u]) ? count - 1u : count;
+    bool sampled = finiteCount > EXACT_CONVENTIONAL_LIGHTS;
+    // Sampled: one pick, then the directional lights after the point lights.
+    uint taken = sampled ? 1u + count - finiteCount : count;
+    // A function of the surface and frame alone, so a deferred replay picks
+    // the same light and issues the same query as its recording.
+    uint seed = sequence ^ asuint(position.x) * 0x8da6b343u ^ asuint(position.y) * 0xd8163841u
+        ^ asuint(position.z) * 0xcb1ab31fu;
+    [loop] for (uint k = 0; k < taken; ++k) {
+        uint i = sampled ? finiteCount + k - 1u : k;
+        float3 toLight; float distance;
+        float3 incident = sampled && k == 0u
+            ? pickConventionalLight(position, normal, geometricNormal, finiteCount, seed, i, toLight, distance)
+            : conventionalIncident(lights[i], position, normal, geometricNormal, toLight, distance);
+        if (!any(incident > 0.0)) continue;
+        bool visibilitySupported;
+        DependencyContext visibilityDependency;
+        bool blocked = traceOccludedTracked(offset, toLight, distance - params.tuning.z,
+            visibilitySupported, visibilityDependency, admissionLimit);
+        dependencyUnion(dependency, visibilityDependency);
+        if (!visibilitySupported) { querySupported = false; return; }
+        if (!blocked) {
+            float3 contribution = incident
+                * scatteringResponse(normal, view, toLight, roughness, fullBsdf, material, ab);
+            addConventionalLightRadiance(background, punctual, conventionalLightIsPunctual(lights[i]),
+                contribution);
         }
     }
 }
@@ -248,7 +304,7 @@ TransportRadiance outgoingTransportRadianceTracked(float3 origin, float3 directi
             dependency, admissionLimit, true, material, ab);
     float3 directional, punctual;
     conventionalLightResponseTracked(position, normal, geometricNormal, view, roughness,
-        directional, punctual, conventionalSupported, dependency, admissionLimit,
+        directSequence ^ 0xC0A10003u, directional, punctual, conventionalSupported, dependency, admissionLimit,
         true, material, ab);
     querySupported = emissiveSupported && environmentSupported && conventionalSupported;
     if (!querySupported) return (TransportRadiance)0;
@@ -844,6 +900,8 @@ struct RtgiCacheCell {
 [[vk::binding(46, 0)]] RWStructuredBuffer<float4> rtgiField;
 // Last frame's composed HDR image over the viewport, exposure applied.
 [[vk::binding(47, 0)]] Texture2D<float4> rtgiLitHistory;
+// build.rs's 64x64 blue-noise tile: four u16 ranks per texel.
+[[vk::binding(49, 0)]] StructuredBuffer<uint2> blueNoiseRanks;
 #include "rtgi_field.slang"
 
 // Mirror RTGI_CACHE_* in render.rs.
@@ -1276,14 +1334,12 @@ RtgiCacheCell rtgiSnapshotCell(uint slot) {
     return cell;
 }
 
-// Final gather noise: interleaved gradient noise (Jimenez 2014) decorrelates
-// neighbouring samples and the R2 sequence (Roberts 2018) steps it each
-// frame, a cheap stand-in for idTech 8's blue noise.
+// Final gather noise: a void-and-cluster blue-noise tile (Ulichney 1993)
+// decorrelates neighbouring samples and the R2 sequence (Roberts 2018) steps
+// it each frame.
 float2 rtgiGatherNoise(uint2 pixel) {
-    float2 offset = float2(
-        frac(52.9829189 * frac(dot(float2(pixel), float2(0.06711056, 0.00583715)))),
-        frac(52.9829189 * frac(dot(float2(pixel) + float2(47.0, 17.0),
-            float2(0.06711056, 0.00583715)))));
+    uint2 w = blueNoiseRanks[(pixel.x & 63u) + (pixel.y & 63u) * 64u];
+    float2 offset = (float2(w.x & 0xffffu, w.x >> 16) + 0.5) / 4096.0;
     return frac(r2(params.frame.x) + offset);
 }
 

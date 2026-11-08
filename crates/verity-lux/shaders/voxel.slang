@@ -43,7 +43,7 @@ static const float COVER_ONE = 4096.0;
 // Per voxel being built: cover and the normal sum.
 [[vk::binding(9, 0)]] RWStructuredBuffer<int> build;
 // The count of free voxels, then their indices.
-[[vk::binding(14, 0)]] RWStructuredBuffer<int> freeVoxels;
+[[vk::binding(15, 0)]] RWStructuredBuffer<int> freeVoxels;
 
 int gridSize() { return int(f.counts.y); }
 int levels() { return int(f.reflection.z); }
@@ -130,21 +130,19 @@ float3 voxelSeen(uint found, float3 d) {
     return radiance[index * 4u + side * 2u].rgb;
 }
 
-// Irradiance / pi from the sun and point lights, shadowed by the voxels.
+// Irradiance / pi from the sun and, while they are few, the point lights,
+// shadowed by the voxels. Many point lights come from `voxelSampled`.
 float3 voxelDirect(float3 x, float3 n, float3 o) {
     float3 light = 0.0;
     float lit = dot(n, f.sunDirection.xyz);
     if (lit > 0.0 && f.sunDirection.w > 0.5 && walk(o, f.sunDirection.xyz, 1e6) == 0u)
         light += f.sunColor.rgb * lit;
+    if (sampledLights()) return light;
     [loop] for (uint i = 0u; i < f.counts.z; i++) {
-        Light source = lights[i];
-        float3 to = source.position.xyz - x;
-        float d2 = max(dot(to, to), 1e-2);
-        float3 l = to * rsqrt(d2);
-        float nl = dot(n, l);
-        float w = saturate(1.0 - pow(d2 * source.position.w, 2.0));
-        if (nl <= 0.0 || w <= 0.0 || walk(o, l, sqrt(d2) - cellSize()) != 0u) continue;
-        light += source.color.rgb * nl * w * w / d2;
+        float3 l;
+        float reach;
+        float3 c = pointLight(i, x, n, l, reach);
+        if (any(c > 0.0) && walk(o, l, reach - cellSize()) == 0u) light += c;
     }
     return light;
 }
@@ -159,6 +157,17 @@ float3 voxelAlbedo(uint4 voxel, float3 x, float3 n) {
         return terrain_albedo(x, n, height, wet, m.params.w);
     }
     return meanAlbedo(m);
+}
+
+// The point lights `voxelDirect` leaves out: one picked and shadowed, for the
+// running mean of arriving light. 0 while they are few.
+float3 voxelSampled(float3 x, float3 n, float3 o, inout uint seed) {
+    if (!sampledLights()) return 0.0;
+    float3 l;
+    float reach;
+    float3 c = pickPointLight(x, n, seed, l, reach);
+    if (!any(c > 0.0) || walk(o, l, reach - cellSize()) != 0u) return 0.0;
+    return c;
 }
 
 // A quarter of the voxels a frame, one side at a time: direct light and a bounce ray.
@@ -195,9 +204,12 @@ void inject(uint3 id : SV_DispatchThreadID) {
     float3 dir = cosineDir(n, u, phi);
     uint found = walk(o, dir, f.sky.w);
     float3 seen = found != 0u ? voxelSeen(found, dir) : background(dir);
+    uint lightSeed = hashU(seed ^ 0x68bc21ebu);
+    seen += voxelSampled(x, n, o, lightSeed);
 
+    // The last 64 visits; a few while the lights change.
     float4 arriving = radiance[slot + 1u];
-    float frames = min(arriving.w + 1.0, 64.0);
+    float frames = min(arriving.w + 1.0, f.extra.y > 0.0 ? f.extra.y : 64.0);
     arriving = float4(lerp(arriving.rgb, seen, 1.0 / frames), frames);
     radiance[slot + 1u] = bad(arriving) ? float4(0.0) : arriving;
     float3 leaving = voxelAlbedo(voxel, x, n) * (voxelDirect(x, n, o) + arriving.rgb);
@@ -391,8 +403,7 @@ void trace(uint3 id : SV_DispatchThreadID) {
     }
     float3 p = worldFromPixel(float2(fp) + 0.5, depth);
     float3 n = gbufferNormal(g);
-    float2 pf = float2(px);
-    float3 noise = float3(ign(pf), ign(pf + float2(47.0, 17.0)), ign(pf + float2(13.0, 101.0)));
+    float3 noise = blueNoise(px).xyz;
     int rays = clamp(int(f.cache.w), 1, 4);
     float3 light = 0.0;
     float hits = 0.0;

@@ -10,9 +10,10 @@
 //! `--eye=X,Y,Z`, `--target=X,Y,Z`, `--updates=N` and `--uncapped` adjust it, `--no-gi-light`
 //! saves direct light alone, and `--pxtgi` (diffuse only without `--reflections`),
 //! `--voxel` and `--reference` run those instead. `--reference` needs a high `--warm`.
+//! `--lights=N` hangs N point lights in two rows along the nave.
 use glam::Vec3;
 use std::{collections::HashMap, path::Path, sync::Arc, time::Instant};
-use verity_core::World;
+use verity_core::{PointLight, World};
 use verity_lux::{
     Lux, Method,
     cascades::settings::Settings,
@@ -317,8 +318,19 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
             pose: 0.0,
         }
     });
+    let mut world = World::new();
+    let count: u32 = arg("lights").map_or(0, |n| n.parse().expect("--lights=N"));
+    for i in 0..count {
+        let along = (i / 2) as f32 / (count.div_ceil(2).max(2) - 1) as f32;
+        world.lights.push(PointLight {
+            position: [-10.0 + 22.0 * along, if i % 2 == 0 { -6.0 } else { -2.0 }, 3.0],
+            color: [1.0, 0.8, 0.6],
+            intensity: 400.0 / count as f32,
+            radius: 12.0,
+        });
+    }
     EventLoop::new()?.run_app(&mut Viewer {
-        world: World::new(),
+        world,
         bench,
         orbit: if arg("eye").is_some() { 0.1 } else { 1.0 },
         window: None,

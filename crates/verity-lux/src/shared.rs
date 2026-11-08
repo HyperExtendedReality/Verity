@@ -18,7 +18,12 @@ pub(crate) enum Res {
     Buffer(vk::Buffer),
     /// A view in `GENERAL` layout, or a depth view in `DEPTH_READ_ONLY_OPTIMAL`.
     View(vk::ImageView, vk::ImageLayout),
+    Accel(vk::AccelerationStructureKHR),
 }
+
+/// A 64x64 blue-noise tile from `build.rs`: four channels of ranks `0..4096`
+/// as u16 per texel, which the GI ray generators step each frame.
+pub(crate) const BLUE_NOISE: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/blue_noise.bin"));
 
 pub(crate) unsafe fn write_set(
     device: &ash::Device,
@@ -33,7 +38,7 @@ pub(crate) unsafe fn write_set(
             Res::Buffer(buffer) => [vk::DescriptorBufferInfo::default()
                 .buffer(*buffer)
                 .range(vk::WHOLE_SIZE)],
-            Res::View(..) => [vk::DescriptorBufferInfo::default()],
+            _ => [vk::DescriptorBufferInfo::default()],
         })
         .collect();
     let images: Vec<[vk::DescriptorImageInfo; 1]> = entries
@@ -42,13 +47,25 @@ pub(crate) unsafe fn write_set(
             Res::View(view, layout) => [vk::DescriptorImageInfo::default()
                 .image_view(*view)
                 .image_layout(*layout)],
-            Res::Buffer(_) => [vk::DescriptorImageInfo::default()],
+            _ => [vk::DescriptorImageInfo::default()],
+        })
+        .collect();
+    let mut accels: Vec<_> = entries
+        .iter()
+        .map(|(_, res)| {
+            let handles = match res {
+                Res::Accel(handle) => std::slice::from_ref(handle),
+                _ => &[],
+            };
+            vk::WriteDescriptorSetAccelerationStructureKHR::default()
+                .acceleration_structures(handles)
         })
         .collect();
     let writes: Vec<_> = entries
         .iter()
+        .zip(&mut accels)
         .enumerate()
-        .map(|(i, (binding, res))| {
+        .map(|(i, ((binding, res), accel))| {
             let write = vk::WriteDescriptorSet::default()
                 .dst_set(set)
                 .dst_binding(*binding)
@@ -56,6 +73,7 @@ pub(crate) unsafe fn write_set(
             match res {
                 Res::Buffer(_) => write.buffer_info(&buffers[i]),
                 Res::View(..) => write.image_info(&images[i]),
+                Res::Accel(_) => write.descriptor_count(1).push_next(accel),
             }
         })
         .collect();

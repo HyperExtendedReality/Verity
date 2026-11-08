@@ -193,6 +193,8 @@ struct DeviceChoice {
     texture_format: TextureFormat,
     /// Maximum sampler anisotropy, or `None` when unsupported.
     anisotropy: Option<f32>,
+    /// Acceleration structures, ray queries and buffer device addresses are on.
+    ray_query: bool,
 }
 
 /// Owns all Vulkan resources and the window for the lifetime of its surface.
@@ -206,6 +208,7 @@ pub struct Renderer {
     device: ash::Device,
     queue: vk::Queue,
     queue_family: u32,
+    ray_query: bool,
     swap_loader: ash::khr::swapchain::Device,
     allocator: Option<Allocator>,
     depth_format: vk::Format,
@@ -374,6 +377,7 @@ impl Renderer {
                 queue_family,
                 texture_format,
                 anisotropy,
+                ray_query,
             } = choice;
             let size = window.inner_size();
             let mut renderer = Self {
@@ -388,6 +392,7 @@ impl Renderer {
                 physical,
                 device,
                 queue_family,
+                ray_query,
                 allocator: None,
                 swap: Swapchain::default(),
                 set_layout: vk::DescriptorSetLayout::null(),
@@ -494,7 +499,7 @@ impl Renderer {
             device: device.clone(),
             physical_device: self.physical,
             debug_settings: AllocatorDebugSettings::default(),
-            buffer_device_address: false,
+            buffer_device_address: self.ray_query,
             allocation_sizes: AllocationSizes::default(),
         })?);
 
@@ -1011,6 +1016,7 @@ impl Renderer {
             device: &self.device,
             queue: self.queue,
             queue_family: self.queue_family,
+            ray_query: self.ray_query,
             allocator: self.allocator.as_mut().expect("allocator lives until drop"),
             frame_set_layout: self.set_layout,
             frames_in_flight: FRAMES,
@@ -2722,10 +2728,14 @@ unsafe fn pick_device(
         let mut v11 = vk::PhysicalDeviceVulkan11Features::default();
         let mut v12 = vk::PhysicalDeviceVulkan12Features::default();
         let mut v13 = vk::PhysicalDeviceVulkan13Features::default();
+        let mut accel = vk::PhysicalDeviceAccelerationStructureFeaturesKHR::default();
+        let mut query = vk::PhysicalDeviceRayQueryFeaturesKHR::default();
         let mut features = vk::PhysicalDeviceFeatures2::default()
             .push_next(&mut v11)
             .push_next(&mut v12)
-            .push_next(&mut v13);
+            .push_next(&mut v13)
+            .push_next(&mut accel)
+            .push_next(&mut query);
         instance.get_physical_device_features2(physical, &mut features);
         let core = features.features;
         // Prefer the highest-quality target the GPU can sample.
@@ -2795,6 +2805,21 @@ unsafe fn pick_device(
             if has(ash::khr::portability_subset::NAME) {
                 names.push(ash::khr::portability_subset::NAME.as_ptr());
             }
+            // Hardware ray queries for GI, unless VERITY_NO_RAY_QUERY forces the
+            // software BVH (to compare the two).
+            let ray_extensions = [
+                ash::khr::acceleration_structure::NAME,
+                ash::khr::ray_query::NAME,
+                ash::khr::deferred_host_operations::NAME,
+            ];
+            let ray_query = std::env::var_os("VERITY_NO_RAY_QUERY").is_none()
+                && ray_extensions.iter().all(|name| has(name))
+                && accel.acceleration_structure != 0
+                && query.ray_query != 0
+                && v12.buffer_device_address != 0;
+            if ray_query {
+                names.extend(ray_extensions.map(CStr::as_ptr));
+            }
             let anisotropy =
                 (core.sampler_anisotropy != 0).then_some(properties.limits.max_sampler_anisotropy);
             let enabled = vk::PhysicalDeviceFeatures::default()
@@ -2806,27 +2831,32 @@ unsafe fn pick_device(
                 vk::PhysicalDeviceVulkan11Features::default().shader_draw_parameters(true);
             let mut v12 = vk::PhysicalDeviceVulkan12Features::default()
                 .shader_sampled_image_array_non_uniform_indexing(true)
-                .descriptor_binding_partially_bound(true);
+                .descriptor_binding_partially_bound(true)
+                .buffer_device_address(ray_query);
             let mut v13 = vk::PhysicalDeviceVulkan13Features::default()
                 .dynamic_rendering(true)
                 .synchronization2(true);
-            let device = instance.create_device(
-                physical,
-                &vk::DeviceCreateInfo::default()
-                    .queue_create_infos(&queues)
-                    .enabled_extension_names(&names)
-                    .enabled_features(&enabled)
-                    .push_next(&mut v11)
-                    .push_next(&mut v12)
-                    .push_next(&mut v13),
-                None,
-            )?;
+            let mut accel = vk::PhysicalDeviceAccelerationStructureFeaturesKHR::default()
+                .acceleration_structure(true);
+            let mut query = vk::PhysicalDeviceRayQueryFeaturesKHR::default().ray_query(true);
+            let mut info = vk::DeviceCreateInfo::default()
+                .queue_create_infos(&queues)
+                .enabled_extension_names(&names)
+                .enabled_features(&enabled)
+                .push_next(&mut v11)
+                .push_next(&mut v12)
+                .push_next(&mut v13);
+            if ray_query {
+                info = info.push_next(&mut accel).push_next(&mut query);
+            }
+            let device = instance.create_device(physical, &info, None)?;
             return Ok(DeviceChoice {
                 physical,
                 device,
                 queue_family: index,
                 texture_format,
                 anisotropy,
+                ray_query,
             });
         }
     }

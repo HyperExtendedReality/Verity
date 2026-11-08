@@ -51,7 +51,9 @@ const VOXEL_ENTRIES: &[&str] = &[
 ];
 
 /// Writes `OUT_DIR/{file}.{entry}.spv` for each entry point, compiling in
-/// parallel; the transport shaders are large.
+/// parallel; the transport shaders are large. The cascades passes also get
+/// `cascades.{entry}.rq.spv`, built with `GI_RAY_QUERY` to trace with hardware
+/// ray queries, which they pick when the GPU supports them.
 fn main() {
     println!("cargo:rerun-if-changed=shaders");
     println!("cargo:rerun-if-changed=../verity-render/shaders/lib");
@@ -59,37 +61,35 @@ fn main() {
     let out = PathBuf::from(env::var_os("OUT_DIR").unwrap());
     let library = PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").unwrap())
         .join("../verity-render/shaders/lib");
-    let mut jobs: Vec<(&str, &str, SlangStage)> = CASCADE_ENTRIES
-        .iter()
-        .map(|&entry| ("cascades", entry, SlangStage::Compute))
-        .collect();
+    let mut jobs: Vec<(&str, &str, bool)> = Vec::new();
+    for ray_query in [false, true] {
+        jobs.extend(CASCADE_ENTRIES.iter().map(|&e| ("cascades", e, ray_query)));
+    }
+    // PXTGI traces the physics scene (verity-physics' `RayScene`), never hardware.
+    jobs.extend(PXTGI_ENTRIES.iter().map(|&e| ("pxtgi", e, false)));
     jobs.extend([
-        ("composite", "compositeAnchors", SlangStage::Compute),
-        ("composite", "compositeCompute", SlangStage::Compute),
-        ("composite", "compositeCapture", SlangStage::Compute),
-        ("debug_surface", "debugSurface", SlangStage::Compute),
+        ("composite", "compositeAnchors", false),
+        ("composite", "compositeCompute", false),
+        ("composite", "compositeCapture", false),
+        ("debug_surface", "debugSurface", false),
     ]);
-    jobs.extend(
-        PXTGI_ENTRIES
-            .iter()
-            .map(|&entry| ("pxtgi", entry, SlangStage::Compute)),
-    );
-    jobs.extend(
-        VOXEL_ENTRIES
-            .iter()
-            .map(|&entry| ("voxel", entry, SlangStage::Compute)),
-    );
+    jobs.extend(VOXEL_ENTRIES.iter().map(|&e| ("voxel", e, false)));
     let compiler = SlangCompiler::default().with_source_root("shaders");
     let failures: Vec<String> = thread::scope(|scope| {
         let handles: Vec<_> = jobs
             .iter()
-            .map(|&(file, entry, stage)| {
+            .map(|&(file, entry, ray_query)| {
                 let (compiler, library, out) = (&compiler, &library, &out);
                 scope.spawn(move || {
                     let settings = SlangSettings {
                         entry_points: vec![entry.into()],
-                        stage: Some(stage),
+                        stage: Some(SlangStage::Compute),
                         include_paths: vec![library.clone()],
+                        defines: if ray_query {
+                            vec!["GI_RAY_QUERY".into()]
+                        } else {
+                            Vec::new()
+                        },
                         ..SlangSettings::default()
                     };
                     let shader = compiler
@@ -97,7 +97,8 @@ fn main() {
                         .map_err(|e| format!("{file}.slang:{entry}: {e}"))?;
                     let bytes: Vec<u8> =
                         shader.words.iter().flat_map(|w| w.to_le_bytes()).collect();
-                    fs::write(out.join(format!("{file}.{entry}.spv")), bytes)
+                    let variant = if ray_query { ".rq" } else { "" };
+                    fs::write(out.join(format!("{file}.{entry}{variant}.spv")), bytes)
                         .map_err(|e| e.to_string())
                 })
             })
@@ -110,4 +111,124 @@ fn main() {
     if !failures.is_empty() {
         panic!("slangc failed:\n{}", failures.join("\n"));
     }
+    write_blue_noise(&out.join("blue_noise.bin"));
+}
+
+/// Side of the blue-noise tile the GI ray generators index by `pixel & 63`.
+const NOISE: usize = 64;
+
+/// Four independent blue-noise channels, ranks `0..4096` as little-endian u16,
+/// interleaved per texel.
+fn write_blue_noise(path: &std::path::Path) {
+    let n = NOISE * NOISE;
+    let channels: Vec<Vec<u16>> = (1..=4).map(rank_channel).collect();
+    for (c, ranks) in channels.iter().enumerate() {
+        let mut seen = vec![false; n];
+        for &r in ranks {
+            assert!(
+                !seen[r as usize],
+                "blue noise channel {c}: rank {r} repeats"
+            );
+            seen[r as usize] = true;
+        }
+        // Neighbouring ranks of white noise differ by n/3 on average; blue by more.
+        let mut sum = 0.0;
+        for y in 0..NOISE {
+            for x in 0..NOISE {
+                let a = ranks[x + y * NOISE] as f64;
+                sum += (a - ranks[(x + 1) % NOISE + y * NOISE] as f64).abs();
+                sum += (a - ranks[x + (y + 1) % NOISE * NOISE] as f64).abs();
+            }
+        }
+        let diff = sum / (2 * n * n) as f64;
+        assert!(
+            diff > 0.36,
+            "blue noise channel {c}: neighbour difference {diff:.3} is white"
+        );
+    }
+    let bytes: Vec<u8> = (0..n)
+        .flat_map(|i| channels.iter().map(move |c| c[i]))
+        .flat_map(u16::to_le_bytes)
+        .collect();
+    fs::write(path, bytes).unwrap();
+}
+
+/// Void and cluster (Ulichney 1993) on a toroidal tile: each texel's rank in
+/// a sequence of points spread as evenly as possible.
+fn rank_channel(seed: u32) -> Vec<u16> {
+    const R: isize = 6;
+    const SIGMA: f32 = 1.9;
+    let n = NOISE * NOISE;
+    let mut kernel = Vec::new();
+    for dy in -R..=R {
+        for dx in -R..=R {
+            let w = (-((dx * dx + dy * dy) as f32) / (2.0 * SIGMA * SIGMA)).exp();
+            kernel.push((dx, dy, w));
+        }
+    }
+    let splat = |energy: &mut [f32], at: usize, sign: f32| {
+        let (x, y) = ((at % NOISE) as isize, (at / NOISE) as isize);
+        for &(dx, dy, w) in &kernel {
+            let i = (x + dx).rem_euclid(NOISE as isize) as usize
+                + (y + dy).rem_euclid(NOISE as isize) as usize * NOISE;
+            energy[i] += sign * w;
+        }
+    };
+    // The tightest cluster (`want` on, highest energy) or largest void.
+    let pick = |energy: &[f32], on: &[bool], want: bool| {
+        (0..n)
+            .filter(|&i| on[i] == want)
+            .reduce(|a, b| {
+                let better = if want {
+                    energy[b] > energy[a]
+                } else {
+                    energy[b] < energy[a]
+                };
+                if better { b } else { a }
+            })
+            .unwrap()
+    };
+    let mut energy = vec![0.0f32; n];
+    let mut on = vec![false; n];
+    let mut state = seed.wrapping_mul(0x9e37_79b9) | 1;
+    let initial = n / 10;
+    let mut placed = 0;
+    while placed < initial {
+        state ^= state << 13;
+        state ^= state >> 17;
+        state ^= state << 5;
+        let i = state as usize % n;
+        if !on[i] {
+            on[i] = true;
+            splat(&mut energy, i, 1.0);
+            placed += 1;
+        }
+    }
+    // Move the tightest cluster to the largest void until that changes nothing.
+    loop {
+        let cluster = pick(&energy, &on, true);
+        on[cluster] = false;
+        splat(&mut energy, cluster, -1.0);
+        let void = pick(&energy, &on, false);
+        on[void] = true;
+        splat(&mut energy, void, 1.0);
+        if void == cluster {
+            break;
+        }
+    }
+    let mut rank = vec![0u16; n];
+    let (mut e, mut o) = (energy.clone(), on.clone());
+    for r in (0..initial).rev() {
+        let cluster = pick(&e, &o, true);
+        o[cluster] = false;
+        splat(&mut e, cluster, -1.0);
+        rank[cluster] = r as u16;
+    }
+    for r in initial..n {
+        let void = pick(&energy, &on, false);
+        on[void] = true;
+        splat(&mut energy, void, 1.0);
+        rank[void] = r as u16;
+    }
+    rank
 }

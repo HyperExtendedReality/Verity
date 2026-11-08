@@ -16,6 +16,7 @@
 
 pub mod cascades;
 pub mod pxtgi;
+mod rt;
 mod shared;
 pub mod voxel;
 
