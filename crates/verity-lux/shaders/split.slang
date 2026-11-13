@@ -1678,9 +1678,16 @@ void finishMergeGroup(inout Entry entry, uint source, float transmittance,
     }
     float3 radiance = group.radiance;
     float support = group.support;
+    // The near part stands for the hits, the far part for what passes them.
+    // Average the far part over the child directions that have samples: dividing
+    // near and far together by their support instead gave the near hits the
+    // weight of the missing children, darkening receivers whose light comes from
+    // afar (arcades) and brightening those lit from close by (a sunlit floor).
+    // A direction with any far estimate is then whole: as a weight, its
+    // children's share would skew probe packing and the parent's merge the same way.
     if (group.childSupport > 0.0) {
-        radiance += transmittance * group.childSum * 0.25;
-        support += transmittance * group.childSupport * 0.25;
+        radiance += transmittance * group.childSum / group.childSupport;
+        support += transmittance;
     }
     float4 merged = support > 0.0
         ? float4(radiance / support, saturate(support)) : 0.0;
@@ -2118,7 +2125,8 @@ void remapProbeHeads(uint3 thread : SV_DispatchThreadID) {
         // representative or a merged-away duplicate) maps to history slot 0, as
         // it always has, so last frame's probe goes unfound. Searching for it
         // instead (EMPTY here) gives the probes' multi-bounce its full reach, but
-        // measured worse on Sponza: 0.236 to 0.246 error at 1.07x the light.
+        // adds 3-4% light where every view already reads at or above the
+        // reference, and measured worse on Sponza and Bistro (README).
         uint encoded = entries[source].valid == (params.frame.x | 0x80000000u)
             ? entries[source].padding.x : 0u;
         uint mapped = encoded == EMPTY ? EMPTY : encoded & 0x7fffffffu;

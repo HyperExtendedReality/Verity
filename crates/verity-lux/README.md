@@ -369,8 +369,49 @@ Same protocol as above, against the commit before:
 `bounceFeedback` misses it. Searching for it instead lets multi-bounce through
 the probes reach everywhere it should, but measured worse in the courtyard:
 0.245–0.247 error at 1.07× the light. More bounce lands where the image is
-already too bright, so the bias lies upstream, and the old mapping stays until
-that is found.
+already too bright. That bias is below.
+
+### Merging far light
+
+Where the light lands, by direct light at the receiver (8-pixel blocks with
+none, some, and more than 0.02): before this change the courtyard read 0.94×
+the reference in shadow and 1.15× on sunlit ground. Two experiments, since
+removed, split it:
+
+- A per-pixel gather that traces each shaded pixel's own rays and shades hits
+  exactly as the cache does, no probes: 1.08× in shadow, 1.13× sunlit. With
+  Lambertian base-colour hits, one bounce, and no sky at hits, to match a
+  one-bounce reference: 1.03× and 1.09×. Neither normal-mapped hit normals nor
+  a ray offset matching the reference's 2 cm accounts for that 3–9% (2 cm made
+  it 1.14× overall, 1 mm 1.05×), so it lies in how the two scenes and their
+  materials differ, which these runs cannot separate further.
+- The probes, against that gather on the same settings: 0.86× in shadow
+  against 1.03×. Within the first interval alone (0.8 m) they held 1.22× the
+  gather's light, so the loss was in the far cascades.
+
+`finishMergeGroup` adds a direction's far light, the next cascade through its
+4 finer child directions, to its near hits. Far cascades have up to 2048
+directions a cell, so at 2048 updates a frame many children hold no sample yet.
+The merge divided near and far together by their combined support, which gave
+the near hits the weight of the missing children: an arcade floor, whose near
+hits are dark ceiling and whose light comes from the courtyard, read dark, and
+a sunlit floor, whose near hits are lit, read bright. The merged support then
+weighted directions in `packProbes` and the parent's merge the same way. Now
+the far light is averaged over the children that have samples, and a direction
+with near and any far estimate counts whole.
+
+| View | GPU time | Light | Error | Error, 80 px | Shadow / sunlit |
+| --- | --- | --- | --- | --- | --- |
+| Sponza courtyard | 3.49–3.63 → 3.50 ms | 1.04× → 1.08× | 0.234–0.238 → 0.208–0.209 | 0.154–0.159 → 0.118–0.121 | 0.94 / 1.15 → 1.03 / 1.10 |
+| Sponza corridor | 2.54 → 2.65 ms | 1.13× → 1.18× | 0.386 → 0.396 | 0.196 → 0.213 | 1.13 → 1.18 in shadow |
+| Bistro street | 5.35 → 5.48 ms | 0.93× → 1.03× | 0.214 → 0.168 | 0.161 → 0.106 | 0.87 / 0.96 → 1.01 / 1.01 |
+
+The corridor, nearly all in shadow, already read bright from light leaking
+between probes; its far light now has its full weight and it reads 4% brighter.
+The time differences are within run-to-run noise; `merge` itself is unchanged.
+With the merge fixed, the `remapProbeHeads` search above still made every view
+worse (courtyard 0.219–0.222, corridor 0.399, Bistro 0.171), adding 3–4% light
+to images already at or above the reference's, so the old mapping stays.
 
 ## Screen and voxel GI
 
