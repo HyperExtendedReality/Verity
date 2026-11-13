@@ -282,19 +282,12 @@ HitAttributes hitAttributes(Hit hit) {
 float3 hitShadingNormal(Hit hit, HitAttributes attributes, float3 incoming) {
     return materialNormal(hit, attributes, incoming);
 }
+// Verity's materials do not emit (`GpuMaterial` has no emission) and its HDR
+// target has no exposure: an unlit instance shows its base colour, and nothing
+// else glows. This read emission and Bevy's exposure weight from scene words at
+// the material index, which in Verity are unrelated data.
 float3 hitEmission(Hit hit, float3 baseColor) {
-    uint material = materialBase(hit);
-    uint flags = sceneWord(instanceBase(hit.instance)+6).w;
-    float3 emission;
-    if ((flags & 16) != 0) emission = baseColor;
-    else emission = asfloat(sceneWord(material+1).xyz)*materialSample(hit,1).xyz;
-#ifndef GI_TRAVERSAL_CHECK
-    float exposureWeight = (flags&16) != 0 ? 0 : asfloat(sceneWord(material+2).w);
-    // Preserve Bevy's emissive exposure weight before cached GI is pre-exposed.
-    float exposure = max(params.environment.w,1e-20);
-    emission *= lerp(1/exposure,1.0,exposureWeight);
-#endif
-    return emission;
+    return (sceneWord(instanceBase(hit.instance) + 6).w & 16) != 0 ? baseColor : 0.0;
 }
 Triangle worldTriangle(Hit hit) {
     uint base = instanceBase(hit.instance);
@@ -303,8 +296,7 @@ Triangle worldTriangle(Hit hit) {
     triangle.b.xyz = transformPoint(base + 3, triangle.b.xyz);
     triangle.c.xyz = transformPoint(base + 3, triangle.c.xyz);
     float4 color = materialBaseColor(hit);
-    uint material = materialBase(hit);
-    float metallic = saturate(asfloat(sceneWord(material + 2).x) * materialSample(hit, 2).b);
+    float metallic = materialMetallic(hit);
     // Preserve the low two cull-mode bits for transport shading.
     triangle.albedo = float4(color.xyz * (1 - metallic), float(sceneWord(base + 6).w & 3u));
     if ((sceneWord(base + 6).w & 16) != 0) triangle.albedo.xyz = 0;
