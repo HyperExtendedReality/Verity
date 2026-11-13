@@ -112,18 +112,11 @@ const SCENE_BINDINGS: &[(u32, D)] = &[
     (1, D::SAMPLED_IMAGE),
     (2, D::SAMPLED_IMAGE),
     (3, D::SAMPLED_IMAGE),
-    (4, D::STORAGE_BUFFER),
-    (5, D::STORAGE_BUFFER),
-    (6, D::STORAGE_BUFFER),
-    (7, D::STORAGE_BUFFER),
-    (8, D::STORAGE_BUFFER),
-    (9, D::STORAGE_BUFFER),
-    (10, D::STORAGE_BUFFER),
+    // Buffers are pointers in `FrameData::buffers`, but for the capture,
+    // which swaps in only while one is pending.
     (11, D::STORAGE_IMAGE),
     (12, D::STORAGE_IMAGE),
     (13, D::STORAGE_BUFFER),
-    (14, D::STORAGE_BUFFER),
-    (16, D::STORAGE_BUFFER),
 ];
 /// The scene TLAS, in set 0 on GPUs with ray queries.
 const TLAS_BINDING: (u32, D) = (15, D::ACCELERATION_STRUCTURE_KHR);
@@ -253,6 +246,8 @@ pub(crate) struct FrameData {
     pub(crate) fade: [f32; 4],
     pub(crate) moved_min: [[f32; 4]; MAX_MOVED],
     pub(crate) moved_max: [[f32; 4]; MAX_MOVED],
+    /// Lights, blue noise, then each method's `METHOD_POINTERS` in order.
+    pub(crate) buffers: [vk::DeviceAddress; 9],
 }
 
 /// `Light` in pxtgi.slang.
@@ -809,7 +804,6 @@ impl Pxtgi {
     /// be in flight no longer.
     unsafe fn write_scene_set(&self, device: &ash::Device, slot: usize, capture: vk::Buffer) {
         let (view, targets) = (self.view.as_ref().unwrap(), self.targets.unwrap());
-        let scene = &self.slots[slot];
         let general = vk::ImageLayout::GENERAL;
         let color = Res::View(view.prev_color.view, general);
         let ray_query = self.pipelines.as_ref().is_some_and(|p| p.ray_query);
@@ -835,18 +829,9 @@ impl Pxtgi {
                 ),
                 (2, Res::View(targets.gbuffer, general)),
                 (3, color),
-                (4, Res::Buffer(scene.primitives.buffer)),
-                (5, Res::Buffer(scene.nodes.buffer)),
-                (6, Res::Buffer(self.cache_keys.buffer)),
-                (7, Res::Buffer(self.cells.buffer)),
-                (8, Res::Buffer(self.geometry_buffer.buffer)),
-                (9, Res::Buffer(scene.soft.buffer)),
-                (10, Res::Buffer(view.lights[slot].buffer)),
                 (11, Res::View(targets.hdr, general)),
                 (12, color),
                 (13, Res::Buffer(capture)),
-                (14, Res::Buffer(self.blue_noise.buffer)),
-                (16, Res::Buffer(view.reference_sum.buffer)),
             ],
         );
     }
@@ -1289,6 +1274,18 @@ impl Pxtgi {
             fade: fade.extend(1.0).to_array(),
             moved_min,
             moved_max,
+            // `publish` and `tend_capture` above have settled every buffer.
+            buffers: [
+                view.lights[slot].address,
+                self.blue_noise.address,
+                self.slots[slot].primitives.address,
+                self.slots[slot].nodes.address,
+                self.cache_keys.address,
+                self.cells.address,
+                self.geometry_buffer.address,
+                self.slots[slot].soft.address,
+                view.reference_sum.address,
+            ],
         };
         view.frame[slot].write(bytemuck::bytes_of(&data));
         if !lights.is_empty() {

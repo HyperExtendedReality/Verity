@@ -1,0 +1,49 @@
+{
+  "entities": [],
+  "lights": [],
+  "sun": {
+    "direction": [
+      -0.3,
+      -0.2,
+      -1.0
+    ],
+    "color": [
+      1.0,
+      0.95,
+      0.88
+    ],
+    "intensity": 3.0
+  },
+  "lighting": {
+    "method": "SplitRadianceCascades",
+    "sky": [
+      0.03,
+      0.035,
+      0.045
+    ],
+    "ground": [
+      0.015,
+      0.015,
+      0.015
+    ]
+  },
+  "assets": [
+    "assets/packed/BistroExterior.glb"
+  ],
+  "cameras": [
+    {
+      "name": "Overview",
+      "position": [
+        24.034777450000004,
+        -206.39413352000003,
+        30.068440327299996
+      ],
+      "target": [
+        24.034777450000004,
+        -4.059872050000003,
+        21.515649345499998
+      ],
+      "vertical_fov": 60.0
+    }
+  ]
+}

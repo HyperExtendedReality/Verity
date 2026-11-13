@@ -210,6 +210,14 @@ pub struct Parameters {
     /// cascade whose hits read the cache instead of shading, bounce rays per
     /// texel (bits 0-7) and software reach in centimetres (bits 8-31).
     pub surface: [u32; 4],
+    /// Elements in the cache entries, previous entries, head words and
+    /// merge-list words: the shaders reach them through pointers, which have
+    /// no length of their own.
+    pub lengths: [u32; 4],
+    /// Elements in the geometry and scene words.
+    pub word_lengths: [u32; 4],
+    /// `CASCADE_POINTERS` in cascades.slang, in order.
+    pub buffers: [u64; 19],
 }
 
 pub fn probe_directory_capacity(samples: u64) -> u64 {
@@ -405,8 +413,8 @@ mod tests {
 
     #[test]
     fn parameters_match_the_shader_block() {
-        // 4 matrices and 29 vec4s, no padding.
-        assert_eq!(std::mem::size_of::<Parameters>(), 4 * 64 + 29 * 16);
+        // 4 matrices, 31 vec4s and 19 pointers, no padding.
+        assert_eq!(std::mem::size_of::<Parameters>(), 4 * 64 + 31 * 16 + 19 * 8);
     }
 
     #[test]

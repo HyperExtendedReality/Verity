@@ -3,13 +3,13 @@
 // world probes, a texel belongs to one side of one surface, so its light never
 // leaks through a wall. `surfaceUpdate` shades a rolling share of texels each
 // frame; ray hits read them through `surfaceRead`.
-[[vk::binding(51, 0)]] StructuredBuffer<uint4> surfaceTriangles; // per triangle: chart corners as half pairs, island + 1
-[[vk::binding(52, 0)]] StructuredBuffer<uint4> surfaceIslands;   // atlas rect x, y, w, h; w = 0 when unplaced
-[[vk::binding(53, 0)]] StructuredBuffer<uint4> surfaceTexels;    // triangle, instance, barycentrics b, c (unorm16), valid
-// Three words per texel: direct light per source and sample mass; incoming
-// bounce light per source and diffuse reflectance; dependency bounds as half
-// floats and flags. Light is R11G11B10 floats.
-[[vk::binding(54, 0)]] RWStructuredBuffer<uint4> surfaceRadiance;
+// Its buffers are pointers that cascades.slang aliases to these names:
+// surfaceTriangles, per triangle: chart corners as half pairs, island + 1.
+// surfaceIslands: atlas rect x, y, w, h; w = 0 when unplaced.
+// surfaceTexels: triangle, instance, barycentrics b, c (unorm16), valid.
+// surfaceRadiance, three words per texel: direct light per source and sample
+// mass; incoming bounce light per source and diffuse reflectance; dependency
+// bounds as half floats and flags. Light is R11G11B10 floats.
 static const uint SURFACE_ATLAS_WIDTH = 2048u; // surface::ATLAS_WIDTH
 static const float SURFACE_MIN_BLEND = 0.1;
 
@@ -21,17 +21,31 @@ struct SurfaceTexel {
     DependencyContext dependency;
 };
 
+// Half-float bits in the low 16 bits of a uint. Slang's f16tof32/f32tof16
+// compile to 16-bit types, which need shaderInt16 and shaderFloat16; the
+// GLSL.std.450 pack/unpack stay in 32-bit registers and need neither.
+float halfToFloat(uint bits) {
+    uint low = bits & 0xffffu;
+    float2 pair = spirv_asm { OpExtInst $$float2 result glsl450 UnpackHalf2x16 $low };
+    return pair.x;
+}
+uint floatToHalf(float value) {
+    float2 pair = float2(value, 0.0);
+    uint packed = spirv_asm { OpExtInst $$uint result glsl450 PackHalf2x16 $pair };
+    return packed & 0xffffu;
+}
+
 uint packSurfaceLight(float3 value) {
     // 60000 keeps rounding below the half-float infinity exponent.
     value = all(isfinite(value)) ? clamp(value, 0.0, 60000.0) : 0.0;
-    uint3 h = uint3(f32tof16(value.x), f32tof16(value.y), f32tof16(value.z));
+    uint3 h = uint3(floatToHalf(value.x), floatToHalf(value.y), floatToHalf(value.z));
     // Round to nearest, then drop the mantissa bits R11G11B10 has no room for.
     return ((h.x + 8u) >> 4u) | (((h.y + 8u) >> 4u) << 11u) | (((h.z + 16u) >> 5u) << 22u);
 }
 
 float3 unpackSurfaceLight(uint value) {
-    return float3(f16tof32((value & 0x7ffu) << 4u), f16tof32(((value >> 11u) & 0x7ffu) << 4u),
-                  f16tof32((value >> 22u) << 5u));
+    return float3(halfToFloat((value & 0x7ffu) << 4u), halfToFloat(((value >> 11u) & 0x7ffu) << 4u),
+                  halfToFloat((value >> 22u) << 5u));
 }
 
 SurfaceTexel loadSurfaceTexel(uint texel) {
@@ -47,8 +61,8 @@ SurfaceTexel loadSurfaceTexel(uint texel) {
     result.bounce.emissive = unpackSurfaceLight(b.y);
     result.bounce.punctual = unpackSurfaceLight(b.z);
     result.reflectance = unpackSurfaceLight(b.w);
-    result.dependency.minimum = float3(f16tof32(c.x), f16tof32(c.x >> 16u), f16tof32(c.y));
-    result.dependency.maximum = float3(f16tof32(c.y >> 16u), f16tof32(c.z), f16tof32(c.z >> 16u));
+    result.dependency.minimum = float3(halfToFloat(c.x), halfToFloat(c.x >> 16u), halfToFloat(c.y));
+    result.dependency.maximum = float3(halfToFloat(c.y >> 16u), halfToFloat(c.z), halfToFloat(c.z >> 16u));
     result.dependency.known = (c.w & 1u) != 0u;
     result.dependency.hasBounds = (c.w & 2u) != 0u;
     return result;
@@ -71,8 +85,8 @@ void storeSurfaceTexel(uint texel, SurfaceTexel value) {
         packSurfaceLight(value.bounce.emissive), packSurfaceLight(value.bounce.punctual),
         packSurfaceLight(value.reflectance));
     surfaceRadiance[texel * 3u + 2u] = uint4(
-        f32tof16(low.x) | (f32tof16(low.y) << 16u), f32tof16(low.z) | (f32tof16(high.x) << 16u),
-        f32tof16(high.y) | (f32tof16(high.z) << 16u), flags);
+        floatToHalf(low.x) | (floatToHalf(low.y) << 16u), floatToHalf(low.z) | (floatToHalf(high.x) << 16u),
+        floatToHalf(high.y) | (floatToHalf(high.z) << 16u), flags);
 }
 
 // The atlas texel under a hit, or EMPTY when its instance or island has none.
@@ -84,9 +98,9 @@ uint surfaceTexelAt(Hit hit) {
     if (chart.w == 0u) return EMPTY;
     uint4 rect = surfaceIslands[instanceWord.y - 1u + chart.w - 1u];
     if (rect.z == 0u) return EMPTY;
-    float2 uv = float2(f16tof32(chart.x), f16tof32(chart.x >> 16u)) * hit.barycentric.x
-        + float2(f16tof32(chart.y), f16tof32(chart.y >> 16u)) * hit.barycentric.y
-        + float2(f16tof32(chart.z), f16tof32(chart.z >> 16u)) * hit.barycentric.z;
+    float2 uv = float2(halfToFloat(chart.x), halfToFloat(chart.x >> 16u)) * hit.barycentric.x
+        + float2(halfToFloat(chart.y), halfToFloat(chart.y >> 16u)) * hit.barycentric.y
+        + float2(halfToFloat(chart.z), halfToFloat(chart.z >> 16u)) * hit.barycentric.z;
     int2 q = int2(floor(uv * asfloat(instanceWord.z)));
     uint2 local = uint2(clamp(q, int2(0, 0), int2(rect.zw) - 1));
     uint texel = (rect.y + local.y) * SURFACE_ATLAS_WIDTH + rect.x + local.x;

@@ -56,8 +56,7 @@ uint ordinaryTransportAdmissionLimit() { return 0u; }
 // GPU (device lost) instead of producing a wrong colour. Every read below is
 // therefore clamped to the bound buffer or page array.
 uint4 geometryInlineWord(uint index) {
-    uint words, stride;
-    geometryWords.GetDimensions(words, stride);
+    uint words = params.wordLengths.x;
     return words == 0u ? (uint4)0 : geometryWords[min(index, words - 1u)];
 }
 uint4 geometryPageWord(uint index) {
@@ -112,8 +111,7 @@ uint4 scenePageWord(uint index) {
     return scenePageTexture.Load(int4(withinPage % side, withinPage / side, layer, 0));
 }
 uint4 sceneInlineWord(uint index) {
-    uint words, stride;
-    sceneWords.GetDimensions(words, stride);
+    uint words = params.wordLengths.y;
     return words == 0u ? (uint4)0 : sceneWords[min(index, words - 1u)];
 }
 uint4 sceneWord(uint index) {

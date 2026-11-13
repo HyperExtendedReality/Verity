@@ -39,6 +39,13 @@ use verity_render::{
 };
 
 const SLOTS: usize = 2;
+
+/// How many `stride`-byte elements a whole-buffer binding held: what
+/// `GetDimensions` reported before shaders read buffers through pointers.
+fn elements(buffer: &Buffer, stride: u64) -> u32 {
+    // `gpu::create_buffer` makes every buffer at least 16 bytes.
+    (buffer.size.max(16) / stride) as u32
+}
 const SOURCE_BACKGROUND: u32 = 1;
 const SOURCE_PUNCTUAL: u32 = 4;
 
@@ -85,19 +92,12 @@ const PASSES: &[(&str, &[u8], &[u8])] = &[
 use vk::DescriptorType as D;
 /// The cascades' set 0, as `compute_layout` in the legacy renderer (minus the
 /// atlas, the DFG texture and the hardware TLAS).
+/// Its buffers are pointers in `Parameters::buffers`.
 const MAIN_BINDINGS: &[(u32, D)] = &[
     (0, D::UNIFORM_BUFFER),
-    (1, D::STORAGE_BUFFER),
-    (2, D::STORAGE_BUFFER),
-    (3, D::STORAGE_BUFFER),
     (4, D::SAMPLED_IMAGE),
-    (6, D::STORAGE_BUFFER),
-    (7, D::STORAGE_BUFFER),
-    (8, D::STORAGE_BUFFER),
-    (9, D::STORAGE_BUFFER),
     (10, D::STORAGE_IMAGE),
     (11, D::SAMPLED_IMAGE),
-    (12, D::STORAGE_BUFFER),
     (13, D::SAMPLED_IMAGE),
     (14, D::STORAGE_IMAGE),
     (15, D::SAMPLED_IMAGE),
@@ -112,18 +112,7 @@ const MAIN_BINDINGS: &[(u32, D)] = &[
     (38, D::STORAGE_IMAGE),
     (39, D::SAMPLED_IMAGE),
     (40, D::SAMPLED_IMAGE),
-    (42, D::STORAGE_BUFFER),
-    (43, D::STORAGE_BUFFER),
-    (44, D::STORAGE_BUFFER),
-    (45, D::STORAGE_BUFFER),
-    (46, D::STORAGE_BUFFER),
     (47, D::SAMPLED_IMAGE),
-    (48, D::STORAGE_BUFFER),
-    (49, D::STORAGE_BUFFER),
-    (51, D::STORAGE_BUFFER),
-    (52, D::STORAGE_BUFFER),
-    (53, D::STORAGE_BUFFER),
-    (54, D::STORAGE_BUFFER),
 ];
 /// The scene TLAS, in set 0 only for the `GI_RAY_QUERY` passes.
 const TLAS_BINDING: (u32, D) = (50, D::ACCELERATION_STRUCTURE_KHR);
@@ -890,17 +879,9 @@ impl SplitRadianceCascades {
                 ] = views;
                 vec![
                     (0, Res::Buffer(view.uniforms[slot][uniform].buffer)),
-                    (1, Res::Buffer(self.geometry.buffer)),
-                    (2, Res::Buffer(self.words.buffer)),
-                    (3, Res::Buffer(view.lights[slot].buffer)),
                     (4, depth),
-                    (6, Res::Buffer(view.heads[p].buffer)),
-                    (7, Res::Buffer(view.entries.buffer)),
-                    (8, Res::Buffer(view.heads[q].buffer)),
-                    (9, Res::Buffer(view.history.buffer)),
                     (10, image(output)),
                     (11, image(input)),
-                    (12, Res::Buffer(view.probes.buffer)),
                     (13, image(sample)),
                     (14, image(metadata_out)),
                     (15, image(metadata_in)),
@@ -915,18 +896,7 @@ impl SplitRadianceCascades {
                     (38, image(background_out)),
                     (39, image(background_sample)),
                     (40, image(&view.background[1 + q])),
-                    (42, Res::Buffer(view.rtgi[0].buffer)),
-                    (43, Res::Buffer(view.rtgi[1].buffer)),
-                    (44, Res::Buffer(view.rtgi[2].buffer)),
-                    (45, Res::Buffer(view.rtgi[3].buffer)),
-                    (46, Res::Buffer(view.rtgi[4].buffer)),
                     (47, placeholder),
-                    (48, Res::Buffer(view.merge_list.buffer)),
-                    (49, Res::Buffer(self.blue_noise.buffer)),
-                    (51, Res::Buffer(self.surface[0].buffer)),
-                    (52, Res::Buffer(self.surface[1].buffer)),
-                    (53, Res::Buffer(self.surface[2].buffer)),
-                    (54, Res::Buffer(self.surface[3].buffer)),
                 ]
             };
             let (irr, meta, bg) = (&view.irradiance, &view.metadata, &view.background);
@@ -1208,9 +1178,39 @@ impl SplitRadianceCascades {
                 settings.surface_bounce_rays.min(8)
                     | ((settings.surface_software_reach.max(0.0) * 100.0) as u32).min(0xff_ffff) << 8,
             ],
+            // As `GetDimensions` saw them: the whole buffer, in elements.
+            lengths: [
+                elements(&view.entries, ENTRY_SIZE),
+                elements(&view.history, ENTRY_SIZE),
+                elements(&view.heads[slot], 4),
+                elements(&view.merge_list, 4),
+            ],
+            word_lengths: [elements(&self.geometry, 16), elements(&self.words, 16), 0, 0],
+            // Uploads and `tend_capture` happen before this; nothing moves until next frame.
+            buffers: [
+                &self.geometry,
+                &self.words,
+                &view.lights[slot],
+                &view.heads[slot],
+                &view.entries,
+                &view.heads[1 - slot],
+                &view.history,
+                &view.probes,
+                &view.merge_list,
+                &view.rtgi[0],
+                &view.rtgi[1],
+                &view.rtgi[2],
+                &view.rtgi[3],
+                &view.rtgi[4],
+                &self.blue_noise,
+                &self.surface[0],
+                &self.surface[1],
+                &self.surface[2],
+                &self.surface[3],
+            ]
+            .map(|buffer| buffer.address),
             ..Parameters::default()
-        };
-        for (index, uniform) in view.uniforms[slot].iter_mut().enumerate() {
+        };        for (index, uniform) in view.uniforms[slot].iter_mut().enumerate() {
             let mut p = params;
             if index < LEVELS {
                 p.frame[1] = index as u32;

@@ -82,11 +82,9 @@ const SCENE_BINDINGS: &[(u32, D)] = &[
     (7, D::STORAGE_BUFFER),
     (8, D::STORAGE_BUFFER),
     (9, D::STORAGE_BUFFER),
-    (10, D::STORAGE_BUFFER),
     (11, D::STORAGE_IMAGE),
     (12, D::STORAGE_IMAGE),
     (13, D::STORAGE_BUFFER),
-    (14, D::STORAGE_BUFFER),
     (15, D::STORAGE_BUFFER),
     (16, D::STORAGE_BUFFER),
     (17, D::STORAGE_BUFFER),
@@ -632,11 +630,9 @@ impl ScreenVoxel {
                 (7, Res::Buffer(view.clip[slot].buffer)),
                 (8, Res::Buffer(self.triangle_buffer.buffer)),
                 (9, Res::Buffer(self.build.buffer)),
-                (10, Res::Buffer(view.lights[slot].buffer)),
                 (11, Res::View(targets.hdr, general)),
                 (12, color),
                 (13, Res::Buffer(capture)),
-                (14, Res::Buffer(self.blue_noise.buffer)),
                 (15, Res::Buffer(self.free.buffer)),
                 (16, Res::Buffer(self.large.buffer)),
                 (17, Res::Buffer(self.chunk_buffer.buffer)),
@@ -882,6 +878,11 @@ impl ScreenVoxel {
         ];
         data.reflection = [0.0, 0.0, self.built.1 as f32, self.built.0];
         data.fade = [1.0; 4];
+        // `tend_capture` above has settled every buffer.
+        data.buffers[..2].copy_from_slice(&[
+            view.lights[slot].address,
+            self.blue_noise.address,
+        ]);
         view.frame[slot].write(bytemuck::bytes_of(&data));
         if !lights.is_empty() {
             view.lights[slot].write(bytemuck::cast_slice(&lights));

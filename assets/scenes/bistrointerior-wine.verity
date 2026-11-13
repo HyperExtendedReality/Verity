@@ -1,0 +1,49 @@
+{
+  "entities": [],
+  "lights": [],
+  "sun": {
+    "direction": [
+      -0.3,
+      -0.2,
+      -1.0
+    ],
+    "color": [
+      1.0,
+      0.95,
+      0.88
+    ],
+    "intensity": 3.0
+  },
+  "lighting": {
+    "method": "SplitRadianceCascades",
+    "sky": [
+      0.03,
+      0.035,
+      0.045
+    ],
+    "ground": [
+      0.015,
+      0.015,
+      0.015
+    ]
+  },
+  "assets": [
+    "assets/packed/BistroInterior_Wine.glb"
+  ],
+  "cameras": [
+    {
+      "name": "Overview",
+      "position": [
+        8.1681001,
+        -20.92383774,
+        4.6309694104000005
+      ],
+      "target": [
+        8.1681001,
+        4.801297574999998,
+        3.461806384
+      ],
+      "vertical_fov": 60.0
+    }
+  ]
+}

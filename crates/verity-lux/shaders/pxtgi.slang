@@ -13,6 +13,13 @@
 #include "terrain.slang"
 // `temporal` seeds new texels with `historyPrior`, defined below.
 #define HISTORY_PRIOR
+// Buffers, as pointers ending `Frame` (`FrameData::buffers`): primitives, their
+// tree, the radiance cache's keys and cells, static mesh tree nodes (two each)
+// and triangles (three corners), the same for soft bodies (rewritten as they
+// deform), and the reference path tracer's fp32 sum.
+#define METHOD_POINTERS \
+    Primitive* prims; Node* nodes; Atomic<uint>* cacheKeys; Cell* cells; \
+    float4* geo; float4* softGeo; float4* referenceSum;
 #include "screen_gi.slang"
 
 // Debug views, as `PxtgiDebug` numbers them.
@@ -59,14 +66,6 @@ struct Cell {
     float4 outgoing;
 };
 
-[[vk::binding(4, 0)]] StructuredBuffer<Primitive> prims;
-[[vk::binding(5, 0)]] StructuredBuffer<Node> nodes;
-[[vk::binding(6, 0)]] RWStructuredBuffer<Atomic<uint>> cacheKeys;
-[[vk::binding(7, 0)]] RWStructuredBuffer<Cell> cells;
-// Static mesh tree nodes (two each) and triangles (three corners).
-[[vk::binding(8, 0)]] StructuredBuffer<float4> geo;
-// The same for soft bodies, rewritten as they deform.
-[[vk::binding(9, 0)]] StructuredBuffer<float4> softGeo;
 // ---------------------------------------------------------------- scene trace
 
 // Where the ray enters a box (1e30: misses it, or only beyond best). `oi` is
@@ -86,8 +85,8 @@ float boxEntry(float3 oi, float3 inv, float3 lo, float3 hi, float best) {
 // rather than selecting between two loads.
 [ForceInline]
 float4 geoAt(bool soft, int at) {
-    if (soft) return softGeo[at];
-    return geo[at];
+    if (soft) return f.softGeo[at];
+    return f.geo[at];
 }
 
 // The first corner of the static triangle the last closest-hit ray took, for
@@ -248,7 +247,7 @@ int walkWorld(float3 o, float3 d, inout float t, out float3 normal, bool anyHit)
         if (q.CandidateType() == CANDIDATE_PROCEDURAL_PRIMITIVE) {
             float best = q.CommittedStatus() == COMMITTED_NOTHING ? t : q.CommittedRayT();
             float3 n;
-            if (hitPrimitive(prims[q.CandidateInstanceID()], o, d, best, n, anyHit)) {
+            if (hitPrimitive(f.prims[q.CandidateInstanceID()], o, d, best, n, anyHit)) {
                 boxNormal = n;
                 boxCorners = hitCorners;
                 q.CommitProceduralPrimitiveHit(best);
@@ -265,11 +264,11 @@ int walkWorld(float3 o, float3 d, inout float t, out float3 normal, bool anyHit)
         hitCorners = boxCorners;
         return hit;
     }
-    Primitive p = prims[hit];
+    Primitive p = f.prims[hit];
     int corners = asint(p.shape.z) + int(q.CommittedPrimitiveIndex()) * 3;
     hitCorners = corners;
-    float3 a = geo[corners].xyz;
-    float3 n = cross(geo[corners + 1].xyz - a, geo[corners + 2].xyz - a);
+    float3 a = f.geo[corners].xyz;
+    float3 n = cross(f.geo[corners + 1].xyz - a, f.geo[corners + 2].xyz - a);
     normal = normalize(n.x * p.r0.xyz + n.y * p.r1.xyz + n.z * p.r2.xyz);
     // Facing the ray: a mesh is hit from either side.
     if (dot(normal, d) > 0.0) normal = -normal;
@@ -284,18 +283,18 @@ int walkWorld(float3 o, float3 d, inout float t, out float3 normal, bool anyHit)
     if (f.counts.y == 0u) return hit;
     float3 inv = safeInv(d);
     float3 oi = o * inv;
-    if (boxEntry(oi, inv, nodes[0].lo.xyz, nodes[0].hi.xyz, t) >= 1e30) return hit;
+    if (boxEntry(oi, inv, f.nodes[0].lo.xyz, f.nodes[0].hi.xyz, t) >= 1e30) return hit;
     int stack[24];
     int top = 0;
     int node = 0;
     [loop] while (true) {
-        Node nd = nodes[node];
+        Node nd = f.nodes[node];
         int count = asint(nd.hi.w);
         if (count == 0) {
             int left = node + 1;
             int right = asint(nd.lo.w);
-            float tl = boxEntry(oi, inv, nodes[left].lo.xyz, nodes[left].hi.xyz, t);
-            float tr = boxEntry(oi, inv, nodes[right].lo.xyz, nodes[right].hi.xyz, t);
+            float tl = boxEntry(oi, inv, f.nodes[left].lo.xyz, f.nodes[left].hi.xyz, t);
+            float tr = boxEntry(oi, inv, f.nodes[right].lo.xyz, f.nodes[right].hi.xyz, t);
             if (tl < 1e30 && tr < 1e30) {
                 bool leftFirst = tl <= tr;
                 if (top < 24) {
@@ -315,7 +314,7 @@ int walkWorld(float3 o, float3 d, inout float t, out float3 normal, bool anyHit)
             int first = asint(nd.lo.w);
             [loop] for (int i = first; i < first + count; i++) {
                 float3 n;
-                if (hitPrimitive(prims[i], o, d, t, n, anyHit)) {
+                if (hitPrimitive(f.prims[i], o, d, t, n, anyHit)) {
                     hit = i;
                     normal = n;
                     if (anyHit) return hit;
@@ -327,7 +326,7 @@ int walkWorld(float3 o, float3 d, inout float t, out float3 normal, bool anyHit)
         [loop] while (top > 0) {
             top--;
             int s = stack[top];
-            if (boxEntry(oi, inv, nodes[s].lo.xyz, nodes[s].hi.xyz, t) < 1e30) {
+            if (boxEntry(oi, inv, f.nodes[s].lo.xyz, f.nodes[s].hi.xyz, t) < 1e30) {
                 node = s;
                 found = true;
                 break;
@@ -350,7 +349,7 @@ bool blocked(float3 o, float3 d, float reach) {
 bool escapes(float3 o, float3 d, float reach) {
     if (f.counts.y == 0u) return true;
     float3 inv = safeInv(d);
-    float3 farT = max((nodes[0].lo.xyz - o) * inv, (nodes[0].hi.xyz - o) * inv);
+    float3 farT = max((f.nodes[0].lo.xyz - o) * inv, (f.nodes[0].hi.xyz - o) * inv);
     return min(min(farT.x, farT.y), farT.z) <= reach;
 }
 
@@ -358,7 +357,7 @@ bool escapes(float3 o, float3 d, float reach) {
 // the mean colour: rays carry no texture coordinates. Terrain is worked out at
 // the hit `x` with normal `n`, as its mean colour varies across the mesh.
 float3 hitAlbedo(int hit, float3 x, float3 n) {
-    float4 a = prims[hit].albedo;
+    float4 a = f.prims[hit].albedo;
     uint index = asuint(a.w);
     if (index == NO_MATERIAL) return a.rgb;
     Material m = materials[index];
@@ -367,7 +366,7 @@ float3 hitAlbedo(int hit, float3 x, float3 n) {
         float height = 0.0;
         float wet = 0.0;
         for (int corner = 0; corner < 3; corner++) {
-            uint ground = asuint(geo[hitCorners + corner].w);
+            uint ground = asuint(f.geo[hitCorners + corner].w);
             height += float(ground & 0xffffu) / 16.0 - 2048.0;
             wet += float(ground >> 16u) / 65535.0;
         }
@@ -407,11 +406,11 @@ int cacheSlot(float3 x, float3 n, bool claim, out bool claimed) {
     uint key = hashU(h ^ 0x9e3779b9u) | 1u;
     [loop] for (uint i = 0u; i < 8u; i++) {
         uint slot = (h + i) & f.cache.y;
-        uint was = cacheKeys[slot].load();
+        uint was = f.cacheKeys[slot].load();
         if (was == key) return int(slot);
         if (was == 0u) {
             if (!claim) return -1;
-            uint previous = cacheKeys[slot].compareExchange(0u, key);
+            uint previous = f.cacheKeys[slot].compareExchange(0u, key);
             if (previous == 0u) {
                 claimed = true;
                 return int(slot);
@@ -438,12 +437,12 @@ float3 smoothCache(float3 x, float3 n, bool leaving) {
         uint key = hashU(h ^ 0x9e3779b9u) | 1u;
         [loop] for (uint j = 0u; j < 8u; j++) {
             uint slot = (h + j) & f.cache.y;
-            uint was = cacheKeys[slot].load();
+            uint was = f.cacheKeys[slot].load();
             if (was == key) {
-                if (cells[slot].normal.w > 0.5) {
+                if (f.cells[slot].normal.w > 0.5) {
                     float3 w3 = lerp(1.0 - t, t, float3(o));
                     float w = w3.x * w3.y * w3.z;
-                    float3 light = leaving ? cells[slot].outgoing.rgb : cells[slot].incoming.rgb;
+                    float3 light = leaving ? f.cells[slot].outgoing.rgb : f.cells[slot].incoming.rgb;
                     sum += float4(light * w, w);
                 }
                 break;
@@ -525,21 +524,21 @@ float3 worldLight(float3 x, float3 n, int hit, bool fromPixels, uint seenAs) {
         int slot = cacheSlot(x, n, fromPixels, claimed);
         if (slot >= 0) {
             if (claimed) {
-                cells[slot].pos = float4(x, asfloat(f.cache.x));
-                cells[slot].normal = float4(n, 0.0);
-                cells[slot].albedo = float4(albedo, 0.0);
-                cells[slot].incoming = 0.0;
+                f.cells[slot].pos = float4(x, asfloat(f.cache.x));
+                f.cells[slot].normal = float4(n, 0.0);
+                f.cells[slot].albedo = float4(albedo, 0.0);
+                f.cells[slot].incoming = 0.0;
             } else {
-                if (fromPixels) cells[slot].pos.w = asfloat(f.cache.x);
-                if (cells[slot].normal.w > 0.5) {
+                if (fromPixels) f.cells[slot].pos.w = asfloat(f.cache.x);
+                if (f.cells[slot].normal.w > 0.5) {
                     // A pixel's ray lights the hit itself and takes only the cell's
                     // bounce light: the cell's outgoing light is the direct light where
                     // it was claimed, which leaks sun across shadow edges a cell
                     // straddles (0.155 to 0.146 error). The cache's own rays gained
                     // nothing from it. Trace runs after the cache took its fade; the
                     // cache's own rays don't.
-                    if (seenAs == SEEN_DIFFUSE && fromPixels) return albedo * (directLight(x, n) + cells[slot].incoming.rgb);
-                    if (seenAs == SEEN_DIFFUSE) return cells[slot].outgoing.rgb * f.fade.rgb;
+                    if (seenAs == SEEN_DIFFUSE && fromPixels) return albedo * (directLight(x, n) + f.cells[slot].incoming.rgb);
+                    if (seenAs == SEEN_DIFFUSE) return f.cells[slot].outgoing.rgb * f.fade.rgb;
                     if (seenAs == SEEN_GLOSSY) return smoothCache(x, n, true);
                     return albedo * (directLight(x, n) + smoothCache(x, n, false));
                 }
@@ -581,12 +580,12 @@ bool historyPrior(float3 p, float3 n, out float4 prior) {
 [numthreads(8, 8, 1)]
 void cache_gather(uint3 id : SV_DispatchThreadID) {
     uint slot = id.y * 512u + id.x;
-    if (slot > f.cache.y || cacheKeys[slot].load() == 0u) return;
-    Cell cell = cells[slot];
+    if (slot > f.cache.y || f.cacheKeys[slot].load() == 0u) return;
+    Cell cell = f.cells[slot];
     if (f.cache.x - asuint(cell.pos.w) > 600u) {
         // Refinements first: whoever claims the slot must not read this as refined.
-        cells[slot].normal.w = 0.0;
-        cacheKeys[slot].store(0u);
+        f.cells[slot].normal.w = 0.0;
+        f.cacheKeys[slot].store(0u);
         return;
     }
     if (!cacheDue(slot, cell)) return;
@@ -612,19 +611,19 @@ void cache_gather(uint3 id : SV_DispatchThreadID) {
     float samples = min(cell.normal.w + 1.0, limit);
     float3 incoming = lerp(cell.incoming.rgb * f.fade.rgb, arriving, 1.0 / samples);
     if (any(incoming != incoming)) incoming = 0.0;
-    cells[slot].incoming = float4(incoming, 0.0);
-    cells[slot].normal.w = samples;
+    f.cells[slot].incoming = float4(incoming, 0.0);
+    f.cells[slot].normal.w = samples;
 }
 
 [shader("compute")]
 [numthreads(8, 8, 1)]
 void cache_shade(uint3 id : SV_DispatchThreadID) {
     uint slot = id.y * 512u + id.x;
-    if (slot > f.cache.y || cacheKeys[slot].load() == 0u) return;
-    Cell cell = cells[slot];
+    if (slot > f.cache.y || f.cacheKeys[slot].load() == 0u) return;
+    Cell cell = f.cells[slot];
     if (!cacheDue(slot, cell)) return;
     float3 n = normalize(cell.normal.xyz);
-    cells[slot].outgoing = float4(cell.albedo.rgb * (directLight(cell.pos.xyz, n) + cell.incoming.rgb), 0.0);
+    f.cells[slot].outgoing = float4(cell.albedo.rgb * (directLight(cell.pos.xyz, n) + cell.incoming.rgb), 0.0);
 }
 
 // A few cosine-weighted rays per texel, marched against the depth buffer (a
@@ -921,7 +920,6 @@ void composite(uint3 id : SV_DispatchThreadID) {
 // steps after a few hundred frames, and drifted 13% dark over 1200.
 static const int REFERENCE_PATHS = 16;
 static const int REFERENCE_BOUNCES = 8;
-[[vk::binding(16, 0)]] RWStructuredBuffer<float4> referenceSum;
 
 [shader("compute")]
 [numthreads(8, 8, 1)]
@@ -966,7 +964,7 @@ void reference(uint3 id : SV_DispatchThreadID) {
     if (bad(now)) now = float4(0.0, 0.0, 0.0, 1.0);
     float frames = f.reflection.z;
     uint at = uint(px.y) * uint(f.sizes.z) + uint(px.x);
-    float4 sum = (frames < 0.5 ? 0.0 : referenceSum[at]) + now;
-    referenceSum[at] = sum;
+    float4 sum = (frames < 0.5 ? 0.0 : f.referenceSum[at]) + now;
+    f.referenceSum[at] = sum;
     out0.Store(px, sum / (frames + 1.0));
 }

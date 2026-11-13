@@ -322,9 +322,7 @@ uint findEntry(int4 key, bool previous = false) {
     if (previous && params.history.z <= 0.0) return EMPTY;
     uint bucket = transportCacheBucket(key, params.size.w);
     uint index = previous ? previousHeads[bucket] : heads[bucket].load();
-    uint count, stride;
-    if (previous) previousEntries.GetDimensions(count, stride);
-    else entries.GetDimensions(count, stride);
+    uint count = previous ? params.lengths.y : params.lengths.x;
     uint limit = previous ? min(cacheHistoryQuota(params), count) : count;
     [loop] for (uint visited = 0u; index != EMPTY && visited < limit; ++visited) {
         if (index >= count) return EMPTY;
@@ -345,9 +343,7 @@ uint findIrradianceProbe(int4 key, bool previous) {
     uint slot = probeDirectoryBucket(key, params);
     uint head = probeDirectoryHead(0u, slot, params);
     uint index = previous ? previousHeads[head] : heads[head].load();
-    uint count, stride;
-    if (previous) previousEntries.GetDimensions(count, stride);
-    else entries.GetDimensions(count, stride);
+    uint count = previous ? params.lengths.y : params.lengths.x;
     [loop] for (uint attempt = 0u; attempt < directoryCapacity; ++attempt) {
         if (index == EMPTY) return EMPTY;
         if (index != TOMBSTONE) {
@@ -573,8 +569,7 @@ void clear(uint3 thread : SV_DispatchThreadID) {
         heads[traceArgsHead(params)].store(0u);
         heads[traceArgsHead(params) + 1u].store(1u);
         heads[traceArgsHead(params) + 2u].store(1u);
-        uint headWords, headStride;
-        heads.GetDimensions(headWords, headStride);
+        uint headWords = params.lengths.z;
         if (params.environmentScale.z <= 0.5 && headWords >= deferredTraceEnd(params)) {
             heads[deferredQueryCountHead(params)].store(0u);
             heads[deferredQueryArgsHead(params)].store(0u);
@@ -1050,8 +1045,7 @@ void retain(uint3 thread : SV_DispatchThreadID) {
     uint valid = params.frame.x | 0x80000000u;
     uint bucketRetained = 0;
     uint bucketLoad = 0;
-    uint previousCount, previousStride;
-    previousEntries.GetDimensions(previousCount, previousStride);
+    uint previousCount = params.lengths.y;
     [loop] for (uint index = previousHeads[thread.x]; index != EMPTY && bucketLoad < bucketQuota; index = previousEntries[index].next) {
         if (index >= previousCount) break;
         uint next = previousEntries[index].next;
@@ -1298,8 +1292,7 @@ void finishTransportVariant(uint2 pixel, uint first, uint lod, float3 surfacePos
 // The deferred scratch exists only in primary cache heads sized for it.
 bool deferredTraceAvailable() {
     if (params.environmentScale.z > 0.5 || params.history.y > 0.5) return false;
-    uint words, stride;
-    heads.GetDimensions(words, stride);
+    uint words = params.lengths.z;
     return words >= deferredTraceEnd(params);
 }
 
@@ -1471,8 +1464,7 @@ void traceResolve(uint3 thread : SV_DispatchThreadID) {
 // Reduce leaves one canonical entry per key, and only those merge. Listing them
 // here spares merge a scan of the whole 240-byte-strided pool for every level.
 void queueMerge(uint index, uint level) {
-    uint words, stride;
-    mergeList.GetDimensions(words, stride);
+    uint words = params.lengths.w;
     uint ticket = mergeList[level * 4u + 3u].add(1u);
     if (ticket % 64u == 0u) mergeList[level * 4u].add(1u);
     mergeList[MERGE_LIST_HEADER + level * ((words - MERGE_LIST_HEADER) / CASCADES) + ticket]
@@ -1852,8 +1844,7 @@ void mergeEntry(uint index) {
 void merge(uint3 thread : SV_DispatchThreadID) {
     uint level = params.frame.y;
     if (thread.x >= mergeList[level * 4u + 3u].load()) return;
-    uint words, stride;
-    mergeList.GetDimensions(words, stride);
+    uint words = params.lengths.w;
     // One thread per canonical entry avoids serial ray traversals along a bucket.
     mergeEntry(mergeList[MERGE_LIST_HEADER + level * ((words - MERGE_LIST_HEADER) / CASCADES)
         + thread.x].load());

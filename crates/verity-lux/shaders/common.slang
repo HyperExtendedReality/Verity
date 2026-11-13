@@ -58,6 +58,14 @@ struct Parameters {
     float4 lightDirtyMax;
     uint4 rayTraced;      // multi-bounce, spatial samples, reservoir history, previous frame ray traced (history valid)
     uint4 surface;        // surface cache texels (0 = off), texels updated per frame, first cascade read from the cache, bounce rays per texel (bits 0-7) and software bounce reach in cm (8-31, 0 = none)
+    // Elements behind the pointers below, which have no GetDimensions.
+    uint4 lengths;        // cache entries, previous entries, head words, merge-list words
+    uint4 wordLengths;    // geometry words, scene words; zw unused
+    // The cascades' buffers, as pointers (`Parameters::buffers`); cascades.slang
+    // declares them and aliases each to its old name. Other passes leave them out.
+#ifdef CASCADE_POINTERS
+    CASCADE_POINTERS
+#endif
 };
 
 [ForceInline]

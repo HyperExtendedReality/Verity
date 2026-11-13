@@ -1,3 +1,13 @@
+// Buffers, as pointers ending `Parameters`, in `Parameters::buffers` order.
+#define CASCADE_POINTERS \
+    uint4* geometryWordsBuffer; uint4* sceneWordsBuffer; Light* lightsBuffer; \
+    Atomic<uint>* headsBuffer; Entry* entriesBuffer; uint* previousHeadsBuffer; \
+    Entry* previousEntriesBuffer; DirectionalProbe* directionalProbesBuffer; \
+    Atomic<uint>* mergeListBuffer; RtgiReservoir* rtgiReservoirsBuffer; \
+    RtgiReservoir* rtgiPreviousReservoirsBuffer; Atomic<uint>* rtgiCacheWordsBuffer; \
+    RtgiCacheCell* rtgiCacheCellsBuffer; float4* rtgiFieldBuffer; \
+    uint2* blueNoiseRanksBuffer; uint4* surfaceTrianglesBuffer; \
+    uint4* surfaceIslandsBuffer; uint4* surfaceTexelsBuffer; uint4* surfaceRadianceBuffer;
 #include "common.slang"
 // The renderer's frame set (materials, textures, DFG table) is bound at set 1.
 #define MATERIAL_SET 1
@@ -5,21 +15,30 @@
 #include "receiver_metadata.slang"
 
 [[vk::binding(0, 0)]] ConstantBuffer<Parameters> params;
-[[vk::binding(1, 0)]] StructuredBuffer<uint4> geometryWords;
-// TLAS, immutable mesh BLASes and instances share one binding. Integer records
+// The buffers keep their names: shared code reads them as before, and the
+// composite, which includes some of it, still binds its own.
+#define geometryWords params.geometryWordsBuffer
+// TLAS, immutable mesh BLASes and instances share one buffer. Integer records
 // preserve bit patterns; transforms/material values are decoded explicitly.
-[[vk::binding(2, 0)]] StructuredBuffer<uint4> sceneWords;
-[[vk::binding(3, 0)]] StructuredBuffer<Light> lights;
+#define sceneWords params.sceneWordsBuffer
+#define lights params.lightsBuffer
+#define heads params.headsBuffer
+#define entries params.entriesBuffer
+#define previousHeads params.previousHeadsBuffer
+#define previousEntries params.previousEntriesBuffer
+#define directionalProbes params.directionalProbesBuffer
+// Per level: dispatch x, y, z and the entry count; then each level's entries.
+#define mergeList params.mergeListBuffer
+// build.rs's 64x64 blue-noise tile: four u16 ranks per texel.
+#define blueNoiseRanks params.blueNoiseRanksBuffer
+// See surface_cache.slang.
+#define surfaceTriangles params.surfaceTrianglesBuffer
+#define surfaceIslands params.surfaceIslandsBuffer
+#define surfaceTexels params.surfaceTexelsBuffer
+#define surfaceRadiance params.surfaceRadianceBuffer
 [[vk::binding(4, 0)]] DepthTexture2D depthTexture;
-[[vk::binding(6, 0)]] RWStructuredBuffer<Atomic<uint>> heads;
-[[vk::binding(7, 0)]] RWStructuredBuffer<Entry> entries;
-[[vk::binding(8, 0)]] StructuredBuffer<uint> previousHeads;
-[[vk::binding(9, 0)]] RWStructuredBuffer<Entry> previousEntries;
 [[vk::binding(10, 0)]] [format("rgba32f")] WTexture2D<float4> irradiance;
 [[vk::binding(11, 0)]] Texture2D<float4> previousIrradiance;
-[[vk::binding(12, 0)]] RWStructuredBuffer<DirectionalProbe> directionalProbes;
-// Per level: dispatch x, y, z and the entry count; then each level's entries.
-[[vk::binding(48, 0)]] RWStructuredBuffer<Atomic<uint>> mergeList;
 static const uint MERGE_LIST_HEADER = 16u;
 [[vk::binding(13, 0)]] Texture2D<float4> currentIrradiance;
 [[vk::binding(14, 0)]] [format("rgba32f")] WTexture2D<float4> historyMetadata;
@@ -907,17 +926,17 @@ struct RtgiCacheCell {
     float4 dependencyMin; // xyz: retained path bounds; w: dependency known
     float4 dependencyMax; // xyz: retained path bounds; w: bounds present
 };
-[[vk::binding(42, 0)]] RWStructuredBuffer<RtgiReservoir> rtgiReservoirs;
-[[vk::binding(43, 0)]] StructuredBuffer<RtgiReservoir> rtgiPreviousReservoirs;
+// Ray-traced GI's buffers are 256-byte placeholders: no pass that indexes them
+// is dispatched yet. Size them (rtgi_cache_bytes in render.rs) before any is.
+#define rtgiReservoirs params.rtgiReservoirsBuffer
+#define rtgiPreviousReservoirs params.rtgiPreviousReservoirsBuffer
 // Cell keys, shading-request stamps, last-use stamps and published-hit
 // flags, then queue counts and entries. Mirrors rtgi_cache_bytes in render.rs.
-[[vk::binding(44, 0)]] RWStructuredBuffer<Atomic<uint>> rtgiCacheWords;
-[[vk::binding(45, 0)]] RWStructuredBuffer<RtgiCacheCell> rtgiCacheCells;
-[[vk::binding(46, 0)]] RWStructuredBuffer<float4> rtgiField;
+#define rtgiCacheWords params.rtgiCacheWordsBuffer
+#define rtgiCacheCells params.rtgiCacheCellsBuffer
+#define rtgiField params.rtgiFieldBuffer
 // Last frame's composed HDR image over the viewport, exposure applied.
 [[vk::binding(47, 0)]] Texture2D<float4> rtgiLitHistory;
-// build.rs's 64x64 blue-noise tile: four u16 ranks per texel.
-[[vk::binding(49, 0)]] StructuredBuffer<uint2> blueNoiseRanks;
 #include "rtgi_field.slang"
 
 // Mirror RTGI_CACHE_* in render.rs.

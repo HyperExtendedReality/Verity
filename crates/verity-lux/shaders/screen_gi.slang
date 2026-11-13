@@ -9,7 +9,10 @@ static const int STEPS = 24;
 // Frames of history a `HISTORY_PRIOR` estimate counts for.
 static const float PRIOR_FRAMES = 2.0;
 static const int MAX_MOVED = 16;
-
+// Each method's own buffer pointers, ending `Frame`; see `FrameData::buffers`.
+#ifndef METHOD_POINTERS
+#define METHOD_POINTERS
+#endif
 
 struct Frame {
     float4x4 clipFromWorld;
@@ -35,6 +38,11 @@ struct Frame {
     // shadow and bounce light reach. Light there is stale.
     float4 movedMin[MAX_MOVED];
     float4 movedMax[MAX_MOVED];
+    // Buffers, in `FrameData::buffers` order.
+    Light* lights;
+    // build.rs's 64x64 blue-noise tile: four u16 ranks per texel.
+    uint2* blueNoiseRanks;
+    METHOD_POINTERS
 };
 
 
@@ -50,11 +58,8 @@ struct Light {
 [[vk::binding(2, 0)]] Texture2D<uint4> gbuffer;
 [[vk::binding(3, 0)]] Texture2D<float4> colorTexture; // last frame's lit image
 
-[[vk::binding(10, 0)]] StructuredBuffer<Light> lights;
 [[vk::binding(11, 0)]] [format("rgba16f")] RWTexture2D<float4> hdr;
 [[vk::binding(12, 0)]] [format("rgba16f")] WTexture2D<float4> colorOut;
-// build.rs's 64x64 blue-noise tile: four u16 ranks per texel.
-[[vk::binding(14, 0)]] StructuredBuffer<uint2> blueNoiseRanks;
 
 // Per-pass inputs and outputs.
 [[vk::binding(0, 1)]] Texture2D<float4> in0;
@@ -220,7 +225,7 @@ float ign(float2 p) { return frac(52.9829189 * frac(dot(p, float2(0.06711056, 0.
 // Four independent blue-noise values in [0, 1) for a pixel, which callers step
 // along golden-ratio sequences per frame and ray.
 float4 blueNoise(int2 px) {
-    uint2 w = blueNoiseRanks[uint(px.x & 63) + uint(px.y & 63) * 64u];
+    uint2 w = f.blueNoiseRanks[uint(px.x & 63) + uint(px.y & 63) * 64u];
     return (float4(w.x & 0xffffu, w.x >> 16, w.y & 0xffffu, w.y >> 16) + 0.5) / 4096.0;
 }
 
@@ -282,7 +287,7 @@ bool sampledLights() { return f.counts.z > EXACT_LIGHTS; }
 // Unshadowed irradiance / pi from point light i at x facing n, and the ray
 // that tests its shadow.
 float3 pointLight(uint i, float3 x, float3 n, out float3 l, out float reach) {
-    Light source = lights[i];
+    Light source = f.lights[i];
     float3 to = source.position.xyz - x;
     float d2 = max(dot(to, to), 1e-2);
     l = to * rsqrt(d2);
