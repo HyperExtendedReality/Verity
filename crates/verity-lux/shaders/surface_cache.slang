@@ -148,6 +148,17 @@ bool surfaceBoxIntersects(DependencyContext dependency, float4 low, float4 high)
     return all(dependency.minimum <= high.xyz) && all(dependency.maximum >= low.xyz);
 }
 
+// Whether a texel's bounce rays can leave the scene: they then bring the sky,
+// and neither the texel's direct light nor a hit that reads it traces the sky.
+bool surfaceBounceSeesSky() {
+    if ((params.surface.w & 0xffu) == 0u) return false;
+#ifdef GI_RAY_QUERY
+    return true;
+#else
+    return (params.surface.w >> 8u) == 0u;
+#endif
+}
+
 // One rolling share of the atlas a frame. Each texel shades its direct light
 // as a diffuse surface seen head on, traces cosine rays whose hits read other
 // texels (so bounces build up across frames), and blends both into its history.
@@ -179,7 +190,7 @@ void surfaceUpdate(uint3 thread : SV_DispatchThreadID) {
     if (!supported) return;
     float3 reflectance = rtgiDiffuseReflectance;
 
-    // Bounce light. Escaped rays bring nothing: the sky is direct light above.
+    // Bounce light; escaped rays bring the sky.
     // Hits on uncached surfaces leave the mean, rather than count as black:
     // shading them instead cost 0.3 ms on Sponza and Bistro for no net gain.
     TransportRadiance incoming = (TransportRadiance)0;
@@ -209,7 +220,10 @@ void surfaceUpdate(uint3 thread : SV_DispatchThreadID) {
         if (bounce.triangle != EMPTY && !surfaceRead(bounce, other)) continue;
         dependencyUnion(dependency, rayDependency);
         counted += 1.0;
-        if (bounce.triangle == EMPTY) continue;
+        if (bounce.triangle == EMPTY) {
+            incoming.background += environmentRadiance(direction);
+            continue;
+        }
         dependencyUnion(dependency, other.dependency);
         incoming.background += other.direct.background + other.bounce.background * other.reflectance;
         incoming.emissive += other.direct.emissive + other.bounce.emissive * other.reflectance;

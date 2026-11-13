@@ -311,8 +311,7 @@ TransportRadiance outgoingTransportRadianceTracked(float3 origin, float3 directi
     float indirectBackgroundCoverage = 0.0;
     TransportRadiance indirect = (TransportRadiance)0;
     // A cached surface brings its bounce light without leaking through walls,
-    // and far hits take all their light from it. Its bounce holds no sky, so
-    // the sky stays direct light here (coverage stays zero).
+    // and far hits take all their light from it.
     SurfaceTexel cached;
     bool fromSurface = !rtgiDirectOnly && surfaceRead(hit, cached);
     if (fromSurface) {
@@ -327,15 +326,20 @@ TransportRadiance outgoingTransportRadianceTracked(float3 origin, float3 directi
         }
     } else if (!rtgiDirectOnly)
         indirect = bounceFeedback(position, normal, dependency, indirectBackgroundCoverage);
-    bool skyFromCache = cachedHitSky(params) && indirectBackgroundCoverage > 0.0;
+    // The sky reaches a hit inside its cached light: a texel's bounce rays and
+    // the probes' escaped rays both carry it. Only a hit neither covers traces it.
+    bool skyFromCache = surfaceShading || fromSurface
+        ? surfaceBounceSeesSky() : indirectBackgroundCoverage > 0.0;
     bool emissiveSupported, environmentSupported = true, conventionalSupported;
     float3 emissiveNee = emissiveResponseTracked(position, normal, geometricNormal, view,
         roughness, directSamples, directSequence ^ 0xE11E0001u, emissiveSupported,
         dependency, admissionLimit, true, material, ab);
     float3 environment = 0.0;
+    // The ambient hemisphere is smooth: one ray, and the cache averages them.
     if (!skyFromCache)
         environment = environmentResponseTracked(position, normal, geometricNormal, view,
-            roughness, directSamples, directSequence ^ 0xE17A0002u, environmentSupported,
+            roughness, params.environmentInfo.w == 0 ? 1u : directSamples,
+            directSequence ^ 0xE17A0002u, environmentSupported,
             dependency, admissionLimit, true, material, ab);
     float3 directional, punctual;
     conventionalLightResponseTracked(position, normal, geometricNormal, view, roughness,

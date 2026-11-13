@@ -607,6 +607,14 @@ void storeDescriptor(uint index, int4 key, float4 origin, uint valid, uint next,
     entries[index].padding = uint2(traced, initialized);
 }
 
+// A descriptor with no surface under it. Readers test `valid` and `padding`
+// before anything else, and those share a cache line: zeroing the key and
+// origin too touched a second one for half of all descriptors.
+void clearDescriptor(uint index) {
+    entries[index].valid = 0u;
+    entries[index].padding = uint2(0u, 0u);
+}
+
 uint permuteCandidateDomain(uint value, uint mask, uint seed) {
     // Each xor-shift and odd multiply is invertible modulo 2^k. Mask after
     // every operation so this remains a permutation of the selected power-of-2
@@ -786,7 +794,7 @@ void seed(uint3 thread : SV_DispatchThreadID) {
     if (!splitSampleSurface(thread.xy, surfacePosition, geometricNormal)) {
         [unroll] for (uint variant = 0u; variant < 2u; ++variant)
             [unroll] for (uint level = 0u; level < CASCADES; ++level)
-                storeDescriptor(probeDescriptorIndex(sample, variant, level), 0, 0.0, 0u, 0u, 0u, 0u);
+                clearDescriptor(probeDescriptorIndex(sample, variant, level));
         return;
     }
 
@@ -810,7 +818,7 @@ void seed(uint3 thread : SV_DispatchThreadID) {
     [unroll] for (uint variant = 0u; variant < 2u; ++variant) {
         if (variant == 1u && highLod == lowLod) {
             [unroll] for (uint level = 0u; level < CASCADES; ++level)
-                storeDescriptor(probeDescriptorIndex(sample, variant, level), 0, 0.0, 0u, 0u, 0u, 0u);
+                clearDescriptor(probeDescriptorIndex(sample, variant, level));
             continue;
         }
         uint lod = variant == 0u ? lowLod : highLod;

@@ -33,11 +33,12 @@ struct Parameters {
     uint4 viewport;       // full-resolution viewport: origin.xy, size.zw
     uint4 size;           // GI width, height, pixel count, hash bucket count
     float4 tuning;        // probe spacing, interval cutoff, normal bias, intensity
-    float4 environment;  // RGB radiance, exposure
+    float4 environment;  // sky RGB radiance, exposure
+    float4 ground;       // ground RGB radiance; with the sky, the renderer's ambient hemisphere
     float4 history;      // temporal blend, deferred trace unavailable, valid, retention frames
     float4 intervalHistory; // transmittance decay, Split flag, diffuse debug .25, early query cap
     uint4 frame;         // frame index, merge cascade, instance count, light count
-    uint4 lightCounts;   // conventional count, emissive count, hit-lighting sample budget, cached hit sky
+    uint4 lightCounts;   // conventional count, emissive count, hit-lighting sample budget, reserved
     float4 stability;    // screen history valid, scene changed, motion vectors, exact Disney diffuse
     uint4 layers;        // light-buffer mask tail, word count, occlusion flags, reserved
     uint4 environmentInfo; // alias-record offset, width, height, enabled
@@ -71,14 +72,6 @@ struct Parameters {
 [ForceInline]
 bool transportSourceActive(Parameters p, uint source) {
     return source == BACKGROUND_SOURCE || (p.sourceHistory.x & source) != 0u;
-}
-
-// Paper-style hit lighting: ray-hit surfaces take sky light from the
-// multi-bounce cache, whose escaped rays carry the environment, instead of
-// tracing environment visibility rays. Set only while the secondary cache runs.
-[ForceInline]
-bool cachedHitSky(Parameters p) {
-    return p.lightCounts.w != 0u;
 }
 
 [ForceInline]

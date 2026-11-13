@@ -568,9 +568,7 @@ impl ApplicationHandler for Viewer {
                 renderer.set_uncapped(self.smoke != Smoke::Off);
                 let method = match self.gi {
                     Gi::None => None,
-                    Gi::Lux => Some(Method::SplitRadianceCascades(LuxSettings::landscape(
-                        SKY.to_array(),
-                    ))),
+                    Gi::Lux => Some(Method::SplitRadianceCascades(LuxSettings::landscape())),
                     Gi::Pxtgi => Some(Method::Pxtgi(PxtgiSettings::default())),
                     Gi::Voxel => Some(Method::ScreenVoxel(ScreenVoxelSettings::default())),
                 };

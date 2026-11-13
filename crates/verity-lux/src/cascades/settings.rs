@@ -44,14 +44,15 @@ pub struct Settings {
     pub normal_bias: f32,
     /// Composite gain on indirect diffuse light.
     pub intensity: f32,
-    /// Constant sky radiance seen by rays that escape the scene.
-    pub environment: [f32; 3],
     /// Keep the renderer's sky reflection, which Lux does not trace. It ignores
     /// occlusion, so leave it off indoors.
     pub sky_reflections: bool,
     pub temporal_blend: f32,
     pub split_transmittance_blend: f32,
     pub history_frames: u32,
+    /// À-trous passes over the shaded image. The probes are already smooth:
+    /// on Sponza, three passes instead of one changed neither error nor flicker
+    /// once warm, and cut error by at most 3% in GI's first second, for 0.22 ms.
     pub spatial_filter_steps: u32,
     pub emissive_samples: u32,
     /// Carry light past the first bounce, through last frame's probes.
@@ -93,12 +94,11 @@ impl Default for Settings {
             max_rays: 131_072,
             normal_bias: 0.005,
             intensity: 1.0,
-            environment: [0.0; 3],
             sky_reflections: false,
             temporal_blend: 0.88,
             split_transmittance_blend: 0.98,
             history_frames: 24,
-            spatial_filter_steps: 3,
+            spatial_filter_steps: 1,
             emissive_samples: 16,
             multi_bounce: true,
             surface_cache: true,
@@ -113,15 +113,14 @@ impl Default for Settings {
 }
 
 impl Settings {
-    /// For open ground hundreds of metres across, under a sky of this radiance.
+    /// For open ground hundreds of metres across.
     /// The defaults suit rooms. Outdoors, what they leave uncapped costs several
     /// times more, and with the budgets below their quarter-metre probes spread
     /// the samples too thin and turn noisy.
-    pub fn landscape(environment: [f32; 3]) -> Self {
+    pub fn landscape() -> Self {
         Self {
             probe_spacing: 4.0,
             interval_length: 6.0,
-            environment,
             sky_reflections: true,
             ..Self::budgeted()
         }
@@ -183,6 +182,8 @@ pub struct Parameters {
     pub size: [u32; 4],
     pub tuning: [f32; 4],
     pub environment: [f32; 4],
+    /// The scene's ground radiance, under `environment`'s sky.
+    pub ground: [f32; 4],
     pub history: [f32; 4],
     pub interval_history: [f32; 4],
     pub frame: [u32; 4],
@@ -414,7 +415,7 @@ mod tests {
     #[test]
     fn parameters_match_the_shader_block() {
         // 4 matrices, 31 vec4s and 19 pointers, no padding.
-        assert_eq!(std::mem::size_of::<Parameters>(), 4 * 64 + 31 * 16 + 19 * 8);
+        assert_eq!(std::mem::size_of::<Parameters>(), 4 * 64 + 32 * 16 + 19 * 8);
     }
 
     #[test]

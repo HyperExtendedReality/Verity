@@ -79,9 +79,17 @@ walls. From `surface_from_level` (3) on, a hit takes all of its light from the
 texel and skips shading. Blended and double-sided surfaces such as foliage are
 not charted and still read the probes. So are retained meshes such as terrain.
 
+A ray that leaves the scene brings the scene's ambient hemisphere
+(`Lighting::sky` and `ground`, or `Renderer::set_ambient`), as PXTGI's and the
+voxel method's do. The renderer drops that hemisphere while GI is on, so this
+is the only sky light a surface gets. A cache texel takes it through its bounce
+rays and a hit reads it from its texel or the probes; a hit neither covers
+traces one sky ray.
+
 Against the path-traced reference (RTX 4070 Laptop, 1280×720, 600 frames).
-The renderer's TAA cycles a 4-frame jitter, so error compares the mean of the
-last four frames with the reference's; single frames swing by up to 0.14.
+Error compares the mean of the last four frames with the reference's; single
+frames swing by up to 0.14. These rows predate sky light and the bench's fix
+for TAA jitter: see [Sky light and a full jitter cycle](#sky-light-and-a-full-jitter-cycle).
 
 | View | Cache | GI time | Mean bounced light | Error | Flicker |
 | --- | --- | --- | --- | --- | --- |
@@ -112,7 +120,8 @@ sets its accuracy.
 ## Measuring against a reference
 
 `examples/sponza_gi.rs --bench=DIR` prints GPU time per pass and saves frames as
-PFM, and `--reference` saves a path-traced image of the same view:
+PFM (`--cold` saves the first frames GI draws), and `--reference` saves a
+path-traced image of the same view:
 `PxtgiDebug::Reference` traces diffuse light with no cache or filter, and hits
 take mean colours as PXTGI's do. `--pxtgi` leaves reflections off to compare
 diffuse with diffuse; add `--reflections` for what PXTGI normally costs.
@@ -280,6 +289,58 @@ to 0.30, `commitCache` 0.44 to 0.19, `merge` 0.43 to 0.44.
   PXTGI's flicker 12% but lost 5% of its light (error 0.170); at 5σ it changed
   nothing. Fewer rays for settled texels: still-camera flicker *is* the settled
   texels' noise, and one ray there took it from 0.015 to 0.022.
+
+### Sky light and a full jitter cycle
+
+The bench's numbers above were taken over half of the renderer's TAA jitter. It
+has 8 phases, not 4, and a readback takes two frames, so 8 saved frames saw only
+the even or the odd ones. Two runs on opposite halves differ in sunlit texture
+by more than the bounced light: scored that way, a run on the other half from
+its reference read 0.44 error where it now reads 0.25. `--bench` now saves 16 frames 3 apart, which is every phase twice.
+Error is the mean of the last 8 against the reference's. Flicker compares frames
+one cycle (24 frames) apart, so it reads about twice what the tables above
+show; compare it within this table only. Error over 80-pixel blocks is beside
+error over 8.
+
+Split, `Settings::budgeted`, before and after sky light, one filter pass and
+the cheaper `seed`. Courtyard rows are the range of two or three runs.
+
+| View | | GPU time | Mean bounced light | Error | Error, 80 px | Flicker |
+| --- | --- | --- | --- | --- | --- | --- |
+| Sponza courtyard | before | 4.38–4.42 ms | 0.97× | 0.250–0.251 | 0.172–0.175 | 0.015–0.016 |
+| | after | 4.01–4.03 ms | 1.05× | 0.236–0.240 | 0.156–0.160 | 0.014 |
+| Sponza corridor | before | 3.44–3.46 ms | 1.10× | 0.376–0.377 | 0.178–0.182 | 0.024–0.027 |
+| | after | 3.13 ms | 1.13× | 0.383–0.386 | 0.193–0.195 | 0.021–0.033 |
+| Bistro street | before | 6.36 ms | 0.73× | 0.354 | 0.309 | 0.008 |
+| | after | 6.10 ms | 0.93× | 0.212 | 0.159 | 0.011 |
+
+- Sky light. Split took its sky from a setting that defaulted to black, and an
+  escaped ray counted as black whatever it was set to: the legacy renderer
+  kept its own ambient light, and Verity's does not. In the open street that
+  was a fifth of the light. The corridor, already 10% bright from light
+  leaking between probes, gains another 2%.
+- One à-trous pass instead of three, 0.22 ms. The probes are smooth before the
+  filter sees them. With 3, 1 and 0 passes the courtyard scored 0.239, 0.236
+  and 0.236 error and 0.015, 0.015 and 0.015 flicker; the corridor 0.385 with 3
+  against 0.383–0.386 with 1; the moving camera's frames differed by 0.3% of
+  the image, as two passes differ from three. Turning away for 90 frames and
+  back, the first frame was already at 0.24 with any count. Only GI's first
+  second (`--cold`) tells them apart: after 45 frames, 0.361, 0.371 and 0.373.
+- `seed` writes 12 bytes of an empty descriptor instead of 52. Readers test
+  `valid` and `padding` first and those share a cache line; the key and origin
+  are on another, and half of all descriptors are empty. 0.46 to 0.36 ms.
+- Transport loses no energy. With Lambertian base-colour hits and one bounce
+  on both sides, Split gives 1.006× the reference's light (0.26 error, 0.15
+  over 80 pixels). With its own diffuse lobe alone it gives 0.72×: the rest of
+  what its hits reflect is specular, which the reference's hits fold into base
+  colour. So the 0.81× that Lambertian hits gave earlier was not lost light.
+- What is left is where the light lands: 0.84× in shadow and 1.07× on sunlit
+  surfaces before, 0.94× and 1.17× after. Not self-intersection: a 5 cm ray
+  offset instead of 5 mm made every class brighter, 1.18× in all, since
+  Sponza's modelled relief occludes that much within centimetres.
+- Tried and dropped: reading only header fields in `rank`, `parents` and
+  `prefix` instead of the 240-byte entry. No change; the compiler already
+  splits the load.
 
 ## Screen and voxel GI
 

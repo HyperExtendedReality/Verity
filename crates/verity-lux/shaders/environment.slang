@@ -36,7 +36,10 @@ float3 environmentRadianceUv(float2 uv) {
                 lerp(environmentTexel(base+int2(0,1)),environmentTexel(base+int2(1,1)),f.x),f.y)*params.environmentScale.x;
 }
 float3 environmentRadiance(float3 direction) {
-    if (params.environmentInfo.w == 0) return params.environment.xyz;
+    // Without a map, the renderer's ambient hemisphere (z is up), which it
+    // leaves to GI while GI is on.
+    if (params.environmentInfo.w == 0)
+        return lerp(params.ground.xyz, params.environment.xyz, direction.z * 0.5 + 0.5);
     return environmentRadianceUv(environmentUv(direction));
 }
 float environmentTexelSolidAngle(uint y) {
@@ -135,18 +138,14 @@ float3 environmentNeeSampleContribution(float3 radiance,
     return radiance * (diffuse * cosine / pdf);
 }
 
-// Escaped Split rays are excluded from the indirect field. Direct environment
-// lighting at visible receivers belongs to Bevy's native ambient/environment
-// lighting; ray-hit surfaces use visibility-tested NEE in the outgoing source.
-// With cached hit sky, secondary-cache escapes instead carry the environment
-// so primary and secondary hits can read sky light from that cache.
+// An escaped ray carries the sky: the renderer drops its ambient hemisphere
+// while GI is on, so this is the only sky light a visible surface gets.
 // Keep support separate so denied traversal is not confused with a measured
 // zero-radiance escape.
 float3 outgoingEnvironmentEscape(float3 direction, bool traversalSupported,
                                  out bool querySupported) {
     querySupported = traversalSupported;
-    if (!traversalSupported || params.environmentScale.z <= 0.5 || !cachedHitSky(params))
-        return 0.0;
+    if (!traversalSupported) return 0.0;
     float3 radiance = environmentRadiance(direction);
     return all(isfinite(radiance)) ? max(radiance, 0.0) : float3(0.0);
 }
@@ -157,7 +156,8 @@ float3 environmentResponseTracked(float3 position, float3 normal, float3 geometr
                              inout DependencyContext dependency, uint admissionLimit,
                              bool fullBsdf, SurfaceBsdf material, float2 ab) {
     querySupported = true;
-    if (count == 0 || (params.environmentInfo.w == 0 && all(params.environment.xyz <= 0.0)))
+    if (count == 0 || (params.environmentInfo.w == 0
+            && all(params.environment.xyz <= 0.0) && all(params.ground.xyz <= 0.0)))
         return 0.0;
 
     float3 sum = 0.0;
@@ -193,7 +193,7 @@ float3 environmentResponseTracked(float3 position, float3 normal, float3 geometr
         float cosine = max(0.0, dot(normal, lightDirection));
         if (cosine <= 0.0 || dot(geometricNormal, lightDirection) <= 0.0) continue;
         if (!aliasSample) {
-            if (params.environmentInfo.w == 0) radiance = params.environment.xyz;
+            if (params.environmentInfo.w == 0) radiance = environmentRadiance(lightDirection);
             else {
                 environmentSampleUv = environmentUv(lightDirection);
                 radiance = environmentRadianceUv(environmentSampleUv);

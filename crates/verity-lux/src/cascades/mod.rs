@@ -161,13 +161,26 @@ struct GiLight {
     source: [u32; 4],
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 enum SunChange {
     None,
     /// Small enough that the cache keeps blending its history (time of day).
     Gradual,
     /// Appeared, vanished or jumped: its bounce history is dropped.
     Hard,
+}
+
+/// How the sky and ground changed: as with the sun, a step of up to 5% keeps
+/// the cache's history blending.
+fn ambient_change(now: [Vec3; 2], before: [Vec3; 2]) -> SunChange {
+    let step = (now[0] - before[0]).abs().max((now[1] - before[1]).abs()).max_element();
+    if step == 0.0 {
+        SunChange::None
+    } else if step <= 0.05 * before[0].max(before[1]).max_element() {
+        SunChange::Gradual
+    } else {
+        SunChange::Hard
+    }
 }
 
 /// How the sun and the point lights changed since the previous frame.
@@ -339,6 +352,8 @@ pub struct SplitRadianceCascades {
     upload_pending: bool,
     previous_clip: Option<Mat4>,
     previous_lights: Vec<GiLight>,
+    /// Last frame's sky and ground.
+    previous_ambient: [Vec3; 2],
     started: Instant,
     /// Debugging aid: `VERITY_LUX_PASS_LIMIT=n` dispatches only the first
     /// `n` passes of each frame, to bisect GPU faults.
@@ -377,6 +392,7 @@ impl SplitRadianceCascades {
             upload_pending: false,
             previous_clip: None,
             previous_lights: Vec::new(),
+            previous_ambient: [Vec3::ZERO; 2],
             started: Instant::now(),
             pass_limit: std::env::var("VERITY_LUX_PASS_LIMIT")
                 .ok()
@@ -1092,8 +1108,13 @@ impl SplitRadianceCascades {
             .is_none_or(|p| !p.abs_diff_eq(clip, 1e-6));
         self.previous_clip = Some(clip);
         let (lights, conventional) = Self::frame_lights(frame);
-        let lights_changed = bytemuck::cast_slice::<_, u8>(&lights)
-            != bytemuck::cast_slice::<_, u8>(&self.previous_lights);
+        // The sky and ground are in the background group, with the sun.
+        let ambient = [frame.sky, frame.ground];
+        let ambient_change = ambient_change(ambient, self.previous_ambient);
+        self.previous_ambient = ambient;
+        let lights_changed = ambient_change != SunChange::None
+            || bytemuck::cast_slice::<_, u8>(&lights)
+                != bytemuck::cast_slice::<_, u8>(&self.previous_lights);
         let first = view.fresh || self.scene_changed;
         let history_valid = self.history_valid && !first;
 
@@ -1104,6 +1125,7 @@ impl SplitRadianceCascades {
         let active = SOURCE_BACKGROUND | if conventional > 0 { SOURCE_PUNCTUAL } else { 0 };
         // Sunlight is stored in the background group, point lights in punctual.
         let (sun_change, points_changed) = light_changes(&lights, &self.previous_lights);
+        let sun_change = sun_change.max(ambient_change);
         let changed = if first {
             active
         } else {
@@ -1111,7 +1133,6 @@ impl SplitRadianceCascades {
                 | (if sun_change != SunChange::None { SOURCE_BACKGROUND } else { 0 })
         };
         let gradual_sun = !first && sun_change == SunChange::Gradual;
-        let [r, g, b] = settings.environment;
         let params = Parameters {
             world_from_clip: clip.inverse().to_cols_array_2d(),
             clip_from_world: clip.to_cols_array_2d(),
@@ -1126,7 +1147,8 @@ impl SplitRadianceCascades {
                 settings.normal_bias,
                 settings.intensity,
             ],
-            environment: [r, g, b, 1.0],
+            environment: frame.sky.extend(1.0).to_array(),
+            ground: frame.ground.extend(0.0).to_array(),
             history: [
                 settings.temporal_blend,
                 0.0,
@@ -1710,5 +1732,17 @@ mod tests {
 
         let moved = [GiLight { position: [1.0, 1.0, 0.0, 2.0], ..point }, base[1], mask];
         assert_eq!(light_changes(&moved, &base), (SunChange::None, true));
+    }
+
+    #[test]
+    fn sky_changes_grade_like_the_sun() {
+        let day = [Vec3::new(0.3, 0.35, 0.45), Vec3::splat(0.15)];
+        assert_eq!(ambient_change(day, day), SunChange::None);
+        let later = [day[0] * 0.98, day[1]];
+        assert_eq!(ambient_change(later, day), SunChange::Gradual);
+        assert_eq!(ambient_change([Vec3::ZERO; 2], day), SunChange::Hard);
+        // Out of darkness there is no history worth blending.
+        assert_eq!(ambient_change(day, [Vec3::ZERO; 2]), SunChange::Hard);
+        assert_eq!(SunChange::Gradual.max(SunChange::Hard), SunChange::Hard);
     }
 }

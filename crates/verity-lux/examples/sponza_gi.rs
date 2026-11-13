@@ -12,6 +12,7 @@
 //! `--voxel` and `--reference` run those instead. `--reference` needs a high `--warm`.
 //! H switches between hardware and software tracing while viewing.
 //! `--turn=N` looks the other way for N frames before saving the still view.
+//! `--cold` saves the first frames GI draws instead, to see how it starts.
 //! `--lights=N` hangs N point lights in two rows along the nave. `--software`
 //! traces without hardware ray queries, and `--world=M` sets PXTGI's ray reach.
 //! `--scene=A.glb,B.glb` loads those from `assets/packed` instead of Sponza.
@@ -39,7 +40,12 @@ use winit::{
 
 /// Frames each measurement averages or saves.
 const TIMED: u32 = 120;
-const SAVED: u32 = 8;
+// Two cycles of the renderer's 8-frame TAA jitter, saved `SAVE_EVERY` frames
+// apart: a readback takes two frames, which would only ever see half the
+// jitter, and three steps through all eight. A cycle's mean then does not
+// depend on where it starts, and saved frames 8 apart share their jitter.
+const SAVED: u32 = 16;
+const SAVE_EVERY: u32 = 3;
 
 /// Where a benchmark has got to.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -67,6 +73,10 @@ struct Bench {
     worst: f32,
     /// Advances only while moving, so saved frames repeat between runs.
     pose: f32,
+    /// Frames drawn, to space the saved ones.
+    tick: u32,
+    /// Save from GI's first frame, with no warm-up or timing (`--cold`).
+    cold: bool,
 }
 
 fn point(name: &str) -> Option<Vec3> {
@@ -133,6 +143,7 @@ impl Bench {
         }
         match self.stage {
             Stage::Warm(_) if !ready => {}
+            Stage::Warm(_) if self.cold && !self.moving => self.stage = Stage::Save(SAVED),
             Stage::Warm(0) => self.stage = Stage::Time(TIMED),
             Stage::Warm(left) => self.stage = Stage::Warm(left - 1),
             Stage::Time(0) => {
@@ -160,7 +171,8 @@ impl Bench {
         if self.moving {
             self.pose += 1.0 / 60.0;
         }
-        (false, matches!(self.stage, Stage::Save(_)))
+        self.tick += 1;
+        (false, matches!(self.stage, Stage::Save(_)) && self.tick.is_multiple_of(SAVE_EVERY))
     }
 }
 
@@ -399,6 +411,8 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
             order: Vec::new(),
             worst: 0.0,
             pose: 0.0,
+            tick: 0,
+            cold: std::env::args().any(|a| a == "--cold"),
         }
     });
     let mut world = World::new();
