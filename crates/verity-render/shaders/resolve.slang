@@ -7,6 +7,11 @@
 #include "lib/gi_surface.slang"
 #include "lib/terrain.slang"
 #include "lib/terrain_layers.slang"
+#include "lib/exposure.slang"
+
+/// Light a white diffuse surface would reflect at the primary surface, for
+/// metering: set by `shade`.
+static float metered_light;
 
 
 /// Barycentrics (b1, b2) and distance of a ray hit on a triangle's plane;
@@ -326,8 +331,12 @@ float3 shade(uint2 id, uint2 pixel, uint2 hit, bool primary) {
     // Hemisphere ambient through the same diffuse and specular albedo as
     // direct light. With GI, indirect light arrives from the extension instead.
     float3 result = 0.0;
+    float3 hemisphere = lerp(globals.ground.rgb, globals.sky.rgb, s.normal.z * 0.5 + 0.5);
+    // shortcut: with GI the hemisphere stands in for the extension's indirect
+    // light, so dark GI-lit interiors meter like the sky; meter GI's own
+    // irradiance if interiors come out too dark.
+    float3 diffuse_light = hemisphere;
     if (globals.counts.z == 0) {
-        float3 hemisphere = lerp(globals.ground.rgb, globals.sky.rgb, s.normal.z * 0.5 + 0.5);
         result = (brdf.diffuse_color + specular_albedo(brdf.f0, dfg)) * hemisphere;
     } else if ((globals.counts.z & 2) != 0) {
         float3 mirrored = reflect(-s.view, s.normal);
@@ -335,7 +344,9 @@ float3 shade(uint2 id, uint2 pixel, uint2 hit, bool primary) {
     }
     if (globals.sun_direction.w > 0.0) {
         float3 l = -globals.sun_direction.xyz;
-        result += evaluate_brdf(brdf, s, l) * globals.sun_color.rgb * sun_shadow(s.position, face, depth) * cloud_shadow(s.position);
+        float3 sun = globals.sun_color.rgb * sun_shadow(s.position, face, depth) * cloud_shadow(s.position);
+        result += evaluate_brdf(brdf, s, l) * sun;
+        diffuse_light += sun * max(dot(s.normal, l), 0.0) / PI;
     }
     uint2 tile = min(uint2(float2(id.xy) / viewport.zw * float2(CLUSTER_X, CLUSTER_Y)), uint2(CLUSTER_X - 1, CLUSTER_Y - 1));
     uint first = cluster_index(uint3(tile, depth_slice(depth))) * LIGHT_WORDS;
@@ -353,10 +364,14 @@ float3 shade(uint2 id, uint2 pixel, uint2 hit, bool primary) {
             float3 l = delta / max(distance, 0.0001);
             float window = pow(max(1.0 - pow(distance / radius, 4.0), 0.0), 2.0);
             float falloff = window / max(distance * distance, 0.01);
-            result += evaluate_brdf(brdf, s, l) * light.color_intensity.rgb * light.color_intensity.a * falloff
+            float3 arriving = light.color_intensity.rgb * light.color_intensity.a * falloff
                 * point_shadow(i, light, s.position, face);
+            result += evaluate_brdf(brdf, s, l) * arriving;
+            diffuse_light += arriving * max(dot(s.normal, l), 0.0) / PI;
         }
     }
+    if (primary)
+        metered_light = dot(diffuse_light, float3(0.2126, 0.7152, 0.0722));
     if (globals.counts.w != 0) {
         float3 colors[5] = {
             float3(0.1, 0.8, 0.2), float3(0.1, 0.5, 1.0),
@@ -368,6 +383,11 @@ float3 shade(uint2 id, uint2 pixel, uint2 hit, bool primary) {
     return result;
 }
 
+/// One pixel in 16 meters the exposure: plenty for an average.
+bool metered(uint2 id) {
+    return (id.x & 3) == 0 && (id.y & 3) == 0;
+}
+
 [shader("compute")]
 [numthreads(8, 8, 1)]
 void resolveMain(uint3 id: SV_DispatchThreadID) {
@@ -376,10 +396,12 @@ void resolveMain(uint3 id: SV_DispatchThreadID) {
         return;
     uint2 pixel = id.xy + uint2(viewport.xy);
     uint2 hit = visibility.Load(int3(pixel, 0));
-    if (hit.x == NO_INSTANCE)
-        clear_pixel(pixel);
-    else
+    bool surface = hit.x != NO_INSTANCE;
+    if (surface)
         hdr_output[pixel] = float4(shade(id.xy, pixel, hit, true), 1.0);
+    else
+        clear_pixel(pixel);
+    meter_exposure(surface && metered(id.xy), metered_light);
 }
 
 /// Every sample of the multisampled visibility pass; `visibility` holds sample 0.
@@ -407,6 +429,7 @@ void resolveMsaaMain(uint3 id: SV_DispatchThreadID) {
     // later into empty pixels; TAA still smooths those edges.
     if (hit.x == NO_INSTANCE) {
         clear_pixel(pixel);
+        meter_exposure(false, 0.0);
         return;
     }
     uint own = 0;
@@ -431,4 +454,5 @@ void resolveMsaaMain(uint3 id: SV_DispatchThreadID) {
         color = (color * a + second * b) / (a + b);
     }
     hdr_output[pixel] = float4(color, 1.0);
+    meter_exposure(metered(id.xy), metered_light);
 }

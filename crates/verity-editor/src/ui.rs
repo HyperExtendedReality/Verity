@@ -1164,7 +1164,7 @@ pub fn show(
                             ui.radio_value(&mut tools.anti_aliasing, mode, mode.label());
                         }
                         ui.add_enabled(
-                            tools.anti_aliasing.temporal(),
+                            tools.anti_aliasing.sharpened(),
                             egui::Slider::new(&mut tools.sharpening, 0.0..=1.0).text("Sharpening"),
                         );
                         ui.checkbox(&mut tools.show_game_ui, "Show game UI")

@@ -4,7 +4,7 @@
 //! `cargo run --release -p verity-render --example sponza [max texture size]`
 //!
 //! `--matrix` draws through Matrix; `--matrix-debug` also colors by tier.
-//! `--uncapped` ignores vsync, for timing.
+//! `--uncapped` ignores vsync, for timing. `--smaa` anti-aliases with SMAA T2x.
 use glam::Vec3;
 use std::{
     error::Error,
@@ -56,6 +56,9 @@ impl Viewer {
         renderer.set_matrix_enabled(debug || args.iter().any(|a| a == "--matrix"));
         renderer.set_matrix_debug(debug);
         renderer.set_uncapped(args.iter().any(|a| a == "--uncapped"));
+        if args.iter().any(|a| a == "--smaa") {
+            renderer.set_anti_aliasing(verity_render::AntiAliasing::Smaa);
+        }
         // Until GI: a blue sky above, warm stone bouncing up from below.
         renderer.set_ambient(Vec3::new(0.25, 0.3, 0.4), Vec3::new(0.12, 0.1, 0.08));
         renderer.set_sun(Some(Sun {

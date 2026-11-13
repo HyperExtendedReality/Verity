@@ -71,6 +71,9 @@ const HDR_FORMAT: vk::Format = vk::Format::R16G16B16A16_SFLOAT;
 // Neutral gray, matching the editor chrome.
 const CLEAR_COLOR: [f32; 4] = [0.086, 0.086, 0.086, 1.0];
 
+/// Exposure state before any metering: no sums, exposure 1, not yet seeded.
+const EXPOSURE_INITIAL: [u32; 4] = [0, 0, 0x3f80_0000, 0];
+
 macro_rules! spirv {
     ($name:literal) => {
         include_bytes!(concat!(env!("OUT_DIR"), "/", $name, ".spv"))
@@ -153,6 +156,28 @@ impl RenderInput<'_> {
 }
 
 /// Back-face culling for one-sided materials; none for two-sided ones.
+/// Smallest bounding-sphere radius over distance for a depth prepass
+/// occluder: about a tenth of the height of a 60 degree view.
+const OCCLUDER_SIZE: f32 = 0.05;
+
+/// Whether an opaque draw with model-space bounds `min`..`max` is large on
+/// screen from `eye`. Small or distant draws cost the prepass about what they
+/// cost the visibility pass and hide little: a 2x quad-overdraw multiplier.
+fn is_occluder(model: glam::Mat4, min: glam::Vec3, max: glam::Vec3, eye: glam::Vec3) -> bool {
+    let scale = (model.x_axis.truncate().length())
+        .max(model.y_axis.truncate().length())
+        .max(model.z_axis.truncate().length());
+    let radius = 0.5 * (max - min).length() * scale;
+    let distance = model.transform_point3(0.5 * (min + max)).distance(eye);
+    distance <= radius || radius >= OCCLUDER_SIZE * distance
+}
+
+/// Sun cascades redrawn on `frame` while they change, as bits: the near two
+/// every frame, the third every other frame, the farthest every fourth.
+fn cascade_schedule(frame: u64) -> u32 {
+    0b0011 | u32::from(frame.is_multiple_of(2)) << 2 | u32::from(frame % 4 == 1) << 3
+}
+
 pub(crate) fn cull_sides(two_sided: bool) -> vk::CullModeFlags {
     if two_sided {
         vk::CullModeFlags::NONE
@@ -287,6 +312,8 @@ pub struct Renderer {
     pipeline_layout: vk::PipelineLayout,
     descriptor_pool: vk::DescriptorPool,
     cluster_pipeline: vk::Pipeline,
+    /// Turns the resolve's metering into the exposure; see `shaders/exposure.slang`.
+    adapt_pipeline: vk::Pipeline,
     visibility_pipeline: vk::Pipeline,
     depth_prepass: vk::Pipeline,
     resolve_pipeline: vk::Pipeline,
@@ -300,6 +327,10 @@ pub struct Renderer {
     frames: Vec<Frame>,
     frame: usize,
     clusters: Buffer,
+    /// Auto exposure state, shared across frames: see `shaders/lib/exposure.slang`.
+    exposure: Buffer,
+    /// When the last frame was presented, for exposure adaptation.
+    last_present: Option<Instant>,
     vertices: Buffer,
     brdf_lut: Buffer,
     vertex_count: u32,
@@ -336,6 +367,14 @@ pub struct Renderer {
     /// must draw them again.
     shadow_key: Vec<u8>,
     shadows_stale: bool,
+    /// Sun cascades this frame redraws, as bits.
+    cascade_redraw: u32,
+    /// Cascades whose casters changed since they were last drawn.
+    cascade_dirty: u32,
+    /// The matrix each cascade was last drawn with, which sampling must use.
+    cascade_view_proj: [[[f32; 4]; 4]; scene::CASCADES],
+    /// Model generation and sun presence the cascades were all drawn for.
+    cascade_basis: Option<(u64, bool)>,
     /// Meshes drawn as set by `set_deforming_meshes`, and the space reserved
     /// for their vertices at `deforming_base` of the shared vertex buffer.
     deforming: Vec<DeformingMesh>,
@@ -404,6 +443,8 @@ pub struct Renderer {
     shadow_calls: Vec<(u32, u32)>,
     culler: Option<gpu_culling::Culler>,
     culling_ranges: Vec<Option<(usize, usize)>>,
+    /// Per draw: whether it occludes enough to join the depth prepass.
+    occluders: Vec<bool>,
     /// Each draw's meshlet runs that pass the frustum, for the camera and
     /// models in `meshlet_runs_key`; a draw keeps its runs while it stays put.
     meshlet_runs: Vec<MeshletRuns>,
@@ -506,6 +547,7 @@ impl Renderer {
                 pipeline_layout: vk::PipelineLayout::null(),
                 descriptor_pool: vk::DescriptorPool::null(),
                 cluster_pipeline: vk::Pipeline::null(),
+                adapt_pipeline: vk::Pipeline::null(),
                 visibility_pipeline: vk::Pipeline::null(),
                 depth_prepass: vk::Pipeline::null(),
                 resolve_pipeline: vk::Pipeline::null(),
@@ -522,6 +564,8 @@ impl Renderer {
                 gpu_timer_attempted: false,
                 scene_stages: [Duration::ZERO; 5],
                 clusters: Buffer::default(),
+                exposure: Buffer::default(),
+                last_present: None,
                 vertices: Buffer::default(),
                 brdf_lut: Buffer::default(),
                 vertex_count: 0,
@@ -547,6 +591,10 @@ impl Renderer {
                 model_generation: 0,
                 shadow_key: Vec::new(),
                 shadows_stale: true,
+                cascade_redraw: 0,
+                cascade_dirty: 0,
+                cascade_view_proj: Default::default(),
+                cascade_basis: None,
                 deforming: Vec::new(),
                 deforming_vertices: Vec::new(),
                 deforming_base: 0,
@@ -598,6 +646,7 @@ impl Renderer {
                 shadow_calls: Vec::new(),
                 culler: None,
                 culling_ranges: Vec::new(),
+                occluders: Vec::new(),
                 meshlet_runs: Vec::new(),
                 meshlet_runs_key: None,
                 hiz_active: false,
@@ -680,6 +729,8 @@ impl Renderer {
             D::SAMPLED_IMAGE,
             // Every visibility sample, for the MSAA resolve; unwritten without MSAA.
             D::SAMPLED_IMAGE,
+            // Auto exposure: see `shaders/lib/exposure.slang`.
+            D::STORAGE_BUFFER,
         ];
         // Instances, lights, vertices, indices and Matrix's buffers: now
         // pointers in `Globals`. Their slots stay empty so no other binding renumbers.
@@ -777,6 +828,13 @@ impl Renderer {
             layout,
             spirv!("resolve.resolveMain"),
             c"resolveMain",
+        )?;
+        self.adapt_pipeline = gpu::compute_pipeline(
+            device,
+            vk::PipelineCache::null(),
+            layout,
+            spirv!("exposure.adaptMain"),
+            c"adaptMain",
         )?;
         // Cull mode is dynamic: `cull_sides` sets it per draw.
         self.visibility_pipeline = gpu::graphics_pipeline(
@@ -930,6 +988,15 @@ impl Renderer {
             storage,
             MemoryLocation::GpuOnly,
         )?;
+        self.exposure = gpu::create_buffer(
+            device,
+            allocator,
+            "exposure",
+            mem::size_of_val(&EXPOSURE_INITIAL) as u64,
+            storage,
+            MemoryLocation::CpuToGpu,
+        )?;
+        self.exposure.write(bytemuck::cast_slice(&EXPOSURE_INITIAL));
 
         for (command, set) in commands.into_iter().zip(sets) {
             let mut frame = Frame {
@@ -1265,6 +1332,7 @@ impl Renderer {
         ];
         infos.push((30, [frame.layer_table.info()]));
         infos.push((31, [frame.layer_feedback.info()]));
+        infos.push((35, [self.exposure.info()]));
         let writes: Vec<_> = infos
             .iter()
             .map(|(binding, info)| {
@@ -2203,12 +2271,34 @@ impl Renderer {
             || self.embedded.as_ref().is_some_and(|e| e.reshaping());
         self.shadows_stale = moving || key != self.shadow_key;
         self.shadow_key = key;
+        // Far cascades redraw in turn, as in Kingdom Come: Deliverance 2. One
+        // that waits samples with the matrix it was drawn with, so its shadows
+        // lag a few frames but stay where they were drawn.
+        let all_cascades = (1 << scene::CASCADES) - 1;
+        if self.shadows_stale {
+            self.cascade_dirty = all_cascades;
+        }
+        let mut redraw = self.cascade_dirty & cascade_schedule(self.frame_number);
+        let basis = (self.model_generation, self.frame_sun.is_some());
+        if self.cascade_basis != Some(basis) {
+            redraw = all_cascades;
+            self.cascade_basis = Some(basis);
+        }
+        self.cascade_dirty &= !redraw;
+        self.cascade_redraw = redraw;
+        for (cascade, fresh) in globals.shadow_view_proj.iter_mut().enumerate() {
+            if redraw & 1 << cascade != 0 {
+                self.cascade_view_proj[cascade] = *fresh;
+            } else {
+                *fresh = self.cascade_view_proj[cascade];
+            }
+        }
         let unjittered = glam::Mat4::from_cols_array_2d(&globals.view_proj);
         let jitter = if !self.anti_aliasing.temporal() {
             glam::Mat4::IDENTITY
         } else {
             // Sub-pixel offset in NDC.
-            let [x, y] = taa::jitter(self.frame_number);
+            let [x, y] = taa::jitter(self.frame_number, self.anti_aliasing);
             let size = [viewport[2].max(1) as f32, viewport[3].max(1) as f32];
             glam::Mat4::from_translation(glam::Vec3::new(2.0 * x / size[0], 2.0 * y / size[1], 0.0))
         };
@@ -2223,6 +2313,7 @@ impl Renderer {
         self.frame_view_proj = (view_proj, previous);
         self.previous_view_proj = Some(unjittered);
         self.culling_ranges.clear();
+        self.occluders.clear();
         let mut jobs = Vec::new();
         let use_culling = self.matrix_enabled && self.culler.is_some();
         for (instance, &(count, _, primitive)) in
@@ -2231,10 +2322,13 @@ impl Renderer {
             let record = &self.instance_data[instance];
             let model = glam::Mat4::from_cols_array_2d(&record.model);
             let start = jobs.len();
+            let masked = self.material_data[record.draw[2] as usize].textures[3] & scene::ALPHA_MASK != 0;
+            let mut bounds: Option<(glam::Vec3, glam::Vec3)> = None;
             if primitive == NO_PRIMITIVE {
                 // Unculled: its bounds change every frame.
             } else if primitive >= EMBEDDED_PRIMITIVE {
                 let (min, max) = self.embedded_bounds[primitive - EMBEDDED_PRIMITIVE];
+                bounds = Some((min, max));
                 jobs.push(gpu_culling::Job::new(
                     view_proj,
                     model,
@@ -2245,6 +2339,11 @@ impl Renderer {
                 ));
             } else if let Some(meshlets) = &self.primitive_meshlets[primitive] {
                 for meshlet in meshlets {
+                    let (min, max) = (
+                        glam::Vec3::from_array(meshlet.bounds.min),
+                        glam::Vec3::from_array(meshlet.bounds.max),
+                    );
+                    bounds = Some(bounds.map_or((min, max), |(lo, hi)| (lo.min(min), hi.max(max))));
                     jobs.push(gpu_culling::Job::new(
                         view_proj,
                         model,
@@ -2257,6 +2356,9 @@ impl Renderer {
             }
             self.culling_ranges
                 .push((jobs.len() > start).then_some((start, jobs.len())));
+            self.occluders.push(bounds.is_some_and(|(min, max)| {
+                !masked && is_occluder(model, min, max, self.camera.eye)
+            }));
         }
         self.culling_active = self.matrix_enabled
             && self.culler.as_mut().is_some_and(|culler| {
@@ -2582,47 +2684,59 @@ impl Renderer {
         // Both images are shared across frames. The queue dependency protects the
         // prior resolve's sampled reads before discarding and rewriting the maps.
         // Unchanged maps stay read-only from the frame that drew them.
-        for (map, layers, size, point) in [
+        // Point lights redraw every face whenever anything changed.
+        let point_redraw = if self.shadows_stale { u32::MAX } else { 0 };
+        for (map, layers, size, point, redraw) in [
             (
                 self.shadow_map.as_ref().unwrap(),
                 &self.shadow_layers,
                 scene::SHADOW_SIZE,
                 false,
+                self.cascade_redraw,
             ),
             (
                 self.point_shadow_map.as_ref().unwrap(),
                 &self.point_shadow_layers,
                 scene::POINT_SHADOW_SIZE,
                 true,
+                point_redraw,
             ),
-        ]
-        .into_iter()
-        .filter(|_| self.shadows_stale)
-        {
-            let all_layers =
-                gpu::subresource(vk::ImageAspectFlags::DEPTH).layer_count(layers.len() as u32);
-            let shadow_barrier = |src_stage, src_access, dst_stage, dst_access, old, new| {
-                gpu::image_barrier(
-                    map.image,
-                    vk::ImageAspectFlags::DEPTH,
-                    src_stage,
-                    src_access,
-                    dst_stage,
-                    dst_access,
-                    old,
-                    new,
-                )
-                .subresource_range(all_layers)
+        ] {
+            let drawn = |index: usize| redraw == u32::MAX || redraw >> index & 1 != 0;
+            if !(0..layers.len()).any(drawn) {
+                continue;
+            }
+            // Only the redrawn layers are discarded; the rest stay sampled.
+            let shadow_barriers = |src_stage, src_access, dst_stage, dst_access, old, new| {
+                (0..layers.len())
+                    .filter(|&index| drawn(index))
+                    .map(|index| {
+                        gpu::image_barrier(
+                            map.image,
+                            vk::ImageAspectFlags::DEPTH,
+                            src_stage,
+                            src_access,
+                            dst_stage,
+                            dst_access,
+                            old,
+                            new,
+                        )
+                        .subresource_range(
+                            gpu::subresource(vk::ImageAspectFlags::DEPTH)
+                                .base_array_layer(index as u32),
+                        )
+                    })
+                    .collect::<Vec<_>>()
             };
             barrier(
-                &[shadow_barrier(
+                &shadow_barriers(
                     S::COMPUTE_SHADER,
                     A::SHADER_SAMPLED_READ,
                     S::EARLY_FRAGMENT_TESTS | S::LATE_FRAGMENT_TESTS,
                     A::DEPTH_STENCIL_ATTACHMENT_WRITE,
                     L::UNDEFINED,
                     L::DEPTH_ATTACHMENT_OPTIMAL,
-                )],
+                ),
                 &[],
             );
             let shadow_area = vk::Rect2D {
@@ -2632,7 +2746,7 @@ impl Renderer {
                     height: size,
                 },
             };
-            for (index, &layer) in layers.iter().enumerate() {
+            for (index, &layer) in layers.iter().enumerate().filter(|&(index, _)| drawn(index)) {
                 let attachment = vk::RenderingAttachmentInfo::default()
                     .image_view(layer)
                     .image_layout(L::DEPTH_ATTACHMENT_OPTIMAL)
@@ -2688,14 +2802,14 @@ impl Renderer {
                 device.cmd_end_rendering(cmd);
             }
             barrier(
-                &[shadow_barrier(
+                &shadow_barriers(
                     S::EARLY_FRAGMENT_TESTS | S::LATE_FRAGMENT_TESTS,
                     A::DEPTH_STENCIL_ATTACHMENT_WRITE,
                     S::COMPUTE_SHADER,
                     A::SHADER_SAMPLED_READ,
                     L::DEPTH_ATTACHMENT_OPTIMAL,
                     L::DEPTH_READ_ONLY_OPTIMAL,
-                )],
+                ),
                 &[],
             );
         }
@@ -2738,7 +2852,11 @@ impl Renderer {
             set_viewport(device, cmd, area);
             device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, self.depth_prepass);
             let mut bound = None;
-            for (instance, &(count, two_sided, _)) in self.draw_calls.iter().enumerate() {
+            // Only large opaque occluders: Hi-Z culling needs the big shapes,
+            // and the visibility pass draws everything anyway.
+            let occluders = (self.draw_calls.iter().enumerate())
+                .filter(|&(instance, _)| self.occluders.get(instance) == Some(&true));
+            for (instance, &(count, two_sided, _)) in occluders {
                 if bound != Some(two_sided) {
                     device.cmd_set_cull_mode(cmd, cull_sides(two_sided));
                     bound = Some(two_sided);
@@ -3017,11 +3135,13 @@ impl Renderer {
                     L::DEPTH_READ_ONLY_OPTIMAL,
                 ),
             ],
+            // Storage writes too: the exposure sums are atomics after last
+            // frame's reset.
             &[memory(
                 S::COMPUTE_SHADER,
                 A::SHADER_STORAGE_WRITE,
                 S::COMPUTE_SHADER,
-                A::SHADER_STORAGE_READ,
+                A::SHADER_STORAGE_READ | A::SHADER_STORAGE_WRITE,
             )],
         );
         if let Some((ids, _)) = msaa {
@@ -3148,6 +3268,37 @@ impl Renderer {
             extent,
         };
 
+        // Adapt the exposure to this frame's metering before the composite applies it.
+        let now = Instant::now();
+        let seconds = self
+            .last_present
+            .map_or(0.0, |last| now.duration_since(last).as_secs_f32());
+        self.last_present = Some(now);
+        let read_write = A::SHADER_STORAGE_READ | A::SHADER_STORAGE_WRITE;
+        gpu::memory_barrier(
+            device,
+            cmd,
+            (S::COMPUTE_SHADER | S::FRAGMENT_SHADER, read_write),
+            (S::COMPUTE_SHADER, read_write),
+        );
+        device.cmd_bind_descriptor_sets(
+            cmd,
+            vk::PipelineBindPoint::COMPUTE,
+            self.pipeline_layout,
+            0,
+            &[set],
+            &[],
+        );
+        device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, self.adapt_pipeline);
+        device.cmd_push_constants(
+            cmd,
+            self.pipeline_layout,
+            vk::ShaderStageFlags::COMPUTE,
+            8,
+            &seconds.to_ne_bytes(),
+        );
+        device.cmd_dispatch(cmd, 1, 1, 1);
+
         // Composite and UI into the swapchain image.
         let target = self.swap.images[image];
         barrier(
@@ -3173,7 +3324,12 @@ impl Renderer {
                     L::COLOR_ATTACHMENT_OPTIMAL,
                 ),
             ],
-            &[],
+            // The exposure the adapt pass just wrote.
+            &[vk::MemoryBarrier2::default()
+                .src_stage_mask(S::COMPUTE_SHADER)
+                .src_access_mask(A::SHADER_STORAGE_WRITE)
+                .dst_stage_mask(S::FRAGMENT_SHADER)
+                .dst_access_mask(A::SHADER_STORAGE_READ)],
         );
         let present_attachment = [vk::RenderingAttachmentInfo::default()
             .image_view(self.swap.views[image])
@@ -3482,6 +3638,7 @@ impl Drop for Renderer {
                 }
                 for buffer in [
                     mem::take(&mut self.clusters),
+                    mem::take(&mut self.exposure),
                     mem::take(&mut self.vertices),
                     mem::take(&mut self.brdf_lut),
                 ] {
@@ -3501,6 +3658,7 @@ impl Drop for Renderer {
             self.allocator.take();
             for pipeline in [
                 self.cluster_pipeline,
+                self.adapt_pipeline,
                 self.visibility_pipeline,
                 self.depth_prepass,
                 self.resolve_pipeline,
@@ -3561,6 +3719,40 @@ fn instance_motion(
         current.insert(slot, (model, base_vertex));
     }
     current
+}
+
+#[cfg(test)]
+mod cascade_tests {
+    use super::*;
+
+    #[test]
+    fn near_large_draws_occlude_and_far_small_ones_do_not() {
+        let unit = (glam::Vec3::splat(-1.0), glam::Vec3::splat(1.0));
+        let at = |z: f32, scale: f32| {
+            glam::Mat4::from_scale_rotation_translation(
+                glam::Vec3::splat(scale),
+                glam::Quat::IDENTITY,
+                glam::Vec3::new(0.0, 0.0, z),
+            )
+        };
+        let eye = glam::Vec3::ZERO;
+        assert!(is_occluder(at(-10.0, 1.0), unit.0, unit.1, eye));
+        assert!(!is_occluder(at(-100.0, 1.0), unit.0, unit.1, eye));
+        assert!(is_occluder(at(-100.0, 10.0), unit.0, unit.1, eye));
+        // The camera inside the bounds.
+        assert!(is_occluder(at(0.0, 0.01), unit.0, unit.1, eye));
+    }
+
+    #[test]
+    fn every_cascade_redraws_within_four_frames_and_near_ones_always() {
+        for start in 0..4 {
+            let bits = (start..start + 4).fold(0, |bits, frame| bits | cascade_schedule(frame));
+            assert_eq!(bits, (1 << scene::CASCADES) - 1);
+        }
+        assert!((0..8).all(|frame| cascade_schedule(frame) & 0b11 == 0b11));
+        // The two far cascades never share a frame.
+        assert!((0..8).all(|frame| cascade_schedule(frame) & 0b1100 != 0b1100));
+    }
 }
 
 #[cfg(test)]

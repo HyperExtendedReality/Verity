@@ -756,6 +756,12 @@ impl Matrix {
         // Dynamic state outlives the bind in `draw_list`.
         device.cmd_set_cull_mode(cmd, crate::cull_sides(false));
         self.draw_list(device, cmd, layout, clusters, LIST_ONE_SIDED, 0);
+        if target == Target::Depth {
+            // The prepass only feeds Hi-Z culling: two-sided clusters (mostly
+            // alpha-tested foliage) and the far voxel and imposter tiers cost
+            // nearly a full shade there and hide little.
+            return;
+        }
         device.cmd_set_cull_mode(cmd, crate::cull_sides(true));
         self.draw_list(device, cmd, layout, clusters, LIST_TWO_SIDED, 0);
         self.draw_list(device, cmd, layout, voxels, LIST_VOXELS, 0);
