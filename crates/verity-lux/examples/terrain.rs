@@ -2,7 +2,8 @@
 //!
 //! `cargo run --release -p verity-lux --example terrain -- --landform island --seed 7 --gi pxtgi`
 //! Landforms: valley, island, archipelago, continent, mountains, plains.
-//! GI: none (the default), lux for Split Radiance Cascades, or pxtgi.
+//! GI: none (the default), lux for Split Radiance Cascades, pxtgi, or voxel for
+//! screen and voxel GI.
 //!
 //! Click to capture the mouse, then WASD to fly, Q/E to descend and rise, Shift
 //! to go faster, hold the left button to dig and the right to fill, F to throw
@@ -29,6 +30,7 @@ use verity_lux::{
     GiStatus, Lux, Method,
     cascades::settings::Settings as LuxSettings,
     pxtgi::{Pxtgi, PxtgiSettings},
+    voxel::ScreenVoxelSettings,
 };
 use verity_physics::{
     Bounds, Collider, PhysicsBody, PhysicsSettings, PhysicsWorld, RigidBody, Velocity,
@@ -123,6 +125,7 @@ enum Gi {
     None,
     Lux,
     Pxtgi,
+    Voxel,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -569,6 +572,7 @@ impl ApplicationHandler for Viewer {
                         SKY.to_array(),
                     ))),
                     Gi::Pxtgi => Some(Method::Pxtgi(PxtgiSettings::default())),
+                    Gi::Voxel => Some(Method::ScreenVoxel(ScreenVoxelSettings::default())),
                 };
                 let installed =
                     method.map_or(Ok(()), |m| renderer.set_extension(Box::new(Lux::new(m))));
@@ -703,6 +707,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         None | Some("none") => Gi::None,
         Some("lux") => Gi::Lux,
         Some("pxtgi") => Gi::Pxtgi,
+        Some("voxel") => Gi::Voxel,
         Some(_) => return Err("unknown --gi".into()),
     };
 

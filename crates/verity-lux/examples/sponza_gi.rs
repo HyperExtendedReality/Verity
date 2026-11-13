@@ -63,6 +63,8 @@ struct Bench {
     moving: bool,
     sums: HashMap<&'static str, (u32, f32, f32)>,
     order: Vec<&'static str>,
+    /// The slowest frame timed: all of its passes.
+    worst: f32,
     /// Advances only while moving, so saved frames repeat between runs.
     pose: f32,
 }
@@ -93,13 +95,18 @@ impl Bench {
     fn report(&mut self) {
         let label = if self.moving { "moving" } else { "still" };
         let mut total = 0.0;
+        // Per frame timed, as some passes run only on some frames.
+        let frames = self.sums.values().map(|s| s.0).max().unwrap_or(1);
         for name in &self.order {
             let (n, sum, peak) = self.sums[name];
-            let mean = sum / n as f32;
+            let mean = sum / frames as f32;
             total += mean;
-            println!("{label} {name:<20} {mean:8.3} ms  peak {peak:8.3}");
+            let ran = if n < frames { format!("  in {n} of {frames} frames") } else { String::new() };
+            println!("{label} {name:<20} {mean:8.3} ms  peak {peak:8.3}{ran}");
         }
         println!("{label} {:<20} {total:8.3} ms", "TOTAL");
+        println!("{label} {:<20} {:8.3} ms", "WORST FRAME", self.worst);
+        self.worst = 0.0;
         self.sums.clear();
         self.order.clear();
     }
@@ -145,6 +152,7 @@ impl Bench {
                     });
                     *entry = (entry.0 + 1, entry.1 + ms, entry.2.max(ms));
                 }
+                self.worst = self.worst.max(times.iter().map(|(_, ms)| ms).sum());
                 self.stage = Stage::Time(left - 1);
             }
             Stage::Save(_) => {}
@@ -389,6 +397,7 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
             moving: false,
             sums: HashMap::new(),
             order: Vec::new(),
+            worst: 0.0,
             pose: 0.0,
         }
     });

@@ -47,6 +47,14 @@ const PXTGI_ENTRIES: &[&str] = &[
 
 /// The screen and voxel method's compute passes, all in `voxel.slang`.
 const VOXEL_ENTRIES: &[&str] = &[
+    "reset",
+    "clear",
+    "claim",
+    "capLarge",
+    "claimLarge",
+    "accumulate",
+    "accumulateLarge",
+    "finalize",
     "inject",
     "trace",
     "temporal",
