@@ -32,7 +32,7 @@ void clusterMain(uint3 id: SV_DispatchThreadID) {
         uint i = word * 32 + bit;
         if (i >= count)
             break;
-        float4 light = lights[i].position_radius;
+        float4 light = globals.lights[i].position_radius;
         float radius = light.w;
         if (!(radius > 0.0) || isinf(radius))
             continue;

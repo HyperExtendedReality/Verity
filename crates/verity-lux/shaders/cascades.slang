@@ -228,6 +228,7 @@ void conventionalLightResponseTracked(float3 position, float3 normal, float3 geo
     }
 }
 
+#include "surface_cache.slang"
 float4 splitRasterMetadata(uint2 full);
 TransportRadiance clampOutgoingTransportRadiance(TransportRadiance radiance) {
     float3 total = radiance.background + radiance.emissive + radiance.punctual;
@@ -266,7 +267,7 @@ TransportRadiance outgoingTransportRadianceTracked(float3 origin, float3 directi
     }
     float3 baseColor = materialBaseColor(hit).rgb;
     // Secondary rays already account for direct emitters through hit-point NEE.
-    if (params.environmentScale.z <= 0.5)
+    if (params.environmentScale.z <= 0.5 && !surfaceShading)
         radiance.emissive = hitEmission(hit, baseColor);
     if ((sceneWord(instanceBase(hit.instance) + 6u).w & 16u) != 0u)
         return clampOutgoingTransportRadiance(radiance);
@@ -290,7 +291,22 @@ TransportRadiance outgoingTransportRadianceTracked(float3 origin, float3 directi
     // replay make the same choice and issue the same query sequence.
     float indirectBackgroundCoverage = 0.0;
     TransportRadiance indirect = (TransportRadiance)0;
-    if (!rtgiDirectOnly)
+    // A cached surface brings its bounce light without leaking through walls,
+    // and far hits take all their light from it. Its bounce holds no sky, so
+    // the sky stays direct light here (coverage stays zero).
+    SurfaceTexel cached;
+    bool fromSurface = !rtgiDirectOnly && surfaceRead(hit, cached);
+    if (fromSurface) {
+        indirect = cached.bounce;
+        dependencyUnion(dependency, cached.dependency);
+        if (hit.distance >= surfaceFarDistance || params.environmentScale.z > 0.5) {
+            float3 diffuse = bsdfDiffuseColor(material) * (1.0 - bsdfSpecularEnergy(material, ab));
+            radiance.background = cached.direct.background + indirect.background * diffuse;
+            radiance.emissive += cached.direct.emissive + indirect.emissive * diffuse;
+            radiance.punctual = cached.direct.punctual + indirect.punctual * diffuse;
+            return clampOutgoingTransportRadiance(radiance);
+        }
+    } else if (!rtgiDirectOnly)
         indirect = bounceFeedback(position, normal, dependency, indirectBackgroundCoverage);
     bool skyFromCache = cachedHitSky(params) && indirectBackgroundCoverage > 0.0;
     bool emissiveSupported, environmentSupported = true, conventionalSupported;

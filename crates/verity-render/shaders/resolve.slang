@@ -6,6 +6,7 @@
 #include "lib/brdf.slang"
 #include "lib/gi_surface.slang"
 #include "lib/terrain.slang"
+#include "lib/terrain_layers.slang"
 
 
 /// Barycentrics (b1, b2) and distance of a ray hit on a triangle's plane;
@@ -46,6 +47,21 @@ float4 sample_material(uint texture, float2 uv, float2 dx, float2 dy, float4 fal
 
 /// Sun visibility from the cascade covering view distance `depth`, with a
 /// 3x3 hardware-PCF filter and a fade over the last tenth of the range.
+/// Sunlight let through the clouds above `position`; see clouds.slang.
+[[vk::binding(32, MATERIAL_SET)]] Texture2D<float> cloud_shadow_map;
+
+float cloud_shadow(float3 position) {
+    if (globals.cloud_shadow.w == 0.0)
+        return 1.0;
+    float3 to_sun = -globals.sun_direction.xyz;
+    to_sun.z = max(to_sun.z, 0.08);
+    float2 ground = position.xy - to_sun.xy * (position.z / to_sun.z);
+    float2 uv = (ground - globals.cloud_shadow.xy) / globals.cloud_shadow.z;
+    if (any(uv < 0.0) || any(uv > 1.0))
+        return 1.0;
+    return cloud_shadow_map.SampleLevel(material_sampler, uv, 0);
+}
+
 float sun_shadow(float3 position, float3 normal, float depth) {
     float range = globals.shadow_splits[CASCADES - 1];
     if (globals.sky.w == 0.0 || depth >= range)
@@ -92,34 +108,29 @@ float point_shadow(uint index, Light light, float3 position, float3 normal) {
 }
 
 
-[shader("compute")]
-[numthreads(8, 8, 1)]
-void resolveMain(uint3 id: SV_DispatchThreadID) {
-    float4 viewport = globals.viewport;
-    if (any(float2(id.xy) >= viewport.zw))
-        return;
-    uint2 pixel = id.xy + uint2(viewport.xy);
-    uint2 hit = visibility.Load(int3(pixel, 0));
-    if (hit.x == NO_INSTANCE) {
-        // Alpha 0 lets the composite keep the swapchain clear color.
-        hdr_output[pixel] = 0.0;
-        if (globals.counts.z != 0) {
-            gi_gbuffer[pixel] = 0;
-            gi_receiver[pixel] = 0;
-            gi_motion[pixel] = 0.0;
-        }
-        return;
+/// Empty pixel: alpha 0 lets the composite keep the swapchain clear color.
+void clear_pixel(uint2 pixel) {
+    hdr_output[pixel] = 0.0;
+    gi_motion[pixel] = 0.0;
+    if (globals.counts.z != 0) {
+        gi_gbuffer[pixel] = 0;
+        gi_receiver[pixel] = 0;
     }
+}
 
+/// Rebuild and light the surface `hit` seen through viewport pixel `id`.
+/// Only the `primary` surface writes the G-buffer, receiver and motion.
+float3 shade(uint2 id, uint2 pixel, uint2 hit, bool primary) {
+    float4 viewport = globals.viewport;
     uint kind = hit.y >> MATRIX_KIND_SHIFT;
     bool is_matrix = kind != 0;
     MatrixInstance matrix_instance;
     Instance instance;
     if (is_matrix) {
-        matrix_instance = matrix_instances[hit.x];
+        matrix_instance = globals.matrix_instances[hit.x];
         instance = matrix_instance.base;
     } else {
-        instance = instances[hit.x];
+        instance = globals.instances[hit.x];
     }
     Material material = materials[instance.draw.z];
     float3x3 model = (float3x3)instance.model;
@@ -131,12 +142,15 @@ void resolveMain(uint3 id: SV_DispatchThreadID) {
     s.agreement = 1.0;
     float3 face;
     uint level = uint(instance.normal_columns[0].w);
+    // Where this surface was last frame, for soft bodies and cloth.
+    float3 previous_position = 0.0;
+    bool vertex_motion = !is_matrix && globals.instance_motion[hit.x].info.x != 0;
 
     if (kind == MATRIX_VOXEL) {
         uint id_bits = hit.y & MATRIX_ID_MASK;
-        MatrixBrick brick = matrix_bricks[id_bits >> MATRIX_VOXEL_BITS];
+        MatrixBrick brick = globals.matrix_bricks[id_bits >> MATRIX_VOXEL_BITS];
         uint bit = id_bits & ((1u << MATRIX_VOXEL_BITS) - 1);
-        uint2 voxel = matrix_voxels[brick.first_voxel + voxel_rank(brick, bit)];
+        uint2 voxel = globals.matrix_voxels[brick.first_voxel + voxel_rank(brick, bit)];
         // Enter the voxel's box along the camera ray, in object space.
         float3 origin = mul(matrix_instance.inverse, float4(eye, 1.0)).xyz;
         float3 ray = normalize(mul(matrix_instance.inverse, float4(direction, 0.0)).xyz);
@@ -166,7 +180,7 @@ void resolveMain(uint3 id: SV_DispatchThreadID) {
         s.roughness = lerp(material.params.y, 1.0, float(voxel.x >> 24) / 255.0);
         level = 3;
     } else if (kind == MATRIX_IMPOSTER) {
-        MatrixAsset asset = matrix_assets[matrix_instance.info.x];
+        MatrixAsset asset = globals.matrix_assets[matrix_instance.info.x];
         ImposterHit imposter = imposter_sample(matrix_instance, asset, eye, direction, matrix_pixels(matrix_instance));
         float3 origin = mul(matrix_instance.inverse, float4(eye, 1.0)).xyz;
         float3 ray = normalize(mul(matrix_instance.inverse, float4(direction, 0.0)).xyz);
@@ -187,7 +201,7 @@ void resolveMain(uint3 id: SV_DispatchThreadID) {
         MatrixCluster cluster;
         if (is_matrix) {
             uint id_bits = hit.y & MATRIX_ID_MASK;
-            cluster = matrix_clusters[id_bits >> MATRIX_TRIANGLE_BITS];
+            cluster = globals.matrix_clusters[id_bits >> MATRIX_TRIANGLE_BITS];
             triangle = id_bits & ((1u << MATRIX_TRIANGLE_BITS) - 1);
             level = min(cluster.depth, 2);
         }
@@ -225,6 +239,13 @@ void resolveMain(uint3 id: SV_DispatchThreadID) {
         float4 metal_rough = sample_material(material.textures.y, texcoord, dx, dy, 1.0);
 
         s.position = eye + direction * b.z;
+        if (vertex_motion) {
+            uint first = globals.instance_motion[hit.x].info.y;
+            float3 q[3];
+            for (uint k = 0; k < 3; ++k)
+                q[k] = globals.previous_positions[first + globals.indices[instance.draw.x + triangle * 3 + k]].xyz;
+            previous_position = interpolate(q[0], q[1], q[2], b);
+        }
         float3 normal = normalize(interpolate(n[0], n[1], n[2], b));
         face = normalize(cross(p[1] - p[0], p[2] - p[0]));
         // Two-sided: shade the side facing the camera.
@@ -263,8 +284,17 @@ void resolveMain(uint3 id: SV_DispatchThreadID) {
             float3 across = interpolate(p[0], p[1], p[2], bx) - s.position;
             float3 along = interpolate(p[0], p[1], p[2], by) - s.position;
             float footprint = sqrt(max(dot(across, across), dot(along, along)));
-            TerrainSurface ground = terrain_surface(
-                s.position, s.normal, texcoord.x, texcoord.y, footprint, material.params.w, material.params.z);
+            TerrainSurface ground;
+            if (terrain_layers_ready()) {
+                // A sixteenth of the pixels ask for pages each frame, a different sixteenth each time.
+                uint frame = layer_table[0];
+                bool feedback = (pixel.x & 3) == (frame & 3) && (pixel.y & 3) == ((frame >> 2) & 3);
+                ground = terrain_layered(
+                    s.position, s.normal, texcoord.x, texcoord.y, footprint, material.params.w, feedback);
+            } else {
+                ground = terrain_surface(
+                    s.position, s.normal, texcoord.x, texcoord.y, footprint, material.params.w, material.params.z);
+            }
             s.base_color = ground.albedo;
             s.roughness = ground.roughness;
             // Bumps can tilt a grazing normal past the viewer, where the specular term blows up.
@@ -275,13 +305,21 @@ void resolveMain(uint3 id: SV_DispatchThreadID) {
     float2 dfg = env_brdf(nv, s.roughness);
     Brdf brdf = make_brdf(s.base_color, s.metallic, s.roughness, nv, dfg);
 
-    if (globals.counts.z != 0) {
+    if (primary && globals.counts.z != 0) {
         gi_gbuffer[pixel] = pack_gbuffer(s.base_color, s.roughness, s.metallic, s.normal);
         gi_receiver[pixel] = pack_receiver(instance.draw.w, face);
-        float4 previous = mul(globals.previous_view_proj, float4(s.position, 1.0));
-        float2 previous_uv = (previous.xy / previous.w) * 0.5 + 0.5;
-        gi_motion[pixel] = (center / viewport.zw) - previous_uv;
     }
+    // Camera and object motion, for GI and TAA. Matrix instances are placed at
+    // load and never move; deforming vertices carry their own last positions.
+    float4 moved = float4(s.position, 1.0);
+    if (vertex_motion)
+        moved.xyz = previous_position;
+    else if (!is_matrix)
+        moved = mul(globals.instance_motion[hit.x].to_previous, moved);
+    float4 previous = mul(globals.previous_view_proj, moved);
+    float2 previous_uv = (previous.xy / previous.w) * 0.5 + 0.5;
+    if (primary)
+        gi_motion[pixel] = (center / viewport.zw) - previous_uv;
 
     // With GI, indirect light arrives from the extension instead.
     float depth = -mul(globals.view, float4(s.position, 1.0)).z;
@@ -297,7 +335,7 @@ void resolveMain(uint3 id: SV_DispatchThreadID) {
     }
     if (globals.sun_direction.w > 0.0) {
         float3 l = -globals.sun_direction.xyz;
-        result += evaluate_brdf(brdf, s, l) * globals.sun_color.rgb * sun_shadow(s.position, face, depth);
+        result += evaluate_brdf(brdf, s, l) * globals.sun_color.rgb * sun_shadow(s.position, face, depth) * cloud_shadow(s.position);
     }
     uint2 tile = min(uint2(float2(id.xy) / viewport.zw * float2(CLUSTER_X, CLUSTER_Y)), uint2(CLUSTER_X - 1, CLUSTER_Y - 1));
     uint first = cluster_index(uint3(tile, depth_slice(depth))) * LIGHT_WORDS;
@@ -306,7 +344,7 @@ void resolveMain(uint3 id: SV_DispatchThreadID) {
         while (bits != 0) {
             uint i = word * 32 + firstbitlow(bits);
             bits &= bits - 1;
-            Light light = lights[i];
+            Light light = globals.lights[i];
             float3 delta = light.position_radius.xyz - s.position;
             float distance = length(delta);
             float radius = light.position_radius.w;
@@ -327,5 +365,70 @@ void resolveMain(uint3 id: SV_DispatchThreadID) {
         };
         result = colors[min(level, 4)];
     }
-    hdr_output[pixel] = float4(result, 1.0);
+    return result;
+}
+
+[shader("compute")]
+[numthreads(8, 8, 1)]
+void resolveMain(uint3 id: SV_DispatchThreadID) {
+    float4 viewport = globals.viewport;
+    if (any(float2(id.xy) >= viewport.zw))
+        return;
+    uint2 pixel = id.xy + uint2(viewport.xy);
+    uint2 hit = visibility.Load(int3(pixel, 0));
+    if (hit.x == NO_INSTANCE)
+        clear_pixel(pixel);
+    else
+        hdr_output[pixel] = float4(shade(id.xy, pixel, hit, true), 1.0);
+}
+
+/// Every sample of the multisampled visibility pass; `visibility` holds sample 0.
+[[vk::binding(34)]] Texture2DMS<uint2> visibility_samples;
+static const uint MSAA_SAMPLES = 4;
+
+/// Weight that keeps a bright sample from dominating an edge (Karis 2014).
+float edge_weight(float3 color, uint samples) {
+    return float(samples) / (1.0 + max(color.r, max(color.g, color.b)));
+}
+
+/// The resolve with 4x MSAA visibility: shade sample 0's triangle and the
+/// first other triangle in the pixel, blended by how many samples each covers.
+/// Sample 0's surface writes the single-sample outputs, matching the depth
+/// resolved from sample 0.
+[shader("compute")]
+[numthreads(8, 8, 1)]
+void resolveMsaaMain(uint3 id: SV_DispatchThreadID) {
+    float4 viewport = globals.viewport;
+    if (any(float2(id.xy) >= viewport.zw))
+        return;
+    uint2 pixel = id.xy + uint2(viewport.xy);
+    uint2 hit = visibility.Load(int3(pixel, 0));
+    // shortcut: an edge against the sky is not blended, since the sky is drawn
+    // later into empty pixels; TAA still smooths those edges.
+    if (hit.x == NO_INSTANCE) {
+        clear_pixel(pixel);
+        return;
+    }
+    uint own = 0;
+    uint2 other = hit;
+    uint others = 0;
+    for (uint s = 0; s < MSAA_SAMPLES; ++s) {
+        uint2 h = visibility_samples.Load(int2(pixel), s);
+        if (all(h == hit)) {
+            ++own;
+        } else if (h.x != NO_INSTANCE) {
+            if (others == 0)
+                other = h;
+            if (all(h == other))
+                ++others;
+        }
+    }
+    float3 color = shade(id.xy, pixel, hit, true);
+    if (others != 0) {
+        float3 second = shade(id.xy, pixel, other, false);
+        float a = edge_weight(color, own);
+        float b = edge_weight(second, others);
+        color = (color * a + second * b) / (a + b);
+    }
+    hdr_output[pixel] = float4(color, 1.0);
 }

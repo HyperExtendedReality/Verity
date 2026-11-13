@@ -1,23 +1,39 @@
 //! Eroded, smooth, editable voxel terrain, Z-up, in metres.
 //!
-//! [`Landscape::generate`] shapes a heightfield from a [`Landform`] preset and
-//! erodes it. [`Terrain`] caches it as a sparse 3D density field that can be
-//! sampled, ray cast and dug into, so cavities and overhangs work. [`Mesher`]
-//! turns dirty chunks into [`MeshData`] on worker threads, and drops results an
-//! edit has overtaken. Density is negative inside the ground.
+//! [`Landscape::generate`] raises land with a [`Landform`]'s uplift and lets
+//! rivers and landslides wear it down, coarse grid to fine ([`erosion`]), so
+//! mountains are what erosion leaves standing. [`Terrain`] caches it as a
+//! sparse 3D density field that can be sampled, ray cast and dug into, so
+//! cavities and overhangs work. [`Mesher`] turns dirty chunks into
+//! [`MeshData`] on worker threads, and drops results an edit has overtaken.
+//! Density is negative inside the ground. [`Far`] draws the landscape beyond
+//! the voxels as level-of-detail patches.
+//!
+//! Like World Creator, a landscape is a base shape plus a stack of [`Filter`]s
+//! applied in order after erosion, and [`Settings::random`] rolls a whole
+//! recipe. [`planet`] builds whole worlds with the same erosion.
 
+mod erosion;
+pub mod lod;
+pub mod planet;
+
+pub use lod::{Far, LodUpdate, Patch, PatchLod, Surface};
+
+use erosion::{Grid, evolve, upsample};
 use fast_surface_nets::{
     SurfaceNetsBuffer,
     ndshape::{ConstShape, ConstShape3u32},
     surface_nets,
 };
-use glam::{DVec2, FloatExt, IVec3, Vec2, Vec3};
+use glam::{DVec2, FloatExt, IVec2, IVec3, Vec2, Vec3};
 use noise::{NoiseFn, Perlin};
 use rayon::prelude::*;
+use serde::{Deserialize, Serialize};
 use std::{
     cell::RefCell,
-    cmp::Reverse,
-    collections::{BinaryHeap, HashMap, HashSet},
+    collections::{HashMap, HashSet},
+    io::{self, Read, Write},
+    ops::Range,
     sync::{
         Arc,
         mpsc::{Receiver, Sender, channel},
@@ -27,15 +43,13 @@ use verity_physics::Ground;
 
 pub const CELLS: i32 = 24;
 pub const VOXEL: f32 = 1.0;
-pub const HALF_WORLD: i32 = 192;
-pub const MIN_Z: i32 = -48;
-pub const MAX_Z: i32 = 144;
-pub const SIDE: usize = (HALF_WORLD * 2 + 1) as usize;
 pub type Shape = ConstShape3u32<26, 26, 26>;
 const N: u32 = CELLS as u32 + 2;
+/// The coarsest erosion grid's samples per side.
+const COARSEST: usize = 65;
 
 /// The large-scale shape of the world. Start from a preset with `Settings::from(Landform::Island)`.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Landform {
     /// Ridged highlands split by a winding river valley. No sea.
     #[default]
@@ -52,24 +66,99 @@ pub enum Landform {
     Plains,
 }
 
-#[derive(Clone, Copy, Debug)]
+impl Landform {
+    pub const ALL: [Landform; 6] = [
+        Landform::Valley,
+        Landform::Island,
+        Landform::Archipelago,
+        Landform::Continent,
+        Landform::Mountains,
+        Landform::Plains,
+    ];
+}
+
+/// A height filter, applied in order after erosion, like World Creator's filter stack.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub enum Filter {
+    /// Steps the ground into benches `step` metres tall; `sharpness` in [0, 1] makes the risers abrupt.
+    Terraces { step: f32, sharpness: f32 },
+    /// Blurs the heights `passes` times, blended in by `strength` in [0, 1].
+    Smooth { strength: f32, passes: u32 },
+    /// Flattens ground above `height` metres into mesas, by `strength` in [0, 1].
+    Plateau { height: f32, strength: f32 },
+    /// Fills hollows toward the ground around them, by `strength` in [0, 1].
+    Sediment { strength: f32 },
+    /// Scales heights about the sea level (or zero) by `scale`, then raises them by `offset` metres.
+    Level { scale: f32, offset: f32 },
+}
+
+impl Filter {
+    /// One of each filter with useful values, to add to a stack.
+    pub const PRESETS: [Filter; 5] = [
+        Filter::Terraces {
+            step: 20.0,
+            sharpness: 0.6,
+        },
+        Filter::Smooth {
+            strength: 0.5,
+            passes: 2,
+        },
+        Filter::Plateau {
+            height: 400.0,
+            strength: 0.8,
+        },
+        Filter::Sediment { strength: 0.6 },
+        Filter::Level {
+            scale: 1.0,
+            offset: 0.0,
+        },
+    ];
+
+    pub fn name(&self) -> &'static str {
+        match self {
+            Filter::Terraces { .. } => "Terraces",
+            Filter::Smooth { .. } => "Smooth",
+            Filter::Plateau { .. } => "Plateau",
+            Filter::Sediment { .. } => "Sediment",
+            Filter::Level { .. } => "Level",
+        }
+    }
+}
+
+/// What to generate: a finite eroded landscape or a whole planet.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub enum Generator {
+    Landscape(Settings),
+    Planet(planet::PlanetSettings),
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct Settings {
     pub seed: u32,
     pub landform: Landform,
     /// Water height in metres. `None` means a dry world; droplets reaching the sea deposit their load.
     pub sea_level: Option<f32>,
-    /// Ridged mountain amplitude in metres.
+    /// Height of the tallest peaks above the sea (or zero), in metres.
     pub mountains: f32,
-    /// Rolling hill amplitude in metres.
+    /// Rolling relief before erosion, in metres.
     pub hills: f32,
-    /// Iterations of stream-power river incision with tectonic uplift. 0 disables it.
+    /// Height samples along each side, rounded up to 2ᵏ + 1.
+    pub size: usize,
+    /// Metres between height samples.
+    pub cell: f32,
+    /// How long rivers have worked, in steps on the coarsest grid; each finer
+    /// grid adds a third as many. 0 leaves the uplifted land unworn.
     pub fluvial_steps: usize,
     pub droplets: usize,
     pub thermal_steps: usize,
     pub erosion_rate: f32,
     pub deposition_rate: f32,
     pub evaporation: f32,
+    /// Steepest slope soil holds, rise over run (0.75 is about 37°). Rock stands four times steeper.
     pub talus: f32,
+    /// Applied in order after erosion.
+    pub filters: Vec<Filter>,
 }
 
 impl Default for Settings {
@@ -81,12 +170,12 @@ impl Default for Settings {
 impl From<Landform> for Settings {
     fn from(landform: Landform) -> Self {
         let (sea_level, mountains, hills) = match landform {
-            Landform::Valley => (None, 44.0, 22.0),
-            Landform::Island => (Some(0.0), 80.0, 10.0),
-            Landform::Archipelago => (Some(0.0), 40.0, 8.0),
-            Landform::Continent => (Some(-10.0), 85.0, 12.0),
-            Landform::Mountains => (None, 95.0, 14.0),
-            Landform::Plains => (None, 24.0, 16.0),
+            Landform::Valley => (None, 450.0, 40.0),
+            Landform::Island => (Some(0.0), 420.0, 30.0),
+            Landform::Archipelago => (Some(0.0), 160.0, 20.0),
+            Landform::Continent => (Some(-10.0), 650.0, 40.0),
+            Landform::Mountains => (None, 800.0, 50.0),
+            Landform::Plains => (None, 90.0, 30.0),
         };
         Self {
             seed: 1337,
@@ -94,6 +183,8 @@ impl From<Landform> for Settings {
             sea_level,
             mountains,
             hills,
+            size: 1025,
+            cell: 4.0,
             fluvial_steps: 60,
             droplets: 4_000,
             thermal_steps: 25,
@@ -101,194 +192,277 @@ impl From<Landform> for Settings {
             deposition_rate: 0.18,
             evaporation: 0.025,
             talus: 0.75,
+            filters: Vec::new(),
         }
     }
 }
 
+impl Settings {
+    /// A whole random recipe from one number: landform, amplitudes, erosion and filters.
+    pub fn random(seed: u32) -> Self {
+        let mut rng = Random(seed as u64 ^ 0x9e37_79b9_7f4a_7c15);
+        let landform = Landform::ALL[(rng.unit() * 6.0) as usize % 6];
+        let mut s = Self::from(landform);
+        s.seed = seed;
+        s.mountains *= 0.6 + rng.unit() * 0.8;
+        s.hills *= 0.6 + rng.unit() * 0.8;
+        s.fluvial_steps = (20.0 + rng.unit() * 80.0) as usize;
+        s.droplets = (1_000.0 + rng.unit() * 8_000.0) as usize;
+        s.thermal_steps = (10.0 + rng.unit() * 30.0) as usize;
+        s.talus = 0.55 + rng.unit() * 0.35;
+        for preset in Filter::PRESETS {
+            if rng.unit() < 0.3 {
+                s.filters.push(match preset {
+                    Filter::Terraces { .. } => Filter::Terraces {
+                        step: 8.0 + rng.unit() * 30.0,
+                        sharpness: rng.unit(),
+                    },
+                    Filter::Plateau { .. } => Filter::Plateau {
+                        height: s.mountains * (0.4 + rng.unit() * 0.4),
+                        strength: 0.5 + rng.unit() * 0.5,
+                    },
+                    other => other,
+                });
+            }
+        }
+        s
+    }
+}
+
+/// A square heightmap, centred on the origin, with each sample's wetness.
 #[derive(Clone)]
 pub struct Landscape {
+    /// Row-major, `side` × `side`.
     pub heights: Vec<f32>,
     pub flow: Vec<f32>,
     pub noise: Perlin,
+    /// Samples along each side.
+    pub side: usize,
+    /// Metres between samples.
+    pub cell: f32,
 }
 
 // Deterministic sampling without an additional random-number dependency.
-struct Random(u64);
+pub(crate) struct Random(pub(crate) u64);
 impl Random {
-    fn unit(&mut self) -> f32 {
+    pub(crate) fn unit(&mut self) -> f32 {
         self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1);
         ((self.0 >> 40) as f32) / ((1u32 << 24) as f32)
     }
 }
 
+/// The ground at one sample before erosion, and what erosion works with there.
+struct Relief {
+    height: f32,
+    /// In [0, 1]: where the crust rises, and so where mountains stand.
+    uplift: f32,
+    /// In [0, 1]: where rock outcrops instead of soil.
+    rock: f32,
+    /// Thickness of the rock's hard and soft layers, in metres.
+    strata: f32,
+    /// Shifts the layers, as a fraction of `strata`, so they do not follow contour lines.
+    phase: f32,
+}
+
+impl Relief {
+    /// How hard the ground is at `height`: hard beds in soft ones, so cliffs and benches form.
+    fn hardness(&self, height: f32) -> f32 {
+        let bed = (height / self.strata + self.phase).rem_euclid(1.0);
+        self.rock * smoothstep(0.55, 0.8, bed as f64) as f32
+    }
+}
+
 impl Landscape {
-    pub fn generate(settings: Settings) -> Self {
-        let noise = Perlin::new(settings.seed);
-        let cells: Vec<(f32, f32)> = (0..SIDE * SIDE)
-            .into_par_iter()
-            .map(|i| {
-                let p = DVec2::new((i % SIDE) as f64, (i / SIDE) as f64) - HALF_WORLD as f64;
-                let (height, rock) = relief(&noise, &settings, p);
-                let height = height.clamp(MIN_Z as f64 + 4.0, MAX_Z as f64 - 8.0);
-                (height as f32, rock as f32)
-            })
-            .collect();
-        let (heights, hardness): (Vec<f32>, Vec<f32>) = cells.into_iter().unzip();
-        let mut terrain = Self {
-            heights,
-            flow: vec![0.0; SIDE * SIDE],
-            noise,
-        };
-        terrain.fluvial(settings, &hardness);
-        terrain.erode(settings, &hardness);
-        terrain
+    /// A level map at `height`, `side` samples `cell` metres apart.
+    pub fn flat(height: f32, side: usize, cell: f32) -> Self {
+        Self {
+            heights: vec![height; side * side],
+            flow: vec![0.0; side * side],
+            noise: Perlin::new(1337),
+            side,
+            cell,
+        }
     }
 
-    fn map_sample(map: &[f32], p: Vec2) -> (f32, Vec2) {
-        let p = p.clamp(Vec2::ZERO, Vec2::splat((SIDE - 2) as f32));
+    /// Metres from the centre to each edge.
+    pub fn half(&self) -> f32 {
+        (self.side - 1) as f32 * self.cell * 0.5
+    }
+
+    /// Map coordinates, in samples, of world `(x, y)`.
+    fn grid(&self, x: f32, y: f32) -> Vec2 {
+        Vec2::new(x, y) / self.cell + (self.side - 1) as f32 * 0.5
+    }
+
+    pub fn generate(settings: Settings) -> Self {
+        let s = &settings;
+        let noise = Perlin::new(s.seed);
+        let side = (s.size.max(COARSEST) - 1).next_power_of_two() + 1;
+        let cell = s.cell.max(0.25);
+        let half = (side - 1) as f64 * cell as f64 * 0.5;
+        // The noise was laid out for a 384 m map: keep the layout at any size.
+        let scale = 192.0 / half;
+        let mut sides = vec![side];
+        while *sides.last().expect("one side") > COARSEST {
+            sides.push((sides.last().expect("one side") - 1) / 2 + 1);
+        }
+        sides.reverse();
+        let sea = s.sea_level.unwrap_or(f32::NEG_INFINITY);
+        let base = s.sea_level.unwrap_or(0.0);
+        let mut rng = Random(s.seed as u64 + 7);
+        // Metres per step at full uplift; rescaled below so the peaks reach `mountains`.
+        let mut rate = s.mountains.max(1.0) * 0.012;
+        let (mut heights, mut initial, mut area) = (Vec::new(), Vec::new(), Vec::new());
+        let mut cells = Vec::new();
+        for (level, &n) in sides.iter().enumerate() {
+            let c = cell * ((side - 1) / (n - 1)) as f32;
+            cells = (0..n * n)
+                .into_par_iter()
+                .map(|i| {
+                    let p = DVec2::new((i % n) as f64, (i / n) as f64) * c as f64 - half;
+                    relief(&noise, s, p * scale)
+                })
+                .collect::<Vec<Relief>>();
+            let fresh: Vec<f32> = cells.iter().map(|r| r.height).collect();
+            heights = if level == 0 {
+                fresh.clone()
+            } else {
+                // The coarse result plus the detail the coarse grid could not hold.
+                let coarse = sides[level - 1];
+                let (worn, smooth) = (upsample(&heights, coarse), upsample(&initial, coarse));
+                (worn.iter().zip(&smooth).zip(&fresh))
+                    .map(|((w, s), f)| w + f - s)
+                    .collect()
+            };
+            initial = fresh;
+            let steps = if level == 0 {
+                s.fluvial_steps
+            } else {
+                s.fluvial_steps.div_ceil(3)
+            };
+            let hard = |i: usize, h: f32| cells[i].hardness(h);
+            let grid = Grid { side: n, cell: c };
+            let start = heights.clone();
+            // Steady-state river relief is proportional to uplift: the coarsest grid runs
+            // rivers alone once to measure it, then again with the uplift that brings it
+            // to `mountains`. Landslides only ever lower that.
+            let measure = level == 0 && steps > 0;
+            for pass in 0..1 + measure as usize {
+                if measure && pass == 1 {
+                    let peak = heights.iter().fold(0.0f32, |m, h| m.max(h - base));
+                    // River relief grows with ln(distance / cell): finer grids add some,
+                    // and uplift that ignored it would leave every slope at the talus angle.
+                    let finer = ((half / cell as f64).ln() / (half / c as f64).ln()) as f32;
+                    rate *= (s.mountains.max(0.0) / peak.max(1.0e-3) / finer).clamp(0.1, 10.0);
+                    heights.copy_from_slice(&start);
+                }
+                let talus = if measure && pass == 0 {
+                    f32::INFINITY
+                } else {
+                    s.talus
+                };
+                let uplift: Vec<f32> = cells.iter().map(|r| r.uplift * rate).collect();
+                area = evolve(
+                    &grid,
+                    &mut heights,
+                    &uplift,
+                    sea,
+                    talus,
+                    &hard,
+                    steps,
+                    &mut rng,
+                );
+            }
+        }
+        // Finer grids add relief the coarsest could not hold: bring the peaks back down.
+        // Only ever down, which keeps every slope under the talus angle.
+        let peak = heights.iter().fold(0.0f32, |m, h| m.max(h - base));
+        if peak > s.mountains.max(1.0) {
+            let k = s.mountains.max(1.0) / peak;
+            (heights.iter_mut().filter(|h| **h > base)).for_each(|h| *h = base + (*h - base) * k);
+        }
+        let mut landscape = Self {
+            heights,
+            // Drainage area seeds the wetness map so valley floors follow the river network.
+            flow: area.iter().map(|a| a / (cell * cell) * 0.05).collect(),
+            noise,
+            side,
+            cell,
+        };
+        let hard = |i: usize, h: f32| cells[i].hardness(h);
+        landscape.erode(s, &hard);
+        landscape.filter(s);
+        landscape
+    }
+
+    fn filter(&mut self, s: &Settings) {
+        let base = s.sea_level.unwrap_or(0.0);
+        for filter in &s.filters {
+            match *filter {
+                Filter::Terraces { step, sharpness } if step > 0.0 => {
+                    let lo = sharpness.clamp(0.0, 0.98) as f64;
+                    for h in &mut self.heights {
+                        let t = ((*h - base) / step) as f64;
+                        *h = base + ((t.floor() + smoothstep(lo, 1.0, t.fract())) as f32) * step;
+                    }
+                }
+                Filter::Terraces { .. } => {}
+                Filter::Smooth { strength, passes } => {
+                    let blurred = blur(&self.heights, self.side, passes.min(64));
+                    for (h, b) in self.heights.iter_mut().zip(blurred) {
+                        *h = h.lerp(b, strength.clamp(0.0, 1.0));
+                    }
+                }
+                Filter::Plateau { height, strength } => {
+                    for h in self.heights.iter_mut().filter(|h| **h > height) {
+                        *h = h.lerp(height + (*h - height) * 0.1, strength.clamp(0.0, 1.0));
+                    }
+                }
+                Filter::Sediment { strength } => {
+                    let around = blur(&self.heights, self.side, 6);
+                    for (h, a) in self.heights.iter_mut().zip(around) {
+                        *h = h.max(h.lerp(a, strength.clamp(0.0, 1.0)));
+                    }
+                }
+                Filter::Level { scale, offset } => {
+                    for h in &mut self.heights {
+                        *h = base + (*h - base) * scale + offset;
+                    }
+                }
+            }
+        }
+    }
+
+    /// Bilinear height and gradient (metres per sample) at map coordinates `p`.
+    fn map_sample(map: &[f32], side: usize, p: Vec2) -> (f32, Vec2) {
+        let p = p.clamp(Vec2::ZERO, Vec2::splat((side - 2) as f32));
         let [x, z] = p.floor().as_uvec2().to_array();
         let f = p.fract();
-        let i = z as usize * SIDE + x as usize;
-        let [a, b, c, d] = [map[i], map[i + 1], map[i + SIDE], map[i + SIDE + 1]];
+        let i = z as usize * side + x as usize;
+        let [a, b, c, d] = [map[i], map[i + 1], map[i + side], map[i + side + 1]];
         let height = a.lerp(b, f.x).lerp(c.lerp(d, f.x), f.y);
         let gradient = Vec2::new((b - a).lerp(d - c, f.y), (c - a).lerp(d - b, f.x));
         (height, gradient)
     }
 
     fn deposit(&mut self, p: Vec2, sediment: f32) {
+        let side = self.side;
         let [x, z] = p.floor().as_uvec2().to_array();
         let f = p.fract();
-        let i = z as usize * SIDE + x as usize;
+        let i = z as usize * side + x as usize;
         for (offset, weight) in [
             (0, (1.0 - f.x) * (1.0 - f.y)),
             (1, f.x * (1.0 - f.y)),
-            (SIDE, (1.0 - f.x) * f.y),
-            (SIDE + 1, f.x * f.y),
+            (side, (1.0 - f.x) * f.y),
+            (side + 1, f.x * f.y),
         ] {
             self.heights[i + offset] += sediment * weight;
         }
     }
 
-    /// Landscape evolution: uplift balanced by stream-power incision (Braun & Willett 2013,
-    /// implicit O(n) solver). Flow is routed over depressions with an epsilon priority flood
-    /// (Barnes et al. 2014), so every cell drains to the sea or the map edge. Only cells above a
-    /// large channel-head drainage area incise: a few connected river valleys cut through the
-    /// relief while the slopes between them keep their shape.
-    fn fluvial(&mut self, s: Settings, hardness: &[f32]) {
-        const INCISION: f32 = 0.035; // K·dt, with drainage area in cells (m = 0.5, n = 1).
-        const UPLIFT: f32 = 0.015; // Fraction of the deficit to the preset relief restored per step.
-        const CHANNEL_HEAD: f32 = 200.0; // Drainage area in cells needed before a channel incises.
-        let n = SIDE * SIDE;
-        let sea = s.sea_level.unwrap_or(f32::NEG_INFINITY);
-        let target = self.heights.clone();
-        let mut filled = vec![0.0f32; n];
-        let mut receiver = vec![0usize; n];
-        let mut area = vec![0.0f32; n];
-        let mut done = vec![false; n];
-        let mut order = Vec::with_capacity(n);
-        let mut heap = BinaryHeap::new();
-        // Per route: the uplift rate of unchannelled cells, and each channel cell
-        // in downstream order with its receiver and incision factor.
-        let mut uplift = vec![0.0f32; n];
-        let mut channels: Vec<(u32, u32, f32)> = Vec::new();
-        let mut rng = Random(s.seed as u64 + 7);
-        for step in 0..s.fluvial_steps {
-            // Reroute every few steps: the update below stays valid on a slightly stale graph.
-            if step % 4 == 0 {
-                // Base level: the sea and the map border.
-                done.fill(false);
-                order.clear();
-                for (i, &h) in self.heights.iter().enumerate() {
-                    if h < sea || is_border(i) {
-                        done[i] = true;
-                        filled[i] = h;
-                        heap.push(Reverse(flood_key(h, i)));
-                    }
-                }
-                while let Some(Reverse(key)) = heap.pop() {
-                    let i = key as u32 as usize;
-                    let level = filled[i];
-                    order.push(i);
-                    for_neighbours(i, |j, _| {
-                        if !done[j] {
-                            done[j] = true;
-                            // A random epsilon keeps filled basins sloping to their spill point without
-                            // the parallel straight channels a constant one carves across flats.
-                            filled[j] = self.heights[j].max(level + 1e-3 * (0.1 + rng.unit()));
-                            heap.push(Reverse(flood_key(filled[j], j)));
-                        }
-                    });
-                }
-                // Steepest descent on the filled surface. A lower neighbour always exists (the cell
-                // that flooded it) and was popped earlier, so `order` runs downstream to upstream.
-                let (heights, filled) = (&self.heights, &filled);
-                receiver.par_iter_mut().enumerate().for_each(|(i, r)| {
-                    *r = i;
-                    if heights[i] < sea || is_border(i) {
-                        return;
-                    }
-                    let mut best = 0.0;
-                    for_neighbours(i, |j, diagonal| {
-                        let slope = (filled[i] - filled[j]) / if diagonal { SQRT_2 } else { 1.0 };
-                        if slope > best {
-                            best = slope;
-                            *r = j;
-                        }
-                    });
-                });
-                area.fill(1.0);
-                for &i in order.iter().rev() {
-                    if receiver[i] != i {
-                        area[receiver[i]] += area[i];
-                    }
-                }
-                // Below the channel-head area slopes stay unchannelled and keep their relief. A
-                // channel's receiver drains more than it does, so it is a channel or a base level:
-                // only channels depend on their neighbours, and only they need `order`.
-                uplift.fill(0.0);
-                channels.clear();
-                for &i in &order {
-                    let r = receiver[i];
-                    if r == i {
-                        continue;
-                    }
-                    let length = if i % SIDE != r % SIDE && i / SIDE != r / SIDE {
-                        SQRT_2
-                    } else {
-                        1.0
-                    };
-                    let erodibility = INCISION * (1.0 - 0.6 * hardness[i]); // Hard rock forms gorges.
-                    let f = erodibility * (area[i] - CHANNEL_HEAD).max(0.0).sqrt() / length;
-                    if f > 0.0 {
-                        channels.push((i as u32, r as u32, f));
-                    } else {
-                        uplift[i] = UPLIFT;
-                    }
-                }
-            }
-            for ((h, t), rate) in self.heights.iter_mut().zip(&target).zip(&uplift) {
-                *h += (t - *h) * rate;
-            }
-            for &(i, r, f) in &channels {
-                let (i, r) = (i as usize, r as usize);
-                let raised = self.heights[i] + (target[i] - self.heights[i]) * UPLIFT;
-                // Implicit in the downstream height, so large rivers stay stable; lakes don't incise.
-                self.heights[i] = if raised > self.heights[r] {
-                    (raised + f * self.heights[r]) / (1.0 + f)
-                } else {
-                    raised
-                };
-            }
-        }
-        if s.fluvial_steps > 0 {
-            // Drainage area seeds the wetness map so valley floors follow the river network.
-            for (f, a) in self.flow.iter_mut().zip(&area) {
-                *f = a * 0.05;
-            }
-        }
-    }
-
-    fn erode(&mut self, s: Settings, hardness: &[f32]) {
+    /// Droplets carve gullies and drop fans, then scree slumps to the talus angle.
+    fn erode(&mut self, s: &Settings, hard: &(impl Fn(usize, f32) -> f32 + Sync)) {
+        let (side, cell) = (self.side, self.cell);
         let mut rng = Random(s.seed as u64 + 1);
         let sea = s.sea_level.unwrap_or(f32::NEG_INFINITY);
         let mut kernel = [0.0f32; 25];
@@ -297,13 +471,15 @@ impl Landscape {
         }
         let total: f32 = kernel.iter().sum();
         kernel.iter_mut().for_each(|w| *w /= total);
+        // The recipe's count was for a 385² map; keep the density on any size.
+        let droplets = s.droplets * (side * side) / (385 * 385);
         // shortcut: sequential droplets avoid write races, move transport to the GPU for larger maps.
-        for _ in 0..s.droplets {
-            let mut p = Vec2::new(rng.unit(), rng.unit()) * (SIDE - 5) as f32 + Vec2::splat(2.0);
+        for _ in 0..droplets {
+            let mut p = Vec2::new(rng.unit(), rng.unit()) * (side - 5) as f32 + Vec2::splat(2.0);
             let mut direction = Vec2::ZERO;
             let (mut speed, mut water, mut sediment) = (1.0f32, 1.0f32, 0.0f32);
             for _ in 0..70 {
-                let (height, gradient) = Self::map_sample(&self.heights, p);
+                let (height, gradient) = Self::map_sample(&self.heights, side, p);
                 if height < sea {
                     break; // Rivers drop their load where they meet the sea, building deltas.
                 }
@@ -312,11 +488,12 @@ impl Landscape {
                     break;
                 }
                 let next = p + direction;
-                if next.min_element() < 2.0 || next.max_element() >= (SIDE - 3) as f32 {
+                if next.min_element() < 2.0 || next.max_element() >= (side - 3) as f32 {
                     break;
                 }
-                let dh = Self::map_sample(&self.heights, next).0 - height;
-                let capacity = (-dh).max(0.02) * speed * water * 3.2;
+                let dh = Self::map_sample(&self.heights, side, next).0 - height;
+                let slope = dh / cell;
+                let capacity = (-slope).max(0.02) * speed * water * 3.2;
                 if dh > 0.0 || sediment > capacity {
                     let amount = if dh > 0.0 {
                         sediment.min(dh)
@@ -329,13 +506,13 @@ impl Landscape {
                     let amount = ((capacity - sediment) * s.erosion_rate).min(-dh).min(0.65);
                     let corner = p.floor().as_uvec2() - 2;
                     for (k, weight) in kernel.iter().enumerate() {
-                        let i = (corner.y as usize + k / 5) * SIDE + corner.x as usize + k % 5;
+                        let i = (corner.y as usize + k / 5) * side + corner.x as usize + k % 5;
                         self.heights[i] -= amount * weight;
                     }
                     sediment += amount;
                 }
-                self.flow[p.y as usize * SIDE + p.x as usize] += water;
-                speed = (speed * speed - dh * 4.0).max(0.01).sqrt();
+                self.flow[p.y as usize * side + p.x as usize] += water;
+                speed = (speed * speed - slope * 4.0).max(0.01).sqrt();
                 water *= 1.0 - s.evaporation;
                 p = next;
                 if water < 0.05 {
@@ -351,15 +528,15 @@ impl Landscape {
         for _ in 0..s.thermal_steps {
             let heights = &self.heights;
             shed.par_iter_mut().enumerate().for_each(|(i, out)| {
-                if is_border(i) {
+                if is_border(side, i) {
                     return;
                 }
-                let lowest = [i - 1, i + 1, i - SIDE, i + SIDE]
+                let lowest = [i - 1, i + 1, i - side, i + side]
                     .into_iter()
                     .min_by(|a, b| heights[*a].total_cmp(&heights[*b]))
                     .expect("four neighbours");
                 // Hard rock holds near-vertical cliffs; soil relaxes to the talus angle.
-                let talus = s.talus * (1.0 + 3.0 * hardness[i]);
+                let talus = s.talus * cell * (1.0 + 3.0 * hard(i, heights[i]));
                 *out = (
                     ((heights[i] - heights[lowest] - talus) * 0.2).max(0.0),
                     lowest,
@@ -368,7 +545,7 @@ impl Landscape {
             let shed = &shed;
             self.heights.par_iter_mut().enumerate().for_each(|(i, h)| {
                 *h -= shed[i].0;
-                for j in [i.wrapping_sub(1), i + 1, i.wrapping_sub(SIDE), i + SIDE] {
+                for j in [i.wrapping_sub(1), i + 1, i.wrapping_sub(side), i + side] {
                     if let Some(&(amount, _)) = shed.get(j).filter(|(_, to)| *to == i) {
                         *h += amount;
                     }
@@ -380,22 +557,43 @@ impl Landscape {
         }
     }
 
+    /// Ground height at world `(x, y)`, smooth across samples (Catmull–Rom).
     pub fn height(&self, x: f32, y: f32) -> f32 {
-        Self::map_sample(
-            &self.heights,
-            Vec2::new(x, y) + Vec2::splat(HALF_WORLD as f32),
+        let side = self.side as isize;
+        let p = self
+            .grid(x, y)
+            .clamp(Vec2::ZERO, Vec2::splat((side - 1) as f32));
+        catmull_rom(
+            |x, y| self.heights[(y.clamp(0, side - 1) * side + x.clamp(0, side - 1)) as usize],
+            p,
         )
-        .0
     }
 
     pub fn wetness(&self, x: f32, y: f32) -> f32 {
-        Self::map_sample(&self.flow, Vec2::new(x, y) + Vec2::splat(HALF_WORLD as f32))
+        Self::map_sample(&self.flow, self.side, self.grid(x, y))
             .0
             .clamp(0.0, 1.0)
     }
 
+    /// Height at `(x, y)`, and how rough the ground is there in metres:
+    /// steep dry rock is rough, wet valley floors are smooth.
+    fn column(&self, x: f32, y: f32) -> (f32, f32) {
+        let gradient = Self::map_sample(&self.heights, self.side, self.grid(x, y)).1;
+        let steep = smoothstep(0.3, 1.0, (gradient.length() / self.cell) as f64) as f32;
+        let rough = 0.35 + 0.9 * steep * (1.0 - self.wetness(x, y));
+        (self.height(x, y), rough)
+    }
+
     pub fn density(&self, p: Vec3) -> f32 {
-        self.density_over(p, self.height(p.x, p.y))
+        let (height, rough) = self.column(p.x, p.y);
+        self.density_over(p, height, rough)
+    }
+
+    /// FNV-1a over the heights, which identifies the generated landscape.
+    pub fn fingerprint(&self) -> u64 {
+        (self.heights.iter()).fold(0xcbf2_9ce4_8422_2325, |hash, h| {
+            (hash ^ h.to_bits() as u64).wrapping_mul(0x0100_0000_01b3)
+        })
     }
 
     fn chunk(&self, coord: IVec3) -> Chunk {
@@ -405,10 +603,11 @@ impl Landscape {
         for y in 0..N {
             for x in 0..N {
                 let column = origin + Vec3::new(x as f32, y as f32, 0.0) * VOXEL;
-                let height = self.height(column.x, column.y);
+                let (height, rough) = self.column(column.x, column.y);
                 for z in 0..N {
                     let p = origin + Vec3::new(x as f32, y as f32, z as f32) * VOXEL;
-                    samples[Shape::linearize([x, y, z]) as usize] = self.density_over(p, height);
+                    samples[Shape::linearize([x, y, z]) as usize] =
+                        self.density_over(p, height, rough);
                 }
             }
         }
@@ -418,7 +617,7 @@ impl Landscape {
         }
     }
 
-    fn density_over(&self, p: Vec3, height: f32) -> f32 {
+    fn density_over(&self, p: Vec3, height: f32, rough: f32) -> f32 {
         let base = p.z - height;
         // The detail weight below is exactly zero here; skipping the 3D noise is bit-identical.
         if base.abs() >= 3.0 {
@@ -428,20 +627,41 @@ impl Landscape {
             self.noise
                 .get([p.x as f64 * 0.14, p.y as f64 * 0.14, p.z as f64 * 0.14]) as f32;
         // A signed scalar field, not an exact Euclidean SDF: never sphere-trace it unchecked.
-        base + detail * 0.55 * (1.0 - base.abs() / 3.0).max(0.0)
+        base + detail * rough * (1.0 - base.abs() / 3.0).max(0.0)
     }
 }
 
-const SQRT_2: f32 = std::f32::consts::SQRT_2;
-
-fn is_border(i: usize) -> bool {
-    let (x, z) = (i % SIDE, i / SIDE);
-    x == 0 || z == 0 || x == SIDE - 1 || z == SIDE - 1
+/// Catmull–Rom interpolation of a grid read through `at`, at grid coordinates `p`.
+pub(crate) fn catmull_rom(at: impl Fn(isize, isize) -> f32, p: Vec2) -> f32 {
+    let weights = |t: f32| {
+        let (t2, t3) = (t * t, t * t * t);
+        [
+            (-t3 + 2.0 * t2 - t) * 0.5,
+            (3.0 * t3 - 5.0 * t2 + 2.0) * 0.5,
+            (-3.0 * t3 + 4.0 * t2 + t) * 0.5,
+            (t3 - t2) * 0.5,
+        ]
+    };
+    let lo = p.floor();
+    let (wx, wy) = (weights(p.x - lo.x), weights(p.y - lo.y));
+    let (x, y) = (lo.x as isize - 1, lo.y as isize - 1);
+    let mut sum = 0.0;
+    for (j, wy) in wy.iter().enumerate() {
+        for (i, wx) in wx.iter().enumerate() {
+            sum += at(x + i as isize, y + j as isize) * wx * wy;
+        }
+    }
+    sum
 }
 
-/// Calls `visit(neighbour, is_diagonal)` for the cells around `i` on the map.
+pub(crate) fn is_border(side: usize, i: usize) -> bool {
+    let (x, z) = (i % side, i / side);
+    x == 0 || z == 0 || x == side - 1 || z == side - 1
+}
+
+/// Calls `visit(neighbour, is_diagonal)` for the cells around `i` on a `side`² map.
 #[inline]
-fn for_neighbours(i: usize, mut visit: impl FnMut(usize, bool)) {
+pub(crate) fn for_neighbours(side: usize, i: usize, mut visit: impl FnMut(usize, bool)) {
     const AROUND: [(isize, isize); 8] = [
         (-1, -1),
         (0, -1),
@@ -452,28 +672,33 @@ fn for_neighbours(i: usize, mut visit: impl FnMut(usize, bool)) {
         (0, 1),
         (1, 1),
     ];
-    let inner = !is_border(i);
-    let (x, y) = ((i % SIDE) as isize, (i / SIDE) as isize);
+    let inner = !is_border(side, i);
+    let (x, y) = ((i % side) as isize, (i / side) as isize);
     for (dx, dy) in AROUND {
         let (nx, ny) = (x + dx, y + dy);
-        if inner || ((0..SIDE as isize).contains(&nx) && (0..SIDE as isize).contains(&ny)) {
-            visit(ny as usize * SIDE + nx as usize, dx != 0 && dy != 0);
+        if inner || ((0..side as isize).contains(&nx) && (0..side as isize).contains(&ny)) {
+            visit(ny as usize * side + nx as usize, dx != 0 && dy != 0);
         }
     }
 }
 
-/// Heap key for the priority flood: orders by height, then index for determinism.
-fn flood_key(height: f32, i: usize) -> u64 {
-    let bits = height.to_bits();
-    let ordered = if bits >> 31 == 1 {
-        !bits
-    } else {
-        bits | 1 << 31
-    };
-    (ordered as u64) << 32 | i as u64
+/// `passes` 3×3 box blurs of a map; the border keeps its heights.
+fn blur(map: &[f32], side: usize, passes: u32) -> Vec<f32> {
+    let mut out = map.to_vec();
+    for _ in 0..passes {
+        let src = out.clone();
+        out.par_iter_mut().enumerate().for_each(|(i, h)| {
+            if !is_border(side, i) {
+                let mut sum = src[i];
+                for_neighbours(side, i, |j, _| sum += src[j]);
+                *h = sum / 9.0;
+            }
+        });
+    }
+    out
 }
 
-fn smoothstep(lo: f64, hi: f64, x: f64) -> f64 {
+pub(crate) fn smoothstep(lo: f64, hi: f64, x: f64) -> f64 {
     let t = ((x - lo) / (hi - lo)).clamp(0.0, 1.0);
     t * t * (3.0 - 2.0 * t)
 }
@@ -502,77 +727,55 @@ fn ridged(noise: &Perlin, p: DVec2, octaves: u32) -> f64 {
     sum
 }
 
-/// Pre-erosion elevation in metres at world position `p` (x, z), and rock hardness in [0, 1].
-fn relief(noise: &Perlin, s: &Settings, p: DVec2) -> (f64, f64) {
-    let (mountains, hills) = (s.mountains as f64, s.hills as f64);
-    if s.landform == Landform::Valley {
+/// The ground before erosion at `p` (x, y), laid out for a 384 m map: low land
+/// with gentle noise to seed drainage, plus the uplift that will become
+/// mountains. Uplift follows a few long ridged belts, so ranges form, not blobs.
+fn relief(noise: &Perlin, s: &Settings, p: DVec2) -> Relief {
+    let (mountains, hills) = (s.mountains.max(0.0) as f64, s.hills as f64);
+    let base = s.sea_level.unwrap_or(0.0) as f64;
+    let rolling = |q: DVec2| (fbm(noise, q * 0.018, 5) * 0.5 + 0.5) * hills;
+    let (low, uplift, q) = if s.landform == Landform::Valley {
         let warp = noise.get([p.x * 0.007, p.y * 0.007]) * 24.0;
-        let mut ridges = 0.0;
-        let mut amplitude = 1.0;
-        let mut frequency = 0.008;
-        for octave in 0..5 {
-            let n = noise.get([
-                (p.x + warp) * frequency,
-                p.y * frequency,
-                octave as f64 * 7.0,
-            ]);
-            ridges += (1.0 - n.abs()).powi(3) * amplitude;
-            frequency *= 2.1;
-            amplitude *= 0.48;
-        }
+        let q = DVec2::new(p.x + warp, p.y);
         let river_x = 28.0 * (p.y * 0.016).sin() - 12.0;
         let valley = (-((p.x - river_x) / 39.0).powi(2)).exp();
-        let mountain =
-            (ridges * mountains + noise.get([p.x * 0.004, p.y * 0.004]) * hills + 20.0).max(10.0);
-        return (mountain * (1.0 - valley * 0.83) + 5.0, 0.0);
-    }
-    // Domain warping bends coastlines and ranges away from the noise grid.
-    let warp = DVec2::new(fbm(noise, p * 0.004, 3), fbm(noise, p * 0.004 + 91.7, 3)) * 45.0;
-    let q = p + warp;
-    let r = q.length() / HALF_WORLD as f64;
-    // Signed "continentalness": below zero is sea floor, above zero is land.
-    let continent = match s.landform {
-        Landform::Island => 0.78 - r * 1.05 + fbm(noise, q * 0.009, 4) * 0.35,
-        Landform::Archipelago => fbm(noise, q * 0.013, 4) * 1.3 + 0.12 - r * r * 0.35,
-        Landform::Continent => {
-            (q.x * 0.8 + q.y * 0.4) / HALF_WORLD as f64 * 0.7 + fbm(noise, q * 0.006, 4) * 0.5 + 0.1
-        }
-        Landform::Mountains => 0.75 + fbm(noise, q * 0.005, 3) * 0.3,
-        Landform::Plains => 0.35 + fbm(noise, q * 0.005, 3) * 0.2,
-        Landform::Valley => unreachable!(),
+        let ranges = ridged(noise, q * 0.008, 3);
+        let uplift = (1.0 - valley * 0.9) * (0.45 + 0.55 * ranges);
+        (base + 5.0 + rolling(q), uplift, q)
+    } else {
+        // Domain warping bends coastlines and ranges away from the noise grid.
+        let warp = DVec2::new(fbm(noise, p * 0.004, 3), fbm(noise, p * 0.004 + 91.7, 3)) * 45.0;
+        let q = p + warp;
+        let r = q.length() / 192.0;
+        // Signed "continentalness": below zero is sea floor, above zero is land.
+        let continent = match s.landform {
+            Landform::Island => 0.78 - r * 1.05 + fbm(noise, q * 0.009, 4) * 0.35,
+            Landform::Archipelago => fbm(noise, q * 0.013, 4) * 1.3 + 0.12 - r * r * 0.35,
+            Landform::Continent => {
+                (q.x * 0.8 + q.y * 0.4) / 192.0 * 0.7 + fbm(noise, q * 0.006, 4) * 0.5 + 0.1
+            }
+            Landform::Mountains => 0.75 + fbm(noise, q * 0.005, 3) * 0.3,
+            Landform::Plains => 0.35 + fbm(noise, q * 0.005, 3) * 0.2,
+            Landform::Valley => unreachable!(),
+        };
+        let land = smoothstep(-0.06, 0.2, continent);
+        let floor = -(10.0 + 0.12 * mountains) + fbm(noise, q * 0.02, 3) * 6.0;
+        // Uplift climbs gradually from the coast, so ranges sit inland on massifs.
+        let dome = smoothstep(0.12, 0.95, continent);
+        let ranges = ridged(noise, q * 0.0085, 3);
+        let uplift = dome * dome * (0.35 + 0.65 * ranges);
+        let low = base + floor * (1.0 - land) + land * (1.2 + rolling(q));
+        (low, uplift, q)
     };
-    let base = s.sea_level.unwrap_or(0.0) as f64;
-    let land = smoothstep(-0.06, 0.2, continent);
-    let floor = -24.0 + fbm(noise, q * 0.02, 3) * 6.0;
-    let rolling = (fbm(noise, q * 0.018, 5) * 0.5 + 0.5) * hills;
-    // A broad concave dome carries most of the elevation and ridges only modulate it, so land
-    // climbs gradually from the coast and peaks sit on massifs instead of rising as spikes.
-    let dome = smoothstep(0.12, 0.95, continent);
-    let ridges = ridged(noise, q * 0.0085, 5);
-    let mut h = base
-        + floor * (1.0 - land)
-        + land * (1.2 + rolling)
-        + mountains * dome * dome * (0.55 + 0.45 * ridges);
-    // Hard-rock outcrops in noise-chosen patches step into benches and cliffs. Step height and
-    // contour wobble vary, so escarpments look broken rather than like contour lines.
-    let rock =
-        smoothstep(0.14, 0.3, fbm(noise, q * 0.007 + 37.0, 3)) * smoothstep(1.0, 4.0, h - base);
-    if rock > 0.0 {
-        let step = 9.0 + 10.0 * (fbm(noise, q * 0.011 + 53.0, 2) * 0.5 + 0.5);
-        let wobble = fbm(noise, q * 0.035 + 11.0, 2) * 3.0;
-        let t = (h - base + wobble) / step;
-        let terraced = base + (t.floor() + smoothstep(0.78, 1.0, t.fract())) * step - wobble;
-        h += (terraced - h) * rock;
+    let height = low + mountains * uplift;
+    Relief {
+        height: height as f32,
+        uplift: uplift as f32,
+        rock: (smoothstep(0.1, 0.3, fbm(noise, q * 0.007 + 37.0, 3))
+            * smoothstep(1.0, 4.0, height - base)) as f32,
+        strata: (20.0 + 40.0 * (fbm(noise, q * 0.011 + 53.0, 2) * 0.5 + 0.5)) as f32,
+        phase: (fbm(noise, q * 0.035 + 11.0, 2) * 0.3) as f32,
     }
-    // Sea cliffs: along rocky stretches of coast the land rises abruptly at the shoreline.
-    let mut hardness = rock;
-    if s.sea_level.is_some() {
-        let coast = smoothstep(0.0, 0.25, fbm(noise, q * 0.012 + 71.0, 3));
-        let rise = smoothstep(0.1, 0.15, continent);
-        h += coast * rise * (6.0 + 8.0 * (fbm(noise, q * 0.02 + 19.0, 2) * 0.5 + 0.5));
-        hardness = hardness.max(coast * smoothstep(0.06, 0.12, continent));
-    }
-    (h, hardness)
 }
 
 #[derive(Clone)]
@@ -587,6 +790,9 @@ pub struct Chunk {
 pub struct Terrain {
     pub landscape: Arc<Landscape>,
     pub chunks: HashMap<IVec3, Chunk>,
+    /// The editable volume's chunks: `lo` inclusive, `hi` exclusive.
+    lo: IVec3,
+    hi: IVec3,
 }
 
 /// The chunk owning lattice point `p`.
@@ -628,44 +834,175 @@ pub fn chunk_origin(coord: IVec3) -> Vec3 {
     (coord * CELLS - IVec3::ONE).as_vec3() * VOXEL
 }
 
-pub fn valid_chunk(c: IVec3) -> bool {
-    (-HALF_WORLD / CELLS..HALF_WORLD / CELLS).contains(&c.x)
-        && (-HALF_WORLD / CELLS..HALF_WORLD / CELLS).contains(&c.y)
-        && (MIN_Z / CELLS..MAX_Z / CELLS).contains(&c.z)
-}
+const EDITS_MAGIC: &[u8; 4] = b"VTED";
+const EDITS_VERSION: u32 = 1;
 
 impl Terrain {
+    /// The editable volume spans the landscape, from below its lowest ground to above its peaks.
     pub fn new(landscape: Landscape) -> Self {
+        let size = CELLS as f32 * VOXEL;
+        let columns = (landscape.half() / size).floor() as i32;
+        let (min, max) = (landscape.heights.iter())
+            .fold((f32::INFINITY, f32::NEG_INFINITY), |(lo, hi), h| {
+                (lo.min(*h), hi.max(*h))
+            });
         Self {
             landscape: Arc::new(landscape),
             chunks: HashMap::new(),
+            lo: IVec3::new(-columns, -columns, ((min - 32.0) / size).floor() as i32),
+            hi: IVec3::new(columns, columns, ((max + 24.0) / size).ceil() as i32),
         }
     }
 
+    /// Every chunk column in the world.
+    fn columns(&self) -> impl Iterator<Item = IVec2> + use<> {
+        let (lo, hi) = (self.lo, self.hi);
+        (lo.y..hi.y).flat_map(move |y| (lo.x..hi.x).map(move |x| IVec2::new(x, y)))
+    }
+
+    pub fn valid_chunk(&self, c: IVec3) -> bool {
+        c.cmpge(self.lo).all() && c.cmplt(self.hi).all()
+    }
+
+    /// Every chunk the original ground surface passes through.
     pub fn initial_coords(&self) -> Vec<IVec3> {
-        let mut coords = Vec::new();
-        for y in -HALF_WORLD / CELLS..HALF_WORLD / CELLS {
-            for x in -HALF_WORLD / CELLS..HALF_WORLD / CELLS {
-                let (mut lo, mut hi) = (f32::INFINITY, f32::NEG_INFINITY);
-                for dy in -1..=CELLS + 1 {
-                    for dx in -1..=CELLS + 1 {
-                        let h = self
-                            .landscape
-                            .height((x * CELLS + dx) as f32, (y * CELLS + dy) as f32);
-                        lo = lo.min(h);
-                        hi = hi.max(h);
-                    }
-                }
-                for z in MIN_Z / CELLS..MAX_Z / CELLS {
-                    if ((z * CELLS - 1) as f32) < hi + 2.0
-                        && (((z + 1) * CELLS + 1) as f32) > lo - 2.0
-                    {
-                        coords.push(IVec3::new(x, y, z));
-                    }
-                }
+        self.columns()
+            .flat_map(|c| self.column_span(c).map(move |z| c.extend(z)))
+            .collect()
+    }
+
+    /// The chunk heights in column `c` that the original ground surface passes through.
+    fn column_span(&self, c: IVec2) -> Range<i32> {
+        let l = &self.landscape;
+        let size = CELLS as f32 * VOXEL;
+        let last = l.side as f32 - 1.0;
+        let from = l.grid(c.x as f32 * size - VOXEL, c.y as f32 * size - VOXEL);
+        let to = l.grid(
+            (c.x + 1) as f32 * size + VOXEL,
+            (c.y + 1) as f32 * size + VOXEL,
+        );
+        // The samples around the column bound its ground, give or take what interpolation adds.
+        let from = (from.floor() - 1.0)
+            .clamp(Vec2::ZERO, Vec2::splat(last))
+            .as_uvec2();
+        let to = (to.ceil() + 1.0)
+            .clamp(Vec2::ZERO, Vec2::splat(last))
+            .as_uvec2();
+        let (mut lo, mut hi) = (f32::INFINITY, f32::NEG_INFINITY);
+        for y in from.y..=to.y {
+            for x in from.x..=to.x {
+                let h = l.heights[y as usize * l.side + x as usize];
+                lo = lo.min(h);
+                hi = hi.max(h);
             }
         }
-        coords
+        // Catmull–Rom overshoot, and the surface detail of up to 1.25 m.
+        let margin = 4.0 + (hi - lo) * 0.1;
+        let mut span = (self.lo.z..self.hi.z).filter(|z| {
+            ((z * CELLS - 1) as f32 * VOXEL) < hi + margin
+                && (((z + 1) * CELLS + 1) as f32 * VOXEL) > lo - margin
+        });
+        match span.next() {
+            Some(first) => first..span.next_back().unwrap_or(first) + 1,
+            None => 0..0,
+        }
+    }
+
+    /// Chunks dug or filled since generation, or loaded from a save.
+    pub fn edited(&self) -> impl Iterator<Item = IVec3> + '_ {
+        (self.chunks.iter())
+            .filter(|(_, chunk)| chunk.revision > 0)
+            .map(|(coord, _)| *coord)
+    }
+
+    /// Write every edited chunk. Edits only load onto the landscape they were made on.
+    /// shortcut: raw samples, about 70 KB a chunk; compress them if saves grow large.
+    pub fn save_edits(&self, mut out: impl Write) -> io::Result<()> {
+        let mut coords: Vec<IVec3> = self.edited().collect();
+        coords.sort_by_key(|c| c.to_array());
+        out.write_all(EDITS_MAGIC)?;
+        out.write_all(&EDITS_VERSION.to_le_bytes())?;
+        out.write_all(&self.landscape.fingerprint().to_le_bytes())?;
+        out.write_all(&(coords.len() as u32).to_le_bytes())?;
+        let mut bytes = Vec::with_capacity(Shape::USIZE * 4);
+        for coord in coords {
+            bytes.clear();
+            bytes.extend(coord.to_array().iter().flat_map(|c| c.to_le_bytes()));
+            bytes.extend(
+                self.chunks[&coord]
+                    .samples
+                    .iter()
+                    .flat_map(|s| s.to_le_bytes()),
+            );
+            out.write_all(&bytes)?;
+        }
+        out.flush()
+    }
+
+    /// Replace this terrain's edits with saved ones: chunks edited since revert
+    /// to the generated ground. Returns every chunk that changed, to remesh. On
+    /// an error the terrain is left as it was.
+    pub fn load_edits(&mut self, mut input: impl Read) -> io::Result<Vec<IVec3>> {
+        let invalid = |message: &str| io::Error::new(io::ErrorKind::InvalidData, message);
+        let mut word = [0u8; 4];
+        input.read_exact(&mut word)?;
+        if &word != EDITS_MAGIC {
+            return Err(invalid("not a terrain edits file"));
+        }
+        input.read_exact(&mut word)?;
+        if u32::from_le_bytes(word) != EDITS_VERSION {
+            return Err(invalid("unsupported terrain edits version"));
+        }
+        let mut fingerprint = [0u8; 8];
+        input.read_exact(&mut fingerprint)?;
+        if u64::from_le_bytes(fingerprint) != self.landscape.fingerprint() {
+            return Err(invalid("the edits were made on a different landscape"));
+        }
+        input.read_exact(&mut word)?;
+        let count = u32::from_le_bytes(word) as usize;
+        let extent = self.hi - self.lo;
+        if count > (extent.x * extent.y * extent.z).max(0) as usize {
+            return Err(invalid("too many chunks"));
+        }
+        let mut loaded = HashMap::with_capacity(count);
+        let mut bytes = vec![0u8; Shape::USIZE * 4];
+        for _ in 0..count {
+            let mut coord = [0u8; 12];
+            input.read_exact(&mut coord)?;
+            let coord = IVec3::from_array(std::array::from_fn(|i| {
+                i32::from_le_bytes(coord[i * 4..i * 4 + 4].try_into().expect("four bytes"))
+            }));
+            if !self.valid_chunk(coord) {
+                return Err(invalid("chunk outside the world"));
+            }
+            input.read_exact(&mut bytes)?;
+            let samples: Vec<f32> = (bytes.as_chunks::<4>().0.iter())
+                .map(|b| f32::from_le_bytes(*b))
+                .collect();
+            if samples.iter().any(|s| !s.is_finite()) {
+                return Err(invalid("non-finite sample"));
+            }
+            if loaded.insert(coord, samples).is_some() {
+                return Err(invalid("duplicate chunk"));
+            }
+        }
+        let reverted: Vec<IVec3> = (self.edited())
+            .filter(|coord| !loaded.contains_key(coord))
+            .collect();
+        // Generated ground needs no chunk: sampling falls back to the landscape,
+        // and the mesher regenerates it, rejecting meshes of the edits.
+        for coord in &reverted {
+            self.chunks.remove(coord);
+        }
+        let mut changed = reverted;
+        for (coord, samples) in loaded {
+            // A new revision rejects meshes still being made of the old samples.
+            let revision = self.chunks.get(&coord).map_or(1, |c| c.revision + 1);
+            let samples = Arc::new(samples);
+            self.chunks.insert(coord, Chunk { samples, revision });
+            changed.push(coord);
+        }
+        Ok(changed)
     }
 
     pub fn ensure_chunk(&mut self, coord: IVec3) {
@@ -772,10 +1109,9 @@ impl Terrain {
                             }
                         }
                         let hit = at((a + b) * 0.5);
-                        return (hit.x.abs() < HALF_WORLD as f32 - 2.0
-                            && hit.y.abs() < HALF_WORLD as f32 - 2.0
-                            && hit.z > MIN_Z as f32 + 2.0
-                            && hit.z < MAX_Z as f32 - 2.0)
+                        let size = CELLS as f32 * VOXEL;
+                        let (lo, hi) = (self.lo.as_vec3() * size, self.hi.as_vec3() * size);
+                        return (hit.cmpgt(lo + 2.0).all() && hit.cmplt(hi - 2.0).all())
                             .then_some(hit);
                     }
                     a = b;
@@ -806,7 +1142,7 @@ impl Terrain {
             for y in lo.y..=hi.y {
                 for x in lo.x..=hi.x {
                     let coord = IVec3::new(x, y, z);
-                    if !valid_chunk(coord) {
+                    if !self.valid_chunk(coord) {
                         continue;
                     }
                     self.ensure_chunk(coord);
@@ -860,6 +1196,8 @@ pub struct MeshData {
     /// that height exposes soil and rock in a dug wall.
     pub terrain_uv: Vec<[f32; 2]>,
     pub indices: Vec<u32>,
+    /// Linear vertex colours; empty for voxel chunks, which the terrain material shades.
+    pub colors: Vec<[f32; 3]>,
     /// World-space minimum and maximum corners.
     pub bounds: (Vec3, Vec3),
 }
@@ -876,6 +1214,7 @@ pub fn polygonize(coord: IVec3, samples: &[f32], landscape: &Landscape) -> MeshD
             normals: Vec::with_capacity(buffer.positions.len()),
             terrain_uv: Vec::with_capacity(buffer.positions.len()),
             indices: buffer.indices.clone(),
+            colors: Vec::new(),
             bounds: (Vec3::INFINITY, Vec3::NEG_INFINITY),
         };
         for (p, n) in buffer.positions.iter().zip(&buffer.normals) {
@@ -922,6 +1261,14 @@ impl Mesher {
         self.pending.extend(coords);
     }
 
+    /// Stop meshing these chunks: no result comes back for them unless queued again.
+    pub fn cancel(&mut self, coords: &[IVec3]) {
+        for coord in coords {
+            self.pending.remove(coord);
+            self.running.remove(coord);
+        }
+    }
+
     /// Chunks waiting or being meshed.
     pub fn outstanding(&self) -> usize {
         self.pending.len() + self.running.len()
@@ -940,8 +1287,11 @@ impl Mesher {
             let Ok((coord, mesh)) = self.receiver.try_recv() else {
                 break;
             };
-            let revision = self.running.remove(&coord);
-            if revision == Some(terrain.chunks[&coord].revision) {
+            let Some(revision) = self.running.remove(&coord) else {
+                continue; // Cancelled.
+            };
+            // A chunk dropped since was regenerated or reverted: mesh it again.
+            if terrain.chunks.get(&coord).map(|c| c.revision) == Some(revision) {
                 ready.push((coord, mesh));
             } else {
                 self.rejected += 1;
@@ -973,5 +1323,73 @@ impl Mesher {
             });
         }
         ready
+    }
+}
+
+/// Keeps the chunks within `radius` of the eye meshed and drops the rest from
+/// memory. Edited chunks stay in memory wherever they are, so their edits
+/// survive and save; only their meshes go. Unedited ground needs no chunk:
+/// sampling, ray casts and physics fall back to the identical landscape.
+pub struct Streamer {
+    /// Horizontal distance to a chunk column within which it is meshed. A
+    /// column unloads a chunk's width further out, so the edge does not churn.
+    pub radius: f32,
+    /// The ground surface's chunk heights in each of the terrain's columns.
+    spans: Vec<(IVec2, Range<i32>)>,
+    resident: HashSet<IVec3>,
+}
+
+impl Streamer {
+    pub fn new(terrain: &Terrain, radius: f32) -> Self {
+        let spans = terrain.columns().collect::<Vec<_>>();
+        let spans = (spans.into_par_iter())
+            .map(|c| (c, terrain.column_span(c)))
+            .collect();
+        Self {
+            radius,
+            spans,
+            resident: HashSet::new(),
+        }
+    }
+
+    /// Chunks with a mesh, or one on its way.
+    pub fn is_resident(&self, coord: IVec3) -> bool {
+        self.resident.contains(&coord)
+    }
+
+    pub fn resident(&self) -> usize {
+        self.resident.len()
+    }
+
+    /// Queue chunks that came within reach of `eye` and cancel those that
+    /// left it. Returns the chunks whose meshes should go.
+    pub fn update(&mut self, terrain: &mut Terrain, mesher: &mut Mesher, eye: Vec3) -> Vec<IVec3> {
+        let distance = |c: IVec2| {
+            let center = (c.as_vec2() + 0.5) * (CELLS as f32 * VOXEL);
+            center.distance(eye.truncate())
+        };
+        let (near, keep) = (self.radius, self.radius + CELLS as f32 * VOXEL);
+        let mut unloaded = Vec::new();
+        self.resident.retain(|c| {
+            let stay = distance(c.truncate()) <= keep;
+            if !stay {
+                unloaded.push(*c);
+            }
+            stay
+        });
+        mesher.cancel(&unloaded);
+        let surface = (self.spans.iter())
+            .filter(|(c, _)| distance(*c) <= near)
+            .flat_map(|(c, span)| span.clone().map(|z| c.extend(z)));
+        // Digging reaches chunks the original surface never passed through.
+        let edited = terrain.edited().filter(|c| distance(c.truncate()) <= near);
+        let loaded: Vec<IVec3> = (surface.chain(edited.collect::<Vec<_>>()))
+            .filter(|c| self.resident.insert(*c))
+            .collect();
+        mesher.queue(loaded);
+        // Running meshes keep their own copy of the samples.
+        let resident = &self.resident;
+        (terrain.chunks).retain(|c, chunk| chunk.revision > 0 || resident.contains(c));
+        unloaded
     }
 }

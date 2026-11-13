@@ -31,6 +31,9 @@ pub struct RetainedMesh {
     pub indices: Vec<u32>,
     /// Minimum and maximum corners of `vertices`.
     pub bounds: (Vec3, Vec3),
+    /// Shade with a plain white material and the vertex colours, instead of
+    /// the retained material (the terrain's), as generated cities do.
+    pub plain: bool,
 }
 
 /// First-fit allocator over vertex ranges, kept sorted and coalesced.
@@ -79,6 +82,8 @@ pub(crate) struct Retained {
     /// Where `material` sits in `Renderer::materials`, which stays put for
     /// extensions, unlike the per-frame materials after it.
     material_index: Option<u32>,
+    /// Where the plain material of `RetainedMesh::plain` meshes sits.
+    plain_index: Option<u32>,
     /// Meshes extensions have not heard about, and when they last did.
     notify: BTreeSet<u64>,
     notified: Option<Instant>,
@@ -168,6 +173,19 @@ impl Renderer {
                 hidden: false,
             });
         }
+        if self.retained.plain_index.is_none() {
+            self.retained.plain_index = Some(self.materials.len() as u32);
+            let white = verity_core::Material {
+                base_color: [1.0; 3],
+                metallic: 0.0,
+                roughness: 0.8,
+            };
+            self.materials.push(LoadedMaterial {
+                gpu: GpuMaterial::plain(&white),
+                double_sided: false,
+                hidden: false,
+            });
+        }
         let waiting = (self.retained.entries.iter()).filter(|(_, e)| e.first_vertex.is_none());
         let keys: Vec<u64> = waiting.clone().map(|(key, _)| *key).collect();
         let mut remaining: u32 = waiting.map(|(_, e)| e.mesh.vertices.len() as u32).sum();
@@ -248,9 +266,6 @@ impl Renderer {
         sun: Option<&Sun>,
     ) -> Result<()> {
         self.retained.drawn = (0, 0);
-        let Some(index) = self.retained.material_index else {
-            return Ok(());
-        };
         let camera = scene::view_proj(&self.camera, viewport);
         let aspect = viewport[2].max(1) as f32 / viewport[3].max(1) as f32;
         let cascades = sun
@@ -259,7 +274,12 @@ impl Renderer {
         let shadows: Vec<&Mat4> = shadows.collect();
         for (slot, entry) in (slot..).zip(self.retained.entries.values()) {
             let bounds = entry.mesh.bounds;
-            let Some(first_vertex) = entry.first_vertex else {
+            let material = if entry.mesh.plain {
+                self.retained.plain_index
+            } else {
+                self.retained.material_index
+            };
+            let (Some(first_vertex), Some(index)) = (entry.first_vertex, material) else {
                 continue;
             };
             if outside(&camera, bounds) && shadows.iter().all(|c| outside(c, bounds)) {

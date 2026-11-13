@@ -11,6 +11,8 @@
 #include "materials.slang"
 #include "brdf.slang"
 #include "terrain.slang"
+// `temporal` seeds new texels with `historyPrior`, defined below.
+#define HISTORY_PRIOR
 #include "screen_gi.slang"
 
 // Debug views, as `PxtgiDebug` numbers them.
@@ -67,10 +69,12 @@ struct Cell {
 [[vk::binding(9, 0)]] StructuredBuffer<float4> softGeo;
 // ---------------------------------------------------------------- scene trace
 
-// Where the ray enters a box (1e30: misses it, or only beyond best).
-float boxEntry(float3 o, float3 inv, float3 lo, float3 hi, float best) {
-    float3 t0 = (lo - o) * inv;
-    float3 t1 = (hi - o) * inv;
+// Where the ray enters a box (1e30: misses it, or only beyond best). `oi` is
+// the origin times `inv`, once per ray, so each slab is one multiply-add
+// (Aila and Laine, "Understanding the efficiency of ray traversal on GPUs").
+float boxEntry(float3 oi, float3 inv, float3 lo, float3 hi, float best) {
+    float3 t0 = lo * inv - oi;
+    float3 t1 = hi * inv - oi;
     float3 nearT = min(t0, t1);
     float3 farT = max(t0, t1);
     float enter = max(max(nearT.x, nearT.y), max(nearT.z, 0.0));
@@ -78,24 +82,33 @@ float boxEntry(float3 o, float3 inv, float3 lo, float3 hi, float best) {
     return enter <= leave ? enter : 1e30;
 }
 
-float4 geoAt(bool soft, int at) { return soft ? softGeo[at] : geo[at]; }
+// `soft` is a literal at every call: inlined, each walk reads one buffer
+// rather than selecting between two loads.
+[ForceInline]
+float4 geoAt(bool soft, int at) {
+    if (soft) return softGeo[at];
+    return geo[at];
+}
 
 // The first corner of the static triangle the last closest-hit ray took, for
 // what the corners' w holds.
 static int hitCorners = 0;
 
-float meshBoxEntry(bool soft, float3 o, float3 inv, int at, float best) {
-    return boxEntry(o, inv, geoAt(soft, at).xyz, geoAt(soft, at + 1).xyz, best);
+[ForceInline]
+float meshBoxEntry(bool soft, float3 oi, float3 inv, int at, float best) {
+    return boxEntry(oi, inv, geoAt(soft, at).xyz, geoAt(soft, at + 1).xyz, best);
 }
 
 // The nearest triangle of a mesh along a local ray (either side), walking its
 // own tree near child first. Shadow rays only need the first intersection.
 // The trees are bounded to about this deep; a deeper one only drops the
 // farthest branches.
+[ForceInline]
 bool hitMesh(bool soft, int nodesAt, int tris, float3 o, float3 d, inout float t, inout float3 n, bool anyHit) {
     bool found = false;
     float3 inv = safeInv(d);
-    if (meshBoxEntry(soft, o, inv, nodesAt, t) >= 1e30) return false;
+    float3 oi = o * inv;
+    if (meshBoxEntry(soft, oi, inv, nodesAt, t) >= 1e30) return false;
     int stack[32];
     int top = 0;
     int node = 0;
@@ -106,8 +119,8 @@ bool hitMesh(bool soft, int nodesAt, int tris, float3 o, float3 d, inout float t
         if (count == 0) {
             int left = node + 1;
             int right = asint(lo.w);
-            float tl = meshBoxEntry(soft, o, inv, nodesAt + left * 2, t);
-            float tr = meshBoxEntry(soft, o, inv, nodesAt + right * 2, t);
+            float tl = meshBoxEntry(soft, oi, inv, nodesAt + left * 2, t);
+            float tr = meshBoxEntry(soft, oi, inv, nodesAt + right * 2, t);
             if (tl < 1e30 && tr < 1e30) {
                 bool leftFirst = tl <= tr;
                 if (top < 32) {
@@ -153,7 +166,7 @@ bool hitMesh(bool soft, int nodesAt, int tris, float3 o, float3 d, inout float t
         [loop] while (top > 0) {
             top--;
             int s = stack[top];
-            if (meshBoxEntry(soft, o, inv, nodesAt + s * 2, t) < 1e30) {
+            if (meshBoxEntry(soft, oi, inv, nodesAt + s * 2, t) < 1e30) {
                 node = s;
                 next = true;
                 break;
@@ -176,7 +189,10 @@ bool hitPrimitive(Primitive q, float3 o, float3 d, inout float best, out float3 
     int kind = int(q.shape.x + 0.5);
     if (kind >= KIND_MESH) {
         t = best;
-        if (!hitMesh(kind == KIND_SOFT, asint(q.shape.y), asint(q.shape.z), lo, ld, t, n, anyHit)) return false;
+        bool found = kind == KIND_SOFT
+            ? hitMesh(true, asint(q.shape.y), asint(q.shape.z), lo, ld, t, n, anyHit)
+            : hitMesh(false, asint(q.shape.y), asint(q.shape.z), lo, ld, t, n, anyHit);
+        if (!found) return false;
     } else if (kind == KIND_BOX) {
         float3 inv = safeInv(ld);
         float3 t0 = (-q.shape.yzw - lo) * inv;
@@ -209,6 +225,57 @@ bool hitPrimitive(Primitive q, float3 o, float3 d, inout float best, out float3 
     return true;
 }
 
+#ifdef GI_RAY_QUERY
+// The same scene as hardware acceleration structures (`Hardware` in pxtgi.rs):
+// one instance per primitive, whose custom index is its index in `prims`. A
+// static mesh is its triangles, in order, so a hit's primitive index is its
+// triangle; anything else is a box around it whose candidates `hitPrimitive` tests.
+[[vk::binding(15, 0)]] RaytracingAccelerationStructure sceneTlas;
+
+int walkWorld(float3 o, float3 d, inout float t, out float3 normal, bool anyHit) {
+    normal = float3(0.0);
+    if (f.counts.x == 0u) return -1;
+    RayDesc ray;
+    ray.Origin = o;
+    ray.Direction = d;
+    ray.TMin = 0.0;
+    ray.TMax = t;
+    RayQuery<RAY_FLAG_NONE> q;
+    q.TraceRayInline(sceneTlas, anyHit ? RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH : RAY_FLAG_NONE, 0xffu, ray);
+    float3 boxNormal = 0.0;
+    int boxCorners = 0;
+    [loop] while (q.Proceed()) {
+        if (q.CandidateType() == CANDIDATE_PROCEDURAL_PRIMITIVE) {
+            float best = q.CommittedStatus() == COMMITTED_NOTHING ? t : q.CommittedRayT();
+            float3 n;
+            if (hitPrimitive(prims[q.CandidateInstanceID()], o, d, best, n, anyHit)) {
+                boxNormal = n;
+                boxCorners = hitCorners;
+                q.CommitProceduralPrimitiveHit(best);
+            }
+        } else {
+            q.CommitNonOpaqueTriangleHit();
+        }
+    }
+    if (q.CommittedStatus() == COMMITTED_NOTHING) return -1;
+    int hit = q.CommittedInstanceID();
+    t = q.CommittedRayT();
+    if (q.CommittedStatus() == COMMITTED_PROCEDURAL_PRIMITIVE_HIT) {
+        normal = boxNormal;
+        hitCorners = boxCorners;
+        return hit;
+    }
+    Primitive p = prims[hit];
+    int corners = asint(p.shape.z) + int(q.CommittedPrimitiveIndex()) * 3;
+    hitCorners = corners;
+    float3 a = geo[corners].xyz;
+    float3 n = cross(geo[corners + 1].xyz - a, geo[corners + 2].xyz - a);
+    normal = normalize(n.x * p.r0.xyz + n.y * p.r1.xyz + n.z * p.r2.xyz);
+    // Facing the ray: a mesh is hit from either side.
+    if (dot(normal, d) > 0.0) normal = -normal;
+    return hit;
+}
+#else
 // The nearest primitive along the ray, near child first; with anyHit the first
 // one in the way (shadow rays). Returns its index, or -1.
 int walkWorld(float3 o, float3 d, inout float t, out float3 normal, bool anyHit) {
@@ -216,7 +283,8 @@ int walkWorld(float3 o, float3 d, inout float t, out float3 normal, bool anyHit)
     int hit = -1;
     if (f.counts.y == 0u) return hit;
     float3 inv = safeInv(d);
-    if (boxEntry(o, inv, nodes[0].lo.xyz, nodes[0].hi.xyz, t) >= 1e30) return hit;
+    float3 oi = o * inv;
+    if (boxEntry(oi, inv, nodes[0].lo.xyz, nodes[0].hi.xyz, t) >= 1e30) return hit;
     int stack[24];
     int top = 0;
     int node = 0;
@@ -226,8 +294,8 @@ int walkWorld(float3 o, float3 d, inout float t, out float3 normal, bool anyHit)
         if (count == 0) {
             int left = node + 1;
             int right = asint(nd.lo.w);
-            float tl = boxEntry(o, inv, nodes[left].lo.xyz, nodes[left].hi.xyz, t);
-            float tr = boxEntry(o, inv, nodes[right].lo.xyz, nodes[right].hi.xyz, t);
+            float tl = boxEntry(oi, inv, nodes[left].lo.xyz, nodes[left].hi.xyz, t);
+            float tr = boxEntry(oi, inv, nodes[right].lo.xyz, nodes[right].hi.xyz, t);
             if (tl < 1e30 && tr < 1e30) {
                 bool leftFirst = tl <= tr;
                 if (top < 24) {
@@ -259,7 +327,7 @@ int walkWorld(float3 o, float3 d, inout float t, out float3 normal, bool anyHit)
         [loop] while (top > 0) {
             top--;
             int s = stack[top];
-            if (boxEntry(o, inv, nodes[s].lo.xyz, nodes[s].hi.xyz, t) < 1e30) {
+            if (boxEntry(oi, inv, nodes[s].lo.xyz, nodes[s].hi.xyz, t) < 1e30) {
                 node = s;
                 found = true;
                 break;
@@ -269,6 +337,7 @@ int walkWorld(float3 o, float3 d, inout float t, out float3 normal, bool anyHit)
     }
     return hit;
 }
+#endif
 
 bool blocked(float3 o, float3 d, float reach) {
     float t = reach;
@@ -422,21 +491,31 @@ uint positionSeed(float3 x) {
     return hashU(asuint(x.x) ^ hashU(asuint(x.y) ^ hashU(asuint(x.z) ^ hashU(f.cache.x))));
 }
 
+// How far reflection rays follow the screen before the scene.
+static const float REFLECT_REACH = 24.0;
+
 // How a hit is seen: by a diffuse ray, a glossy reflection, or a mirror.
 static const uint SEEN_DIFFUSE = 0u;
 static const uint SEEN_GLOSSY = 1u;
 static const uint SEEN_MIRROR = 2u;
 
-// The light leaving a surface toward the ray: last frame's image where that
-// point was on it; otherwise its cache cell once refined, or else the direct
-// light on its albedo. A pixel's ray claims the cell and keeps it alive. A
+// The light leaving a surface toward the ray: for a reflection, last frame's
+// image where that point was on it; otherwise its cache cell once refined, or
+// else the direct light on its albedo. Diffuse rays skip the image: its
+// shading (shadow maps, Hammon diffuse as it then was, normal-map spread) ran
+// brighter than the scene's own Lambertian light, and against a path-traced
+// reference of the courtyard taking it cost 0.13 error where the cache gave
+// 0.08. A pixel's ray
+// claims the cell and keeps it alive. A
 // reflection shows the point itself, so it takes the cells around it blended;
 // a mirror's lights the point directly and takes only their bounce light (lit
 // directly, a glossy surface's scattered rays would flicker between light and
 // shadow).
 float3 worldLight(float3 x, float3 n, int hit, bool fromPixels, uint seenAs) {
     float3 s = project(f.clipFromWorld, x);
-    if (f.extra.z > 0.5 && s.z > f.camera.w && onScreen(s.xy) && abs(surfaceDepth(s.xy) - s.z) < 0.1 + 0.02 * s.z) {
+    int debug = int(f.misc.w);
+    bool worldOnly = debug >= DEBUG_WORLD_ONLY && debug <= DEBUG_WORLD_POSITION;
+    if (!worldOnly && seenAs != SEEN_DIFFUSE && f.extra.z > 0.5 && s.z > f.camera.w && onScreen(s.xy) && abs(surfaceDepth(s.xy) - s.z) < 0.1 + 0.02 * s.z) {
         float2 pc;
         if (previousSurface(x, pc)) return lastImage(pc);
     }
@@ -453,8 +532,14 @@ float3 worldLight(float3 x, float3 n, int hit, bool fromPixels, uint seenAs) {
             } else {
                 if (fromPixels) cells[slot].pos.w = asfloat(f.cache.x);
                 if (cells[slot].normal.w > 0.5) {
-                    // Trace runs after the cache took its fade; the cache's own rays don't.
-                    if (seenAs == SEEN_DIFFUSE) return cells[slot].outgoing.rgb * (fromPixels ? 1.0 : f.fade.rgb);
+                    // A pixel's ray lights the hit itself and takes only the cell's
+                    // bounce light: the cell's outgoing light is the direct light where
+                    // it was claimed, which leaks sun across shadow edges a cell
+                    // straddles (0.155 to 0.146 error). The cache's own rays gained
+                    // nothing from it. Trace runs after the cache took its fade; the
+                    // cache's own rays don't.
+                    if (seenAs == SEEN_DIFFUSE && fromPixels) return albedo * (directLight(x, n) + cells[slot].incoming.rgb);
+                    if (seenAs == SEEN_DIFFUSE) return cells[slot].outgoing.rgb * f.fade.rgb;
                     if (seenAs == SEEN_GLOSSY) return smoothCache(x, n, true);
                     return albedo * (directLight(x, n) + smoothCache(x, n, false));
                 }
@@ -467,10 +552,25 @@ float3 worldLight(float3 x, float3 n, int hit, bool fromPixels, uint seenAs) {
 
 // ---------------------------------------------------------------- passes
 
-// A quarter of the cells a frame, plus every cell near something physics moved
-// and all of them while the lights change.
-bool cacheDue(uint slot, float3 x) {
-    return (slot & 3u) == (f.cache.x & 3u) || f.extra.y > 0.0 || movedNear(x);
+// Cells that lit the view in the last couple of frames refresh every second
+// frame, the rest every eighth: work goes where the camera looks, while what it
+// turned from stays warm (and alive, for 600 frames) for when it turns back.
+// Every cell near something physics moved, and all while the lights change.
+bool cacheDue(uint slot, Cell cell) {
+    if (f.extra.y > 0.0 || movedNear(cell.pos.xyz)) return true;
+    uint period = f.cache.x - asuint(cell.pos.w) <= 2u ? 4u : 16u;
+    return (slot & (period - 1u)) == (f.cache.x & (period - 1u));
+}
+
+// For a texel with no history (just come into view): the cache's bounce light
+// at its surface, so it starts near the answer rather than from two rays.
+bool historyPrior(float3 p, float3 n, out float4 prior) {
+    prior = 0.0;
+    if (f.cache.z == 0u) return false;
+    float3 light = smoothCache(p, n, false);
+    if (!any(light > 0.0)) return false;
+    prior = float4(light, 1.0);
+    return true;
 }
 
 // The arriving half of a cache update: one ray per due cell, into a running
@@ -489,7 +589,7 @@ void cache_gather(uint3 id : SV_DispatchThreadID) {
         cacheKeys[slot].store(0u);
         return;
     }
-    if (!cacheDue(slot, cell.pos.xyz)) return;
+    if (!cacheDue(slot, cell)) return;
     float3 n = normalize(cell.normal.xyz);
     float u = frac(float(hashU(slot) & 0xffffu) / 65536.0 + float(f.cache.x) * 0.7548776662);
     float phi = 6.2831853 * frac(float(hashU(slot ^ 0x5bd1e995u) & 0xffffu) / 65536.0 + float(f.cache.x) * 0.5698402910);
@@ -522,7 +622,7 @@ void cache_shade(uint3 id : SV_DispatchThreadID) {
     uint slot = id.y * 512u + id.x;
     if (slot > f.cache.y || cacheKeys[slot].load() == 0u) return;
     Cell cell = cells[slot];
-    if (!cacheDue(slot, cell.pos.xyz)) return;
+    if (!cacheDue(slot, cell)) return;
     float3 n = normalize(cell.normal.xyz);
     cells[slot].outgoing = float4(cell.albedo.rgb * (directLight(cell.pos.xyz, n) + cell.incoming.rgb), 0.0);
 }
@@ -548,7 +648,8 @@ void trace(uint3 id : SV_DispatchThreadID) {
     int rays = clamp(int(f.cache.w), 1, 4);
     int debug = int(f.misc.w);
     // The world-only debug views show the scene's light alone: no screen march.
-    int steps = debug >= DEBUG_WORLD_ONLY && debug <= DEBUG_WORLD_POSITION ? 0 : STEPS;
+    bool screen = f.misc.y > 0.0 && !(debug >= DEBUG_WORLD_ONLY && debug <= DEBUG_WORLD_POSITION);
+    int steps = screen ? STEPS : 0;
     float3 light = 0.0;
     float hits = 0.0;
     float3 origin = p + n * (0.02 + 0.002 * linearDepth(depth));
@@ -569,6 +670,11 @@ void trace(uint3 id : SV_DispatchThreadID) {
             int hit = walkWorld(origin, dir, t, wn, false);
             if (hit >= 0) {
                 light += clampFirefly(worldLight(origin + dir * t, wn, hit, true, SEEN_DIFFUSE));
+                hits += 1.0;
+            } else if (escapes(origin, dir, f.sky.w)) {
+                // The sky along this ray, as the cache and reference take it: the
+                // composite's hemisphere at the normal is only right on open ground.
+                light += background(dir);
                 hits += 1.0;
             }
         }
@@ -611,7 +717,7 @@ void reflect_trace(uint3 id : SV_DispatchThreadID) {
     if (dot(dir, n) <= 0.0) dir = reflect(v, n);
     float3 origin = p + n * (0.02 + 0.002 * linearDepth(depth));
     float jitter = frac(noise.z + f.misc.x * 0.6180339887);
-    float4 result = march(origin, dir, 3.0 * f.misc.y, 32, jitter);
+    float4 result = march(origin, dir, REFLECT_REACH, 32, jitter);
     if (result.w < 0.5 && f.reflection.x > 1.5 && f.counts.x > 0u) {
         float far = 60.0;
         float3 wn;
@@ -665,7 +771,7 @@ void reflect_temporal(uint3 id : SV_DispatchThreadID) {
         }
     }
     out0.Store(px, result);
-    out1.Store(px, linearDepth(depth));
+    out1.Store(px, float2(linearDepth(depth), 0.0));
 }
 
 // One pass of an edge-avoiding a-trous filter over the accumulated
@@ -809,10 +915,13 @@ void composite(uint3 id : SV_DispatchThreadID) {
     colorOut.Store(at, float4(diffuseLit(lit.rgb, brdf, rough, n, view) + diffuse * brdf.diffuse_color, lit.a));
 }
 
-// Plain path tracing for `PxtgiDebug::Reference`: a running mean over frames in
-// the image the composite reads, through direct light at each bounce.
+// Plain path tracing for `PxtgiDebug::Reference`: a mean over frames in the
+// image the composite reads, through direct light at each bounce. The sum is
+// kept in fp32: a running mean in that half-float image stops taking small
+// steps after a few hundred frames, and drifted 13% dark over 1200.
 static const int REFERENCE_PATHS = 16;
 static const int REFERENCE_BOUNCES = 8;
+[[vk::binding(16, 0)]] RWStructuredBuffer<float4> referenceSum;
 
 [shader("compute")]
 [numthreads(8, 8, 1)]
@@ -856,5 +965,8 @@ void reference(uint3 id : SV_DispatchThreadID) {
     float4 now = float4(light / float(REFERENCE_PATHS), 1.0);
     if (bad(now)) now = float4(0.0, 0.0, 0.0, 1.0);
     float frames = f.reflection.z;
-    out0.Store(px, frames < 0.5 ? now : lerp(giLight.Load(int3(px, 0)), now, 1.0 / (frames + 1.0)));
+    uint at = uint(px.y) * uint(f.sizes.z) + uint(px.x);
+    float4 sum = (frames < 0.5 ? 0.0 : referenceSum[at]) + now;
+    referenceSum[at] = sum;
+    out0.Store(px, sum / (frames + 1.0));
 }

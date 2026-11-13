@@ -1,10 +1,18 @@
 //! Verity runtime world and fixed-step physics simulation.
 
-use std::{collections::HashMap, time::Duration};
+pub mod agents;
+
+use std::{
+    collections::HashMap,
+    time::{Duration, Instant},
+};
+
+use agents::{Agents, CrowdComponent};
 
 use verity_core::{ComponentRegistry, EntityHandle, Scene, World};
 use verity_physics::{
     JointComponent, PhysicsSettings, PhysicsWorld, RigidBodyComponent, SoftBodyComponent,
+    StepProfile,
 };
 
 /// Every component type the runtime simulates.
@@ -13,7 +21,24 @@ pub fn registry() -> ComponentRegistry {
     registry.register::<RigidBodyComponent>();
     registry.register::<JointComponent>();
     registry.register::<SoftBodyComponent>();
+    registry.register::<CrowdComponent>();
     registry
+}
+
+/// A city's network and the traffic and people running on it.
+pub struct CityRun {
+    pub city: verity_pcg::City,
+    pub network: verity_pcg::Network,
+    pub sim: verity_pcg::Simulation,
+}
+
+impl CityRun {
+    /// Build the city laid on `height`.
+    pub fn new(city: verity_pcg::City, height: verity_pcg::Height) -> Self {
+        let network = verity_pcg::Network::build(&city, height);
+        let sim = verity_pcg::Simulation::new(&city, &network);
+        Self { city, network, sim }
+    }
 }
 
 /// Owns the authoritative runtime world and its native physics simulation.
@@ -30,6 +55,17 @@ pub struct Runtime {
     soft: Vec<(EntityHandle, verity_physics::SoftId)>,
     /// Joints that yielded or broke in the last [`Self::advance`].
     pub joint_events: Vec<verity_physics::JointEvent>,
+    /// Physics phase times summed over the ticks of the last [`Self::advance`].
+    pub last_profile: StepProfile,
+    /// Ticks the last [`Self::advance`] ran.
+    pub last_ticks: u64,
+    /// Crowds from Crowd components.
+    pub agents: Agents,
+    pub city: Option<CityRun>,
+    /// Where the world is watched from; agents far from all of it think less.
+    pub focus: Vec<glam::Vec3>,
+    /// Time spent on crowds and the city in the last [`Self::advance`].
+    pub last_agents: Duration,
     fixed_timestep: Duration,
     accumulated: Duration,
 }
@@ -44,6 +80,12 @@ impl Runtime {
             joints: HashMap::new(),
             soft: Vec::new(),
             joint_events: Vec::new(),
+            last_profile: StepProfile::default(),
+            last_ticks: 0,
+            agents: Agents::default(),
+            city: None,
+            focus: Vec::new(),
+            last_agents: Duration::ZERO,
             fixed_timestep: Duration::from_nanos(16_666_667),
             accumulated: Duration::ZERO,
         }
@@ -92,6 +134,12 @@ impl Runtime {
         }
         runtime.add_joints()?;
         runtime.add_soft_bodies()?;
+        runtime.agents = Agents::from_world(&runtime.world)?;
+        if let Some(recipe) = &scene.city {
+            let city: verity_pcg::City =
+                serde_json::from_value(recipe.clone()).map_err(|e| format!("City: {e}"))?;
+            runtime.city = Some(CityRun::new(city, &verity_pcg::flat));
+        }
         Ok(runtime)
     }
 
@@ -191,6 +239,13 @@ impl Runtime {
                         Some(verity_physics::Collider::Sphere { radius }) => {
                             q.length() <= radius + 0.05
                         }
+                        Some(verity_physics::Collider::Capsule {
+                            radius,
+                            half_height,
+                        }) => {
+                            let core = q.z.clamp(-half_height, half_height);
+                            (q - glam::Vec3::Z * core).length() <= radius + 0.05
+                        }
                         Some(verity_physics::Collider::Ground) | None => false,
                     }
                 };
@@ -255,17 +310,28 @@ impl Runtime {
             .expect("elapsed time overflow");
         let mut ticks = 0u64;
         self.joint_events.clear();
+        self.last_profile = StepProfile::default();
+        self.last_agents = Duration::ZERO;
+        self.agents.crowd.focus.clone_from(&self.focus);
+        if let Some(city) = &mut self.city {
+            city.sim.set_focus(&self.focus);
+        }
         while self.accumulated >= self.fixed_timestep {
-            self.physics.step(
-                &mut self.world,
-                &self.physics_settings,
-                self.fixed_timestep.as_secs_f32(),
-            );
+            let dt = self.fixed_timestep.as_secs_f32();
+            self.physics.step(&mut self.world, &self.physics_settings, dt);
             self.joint_events
                 .extend_from_slice(self.physics.joint_events());
+            self.last_profile.accumulate(&self.physics.last_profile());
+            let start = Instant::now();
+            self.agents.step(&self.world, dt);
+            if let Some(city) = &mut self.city {
+                city.sim.step(&city.network, dt);
+            }
+            self.last_agents += start.elapsed();
             self.accumulated -= self.fixed_timestep;
             ticks = ticks.checked_add(1).expect("physics tick count overflow");
         }
+        self.last_ticks = ticks;
         ticks
     }
 }
@@ -485,8 +551,11 @@ mod tests {
     fn verity_scene_rejects_unsupported_and_invalid_physics() {
         let mut scene = Scene::default();
         for (body, expected) in [
-            (serde_json::json!({ "shape": "Capsule" }), "collider"),
-            (serde_json::json!({ "restitution": 0.5 }), "restitution"),
+            (
+                serde_json::json!({ "shape": "Capsule", "half_height": 0.0 }),
+                "half height",
+            ),
+            (serde_json::json!({ "restitution": -0.5 }), "restitution"),
             (
                 serde_json::json!({ "shape": "Sphere", "radius": -1.0 }),
                 "radius",

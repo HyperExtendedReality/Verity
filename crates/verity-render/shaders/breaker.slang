@@ -15,6 +15,10 @@ struct Constants {
 };
 [[vk::push_constant]] ConstantBuffer<Constants> wave;
 
+/// HDR alpha above 1 is TAA's reactive mask (see taa.slang): the waves move
+/// with no motion vectors, so they keep less history.
+static const float BREAKER_REACTIVE = 0.5;
+
 Cell sampleCell(float2 p) {
     float2 q = clamp((p - wave.domain.xy) / wave.domain.z - 0.5,
                      0.0, float2(wave.dimensions.xy - 1));
@@ -89,5 +93,5 @@ float4 fragmentMain(VertexOutput input): SV_Target0 {
     if (sampleCell(input.rest).medium.y <= 0.0) discard;
     float foam = saturate(input.breaking * (1.0 - n.z) * 2.5);
     return float4(lerp(float3(0.025, 0.19, 0.23) * light,
-                       float3(0.7, 0.85, 0.82) * light, foam), 1.0);
+                       float3(0.7, 0.85, 0.82) * light, foam), 1.0 + BREAKER_REACTIVE);
 }

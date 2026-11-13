@@ -1,6 +1,6 @@
 //! CPU meshlet preparation and conservative homogeneous-frustum testing.
 
-use glam::{Mat4, Vec4};
+use glam::Mat4;
 use verity_matrix::Bounds;
 
 /// Only draw ranges and bounds are needed: the GPU keeps the original indices.
@@ -35,8 +35,9 @@ pub(crate) fn visible_runs(
     mut emit: impl FnMut(u32, u32),
 ) {
     let mut run: Option<(u32, u32)> = None;
+    let frustum = Frustum::new(clip_from_world, model);
     for meshlet in meshlets {
-        if visible(&meshlet.bounds, clip_from_world, model) {
+        if frustum.visible(&meshlet.bounds) {
             let first = meshlet.first_triangle * 3;
             let count = meshlet.triangle_count * 3;
             match &mut run {
@@ -59,40 +60,71 @@ pub(crate) fn visible_runs(
 
 /// Reject only if every corner is strictly outside one Vulkan clip plane.
 /// Non-finite transforms or arithmetic cannot establish invisibility.
-pub(crate) fn visible(bounds: &Bounds, clip_from_world: Mat4, model: Mat4) -> bool {
-    let mut outside = [true; 6];
-    for x in [bounds.min[0], bounds.max[0]] {
-        for y in [bounds.min[1], bounds.max[1]] {
-            for z in [bounds.min[2], bounds.max[2]] {
-                let object = Vec4::new(x, y, z, 1.0);
-                let p = clip_from_world * (model * object);
-                // Bound intermediate magnitudes, not just the final coordinates:
-                // cancellation in either shader multiplication can amplify error.
-                let abs_mul = |m: Mat4, v: Vec4| {
-                    m.x_axis.abs() * v.x
-                        + m.y_axis.abs() * v.y
-                        + m.z_axis.abs() * v.z
-                        + m.w_axis.abs() * v.w
-                };
-                let magnitude = abs_mul(clip_from_world, abs_mul(model, object.abs()));
-                if !p.is_finite() || !magnitude.is_finite() {
-                    return true;
-                }
-                let epsilon = 1.0e-5 * magnitude.max_element().max(1.0);
-                let distances = [p.x + p.w, p.w - p.x, p.y + p.w, p.w - p.y, p.z, p.w - p.z];
-                for (all_outside, distance) in outside.iter_mut().zip(distances) {
-                    *all_outside &= distance < -epsilon;
-                }
-            }
+struct Frustum {
+    /// `clip * model`, and `|clip| * |model|`, which bounds how far a box's
+    /// extent can move each clip coordinate. Precomputed: they cost half of
+    /// each meshlet's test.
+    clip_model: Mat4,
+    abs_clip_model: Mat4,
+}
+
+impl Frustum {
+    fn new(clip: Mat4, model: Mat4) -> Self {
+        let abs = |m: Mat4| {
+            Mat4::from_cols(
+                m.x_axis.abs(),
+                m.y_axis.abs(),
+                m.z_axis.abs(),
+                m.w_axis.abs(),
+            )
+        };
+        Self {
+            clip_model: clip * model,
+            abs_clip_model: abs(clip) * abs(model),
         }
     }
-    !outside.into_iter().any(|all_outside| all_outside)
+
+    fn visible(&self, bounds: &Bounds) -> bool {
+        if bounds
+            .min
+            .iter()
+            .chain(&bounds.max)
+            .any(|&v| v != 0.0 && v.abs() < 2.0 * f32::MIN_POSITIVE)
+        {
+            return true;
+        }
+        let min = glam::Vec3::from_array(bounds.min) * 0.5;
+        let max = glam::Vec3::from_array(bounds.max) * 0.5;
+        let center = (min + max).extend(1.0);
+        let extent = (max - min).extend(0.0);
+        let p = self.clip_model * center;
+        let radius = self.abs_clip_model * extent;
+        let magnitude = self.abs_clip_model * (center.abs() + extent);
+        if !p.is_finite() || !radius.is_finite() || !magnitude.is_finite() {
+            return true;
+        }
+        let epsilon = 1.0e-5 * magnitude.max_element().max(1.0);
+        let distances = [
+            p.x + p.w + radius.x + radius.w,
+            p.w - p.x + radius.w + radius.x,
+            p.y + p.w + radius.y + radius.w,
+            p.w - p.y + radius.w + radius.y,
+            p.z + radius.z,
+            p.w - p.z + radius.w + radius.z,
+        ];
+        !distances.into_iter().any(|distance| distance < -epsilon)
+    }
+}
+
+#[cfg(test)]
+fn visible(bounds: &Bounds, clip_from_world: Mat4, model: Mat4) -> bool {
+    Frustum::new(clip_from_world, model).visible(bounds)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use glam::Vec3;
+    use glam::{Vec3, Vec4};
 
     #[test]
     fn clip_bounds_are_conservative_for_transforms_and_invalid_values() {
@@ -135,6 +167,65 @@ mod tests {
             projection,
             Mat4::from_translation(Vec3::new(0.0, 0.0, 1.0))
         ));
+    }
+
+    #[test]
+    fn subnormal_bounds_can_be_scaled_into_view() {
+        let bounds = Bounds {
+            min: [0.0; 3],
+            max: [f32::from_bits(1), 0.0, 0.0],
+        };
+        let model = Mat4::from_scale_rotation_translation(
+            Vec3::new(1e38, 1.0, 1.0),
+            glam::Quat::IDENTITY,
+            Vec3::new(-1.4e-7, 0.0, 0.5),
+        );
+        assert!(visible(
+            &bounds,
+            Mat4::from_scale(Vec3::new(1e8, 1.0, 1.0)),
+            model
+        ));
+    }
+
+    #[test]
+    fn intersecting_bounds_are_not_culled() {
+        let projection = Mat4::perspective_infinite_reverse_rh(1.0, 1.5, 0.1);
+        let bounds = Bounds {
+            min: [-0.5; 3],
+            max: [0.5; 3],
+        };
+        for x in -12..=12 {
+            for z in -12..=2 {
+                let model = Mat4::from_scale_rotation_translation(
+                    Vec3::new(-1.3, 0.7, 2.0),
+                    glam::Quat::from_rotation_y(0.7),
+                    Vec3::new(x as f32 * 0.25, 0.1, z as f32 * 0.25),
+                );
+                let corners: Vec<_> = [-0.5, 0.5]
+                    .into_iter()
+                    .flat_map(|x| {
+                        [-0.5, 0.5].into_iter().flat_map(move |y| {
+                            [-0.5, 0.5]
+                                .into_iter()
+                                .map(move |z| projection * model * Vec4::new(x, y, z, 1.0))
+                        })
+                    })
+                    .collect();
+                let outside = (0..6).any(|plane| {
+                    corners.iter().all(|p| match plane {
+                        0 => p.x + p.w < -1e-4,
+                        1 => p.w - p.x < -1e-4,
+                        2 => p.y + p.w < -1e-4,
+                        3 => p.w - p.y < -1e-4,
+                        4 => p.z < -1e-4,
+                        _ => p.w - p.z < -1e-4,
+                    })
+                });
+                if !outside {
+                    assert!(visible(&bounds, projection, model));
+                }
+            }
+        }
     }
 
     #[test]

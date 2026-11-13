@@ -6,7 +6,7 @@
 //! `--sponza` adds the Sponza scene as static trace meshes. For measurements:
 //! `--frames=N` quits after N frames, `--dump=file.pfm` saves the last one,
 //! `--debug=hits|bounce|reflections|world|position|roundtrip` picks a view,
-//! `--no-gi` runs the plain renderer, `--lights=N` spreads the light over N, `--extinction` puts the light out at
+//! `--no-gi` runs the plain renderer, `--software` traces without ray queries, `--lights=N` spreads the light over N, `--extinction` puts the light out at
 //! frame 240 and prints how fast its bounce light goes, and `--reference`
 //! path traces the bounce light on the CPU to compare with `--debug=bounce`.
 use glam::{Quat, Vec3};
@@ -470,6 +470,7 @@ impl ApplicationHandler for Viewer {
                 };
                 let settings = PxtgiSettings {
                     debug,
+                    hardware_rays: flag("software").is_none(),
                     ..PxtgiSettings::default()
                 };
                 renderer.set_extension(Box::new(Pxtgi::new(settings)))?;

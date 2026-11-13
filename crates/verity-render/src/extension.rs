@@ -109,6 +109,13 @@ pub trait RenderExtension: Send {
     /// The render targets were (re)created. The GPU is idle.
     fn targets_changed(&mut self, gpu: &mut Gpu, targets: &Targets) -> Result<()>;
 
+    /// Before this frame records anything, with `viewport` the area it will
+    /// draw (empty when it draws no 3D view). Earlier frames may still be on
+    /// the GPU, so replacing resources they use means waiting for it first.
+    fn prepare(&mut self, _gpu: &mut Gpu, _viewport: [u32; 4]) -> Result<()> {
+        Ok(())
+    }
+
     /// Record this frame's commands. Resolve writes to the HDR target and the
     /// G-buffer are visible to compute shaders; leave HDR writes visible to
     /// compute shaders too.

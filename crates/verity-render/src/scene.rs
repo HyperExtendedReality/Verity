@@ -1,5 +1,7 @@
 //! CPU-side packing of frame data into the layouts in `shaders/lib/common.slang`.
 
+use crate::gpu::DeviceAddress;
+use ash::vk;
 use bytemuck::{Pod, Zeroable};
 use glam::{Mat3, Mat4, Quat, Vec3};
 use verity_core::{Material, PointLight, Transform};
@@ -77,7 +79,22 @@ pub struct Globals {
     pub ground: [f32; 4],
     /// World-to-clip transforms for the six faces of each shadowed point light.
     pub point_shadow_view_proj: [[[f32; 4]; 4]; MAX_POINT_SHADOWS * POINT_SHADOW_FACES],
+    /// Cloud shadow map: world xy of its corner, its size; w: 1 when in use.
+    pub cloud_shadow: [f32; 4],
+    // GPU pointers to this frame's arrays, set in `upload_frame`.
+    pub instances: DeviceAddress<Instance>,
+    pub lights: DeviceAddress<Light>,
+    pub instance_motion: DeviceAddress<crate::InstanceMotion>,
+    pub previous_positions: DeviceAddress<[f32; 4]>,
+    pub vertices: DeviceAddress<Vertex>,
+    pub indices: DeviceAddress<u32>,
+    /// Matrix's buffers; see `Matrix::addresses`.
+    pub matrix: [vk::DeviceAddress; crate::matrix::BINDINGS],
 }
+
+// The std140 size of `Globals` in common.slang: 4 + 4 + 24 matrices, 11 vec4s,
+// then 6 + 11 pointers. A field added on one side only fails here.
+const _: () = assert!(std::mem::size_of::<Globals>() == (4 + 4 + 24) * 64 + 11 * 16 + 17 * 8);
 
 /// The sun's shadow cascades for one camera.
 #[derive(Clone, Copy, Debug)]
@@ -348,6 +365,8 @@ pub fn globals(
             .to_array(),
         ground: lighting.ground.extend(0.0).to_array(),
         point_shadow_view_proj: [[[0.0; 4]; 4]; MAX_POINT_SHADOWS * POINT_SHADOW_FACES],
+        cloud_shadow: [0.0; 4],
+        ..Zeroable::zeroed()
     }
 }
 

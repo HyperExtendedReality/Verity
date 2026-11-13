@@ -1,0 +1,10 @@
+[package]
+name = "verity-nav"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Navigation for Verity: splines, graphs, navmeshes, flow fields and neighbour queries"
+publish = false
+
+[dependencies]
+glam = "0.29"

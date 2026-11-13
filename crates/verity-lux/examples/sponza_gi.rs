@@ -10,7 +10,15 @@
 //! `--eye=X,Y,Z`, `--target=X,Y,Z`, `--updates=N` and `--uncapped` adjust it, `--no-gi-light`
 //! saves direct light alone, and `--pxtgi` (diffuse only without `--reflections`),
 //! `--voxel` and `--reference` run those instead. `--reference` needs a high `--warm`.
-//! `--lights=N` hangs N point lights in two rows along the nave.
+//! H switches between hardware and software tracing while viewing.
+//! `--turn=N` looks the other way for N frames before saving the still view.
+//! `--lights=N` hangs N point lights in two rows along the nave. `--software`
+//! traces without hardware ray queries, and `--world=M` sets PXTGI's ray reach.
+//! `--scene=A.glb,B.glb` loads those from `assets/packed` instead of Sponza.
+//! `--no-surface-cache` turns the surface cache off; `--surface-level=N` and
+//! `--surface-texel=M` set the first cascade read from it and its texel size;
+//! `--surface-updates=N` and `--surface-rays=N` its texels shaded a frame and
+//! bounce rays each; `--surface-reach=M` caps software bounce rays.
 use glam::Vec3;
 use std::{collections::HashMap, path::Path, sync::Arc, time::Instant};
 use verity_core::{PointLight, World};
@@ -24,6 +32,7 @@ use verity_render::{Renderer, Sun};
 use winit::{
     application::ApplicationHandler,
     event::WindowEvent,
+    keyboard::Key,
     event_loop::{ActiveEventLoop, EventLoop},
     window::{Window, WindowId},
 };
@@ -38,6 +47,8 @@ enum Stage {
     /// Waiting for pipelines, then this many frames.
     Warm(u32),
     Time(u32),
+    /// Looking the other way for this many frames before saving (`--turn`).
+    Away(u32),
     Save(u32),
 }
 
@@ -45,6 +56,9 @@ enum Stage {
 struct Bench {
     dir: String,
     warm: u32,
+    /// Frames to look away before saving the still view, testing how GI
+    /// stands up to the camera turning around and back.
+    turn: u32,
     stage: Stage,
     moving: bool,
     sums: HashMap<&'static str, (u32, f32, f32)>,
@@ -116,8 +130,13 @@ impl Bench {
             Stage::Warm(left) => self.stage = Stage::Warm(left - 1),
             Stage::Time(0) => {
                 self.report();
-                self.stage = Stage::Save(SAVED);
+                self.stage = match self.turn {
+                    0 => Stage::Save(SAVED),
+                    turn => Stage::Away(turn),
+                };
             }
+            Stage::Away(0) => self.stage = Stage::Save(SAVED),
+            Stage::Away(left) => self.stage = Stage::Away(left - 1),
             Stage::Time(left) => {
                 for &(name, ms) in times {
                     let entry = self.sums.entry(name).or_insert_with(|| {
@@ -142,6 +161,8 @@ struct Viewer {
     bench: Option<Bench>,
     /// How far the camera swings around its centre.
     orbit: f32,
+    /// Tracing with hardware ray queries; H switches.
+    hardware_rays: bool,
     window: Option<Arc<Window>>,
     renderer: Option<Renderer>,
     start: Instant,
@@ -188,16 +209,52 @@ impl ApplicationHandler for Viewer {
                 if flag("--no-gi-light") {
                     settings.intensity = 0.0;
                 }
+                settings.hardware_rays = !flag("--software");
+                settings.surface_cache = !flag("--no-surface-cache");
+                if let Some(level) = arg("surface-level") {
+                    settings.surface_from_level = level.parse().expect("--surface-level=N");
+                }
+                if let Some(updates) = arg("surface-updates") {
+                    settings.surface_updates = updates.parse().expect("--surface-updates=N");
+                }
+                if let Some(reach) = arg("surface-reach") {
+                    settings.surface_software_reach = reach.parse().expect("--surface-reach=M");
+                }
+                if let Some(rays) = arg("surface-rays") {
+                    settings.surface_bounce_rays = rays.parse().expect("--surface-rays=N");
+                }
+                if let Some(texel) = arg("surface-texel") {
+                    settings.surface_texel = texel.parse().expect("--surface-texel=M");
+                }
+                if let Some(steps) = arg("filter") {
+                    settings.spatial_filter_steps = steps.parse().expect("--filter=N");
+                }
+                if let Some(spacing) = arg("spacing") {
+                    settings.probe_spacing = spacing.parse().expect("--spacing=M");
+                }
+                if let Some(length) = arg("interval") {
+                    settings.interval_length = length.parse().expect("--interval=M");
+                }
                 let lux = Lux::new(if flag("--reference") {
                     Method::Pxtgi(PxtgiSettings {
                         debug: PxtgiDebug::Reference,
                         reflections: PxtgiReflections::Off,
                         world_ray_distance: 200.0,
+                        hardware_rays: !flag("--software"),
                         ..PxtgiSettings::default()
                     })
                 } else if flag("--pxtgi") {
                     Method::Pxtgi(PxtgiSettings {
                         rays_per_texel: arg("rays").map_or(2, |r| r.parse().expect("--rays=N")),
+                        world_ray_distance: arg("world").map_or(30.0, |w| w.parse().expect("--world=M")),
+                        debug: if flag("--world-only") {
+                            PxtgiDebug::WorldOnly
+                        } else {
+                            PxtgiDebug::Off
+                        },
+                        hardware_rays: !flag("--software"),
+                        multi_bounce: !flag("--single-bounce"),
+                        max_distance: arg("screen").map_or(0.0, |m| m.parse().expect("--screen=M")),
                         reflections: if flag("--reflections") {
                             PxtgiReflections::Traced
                         } else {
@@ -220,7 +277,8 @@ impl ApplicationHandler for Viewer {
                 renderer.set_extension(Box::new(lux))?;
             }
             let packed = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../assets/packed");
-            for scene in ["NewSponza_Main.glb", "NewSponza_Curtains.glb"] {
+            let scenes = arg("scene").unwrap_or("NewSponza_Main.glb,NewSponza_Curtains.glb".into());
+            for scene in scenes.split(',') {
                 renderer.load_gltf(packed.join(scene), 512)?;
             }
             renderer.set_sun(Some(Sun {
@@ -254,6 +312,18 @@ impl ApplicationHandler for Viewer {
         }
         match event {
             WindowEvent::CloseRequested => event_loop.exit(),
+            WindowEvent::KeyboardInput { event, .. }
+                if event.state.is_pressed()
+                    && !event.repeat
+                    && event.logical_key == Key::Character("h".into()) =>
+            {
+                if let Some(lux) = self.renderer.as_mut().and_then(|r| r.extension_mut::<Lux>()) {
+                    self.hardware_rays = !self.hardware_rays;
+                    lux.set_hardware_rays(self.hardware_rays);
+                    let mode = if self.hardware_rays { "hardware" } else { "software" };
+                    println!("tracing in {mode}");
+                }
+            }
             WindowEvent::Resized(size) => {
                 if let Some(renderer) = &mut self.renderer {
                     renderer.resize(size.width, size.height);
@@ -270,7 +340,10 @@ impl ApplicationHandler for Viewer {
                 let center = Vec3::new(2.0, -4.0, 3.0);
                 let orbit = Vec3::new(6.0 * t.cos(), -1.2 * t.sin(), 0.0);
                 let eye = point("eye").unwrap_or(center) + orbit * self.orbit;
-                let target = point("target").unwrap_or(center + Vec3::Z * 2.0) - orbit * self.orbit;
+                let mut target = point("target").unwrap_or(center + Vec3::Z * 2.0) - orbit * self.orbit;
+                if self.bench.as_ref().is_some_and(|b| matches!(b.stage, Stage::Away(_))) {
+                    target = eye * 2.0 - target;
+                }
                 renderer.set_camera(eye, target, 60f32.to_radians());
                 if let Err(error) = renderer.draw_world(&self.world) {
                     eprintln!("render: {error}");
@@ -311,6 +384,7 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
         Bench {
             dir,
             warm,
+            turn: arg("turn").map_or(0, |n| n.parse().expect("--turn=N")),
             stage: Stage::Warm(warm),
             moving: false,
             sums: HashMap::new(),
@@ -333,6 +407,7 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
         world,
         bench,
         orbit: if arg("eye").is_some() { 0.1 } else { 1.0 },
+        hardware_rays: !std::env::args().any(|a| a == "--software"),
         window: None,
         renderer: None,
         start: Instant::now(),

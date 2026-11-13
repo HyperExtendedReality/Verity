@@ -16,6 +16,7 @@
 
 pub mod cascades;
 pub mod pxtgi;
+mod pxtgi_accel;
 mod rt;
 mod shared;
 pub mod voxel;
@@ -70,6 +71,10 @@ pub trait GiMethod: RenderExtension {
     fn pass_times(&self) -> &[(&'static str, f32)] {
         &[]
     }
+
+    /// Trace with hardware ray queries where the GPU has them, or walk the
+    /// method's own tree. Methods that trace nothing ignore it.
+    fn set_hardware_rays(&mut self, _on: bool) {}
 
     /// Read back the next frame's HDR image, if the method can.
     fn request_capture(&mut self) {}
@@ -171,6 +176,12 @@ impl Lux {
         self.method.pass_times()
     }
 
+    /// Trace with hardware ray queries where the GPU has them (the default),
+    /// or in software. Split Radiance Cascades recompile its passes to switch.
+    pub fn set_hardware_rays(&mut self, on: bool) {
+        self.method.set_hardware_rays(on);
+    }
+
     /// Read back the next frame's HDR image, if the method can.
     pub fn request_capture(&mut self) {
         self.method.request_capture();
@@ -224,6 +235,10 @@ impl RenderExtension for Lux {
 
     fn targets_changed(&mut self, gpu: &mut Gpu, targets: &Targets) -> Result<()> {
         self.method.targets_changed(gpu, targets)
+    }
+
+    fn prepare(&mut self, gpu: &mut Gpu, viewport: [u32; 4]) -> Result<()> {
+        self.method.prepare(gpu, viewport)
     }
 
     fn record(&mut self, gpu: &mut Gpu, frame: &FrameContext) -> Result<()> {

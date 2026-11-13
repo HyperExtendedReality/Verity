@@ -43,9 +43,9 @@ struct VertexOutput {
 
 [shader("vertex")]
 VertexOutput vertexMain(uint vertex: SV_VertexID, uint entry: SV_InstanceID) {
-    uint2 item = matrix_entries[draw.list + entry];
-    MatrixInstance instance = matrix_instances[item.x];
-    MatrixCluster cluster = matrix_clusters[item.y];
+    uint2 item = globals.matrix_entries[draw.list + entry];
+    MatrixInstance instance = globals.matrix_instances[item.x];
+    MatrixCluster cluster = globals.matrix_clusters[item.y];
     uint triangle = vertex / 3;
     VertexOutput output;
     output.uv = 0.0;
@@ -69,7 +69,7 @@ void alphaTest(VertexOutput input) {
     if (imposter_pixel(input.position.xy, input.fade))
         discard;
 #endif
-    Material material = materials[matrix_instances[input.id.x].base.draw.z];
+    Material material = materials[globals.matrix_instances[input.id.x].base.draw.z];
     if ((material.textures.w & ALPHA_MASK) != 0) {
         float alpha = material.base_color.a * input.alpha;
         if (material.textures.x != NO_TEXTURE)
@@ -106,7 +106,7 @@ float3 arriving(float3 world) {
 #if MATRIX_TARGET == TARGET_SHADOW
     if (draw.cascade < CASCADES)
         return globals.sun_direction.xyz;
-    return world - lights[(draw.cascade - CASCADES) / POINT_SHADOW_FACES].position_radius.xyz;
+    return world - globals.lights[(draw.cascade - CASCADES) / POINT_SHADOW_FACES].position_radius.xyz;
 #else
     return world - globals.eye.xyz;
 #endif
@@ -114,9 +114,9 @@ float3 arriving(float3 world) {
 
 [shader("vertex")]
 VertexOutput vertexMain(uint vertex: SV_VertexID, uint entry: SV_InstanceID) {
-    uint2 item = matrix_entries[draw.list + entry];
-    MatrixInstance instance = matrix_instances[item.x];
-    MatrixBrick brick = matrix_bricks[item.y];
+    uint2 item = globals.matrix_entries[draw.list + entry];
+    MatrixInstance instance = globals.matrix_instances[item.x];
+    MatrixBrick brick = globals.matrix_bricks[item.y];
     // Two triangles per face. Only faces toward the ray survive: marching
     // starts on the surface the ray enters, whatever the winding.
     uint face = vertex / 6;
@@ -141,8 +141,8 @@ VertexOutput vertexMain(uint vertex: SV_VertexID, uint entry: SV_InstanceID) {
 }
 
 bool voxelHit(VertexOutput input, out float depth, out uint id) {
-    MatrixInstance instance = matrix_instances[input.item.x];
-    MatrixBrick brick = matrix_bricks[input.item.y];
+    MatrixInstance instance = globals.matrix_instances[input.item.x];
+    MatrixBrick brick = globals.matrix_bricks[input.item.y];
     float3 world = mul(instance.base.model, float4(input.object, 1.0)).xyz;
     float3 ray = normalize(mul(instance.inverse, float4(arriving(world), 0.0)).xyz);
     uint bit;
@@ -212,8 +212,8 @@ struct VertexOutput {
 
 [shader("vertex")]
 VertexOutput vertexMain(uint vertex: SV_VertexID, uint entry: SV_InstanceID) {
-    uint index = matrix_entries[draw.list + entry].x;
-    MatrixInstance instance = matrix_instances[index];
+    uint index = globals.matrix_entries[draw.list + entry].x;
+    MatrixInstance instance = globals.matrix_instances[index];
     float3 center = instance.sphere.xyz;
     float radius = instance.sphere.w;
     float3 offset = globals.eye.xyz - center;
@@ -238,8 +238,8 @@ bool imposterHit(VertexOutput input, out float depth) {
     depth = 0.0;
     if (!imposter_pixel(input.position.xy, input.fade))
         return false;
-    MatrixInstance instance = matrix_instances[input.instance];
-    MatrixAsset asset = matrix_assets[instance.info.x];
+    MatrixInstance instance = globals.matrix_instances[input.instance];
+    MatrixAsset asset = globals.matrix_assets[instance.info.x];
     float3 direction = normalize(input.world - globals.eye.xyz);
     ImposterHit hit = imposter_sample(instance, asset, globals.eye.xyz, direction, input.pixels);
     if (hit.alpha < IMPOSTER_ALPHA)
@@ -296,9 +296,9 @@ struct FragmentOutput {
 [shader("vertex")]
 VertexOutput vertexMain(uint vertex: SV_VertexID, uint entry: SV_InstanceID) {
     // `list` is the instance; `cascade` the frame, as y * grid + x.
-    MatrixInstance instance = matrix_instances[draw.list];
-    MatrixAsset asset = matrix_assets[instance.info.x];
-    MatrixCluster cluster = matrix_clusters[asset.first_cluster + entry];
+    MatrixInstance instance = globals.matrix_instances[draw.list];
+    MatrixAsset asset = globals.matrix_assets[instance.info.x];
+    MatrixCluster cluster = globals.matrix_clusters[asset.first_cluster + entry];
     VertexOutput output;
     output.normal = 0.0;
     output.uv = 0.0;

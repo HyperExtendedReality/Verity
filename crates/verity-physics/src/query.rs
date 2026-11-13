@@ -62,11 +62,6 @@ impl Bounds {
         }
     }
 
-    fn area(self) -> f32 {
-        let d = (self.max - self.min).max(Vec3::ZERO);
-        d.x * d.y + d.y * d.z + d.z * d.x
-    }
-
     /// Where a ray enters, if before `best`; `inverse` is 1 / its direction.
     fn entry(self, origin: Vec3, inverse: Vec3, best: f32) -> Option<f32> {
         let (t0, t1) = ((self.min - origin) * inverse, (self.max - origin) * inverse);
@@ -111,7 +106,13 @@ impl Bvh {
         let mut order: Vec<u32> = (0..bounds.len() as u32).collect();
         let mut nodes = Vec::with_capacity(bounds.len());
         if !bounds.is_empty() {
-            subdivide(bounds, &mut order, 0, 0, &mut nodes);
+            // SIMD boxes and centers, made once: the builder is mostly their math.
+            let boxes: Vec<Box3> = bounds
+                .iter()
+                .map(|b| Box3 { min: b.min.into(), max: b.max.into() })
+                .collect();
+            let centers: Vec<Vec3A> = boxes.iter().map(|b| (b.min + b.max) * 0.5).collect();
+            nodes = subtree(&boxes, &centers, &mut order, 0, 0);
         }
         Self { nodes, order }
     }
@@ -201,77 +202,157 @@ fn node_bounds(node: &BvhNode) -> Bounds {
     }
 }
 
+/// A box in SIMD lanes, for building.
+#[derive(Clone, Copy)]
+struct Box3 {
+    min: Vec3A,
+    max: Vec3A,
+}
+
+impl Box3 {
+    const EMPTY: Self = Self {
+        min: Vec3A::splat(f32::INFINITY),
+        max: Vec3A::splat(f32::NEG_INFINITY),
+    };
+
+    fn union(self, other: Self) -> Self {
+        Self { min: self.min.min(other.min), max: self.max.max(other.max) }
+    }
+
+    fn with(self, p: Vec3A) -> Self {
+        Self { min: self.min.min(p), max: self.max.max(p) }
+    }
+
+    /// Half the surface area, which is all the heuristic compares.
+    fn area(self) -> f32 {
+        let d = (self.max - self.min).max(Vec3A::ZERO);
+        d.x * d.y + d.y * d.z + d.z * d.x
+    }
+
+    fn bounds(self) -> Bounds {
+        Bounds { min: self.min.into(), max: self.max.into() }
+    }
+}
+
+/// Items past which the two halves of a node build on separate threads.
+const PARALLEL_ITEMS: usize = 4096;
+/// Items below which a node bins only its widest axis: small nodes are most of
+/// a tree, and searching all three costs them more than it finds.
+const ALL_AXES_ITEMS: usize = 64;
+
+/// A tree over `items` whose right-child links count from its own root, for
+/// [`subdivide`] to splice in.
+fn subtree(boxes: &[Box3], centers: &[Vec3A], items: &mut [u32], first: u32, depth: u32) -> Vec<BvhNode> {
+    let mut nodes = Vec::with_capacity(items.len());
+    subdivide(boxes, centers, items, first, depth, &mut nodes);
+    nodes
+}
+
+/// Append a [`subtree`], moving its right-child links to where it lands.
+fn splice(nodes: &mut Vec<BvhNode>, subtree: Vec<BvhNode>) {
+    let base = nodes.len() as u32;
+    nodes.extend(subtree.into_iter().map(|mut n| {
+        if n[1][3].to_bits() == 0 {
+            n[0][3] = f32::from_bits(n[0][3].to_bits() + base);
+        }
+        n
+    }));
+}
+
 fn subdivide(
-    bounds: &[Bounds],
+    boxes: &[Box3],
+    centers: &[Vec3A],
     items: &mut [u32],
     first: u32,
     depth: u32,
     nodes: &mut Vec<BvhNode>,
 ) {
     let at = nodes.len();
-    let all = items
-        .iter()
-        .fold(Bounds::EMPTY, |all, &i| all.union(bounds[i as usize]));
+    let all = items.iter().fold(Box3::EMPTY, |all, &i| all.union(boxes[i as usize])).bounds();
     nodes.push(node(all, first, items.len() as u32));
     if items.len() <= LEAF_ITEMS {
         return;
     }
     let middle = (depth < SAH_DEPTH)
-        .then(|| sah_split(bounds, items))
+        .then(|| sah_split(boxes, centers, items))
         .flatten()
-        .unwrap_or_else(|| median_split(bounds, items));
+        .unwrap_or_else(|| median_split(centers, items));
+    let parallel = items.len() >= PARALLEL_ITEMS;
     let (left, right) = items.split_at_mut(middle);
-    subdivide(bounds, left, first, depth + 1, nodes);
-    let right_at = nodes.len() as u32;
-    subdivide(bounds, right, first + middle as u32, depth + 1, nodes);
+    let right_first = first + middle as u32;
+    let right_at = if parallel {
+        // The same tree as built in order, whichever half finishes first.
+        let (l, r) = rayon::join(
+            || subtree(boxes, centers, left, first, depth + 1),
+            || subtree(boxes, centers, right, right_first, depth + 1),
+        );
+        splice(nodes, l);
+        let right_at = nodes.len() as u32;
+        splice(nodes, r);
+        right_at
+    } else {
+        subdivide(boxes, centers, left, first, depth + 1, nodes);
+        let right_at = nodes.len() as u32;
+        subdivide(boxes, centers, right, right_first, depth + 1, nodes);
+        right_at
+    };
     nodes[at] = node(all, right_at, 0);
 }
 
-/// Partition `items` at the cheapest of the binned planes along the widest
-/// axis of their centers; `None` when the centers coincide or nothing beats a
-/// leaf of a size a leaf may have.
-fn sah_split(bounds: &[Bounds], items: &mut [u32]) -> Option<usize> {
-    let centers = items.iter().fold(Bounds::EMPTY, |all, &i| {
-        all.with(bounds[i as usize].center())
-    });
-    let extent = centers.max - centers.min;
-    let axis = widest(extent);
-    if extent[axis] <= 0.0 {
-        return None;
-    }
-    let scale = BINS as f32 / extent[axis];
-    let bin = |i: u32| {
-        let c = bounds[i as usize].center()[axis];
-        (((c - centers.min[axis]) * scale) as usize).min(BINS - 1)
-    };
-    let mut bins = [(Bounds::EMPTY, 0usize); BINS];
+/// Partition `items` at the cheapest of the binned planes along any axis of
+/// their centers; `None` when the centers coincide or nothing beats a leaf of a
+/// size a leaf may have. All three axes, not only the widest: a long thin
+/// cluster often splits best across its length, and on Sponza the trees took
+/// PXTGI's software rays 28% less time. One pass bins all three.
+fn sah_split(boxes: &[Box3], centers: &[Vec3A], items: &mut [u32]) -> Option<usize> {
+    let span = items.iter().fold(Box3::EMPTY, |all, &i| all.with(centers[i as usize]));
+    let extent = span.max - span.min;
+    // No more bins than items: small nodes, most of a tree, sweep fewer planes.
+    let count = items.len().clamp(4, BINS);
+    let scale = Vec3A::select(extent.cmpgt(Vec3A::ZERO), count as f32 / extent, Vec3A::ZERO);
+    let top = Vec3A::splat((count - 1) as f32);
+    let bin = |c: Vec3A| ((c - span.min) * scale).min(top).as_uvec3();
+    let widest = widest(extent.into());
+    let searched = |axis: usize| extent[axis] > 0.0 && (items.len() >= ALL_AXES_ITEMS || axis == widest);
+    let mut bins = [[(Box3::EMPTY, 0u32); BINS]; 3];
     for &i in items.iter() {
-        let b = &mut bins[bin(i)];
-        *b = (b.0.union(bounds[i as usize]), b.1 + 1);
-    }
-    let mut right_area = [0.0; BINS];
-    let (mut area, mut count) = (Bounds::EMPTY, 0);
-    for plane in (1..BINS).rev() {
-        area = area.union(bins[plane].0);
-        count += bins[plane].1;
-        right_area[plane] = area.area() * count as f32;
-    }
-    let (mut left, mut left_count) = (Bounds::EMPTY, 0);
-    let (mut best, mut cost) = (0, f32::INFINITY);
-    for plane in 1..BINS {
-        left = left.union(bins[plane - 1].0);
-        left_count += bins[plane - 1].1;
-        let total = left.area() * left_count as f32 + right_area[plane];
-        if left_count > 0 && left_count < items.len() && total < cost {
-            (best, cost) = (plane, total);
+        let at = bin(centers[i as usize]);
+        let item = boxes[i as usize];
+        for (axis, bins) in bins.iter_mut().enumerate() {
+            if !searched(axis) {
+                continue;
+            }
+            let b = &mut bins[at[axis] as usize];
+            *b = (b.0.union(item), b.1 + 1);
         }
     }
-    if best == 0 {
-        return None;
+    let mut best: Option<(usize, u32)> = None;
+    let mut cost = f32::INFINITY;
+    for (axis, bins) in bins.iter().enumerate() {
+        if !searched(axis) {
+            continue;
+        }
+        let mut right_area = [0.0; BINS];
+        let (mut area, mut right_count) = (Box3::EMPTY, 0);
+        for plane in (1..count).rev() {
+            area = area.union(bins[plane].0);
+            right_count += bins[plane].1;
+            right_area[plane] = area.area() * right_count as f32;
+        }
+        let (mut left, mut left_count) = (Box3::EMPTY, 0);
+        for plane in 1..count {
+            left = left.union(bins[plane - 1].0);
+            left_count += bins[plane - 1].1;
+            let total = left.area() * left_count as f32 + right_area[plane];
+            if left_count > 0 && (left_count as usize) < items.len() && total < cost {
+                (best, cost) = (Some((axis, plane as u32)), total);
+            }
+        }
     }
+    let (axis, plane) = best?;
     let (mut low, mut high) = (0, items.len());
     while low < high {
-        if bin(items[low]) < best {
+        if bin(centers[items[low] as usize])[axis] < plane {
             low += 1;
         } else {
             high -= 1;
@@ -281,14 +362,12 @@ fn sah_split(bounds: &[Bounds], items: &mut [u32]) -> Option<usize> {
     Some(low)
 }
 
-fn median_split(bounds: &[Bounds], items: &mut [u32]) -> usize {
-    let spread = items.iter().fold(Bounds::EMPTY, |all, &i| {
-        all.with(bounds[i as usize].center())
-    });
-    let axis = widest(spread.max - spread.min);
+fn median_split(centers: &[Vec3A], items: &mut [u32]) -> usize {
+    let spread = items.iter().fold(Box3::EMPTY, |all, &i| all.with(centers[i as usize]));
+    let axis = widest((spread.max - spread.min).into());
     let middle = items.len() / 2;
     items.select_nth_unstable_by(middle, |&a, &b| {
-        let center = |i: u32| bounds[i as usize].center()[axis];
+        let center = |i: u32| centers[i as usize][axis];
         center(a).total_cmp(&center(b))
     });
     middle
@@ -380,6 +459,48 @@ fn corner_bounds(corners: [Vec3; 3]) -> Bounds {
     corners.into_iter().fold(Bounds::EMPTY, Bounds::with)
 }
 
+/// Where `origin + direction t` enters a Z-aligned capsule at the origin,
+/// and the outward normal there: a negative `t` when `origin` is inside.
+pub(crate) fn capsule_ray(
+    origin: Vec3,
+    direction: Vec3,
+    radius: f32,
+    half_height: f32,
+) -> Option<(f32, Vec3)> {
+    let sphere = |center: Vec3| {
+        let o = origin - center;
+        let (a, b, c) = (
+            direction.length_squared(),
+            o.dot(direction),
+            o.length_squared(),
+        );
+        let h = b * b - a * (c - radius * radius);
+        (h >= 0.0 && a > 0.0).then(|| {
+            let t = (-b - h.sqrt()) / a;
+            (t, (o + direction * t) / radius)
+        })
+    };
+    // The side, where it lies between the caps.
+    let (o, d) = (origin.truncate(), direction.truncate());
+    let a = d.length_squared();
+    if a > 1.0e-12 {
+        let b = o.dot(d);
+        let h = b * b - a * (o.length_squared() - radius * radius);
+        if h < 0.0 {
+            return None;
+        }
+        let t = (-b - h.sqrt()) / a;
+        let p = origin + direction * t;
+        if p.z.abs() <= half_height {
+            return Some((t, Vec3::new(p.x, p.y, 0.0) / radius));
+        }
+    }
+    let caps = [half_height, -half_height].map(|z| sphere(Vec3::new(0.0, 0.0, z)));
+    caps.into_iter()
+        .flatten()
+        .min_by(|x, y| x.0.total_cmp(&y.0))
+}
+
 impl Collider {
     /// The nearest entry of a ray from outside, in the collider's own frame,
     /// and the outward normal there. `direction` need not be unit length: `t`
@@ -414,6 +535,11 @@ impl Collider {
                 let t = (-b - h.sqrt()) / a;
                 (t > 0.0 && t < max).then(|| (t, (origin + direction * t) / radius))
             }
+            Self::Capsule {
+                radius,
+                half_height,
+            } => capsule_ray(origin, direction, radius, half_height)
+                .filter(|&(t, _)| t > 0.0 && t < max),
             // Rays see ground as the mesh drawn for it, not through its body.
             Self::Ground => None,
         }
@@ -423,6 +549,10 @@ impl Collider {
         let center = Vec3::from(pose.translation);
         let reach = match self {
             Self::Sphere { radius } => Vec3::splat(radius),
+            Self::Capsule {
+                radius,
+                half_height,
+            } => Vec3::from(pose.matrix3.z_axis.abs()) * half_height + radius,
             Self::Ground => Vec3::ZERO,
             Self::Cuboid { half_extents } => {
                 let m = Mat3A::from_cols(

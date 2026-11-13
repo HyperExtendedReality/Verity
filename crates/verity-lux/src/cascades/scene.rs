@@ -16,7 +16,8 @@
 //! render-layer mask word: Verity has a single layer (bit 0), and lux's
 //! traversal only hits instances whose mask meets the view's (see `LAYER_MASK`).
 
-use glam::{Affine3A, Mat4, UVec3, UVec4, Vec3};
+use super::surface::{self, Charts};
+use glam::{Affine3A, Mat4, UVec2, UVec3, UVec4, Vec3};
 use rayon::prelude::*;
 use std::{collections::BTreeMap, mem, ops::Range};
 use verity_render::{
@@ -25,6 +26,8 @@ use verity_render::{
 };
 
 pub const VERTEX_WORDS: u32 = 5;
+/// The surface atlas's texel budget; past it texels grow.
+const MAX_SURFACE_TEXELS: usize = 1 << 21;
 pub const INSTANCE_WORDS: usize = 9;
 /// Instance flags, as in the traversal shader: bits 0-1 are the cull mode.
 pub const FLAG_CULL_BACK: u32 = 1;
@@ -63,6 +66,12 @@ struct Instance {
     count: u32,
     flags: u32,
     material: u32,
+    /// Index into [`GiScene::charts`], or `u32::MAX` when the surface cache
+    /// leaves the instance out.
+    chart: u32,
+    /// Instance word 7's `y` (island table base + 1, 0 = uncharted) and `z`
+    /// (texels per local metre), set by [`GiScene::pack`].
+    surface: UVec2,
 }
 
 /// One retained mesh's BLAS, with its indices and nodes relative to itself, so
@@ -149,7 +158,7 @@ impl RetainedBlas {
                 })
             })
             .collect();
-        let nodes = build_tree(&mut triangles, |t| (t.min, t.max));
+        let nodes = build_tree_parallel(&mut triangles, |t| (t.min, t.max));
         let mut vertex_words = Vec::with_capacity(mesh.vertices.len() * VERTEX_WORDS as usize);
         mesh.vertices
             .iter()
@@ -175,6 +184,10 @@ pub struct GiScene {
     instances: Vec<Instance>,
     retained: BTreeMap<u64, RetainedBlas>,
     retained_material: u32,
+    /// Each charted BLAS's first global triangle and islands.
+    charts: Vec<(u32, Charts)>,
+    /// Surface cache texel size in metres; zero leaves every instance out.
+    surface_texel: f32,
     /// Instances the words can hold, and nodes reserved for a TLAS over them, so
     /// BLAS and instance addresses survive it being rebuilt.
     instance_room: u32,
@@ -205,9 +218,31 @@ pub struct GiWords {
     pub scene_words: Vec<UVec4>,
     pub triangles: u32,
     pub instances: u32,
+    pub surface: SurfaceWords,
+}
+
+/// The surface cache's words, laid out by [`GiScene::pack`].
+#[derive(Default)]
+pub struct SurfaceWords {
+    /// One word per global triangle: its three corners' chart coordinates as
+    /// half-float pairs, then island + 1 (0 = uncharted).
+    pub triangles: Vec<UVec4>,
+    /// Per instance island: its atlas rect `(x, y, w, h)`, `w` = 0 when unplaced.
+    pub islands: Vec<UVec4>,
+    /// Texel records, row-major over an atlas [`surface::ATLAS_WIDTH`] wide;
+    /// see [`surface::rasterize`].
+    pub texels: Vec<UVec4>,
+    /// The texel size used, in metres: larger than asked when the atlas was full.
+    pub texel: f32,
 }
 
 impl GiScene {
+    /// Size surface cache texels in metres from the next [`GiScene::pack`]; zero
+    /// turns the cache off.
+    pub fn set_surface_texel(&mut self, texel: f32) {
+        self.surface_texel = texel;
+    }
+
     /// Build one scene's words in one step.
     pub fn build(scene: &SceneData, material_base: u32) -> GiWords {
         let mut gi = Self::default();
@@ -223,31 +258,61 @@ impl GiScene {
         let vertex_base = (self.vertex_words.len() / VERTEX_WORDS as usize) as u32;
         // Per primitive: (root node, first triangle, triangle count).
         let mut spans = Vec::with_capacity(scene.primitives.len());
-        for primitive in &scene.primitives {
-            let start = primitive.first_index as usize;
-            let indices = &scene.indices[start..start + primitive.index_count as usize];
-            let mut local: Vec<Triangle> = indices
-                .as_chunks::<3>()
-                .0
-                .iter()
-                .filter_map(|tri| {
-                    let local = UVec3::new(tri[0], tri[1], tri[2]) + primitive.base_vertex;
-                    let [a, b, c] = local.to_array().map(|i| {
-                        let p = scene.vertices[i as usize].position;
-                        Vec3::new(p[0], p[1], p[2])
-                    });
-                    let cross = (b - a).cross(c - a);
-                    // Degenerate triangles can never be hit.
-                    (cross.is_finite() && cross != Vec3::ZERO).then(|| Triangle {
-                        indices: local + vertex_base,
-                        min: a.min(b).min(c),
-                        max: a.max(b).max(c),
+        // Each primitive's tree is independent, so build them in parallel and
+        // append them in order.
+        let built: Vec<_> = scene
+            .primitives
+            .par_iter()
+            .map(|primitive| {
+                let start = primitive.first_index as usize;
+                let indices = &scene.indices[start..start + primitive.index_count as usize];
+                let mut local: Vec<Triangle> = indices
+                    .as_chunks::<3>()
+                    .0
+                    .iter()
+                    .filter_map(|tri| {
+                        let local = UVec3::new(tri[0], tri[1], tri[2]) + primitive.base_vertex;
+                        let [a, b, c] = local.to_array().map(|i| {
+                            let p = scene.vertices[i as usize].position;
+                            Vec3::new(p[0], p[1], p[2])
+                        });
+                        let cross = (b - a).cross(c - a);
+                        // Degenerate triangles can never be hit.
+                        (cross.is_finite() && cross != Vec3::ZERO).then(|| Triangle {
+                            indices: local + vertex_base,
+                            min: a.min(b).min(c),
+                            max: a.max(b).max(c),
+                        })
                     })
-                })
-                .collect();
+                    .collect();
+                let nodes = build_tree_parallel(&mut local, |t| (t.min, t.max));
+                // Blended and double-sided surfaces (foliage, glass) have no
+                // single outward side to cache; their hits read world probes.
+                let material = &scene.materials[primitive.material as usize];
+                let charted = !material.double_sided && material.alpha_mode != AlphaMode::Blend;
+                let charts = charted.then(|| {
+                    let corners: Vec<[Vec3; 3]> = local
+                        .iter()
+                        .map(|t| {
+                            t.indices.to_array().map(|i| {
+                                let p = scene.vertices[(i - vertex_base) as usize].position;
+                                Vec3::new(p[0], p[1], p[2])
+                            })
+                        })
+                        .collect();
+                    surface::chart(&corners)
+                });
+                (local, nodes, charts)
+            })
+            .collect();
+        let mut chart_of = Vec::with_capacity(built.len());
+        for (local, nodes, charts) in built {
             let first = self.triangles.len() as u32;
+            chart_of.push(charts.map_or(u32::MAX, |charts| {
+                self.charts.push((first, charts));
+                self.charts.len() as u32 - 1
+            }));
             let root = self.blas.len() as u32;
-            let nodes = build_tree(&mut local, |t| (t.min, t.max));
             self.blas.extend(nodes.iter().map(|node| BvhNode {
                 first: node.first + if node.count == 0 { root } else { first },
                 ..*node
@@ -269,6 +334,7 @@ impl GiScene {
             if !determinant.is_finite() || determinant == 0.0 {
                 return None;
             }
+            let chart = chart_of[draw.primitive as usize];
             let node = blas[root as usize];
             let (min, max) = transformed_bounds(draw.transform, node.min, node.max);
             let cull = if material.double_sided || material.alpha_mode == AlphaMode::Blend {
@@ -287,6 +353,8 @@ impl GiScene {
                 count,
                 flags: cull | mirrored,
                 material: material_base + primitive.material,
+                chart,
+                surface: UVec2::ZERO,
             })
         }));
 
@@ -393,13 +461,16 @@ impl GiScene {
         self.tlas_room = 2 * self.instance_room;
         let base = 1 + 2 * (self.tlas_room + nodes);
         let mask = base + self.instance_room * INSTANCE_WORDS as u32;
-        let mut scene_words = vec![UVec4::ZERO; mask as usize + 1];
+        // After the mask, each glTF instance's place in the TLAS order, four a
+        // word, for surface texels that name instances by their load order.
+        let slots = self.instances.len().div_ceil(4).max(1);
+        let mut scene_words = vec![UVec4::ZERO; mask as usize + 1 + slots];
         scene_words[0] = UVec4::new(mask, base, 0, INSTANCE_WORDS as u32);
         let blas_words = node_words(&self.blas, self.tlas_room);
         for (word, value) in (1 + 2 * self.tlas_room as usize..).zip(blas_words) {
             scene_words[word] = value;
         }
-        *scene_words.last_mut().expect("holds the layer mask") = LAYER_MASK;
+        scene_words[mask as usize] = LAYER_MASK;
 
         let vertex_base = (1 + triangles).next_multiple_of(VERTEX_WORDS);
         let mut geometry_words =
@@ -412,11 +483,13 @@ impl GiScene {
         geometry_words[first_vertex..first_vertex + self.vertex_words.len()]
             .copy_from_slice(&self.vertex_words);
 
+        let surface = self.pack_surface(triangles);
         self.packed = GiWords {
             geometry_words,
             scene_words,
             triangles: 0,
             instances: count as u32,
+            surface,
         };
         for blas in self.retained.values() {
             let slot = blas.slot.expect("laid out above");
@@ -428,15 +501,106 @@ impl GiScene {
         &self.packed
     }
 
+    /// Charts every glTF instance into the surface atlas, growing the texel
+    /// until the atlas fits [`MAX_SURFACE_TEXELS`] or islands are one texel. `triangle_room` is the
+    /// geometry's triangle capacity. Sets each instance's `surface`.
+    fn pack_surface(&mut self, triangle_room: u32) -> SurfaceWords {
+        for instance in &mut self.instances {
+            instance.surface = UVec2::ZERO;
+        }
+        let mut words = SurfaceWords {
+            triangles: vec![UVec4::ZERO; triangle_room as usize],
+            ..SurfaceWords::default()
+        };
+        if self.surface_texel.is_nan() || self.surface_texel <= 0.0 || self.charts.is_empty() {
+            return words;
+        }
+        for (first, charts) in &self.charts {
+            for (j, (uv, &island)) in charts.uv.iter().zip(&charts.island).enumerate() {
+                let pair = |v: glam::Vec2| surface::half(v.x) | (surface::half(v.y) << 16);
+                words.triangles[*first as usize + j] =
+                    UVec4::new(pair(uv[0]), pair(uv[1]), pair(uv[2]), island + 1);
+            }
+        }
+        // Texels per local metre: the largest axis scale, so no axis undersamples.
+        let scale = |i: &Instance| {
+            let m = i.world_from_local.matrix3;
+            m.x_axis.length().max(m.y_axis.length()).max(m.z_axis.length())
+        };
+        let mut texel = self.surface_texel;
+        let (owners, rects, height) = loop {
+            let mut sizes = Vec::new();
+            let mut owners = Vec::new();
+            for (index, instance) in self.instances.iter().enumerate() {
+                let Some((_, charts)) = self.charts.get(instance.chart as usize) else {
+                    continue;
+                };
+                let density = scale(instance) / texel;
+                for (island, &extent) in charts.extents.iter().enumerate() {
+                    if let Some(size) = surface::island_size(extent, density) {
+                        sizes.push(size);
+                        owners.push((index, island));
+                    }
+                }
+            }
+            let (rects, height) = surface::pack(&sizes);
+            // Every island takes at least a texel, so past a point growing texels saves nothing.
+            let fits = height as usize * surface::ATLAS_WIDTH as usize <= MAX_SURFACE_TEXELS;
+            if fits || texel > 16.0 * self.surface_texel {
+                break (owners, rects, height);
+            }
+            texel *= 1.25;
+        };
+        words.texel = texel;
+        // Island tables, one block per charted instance, in instance order.
+        let mut tables: Vec<Vec<Option<surface::Rect>>> = vec![Vec::new(); self.instances.len()];
+        for (index, instance) in self.instances.iter().enumerate() {
+            if let Some((_, charts)) = self.charts.get(instance.chart as usize) {
+                tables[index] = vec![None; charts.extents.len()];
+            }
+        }
+        for (&(index, island), rect) in owners.iter().zip(rects) {
+            tables[index][island] = Some(rect);
+        }
+        for (index, table) in tables.iter().enumerate() {
+            if table.is_empty() {
+                continue;
+            }
+            let density = scale(&self.instances[index]) / texel;
+            self.instances[index].surface =
+                UVec2::new(words.islands.len() as u32 + 1, density.to_bits());
+            words.islands.extend(
+                table.iter().map(|r| r.map_or(UVec4::ZERO, |r| UVec4::new(r.x, r.y, r.w, r.h))),
+            );
+        }
+        let blocks: Vec<_> = (self.instances.par_iter().enumerate())
+            .filter_map(|(index, instance)| {
+                let (first, charts) = self.charts.get(instance.chart as usize)?;
+                let density = scale(instance) / texel;
+                Some(surface::rasterize(charts, *first, index as u32, density, &tables[index]))
+            })
+            .collect();
+        let width = surface::ATLAS_WIDTH as usize;
+        words.texels = vec![UVec4::ZERO; width * height as usize];
+        for (rect, texels) in blocks.into_iter().flatten() {
+            for (row, line) in texels.chunks_exact(rect.w as usize).enumerate() {
+                let at = (rect.y as usize + row) * width + rect.x as usize;
+                words.texels[at..at + line.len()].copy_from_slice(line);
+            }
+        }
+        words
+    }
+
     /// The TLAS and every instance, which are small enough to rewrite whole.
     /// Returns the ranges of `scene_words` written.
-    fn write_top(&mut self) -> [Range<usize>; 2] {
-        let mut instances = self.instances.clone();
+    fn write_top(&mut self) -> [Range<usize>; 3] {
+        // Each glTF instance keeps its load order through the sort.
+        let mut instances: Vec<(u32, Instance)> = (0u32..).zip(self.instances.iter().copied()).collect();
         instances.extend(self.retained.values().map(|blas| {
             let slot = blas.slot.expect("laid out by pack");
             let top = blas.nodes[0];
             // Retained vertices are in world space.
-            Instance {
+            (u32::MAX, Instance {
                 world_from_local: Affine3A::IDENTITY,
                 local_from_world: Affine3A::IDENTITY,
                 min: top.min,
@@ -446,9 +610,11 @@ impl GiScene {
                 count: blas.triangles.len() as u32,
                 flags: FLAG_CULL_BACK,
                 material: self.retained_material,
-            }
+                chart: u32::MAX,
+                surface: UVec2::ZERO,
+            })
         }));
-        let tlas = build_tree(&mut instances, |i| (i.min, i.max));
+        let tlas = build_tree(&mut instances, |(_, i)| (i.min, i.max));
         self.packed.instances = instances.len() as u32;
         let words = &mut self.packed.scene_words;
         words[0].z = instances.len() as u32;
@@ -463,7 +629,7 @@ impl GiScene {
             words[word] = value;
             word += 1;
         };
-        for (index, instance) in instances.iter().enumerate() {
+        for (index, (_, instance)) in instances.iter().enumerate() {
             for transform in [instance.local_from_world, instance.world_from_local] {
                 let rows = Mat4::from(transform).transpose();
                 for row in [rows.x_axis, rows.y_axis, rows.z_axis] {
@@ -472,7 +638,7 @@ impl GiScene {
             }
             // No hardware-opaque hint yet.
             push(UVec4::new(mask, 1, 0, instance.flags));
-            push(UVec4::new(index as u32, 0, 0, instance.material));
+            push(UVec4::new(index as u32, instance.surface.x, instance.surface.y, instance.material));
             push(UVec4::new(
                 self.tlas_room + instance.root,
                 instance.first,
@@ -481,7 +647,17 @@ impl GiScene {
             ));
         }
         let end = base + instances.len() * INSTANCE_WORDS;
-        [0..1 + 2 * tlas.len(), base..end]
+        let slots = mask as usize + 1;
+        let count = self.instances.len().div_ceil(4);
+        for word in &mut words[slots..slots + count] {
+            *word = UVec4::ZERO;
+        }
+        for (index, &(order, _)) in instances.iter().enumerate() {
+            if order != u32::MAX {
+                words[slots + order as usize / 4][order as usize % 4] = index as u32;
+            }
+        }
+        [0..1 + 2 * tlas.len(), base..end, slots..slots + count]
     }
 }
 
@@ -570,144 +746,229 @@ fn bounds_area(min: Vec3, max: Vec3) -> f64 {
 /// capped at 48, bounding traversal's depth-first stacks to 49 pending nodes.
 /// Reorders `elements` so leaves cover contiguous ranges.
 pub fn build_tree<T>(elements: &mut [T], bounds: impl Fn(&T) -> (Vec3, Vec3)) -> Vec<BvhNode> {
+    build_tree_with(elements, bounds, serial_children)
+}
+
+fn build_tree_parallel<T: Send>(
+    elements: &mut [T],
+    bounds: impl Fn(&T) -> (Vec3, Vec3) + Sync,
+) -> Vec<BvhNode> {
+    build_tree_with(elements, bounds, parallel_children)
+}
+
+type Children<T, F> = fn(&mut Vec<BvhNode>, usize, &mut [T], &mut [T], usize, u32, &F);
+
+fn build_tree_with<T, F: Fn(&T) -> (Vec3, Vec3)>(
+    elements: &mut [T],
+    bounds: F,
+    children: Children<T, F>,
+) -> Vec<BvhNode> {
     if elements.is_empty() {
         return Vec::new();
     }
-    fn build<T>(
-        nodes: &mut Vec<BvhNode>,
-        index: usize,
-        elements: &mut [T],
-        first: usize,
-        depth: u32,
-        bounds: &impl Fn(&T) -> (Vec3, Vec3),
-    ) {
-        let (mut min, mut max) = (Vec3::INFINITY, Vec3::NEG_INFINITY);
-        let (mut center_min, mut center_max) = (Vec3::INFINITY, Vec3::NEG_INFINITY);
+    let mut nodes = vec![BvhNode::default()];
+    build(&mut nodes, 0, elements, 0, 0, &bounds, children);
+    nodes
+}
+
+fn build<T, F: Fn(&T) -> (Vec3, Vec3)>(
+    nodes: &mut Vec<BvhNode>,
+    index: usize,
+    elements: &mut [T],
+    first: usize,
+    depth: u32,
+    bounds: &F,
+    descend: Children<T, F>,
+) {
+    let (mut min, mut max) = (Vec3::INFINITY, Vec3::NEG_INFINITY);
+    let (mut center_min, mut center_max) = (Vec3::INFINITY, Vec3::NEG_INFINITY);
+    for element in elements.iter() {
+        let (a, b) = bounds(element);
+        min = min.min(a);
+        max = max.max(b);
+        let center = a * 0.5 + b * 0.5;
+        center_min = center_min.min(center);
+        center_max = center_max.max(center);
+    }
+    nodes[index] = BvhNode {
+        min,
+        max,
+        first: first as u32,
+        count: elements.len() as u32,
+    };
+    if elements.len() <= 4 || depth == 48 {
+        return;
+    }
+    const BINS: usize = 12;
+    #[derive(Clone, Copy)]
+    struct Bin {
+        min: Vec3,
+        max: Vec3,
+        count: usize,
+    }
+    const EMPTY: Bin = Bin {
+        min: Vec3::INFINITY,
+        max: Vec3::NEG_INFINITY,
+        count: 0,
+    };
+    let join = |a: Bin, b: Bin| Bin {
+        min: a.min.min(b.min),
+        max: a.max.max(b.max),
+        count: a.count + b.count,
+    };
+    let cost = |b: Bin| {
+        if b.count == 0 {
+            0.0
+        } else {
+            bounds_area(b.min, b.max) * b.count as f64
+        }
+    };
+    let bin_of = |center: f32, axis: usize, span: f64| {
+        (((f64::from(center) - f64::from(center_min[axis])) / span * BINS as f64) as usize)
+            .min(BINS - 1)
+    };
+    let mut best = (f64::INFINITY, None);
+    for axis in 0..3 {
+        let span = f64::from(center_max[axis]) - f64::from(center_min[axis]);
+        if span <= 0.0 {
+            continue;
+        }
+        let mut bins = [EMPTY; BINS];
         for element in elements.iter() {
             let (a, b) = bounds(element);
-            min = min.min(a);
-            max = max.max(b);
-            let center = a * 0.5 + b * 0.5;
-            center_min = center_min.min(center);
-            center_max = center_max.max(center);
+            let bin = bin_of(a[axis] * 0.5 + b[axis] * 0.5, axis, span);
+            bins[bin] = join(
+                bins[bin],
+                Bin {
+                    min: a,
+                    max: b,
+                    count: 1,
+                },
+            );
         }
-        nodes[index] = BvhNode {
-            min,
-            max,
-            first: first as u32,
-            count: elements.len() as u32,
-        };
-        if elements.len() <= 4 || depth == 48 {
-            return;
+        let mut right = [EMPTY; BINS];
+        let mut sum = EMPTY;
+        for i in (0..BINS).rev() {
+            sum = join(sum, bins[i]);
+            right[i] = sum;
         }
-        const BINS: usize = 12;
-        #[derive(Clone, Copy)]
-        struct Bin {
-            min: Vec3,
-            max: Vec3,
-            count: usize,
-        }
-        const EMPTY: Bin = Bin {
-            min: Vec3::INFINITY,
-            max: Vec3::NEG_INFINITY,
-            count: 0,
-        };
-        let join = |a: Bin, b: Bin| Bin {
-            min: a.min.min(b.min),
-            max: a.max.max(b.max),
-            count: a.count + b.count,
-        };
-        let cost = |b: Bin| {
-            if b.count == 0 {
-                0.0
-            } else {
-                bounds_area(b.min, b.max) * b.count as f64
-            }
-        };
-        let bin_of = |center: f32, axis: usize, span: f64| {
-            (((f64::from(center) - f64::from(center_min[axis])) / span * BINS as f64) as usize)
-                .min(BINS - 1)
-        };
-        let mut best = (f64::INFINITY, None);
-        for axis in 0..3 {
-            let span = f64::from(center_max[axis]) - f64::from(center_min[axis]);
-            if span <= 0.0 {
-                continue;
-            }
-            let mut bins = [EMPTY; BINS];
-            for element in elements.iter() {
-                let (a, b) = bounds(element);
-                let bin = bin_of(a[axis] * 0.5 + b[axis] * 0.5, axis, span);
-                bins[bin] = join(
-                    bins[bin],
-                    Bin {
-                        min: a,
-                        max: b,
-                        count: 1,
-                    },
-                );
-            }
-            let mut right = [EMPTY; BINS];
-            let mut sum = EMPTY;
-            for i in (0..BINS).rev() {
-                sum = join(sum, bins[i]);
-                right[i] = sum;
-            }
-            let mut left = EMPTY;
-            for i in 0..BINS - 1 {
-                left = join(left, bins[i]);
-                let total = cost(left) + cost(right[i + 1]);
-                if left.count > 0 && right[i + 1].count > 0 && total < best.0 {
-                    best = (total, Some((axis, i, span)));
-                }
+        let mut left = EMPTY;
+        for i in 0..BINS - 1 {
+            left = join(left, bins[i]);
+            let total = cost(left) + cost(right[i + 1]);
+            if left.count > 0 && right[i + 1].count > 0 && total < best.0 {
+                best = (total, Some((axis, i, span)));
             }
         }
-        let midpoint = if let (_, Some((axis, last_bin, span))) = best {
-            let (mut left, mut right) = (0, elements.len());
-            while left < right {
-                let (a, b) = bounds(&elements[left]);
-                if bin_of(a[axis] * 0.5 + b[axis] * 0.5, axis, span) <= last_bin {
-                    left += 1;
-                } else {
-                    right -= 1;
-                    elements.swap(left, right);
-                }
-            }
-            left
-        } else {
-            let size = center_max - center_min;
-            let axis = if size.x >= size.y && size.x >= size.z {
-                0
-            } else if size.y >= size.z {
-                1
-            } else {
-                2
-            };
-            let midpoint = elements.len() / 2;
-            elements.select_nth_unstable_by(midpoint, |a, b| {
-                let (a, b) = (bounds(a), bounds(b));
-                (a.0[axis] + a.1[axis]).total_cmp(&(b.0[axis] + b.1[axis]))
-            });
-            midpoint
-        };
-        let children = nodes.len();
-        nodes.extend([BvhNode::default(); 2]);
-        nodes[index].first = children as u32;
-        nodes[index].count = 0;
-        let (left, right) = elements.split_at_mut(midpoint);
-        build(nodes, children, left, first, depth + 1, bounds);
-        build(
-            nodes,
-            children + 1,
-            right,
-            first + midpoint,
-            depth + 1,
-            bounds,
-        );
     }
-    let mut nodes = vec![BvhNode::default()];
-    build(&mut nodes, 0, elements, 0, 0, &bounds);
-    nodes
+    let midpoint = if let (_, Some((axis, last_bin, span))) = best {
+        let (mut left, mut right) = (0, elements.len());
+        while left < right {
+            let (a, b) = bounds(&elements[left]);
+            if bin_of(a[axis] * 0.5 + b[axis] * 0.5, axis, span) <= last_bin {
+                left += 1;
+            } else {
+                right -= 1;
+                elements.swap(left, right);
+            }
+        }
+        left
+    } else {
+        let size = center_max - center_min;
+        let axis = if size.x >= size.y && size.x >= size.z {
+            0
+        } else if size.y >= size.z {
+            1
+        } else {
+            2
+        };
+        let midpoint = elements.len() / 2;
+        elements.select_nth_unstable_by(midpoint, |a, b| {
+            let (a, b) = (bounds(a), bounds(b));
+            (a.0[axis] + a.1[axis]).total_cmp(&(b.0[axis] + b.1[axis]))
+        });
+        midpoint
+    };
+    let children = nodes.len();
+    nodes.extend([BvhNode::default(); 2]);
+    nodes[index].first = children as u32;
+    nodes[index].count = 0;
+    let (left, right) = elements.split_at_mut(midpoint);
+    descend(nodes, children, left, right, first, depth, bounds);
+}
+
+fn parallel_children<T: Send, F: Fn(&T) -> (Vec3, Vec3) + Sync>(
+    nodes: &mut Vec<BvhNode>,
+    children: usize,
+    left: &mut [T],
+    right: &mut [T],
+    first: usize,
+    depth: u32,
+    bounds: &F,
+) {
+    if depth < 3 && left.len() + right.len() >= 250_000 {
+        let subtree = |elements: &mut [T], first| {
+            let mut tree = vec![BvhNode::default()];
+            build(
+                &mut tree,
+                0,
+                elements,
+                first,
+                depth + 1,
+                bounds,
+                parallel_children,
+            );
+            tree
+        };
+        let midpoint = left.len();
+        let (left, right) =
+            rayon::join(|| subtree(left, first), || subtree(right, first + midpoint));
+        for (root, tree) in [(children, left), (children + 1, right)] {
+            let offset = nodes.len() as u32 - 1;
+            for (i, mut node) in tree.into_iter().enumerate() {
+                if node.count == 0 {
+                    node.first += offset;
+                }
+                if i == 0 {
+                    nodes[root] = node;
+                } else {
+                    nodes.push(node);
+                }
+            }
+        }
+    } else {
+        serial_children(nodes, children, left, right, first, depth, bounds);
+    }
+}
+
+fn serial_children<T, F: Fn(&T) -> (Vec3, Vec3)>(
+    nodes: &mut Vec<BvhNode>,
+    children: usize,
+    left: &mut [T],
+    right: &mut [T],
+    first: usize,
+    depth: u32,
+    bounds: &F,
+) {
+    let midpoint = left.len();
+    build(
+        nodes,
+        children,
+        left,
+        first,
+        depth + 1,
+        bounds,
+        serial_children,
+    );
+    build(
+        nodes,
+        children + 1,
+        right,
+        first + midpoint,
+        depth + 1,
+        bounds,
+        serial_children,
+    );
 }
 
 #[cfg(test)]
@@ -1016,7 +1277,12 @@ mod tests {
             let word = gi.scene_words[(base + i * stride) as usize + 6];
             assert_eq!((word.x, word.y), (mask, 1));
         }
-        assert_eq!(mask as usize + 1, gi.scene_words.len());
+        // After the mask, every instance's TLAS slot by load order, each slot once.
+        let slots = &gi.scene_words[mask as usize + 1..];
+        assert_eq!(slots.len(), (count as usize).div_ceil(4));
+        let mut seen: Vec<u32> = (0..count as usize).map(|i| slots[i / 4][i % 4]).collect();
+        seen.sort_unstable();
+        assert_eq!(seen, (0..count).collect::<Vec<_>>());
     }
 
     #[test]
@@ -1037,5 +1303,43 @@ mod tests {
             }
         }
         assert!(covered.iter().all(|&c| c == 1));
+    }
+
+    #[test]
+    fn tree_accepts_thread_local_data() {
+        let value = std::rc::Rc::new(Vec3::ONE);
+        let mut points = [value];
+        let nodes = build_tree(&mut points, |p| (**p, **p));
+        assert_eq!(nodes[0].min, Vec3::ONE);
+    }
+
+    #[test]
+    fn large_tree_reaches_every_element() {
+        let mut points: Vec<Vec3> = (0..1_000_000)
+            .map(|i| Vec3::new((i % 1000) as f32, (i / 1000) as f32, 0.0))
+            .collect();
+        let nodes = build_tree_parallel(&mut points, |&p| (p, p));
+        let mut covered = vec![false; points.len()];
+        let mut visited = vec![false; nodes.len()];
+        let mut pending = vec![0usize];
+        while let Some(i) = pending.pop() {
+            assert!(!std::mem::replace(&mut visited[i], true));
+            let node = nodes[i];
+            if node.count == 0 {
+                let first = node.first as usize;
+                for child in [first, first + 1] {
+                    assert!(nodes[child].min.cmpge(node.min).all());
+                    assert!(nodes[child].max.cmple(node.max).all());
+                    pending.push(child);
+                }
+            } else {
+                for j in node.first as usize..(node.first + node.count) as usize {
+                    assert!(!std::mem::replace(&mut covered[j], true));
+                    assert!(points[j].cmpge(node.min).all() && points[j].cmple(node.max).all());
+                }
+            }
+        }
+        assert!(visited.into_iter().all(|seen| seen));
+        assert!(covered.into_iter().all(|seen| seen));
     }
 }

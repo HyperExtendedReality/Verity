@@ -143,21 +143,21 @@ bool lightHitBoundsIntersectLocalLightDirty(float4 bounds) {
 [ForceInline]
 float4 entryRadianceInterval(Entry entry, uint source) {
     if (source == BACKGROUND_SOURCE) return entry.interval;
-    if (source == EMISSIVE_SOURCE) return entry.emissiveInterval;
+    if (source == EMISSIVE_SOURCE) return 0.0;
     return entry.punctualInterval;
 }
 
 [ForceInline]
 void setEntryRadianceInterval(inout Entry entry, uint source, float4 value) {
     if (source == BACKGROUND_SOURCE) entry.interval = value;
-    else if (source == EMISSIVE_SOURCE) entry.emissiveInterval = value;
+    else if (source == EMISSIVE_SOURCE) {}
     else entry.punctualInterval = value;
 }
 
 [ForceInline]
 void setEntryRadianceMerged(inout Entry entry, uint source, float4 value) {
     if (source == BACKGROUND_SOURCE) entry.merged = value;
-    else if (source == EMISSIVE_SOURCE) entry.emissiveMerged = value;
+    else if (source == EMISSIVE_SOURCE) {}
     else entry.punctualMerged = value;
 }
 
@@ -328,7 +328,7 @@ uint findEntry(int4 key, bool previous = false) {
     uint limit = previous ? min(cacheHistoryQuota(params), count) : count;
     [loop] for (uint visited = 0u; index != EMPTY && visited < limit; ++visited) {
         if (index >= count) return EMPTY;
-        // Hash-chain traversal needs only the link and key, not the 272-byte
+        // Hash-chain traversal needs only the link and key, not the 240-byte
         // radiance record. A conditional aggregate load expands to every field.
         uint next = previous ? previousEntries[index].next : entries[index].next;
         if (next == index) return EMPTY;
@@ -386,6 +386,41 @@ uint findIrradianceProbe(int4 key, bool previous) {
 // repeated per source. Every source keeps its own support, weights and
 // light-hit bounds, accumulated in the same corner order. An inactive source
 // yields analytic zero, float4(0, 0, 0, 1), and touches no bounds.
+
+// A retained entry nothing changed is a stub in `entries`: key, links, counts
+// and padding. Its radiance, bounds and dependencies stay in its history slot,
+// `identity.y - 1`, which commit leaves in place. Fields past the stub come
+// through these.
+uint payloadSlot(uint index) { return entries[index].identity.y; }
+float4 mergedOf(uint index) {
+    uint h = payloadSlot(index);
+    return h != 0u ? previousEntries[h - 1u].merged : entries[index].merged;
+}
+float4 punctualMergedOf(uint index) {
+    uint h = payloadSlot(index);
+    return h != 0u ? previousEntries[h - 1u].punctualMerged : entries[index].punctualMerged;
+}
+DependencyContext mergedDependencyOf(uint index) {
+    uint h = payloadSlot(index);
+    return h != 0u
+        ? storedDependency(previousEntries[h - 1u].mergedDependencyMin, previousEntries[h - 1u].mergedDependencyMax)
+        : storedDependency(entries[index].mergedDependencyMin, entries[index].mergedDependencyMax);
+}
+// The whole entry: a stub's header over its history slot's payload.
+Entry loadEntry(uint index) {
+    uint h = payloadSlot(index);
+    if (h == 0u) return entries[index];
+    Entry entry = previousEntries[h - 1u];
+    entry.key = entries[index].key;
+    entry.next = entries[index].next;
+    entry.valid = entries[index].valid;
+    entry.lastSample = entries[index].lastSample;
+    entry.samples = entries[index].samples;
+    entry.identity = entries[index].identity;
+    entry.padding = entries[index].padding;
+    return entry;
+}
+
 void interpolateMergedChildSources(int3 base, float3 fraction, uint direction,
                                    uint level, uint lod, uint sources,
                                    inout DependencyContext dependency,
@@ -397,8 +432,8 @@ void interpolateMergedChildSources(int3 base, float3 fraction, uint direction,
     uint active = 0u;
     [unroll] for (uint bit = 1u; bit <= PUNCTUAL_SOURCE; bit <<= 1u)
         if ((sources & bit) != 0u && transportSourceActive(params, bit)) active |= bit;
-    float3 backgroundSum = 0.0, emissiveSum = 0.0, punctualSum = 0.0;
-    float backgroundTotal = 0.0, emissiveTotal = 0.0, punctualTotal = 0.0;
+    float3 backgroundSum = 0.0, punctualSum = 0.0;
+    float backgroundTotal = 0.0, punctualTotal = 0.0;
     float potential = 0.0;
     if (active != 0u) {
         [loop] for (uint corner = 0u; corner < 8u; ++corner) {
@@ -413,18 +448,29 @@ void interpolateMergedChildSources(int3 base, float3 fraction, uint direction,
             int4 key = int4(base + int3(bit), int(direction | (level << 12u) | (lod << 18u)));
             uint index = findEntry(key, false);
             if (index == EMPTY) continue;
-            float4 childLightHitBounds = entries[index].boundaryMerged;
+            // One branch picks where this child's payload is, then each field
+            // is read once.
+            uint h = payloadSlot(index);
+            bool punctualActive = (active & PUNCTUAL_SOURCE) != 0u;
+            float4 childLightHitBounds, childMerged, childPunctual = 0.0;
+            if (h != 0u) {
+                childLightHitBounds = previousEntries[h - 1u].boundaryMerged;
+                childMerged = previousEntries[h - 1u].merged;
+                if (punctualActive) childPunctual = previousEntries[h - 1u].punctualMerged;
+            } else {
+                childLightHitBounds = entries[index].boundaryMerged;
+                childMerged = entries[index].merged;
+                if (punctualActive) childPunctual = entries[index].punctualMerged;
+            }
             bool supported = false;
             // The sources usually accumulate the same corners, so their
             // bounds stay bit-identical. Reuse a union already computed from
             // an identical accumulator this corner instead of repeating it.
             float4 backgroundBefore = backgroundBounds;
-            float4 emissiveBefore = emissiveBounds;
             bool backgroundUnited = false;
-            bool emissiveUnited = false;
             // RGB is conditional per source; support stays independent until packing.
             if ((active & BACKGROUND_SOURCE) != 0u) {
-                float4 sample = entries[index].merged;
+                float4 sample = childMerged;
                 if (sample.w > 0.0 && all(isfinite(sample))) {
                     float supportedWeight = weight * saturate(sample.w);
                     backgroundSum += sample.xyz * supportedWeight;
@@ -434,45 +480,28 @@ void interpolateMergedChildSources(int3 base, float3 fraction, uint direction,
                     supported = true;
                 }
             }
-            if ((active & EMISSIVE_SOURCE) != 0u) {
-                float4 sample = entries[index].emissiveMerged;
-                if (sample.w > 0.0 && all(isfinite(sample))) {
-                    float supportedWeight = weight * saturate(sample.w);
-                    emissiveSum += sample.xyz * supportedWeight;
-                    emissiveTotal += supportedWeight;
-                    emissiveBounds = backgroundUnited && sameBits(emissiveBounds, backgroundBefore)
-                        ? backgroundBounds
-                        : unionConservativeSpheres(emissiveBounds, childLightHitBounds);
-                    emissiveUnited = true;
-                    supported = true;
-                }
-            }
-            if ((active & PUNCTUAL_SOURCE) != 0u) {
-                float4 sample = entries[index].punctualMerged;
+            if (punctualActive) {
+                float4 sample = childPunctual;
                 if (sample.w > 0.0 && all(isfinite(sample))) {
                     float supportedWeight = weight * saturate(sample.w);
                     punctualSum += sample.xyz * supportedWeight;
                     punctualTotal += supportedWeight;
                     punctualBounds = backgroundUnited && sameBits(punctualBounds, backgroundBefore)
                         ? backgroundBounds
-                        : emissiveUnited && sameBits(punctualBounds, emissiveBefore)
-                            ? emissiveBounds
-                            : unionConservativeSpheres(punctualBounds, childLightHitBounds);
+                        : unionConservativeSpheres(punctualBounds, childLightHitBounds);
                     supported = true;
                 }
             }
             // Dependency union is an order-independent box union.
             if (supported)
-                dependencyUnion(dependency, storedDependency(
-                    entries[index].mergedDependencyMin, entries[index].mergedDependencyMax));
+                dependencyUnion(dependency, mergedDependencyOf(index));
         }
     }
     background = (active & BACKGROUND_SOURCE) == 0u ? float4(0.0, 0.0, 0.0, 1.0)
         : (backgroundTotal > 0.0 ? float4(backgroundSum / backgroundTotal,
             saturate(backgroundTotal / max(potential, 1e-8))) : 0.0);
-    emissive = (active & EMISSIVE_SOURCE) == 0u ? float4(0.0, 0.0, 0.0, 1.0)
-        : (emissiveTotal > 0.0 ? float4(emissiveSum / emissiveTotal,
-            saturate(emissiveTotal / max(potential, 1e-8))) : 0.0);
+    // Entries hold no emissive radiance: an active emissive source has no support.
+    emissive = (active & EMISSIVE_SOURCE) == 0u ? float4(0.0, 0.0, 0.0, 1.0) : 0.0;
     punctual = (active & PUNCTUAL_SOURCE) == 0u ? float4(0.0, 0.0, 0.0, 1.0)
         : (punctualTotal > 0.0 ? float4(punctualSum / punctualTotal,
             saturate(punctualTotal / max(potential, 1e-8))) : 0.0);
@@ -571,7 +600,7 @@ void clear(uint3 thread : SV_DispatchThreadID) {
 }
 
 // Descriptors are read for these fields only, until a deposit replaces the whole
-// entry. Writing all 272 bytes of two variants and four levels per grid cell made
+// entry. Writing all 240 bytes of two variants and four levels per grid cell made
 // seeding bandwidth bound.
 void storeDescriptor(uint index, int4 key, float4 origin, uint valid, uint next,
                      uint traced, uint initialized) {
@@ -756,7 +785,7 @@ void seed(uint3 thread : SV_DispatchThreadID) {
     if (any(thread.xy >= params.size.xy)) return;
     uint sample = thread.x + thread.y * params.size.x;
     // Every descriptor is written exactly once, either with its seeded entry
-    // or zero. Entries are 272 bytes, so clearing and then overwriting them
+    // or zero. Entries are 240 bytes, so clearing and then overwriting them
     // doubled this bandwidth-bound pass.
     float3 surfacePosition, geometricNormal;
     if (!splitSampleSurface(thread.xy, surfacePosition, geometricNormal)) {
@@ -1009,6 +1038,16 @@ void retain(uint3 thread : SV_DispatchThreadID) {
     uint capacity = currentCapacity();
     uint bucketQuota = cacheHistoryQuota(params);
     uint bucketBase = thread.x * bucketQuota;
+    // The history slots commitCache gives this bucket.
+    uint commitQuota = min(bucketQuota, 4u);
+    uint commitBase = thread.x * commitQuota;
+    // No geometry or light changed: every test below passes on the header
+    // alone, and an entry in range becomes a stub without loading its payload.
+    bool quiet = params.dirtyMin.w <= 0.0
+        && (params.sourceHistory.y & (BACKGROUND_SOURCE | PUNCTUAL_SOURCE)) == 0u
+        && (params.sourceHistory.z & 10u) == 0u;
+    bool punctualActive = transportSourceActive(params, PUNCTUAL_SOURCE);
+    uint valid = params.frame.x | 0x80000000u;
     uint bucketRetained = 0;
     uint bucketLoad = 0;
     uint previousCount, previousStride;
@@ -1019,10 +1058,26 @@ void retain(uint3 thread : SV_DispatchThreadID) {
         if (next == index) break;
         bucketLoad++;
         if (!intervalHistoryAlive(previousEntries[index].lastSample, params)) continue;
+        // Without point lights retain clears their fields, which commit already did.
+        if (quiet && index - commitBase < commitQuota
+            && (punctualActive
+                || (all(asuint(previousEntries[index].punctualInterval) == 0u)
+                    && all(asuint(previousEntries[index].punctualMerged) == asuint(float4(0.0, 0.0, 0.0, 1.0)))))) {
+            uint slot = capacity + bucketBase + bucketRetained++;
+            entries[slot].key = previousEntries[index].key;
+            entries[slot].next = heads[thread.x].exchange(slot);
+            entries[slot].valid = valid;
+            entries[slot].lastSample = previousEntries[index].lastSample;
+            entries[slot].samples = 0u;
+            entries[slot].identity = uint2(previousEntries[index].samples, index + 1u);
+            entries[slot].padding = previousEntries[index].padding;
+            continue;
+        }
         DependencyContext dependency = storedDependency(
             previousEntries[index].dependencyMin, previousEntries[index].dependencyMax);
         if (!betaHistoryEligible(dependency, previousEntries[index].normal)) continue;
         Entry entry = previousEntries[index];
+        Entry stored = entry;
         if (!backgroundMotionHistoryAlive(entry.lastSample)
             || !radianceHistoryEligible(entryDependency(entry),
                 entry.boundaryInterval, BACKGROUND_SOURCE))
@@ -1031,17 +1086,6 @@ void retain(uint3 thread : SV_DispatchThreadID) {
             || !radianceHistoryEligible(entryMergedDependency(entry),
                 entry.boundaryMerged, BACKGROUND_SOURCE))
             entry.merged = 0.0;
-        if (!transportSourceActive(params, EMISSIVE_SOURCE)) {
-            entry.emissiveInterval = 0.0;
-            entry.emissiveMerged = float4(0.0, 0.0, 0.0, 1.0);
-        } else {
-            if (!radianceHistoryEligible(entryDependency(entry),
-                    entry.boundaryInterval, EMISSIVE_SOURCE))
-                entry.emissiveInterval = 0.0;
-            if (!radianceHistoryEligible(entryMergedDependency(entry),
-                    entry.boundaryMerged, EMISSIVE_SOURCE))
-                entry.emissiveMerged = 0.0;
-        }
         if (!transportSourceActive(params, PUNCTUAL_SOURCE)) {
             entry.punctualInterval = 0.0;
             entry.punctualMerged = float4(0.0, 0.0, 0.0, 1.0);
@@ -1054,12 +1098,30 @@ void retain(uint3 thread : SV_DispatchThreadID) {
                 entry.punctualMerged = 0.0;
         }
         uint slot = capacity + bucketBase + bucketRetained++;
+        // An entry nothing changes is written as a stub over its history slot,
+        // which commit then keeps; it must be a slot commit gives this bucket.
+        bool same = all(asuint(entry.interval) == asuint(stored.interval))
+            && all(asuint(entry.merged) == asuint(stored.merged))
+            && all(asuint(entry.punctualInterval) == asuint(stored.punctualInterval))
+            && all(asuint(entry.punctualMerged) == asuint(stored.punctualMerged))
+            && index - commitBase < commitQuota;
+        uint link = heads[thread.x].exchange(slot);
         // `samples` holds accumulated mass here; reduce restores it if merge skips.
-        entry.identity.x = entry.samples;
-        entry.samples = 0;
-        entry.valid = params.frame.x | 0x80000000u;
-        entry.next = heads[thread.x].exchange(slot);
-        entries[slot] = entry;
+        if (same) {
+            entries[slot].key = entry.key;
+            entries[slot].next = link;
+            entries[slot].valid = valid;
+            entries[slot].lastSample = entry.lastSample;
+            entries[slot].samples = 0u;
+            entries[slot].identity = uint2(entry.samples, index + 1u);
+            entries[slot].padding = entry.padding;
+        } else {
+            entry.identity = uint2(entry.samples, 0u);
+            entry.samples = 0;
+            entry.valid = valid;
+            entry.next = link;
+            entries[slot] = entry;
+        }
     }
     // The loop visits at most bucketQuota entries, so every eligible entry fits.
     // Aggregate the diagnostic rather than contending on it for each entry.
@@ -1088,10 +1150,6 @@ void deposit(uint first, float3 samplePosition, float3 rayOrigin,
             * spacing(params, level, lod), 1.0);
         entry.interval = float4(terminates ? radiance.background : 0.0,
             terminates ? 0.0 : 1.0);
-        entry.emissiveInterval = float4(
-            terminates && transportSourceActive(params, EMISSIVE_SOURCE)
-                ? radiance.emissive : 0.0,
-            transportSourceActive(params, EMISSIVE_SOURCE) ? 1.0 : 0.0);
         entry.punctualInterval = float4(
             terminates && transportSourceActive(params, PUNCTUAL_SOURCE)
                 ? radiance.punctual : 0.0,
@@ -1198,6 +1256,13 @@ bool loadDeferredSlot(uint slot, out float3 surfacePosition, out float3 rayOrigi
     return heads[word + 31u].load() == deferredSlotTag();
 }
 
+// Where a ray's hits start reading the surface cache: the start of cascade
+// params.surface.z's interval, or never.
+float surfaceCacheDistance(uint lod) {
+    return params.surface.x != 0u && params.surface.z < CASCADES
+        ? splitIntervalStart(params.surface.z, lod) : 1e30;
+}
+
 // Hit shading, optional secondary seeding, and interval deposition for one
 // traced receiver variant. Shared by the immediate and deferred traces.
 void finishTransportVariant(uint2 pixel, uint first, uint lod, float3 surfacePosition,
@@ -1206,6 +1271,7 @@ void finishTransportVariant(uint2 pixel, uint first, uint lod, float3 surfacePos
                             float dependencyDistance, float dependencyPadding) {
     DependencyContext outgoingDependency = dependencyEmpty();
     bool radianceSupported;
+    surfaceFarDistance = surfaceCacheDistance(lod);
     TransportRadiance radiance = outgoingTransportRadianceTracked(rayOrigin,
         direction, hit, radianceSupported, outgoingDependency,
         mergeVisibilityAdmissionLimit());
@@ -1319,6 +1385,11 @@ void traceRecord(uint3 thread : SV_DispatchThreadID) {
         visibilityMode = VISIBILITY_RECORD;
         visibilitySlot = slot;
         visibilityQueries = 0u;
+        // Replay (traceResolve) shades with this LOD's distance too, so both
+        // passes issue the same visibility queries.
+        uint2 pixel = ticketPixel(ticket);
+        uint first = probeDescriptorIndex(pixel.x + pixel.y * params.size.x, variant, 0u);
+        surfaceFarDistance = surfaceCacheDistance((uint(entries[first].key.w) & PROBE_LOD) >> 18u);
         bool recordedSupported;
         DependencyContext recordedDependency = dependencyEmpty();
         outgoingTransportRadianceTracked(rayOrigin, direction, hit, recordedSupported,
@@ -1398,7 +1469,7 @@ void traceResolve(uint3 thread : SV_DispatchThreadID) {
 }
 
 // Reduce leaves one canonical entry per key, and only those merge. Listing them
-// here spares merge a scan of the whole 272-byte-strided pool for every level.
+// here spares merge a scan of the whole 240-byte-strided pool for every level.
 void queueMerge(uint index, uint level) {
     uint words, stride;
     mergeList.GetDimensions(words, stride);
@@ -1409,11 +1480,14 @@ void queueMerge(uint index, uint level) {
 }
 
 // An entry with no new sample only picks up what changed in farther cascades, so
-// a quarter of them refresh each frame. Changes to light or geometry refresh all.
+// a quarter of them refresh each frame; one out of view (no sample for a while),
+// a sixteenth, staying ready for the camera to turn back. Changes to light or
+// geometry refresh all.
 bool retainedMergeDue(Entry entry) {
+    uint period = params.frame.x - entry.lastSample <= 8u ? 3u : 15u;
     return params.sourceHistory.y != 0u || params.dirtyMin.w > 0.0
         || !(entry.merged.w > 0.0)
-        || ((hashKey(entry.key, 4u) + params.frame.x) & 3u) == 0u;
+        || ((hashKey(entry.key, 16u) + params.frame.x) & period) == 0u;
 }
 
 [shader("compute")]
@@ -1424,13 +1498,10 @@ void reduce(uint3 thread : SV_DispatchThreadID) {
     uint source = gpuSortLinkedList(heads[bucket].load());
     uint unique = EMPTY;
     [loop] while (source != EMPTY) {
-        Entry firstEntry = entries[source];
-        int4 key = firstEntry.key;
+        int4 key = entries[source].key;
         uint cursor = source;
         uint freshCount = 0u;
         float4 intervalSum = 0.0;
-        float3 emissiveSum = 0.0;
-        float emissiveCount = 0.0;
         float3 punctualSum = 0.0;
         float punctualCount = 0.0;
         DependencyContext freshDependency = dependencyEmpty();
@@ -1438,16 +1509,12 @@ void reduce(uint3 thread : SV_DispatchThreadID) {
         float4 freshBetaSegmentSphere = emptyLightHitBounds();
         uint retainedIndex = EMPTY;
         [loop] while (cursor != EMPTY && all(entries[cursor].key == key)) {
-            Entry sample = entries[cursor];
-            uint next = sample.next;
-            if (sample.samples > 0u) {
+            uint next = entries[cursor].next;
+            // Only fresh samples carry a payload here; retained stubs do not.
+            if (entries[cursor].samples > 0u) {
+                Entry sample = entries[cursor];
                 intervalSum += sample.interval * float(sample.samples);
                 freshCount += sample.samples;
-                float sampleEmissiveCount = max(sample.emissiveInterval.w, 0.0);
-                if (isfinite(sampleEmissiveCount) && sampleEmissiveCount > 0.0) {
-                    emissiveSum += sample.emissiveInterval.xyz * sampleEmissiveCount;
-                    emissiveCount += sampleEmissiveCount;
-                }
                 float samplePunctualCount = max(sample.punctualInterval.w, 0.0);
                 if (isfinite(samplePunctualCount) && samplePunctualCount > 0.0) {
                     punctualSum += sample.punctualInterval.xyz * samplePunctualCount;
@@ -1459,7 +1526,7 @@ void reduce(uint3 thread : SV_DispatchThreadID) {
                 freshBetaSegmentSphere = unionConservativeSpheres(
                     freshBetaSegmentSphere, sample.normal);
             } else if (retainedIndex == EMPTY
-                       && sample.valid == (params.frame.x | 0x80000000u)) {
+                       && entries[cursor].valid == (params.frame.x | 0x80000000u)) {
                 retainedIndex = cursor;
             }
             if (cursor != source) entries[cursor].valid = 0u;
@@ -1467,10 +1534,11 @@ void reduce(uint3 thread : SV_DispatchThreadID) {
         }
         uint nextGroup = cursor;
         if (freshCount > 0u) {
-            Entry aggregate = firstEntry;
+            // Every payload field is set below, so a stub first in line is fine.
+            Entry aggregate = (Entry)0;
+            aggregate.identity.x = entries[source].identity.x;
+            aggregate.padding = entries[source].padding;
             aggregate.interval = intervalSum / float(freshCount);
-            aggregate.emissiveInterval = emissiveCount > 0.0
-                ? float4(emissiveSum / emissiveCount, emissiveCount) : 0.0;
             aggregate.punctualInterval = punctualCount > 0.0
                 ? float4(punctualSum / punctualCount, punctualCount) : 0.0;
             aggregate.key = key;
@@ -1482,8 +1550,8 @@ void reduce(uint3 thread : SV_DispatchThreadID) {
             aggregate.valid = params.frame.x | 0x80000000u;
             aggregate.lastSample = params.frame.x;
             aggregate.merged = 0.0;
-            aggregate.emissiveMerged = 0.0;
             aggregate.punctualMerged = 0.0;
+            aggregate.identity.y = 0u;
             aggregate.next = unique;
             storeEntryDependency(aggregate, freshDependency);
             storeEntryMergedDependency(aggregate, dependencyUnknown());
@@ -1495,15 +1563,32 @@ void reduce(uint3 thread : SV_DispatchThreadID) {
             queueMerge(source, level);
         } else if (retainedIndex != EMPTY) {
             // The walk only cleared this slot's valid word, which is rewritten below.
-            Entry retained = entries[retainedIndex];
+            // A stub moves as its header; merge loads its payload if it is due.
+            bool stub = payloadSlot(retainedIndex) != 0u;
+            Entry retained = stub ? (Entry)0 : entries[retainedIndex];
+            retained.key = key;
+            retained.lastSample = entries[retainedIndex].lastSample;
+            retained.identity = entries[retainedIndex].identity;
+            retained.padding = entries[retainedIndex].padding;
+            retained.merged = mergedOf(retainedIndex);
             retained.next = unique;
             retained.valid = params.frame.x | 0x80000000u;
             bool alive = intervalHistoryAlive(retained.lastSample, params);
             bool due = alive && retainedMergeDue(retained);
             retained.samples = alive && !due ? retained.identity.x : 0u;
-            entries[source] = retained;
+            if (!stub) {
+                entries[source] = retained;
+            } else {
+                entries[source].key = key;
+                entries[source].next = retained.next;
+                entries[source].valid = retained.valid;
+                entries[source].lastSample = retained.lastSample;
+                entries[source].samples = retained.samples;
+                entries[source].identity = retained.identity;
+                entries[source].padding = retained.padding;
+            }
             unique = source;
-            if (due) queueMerge(source, (uint(retained.key.w) >> 12u) & 3u);
+            if (due) queueMerge(source, (uint(key.w) >> 12u) & 3u);
         } else {
             entries[source].valid = 0u;
         }
@@ -1660,9 +1745,11 @@ void mergeRadianceGroups(inout Entry entry, uint level, float transmittance,
 
 void mergeEntry(uint index) {
     uint level = params.frame.y;
-    Entry entry = entries[index];
+    if (((uint(entries[index].key.w) >> 12u) & 3u) != level) return;
+    // Merged, it is written whole and is no longer a stub.
+    Entry entry = loadEntry(index);
+    entry.identity.y = 0u;
     int4 key = entry.key;
-    if (((uint(key.w) >> 12u) & 3u) != level) return;
 
     float samples = float(entry.samples);
     float radianceBlend = min(saturate(params.history.x), 0.999);
@@ -1853,11 +1940,9 @@ void packProbes(uint3 groupId : SV_GroupID, uint lane : SV_GroupIndex) {
             int4 directionKey = int4(packProbeKey.xyz, int(lane | lodBits));
             source = findEntry(directionKey, false);
             if (source != EMPTY) {
-                background = entries[source].merged;
-                if (transportSourceActive(params, EMISSIVE_SOURCE))
-                    emissive = entries[source].emissiveMerged;
+                background = mergedOf(source);
                 if (transportSourceActive(params, PUNCTUAL_SOURCE))
-                    punctual = entries[source].punctualMerged;
+                    punctual = punctualMergedOf(source);
             }
         }
         // Validate once per direction, not once per output texel. Unsupported
@@ -1939,7 +2024,7 @@ void packProbes(uint3 groupId : SV_GroupID, uint lane : SV_GroupIndex) {
                 supported = supported || packProbePunctual[direction].w > 0.0;
             if (supported)
                 dependencyUnion(packedDependency,
-                    entryMergedDependency(entries[source]));
+                    mergedDependencyOf(source));
         }
         storeProbeDependency(directionalProbes[output], packedDependency);
         if (params.environmentScale.z > 0.5) {
@@ -1962,11 +2047,10 @@ void commitCache(uint3 thread : SV_DispatchThreadID) {
     [unroll] for (uint slot = 0; slot < 4; ++slot) selected[slot] = EMPTY;
     uint source = heads[bucket].load();
     [loop] while (source != EMPTY) {
-        Entry entry = entries[source];
-        uint next = entry.next;
+        uint next = entries[source].next;
         bool eligible = params.history.w > 0.0
-            && entry.valid == (params.frame.x | 0x80000000u)
-            && intervalHistoryAlive(entry.lastSample, params);
+            && entries[source].valid == (params.frame.x | 0x80000000u)
+            && intervalHistoryAlive(entries[source].lastSample, params);
         entries[source].padding.x = EMPTY;
         if (eligible) {
             // Reduction sorts by key, not age. Retaining its first keys can
@@ -1985,16 +2069,42 @@ void commitCache(uint3 thread : SV_DispatchThreadID) {
         }
         source = next;
     }
+    // An entry retain and reduce left as it was keeps its history slot, and
+    // only its links are rewritten; the rest take the bucket's free slots.
+    uint place[4];
+    uint used = 0u;
+    [unroll] for (uint r = 0; r < 4; ++r) {
+        place[r] = EMPTY;
+        if (r >= quota || selected[r] == EMPTY) continue;
+        uint at = entries[selected[r]].identity.y - 1u - base;
+        if (entries[selected[r]].identity.y != 0u && at < quota && (used & (1u << at)) == 0u) {
+            place[r] = base + at;
+            used |= 1u << at;
+        }
+    }
     uint output = EMPTY;
     [loop] for (uint retained = 0; retained < quota; ++retained) {
         source = selected[retained];
         if (source == EMPTY) break;
-        uint slot = base + retained;
-        Entry entry = entries[source];
-        entry.next = output;
-        entry.padding.x = slot | (params.intervalHistory.y > 0.5 ? 0x80000000u : 0u);
-        previousEntries[slot] = entry;
-        entries[source].padding.x = entry.padding.x;
+        uint slot = place[retained];
+        bool kept = slot != EMPTY;
+        if (!kept) {
+            uint free = firstbitlow(~used);
+            used |= 1u << free;
+            slot = base + free;
+        }
+        uint remap = slot | (params.intervalHistory.y > 0.5 ? 0x80000000u : 0u);
+        if (kept) {
+            previousEntries[slot].next = output;
+            previousEntries[slot].valid = entries[source].valid;
+            previousEntries[slot].padding.x = remap;
+        } else {
+            Entry entry = entries[source];
+            entry.next = output;
+            entry.padding.x = remap;
+            previousEntries[slot] = entry;
+        }
+        entries[source].padding.x = remap;
         output = slot;
     }
     // After commit this head array addresses the retained history entries.

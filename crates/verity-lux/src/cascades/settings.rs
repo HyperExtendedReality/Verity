@@ -7,7 +7,7 @@ use bytemuck::{Pod, Zeroable};
 /// Cascade levels; mirrors the shaders.
 pub const LEVELS: usize = 4;
 /// Bytes per interval cache entry.
-pub const ENTRY_SIZE: u64 = 272;
+pub const ENTRY_SIZE: u64 = 240;
 /// Bytes per directional irradiance probe record.
 pub const PROBE_SIZE: u64 = 1792;
 pub const CACHE_WORK_GROUPS: u64 = 2;
@@ -56,6 +56,31 @@ pub struct Settings {
     pub emissive_samples: u32,
     /// Carry light past the first bounce, through last frame's probes.
     pub multi_bounce: bool,
+    /// Cache outgoing light on the scene's surfaces, in islands of nearly flat
+    /// triangles packed into an atlas, and let ray hits read it: multi-bounce
+    /// light then stays on the surface it belongs to instead of leaking through
+    /// walls from world probes. Blended and double-sided surfaces stay out.
+    pub surface_cache: bool,
+    /// The cache's texel size in metres. It grows when the atlas would pass
+    /// two million texels.
+    pub surface_texel: f32,
+    /// Texels shaded per frame, each with direct light and bounce rays.
+    pub surface_updates: u32,
+    /// Bounce rays per texel update, at most 8.
+    pub surface_bounce_rays: u32,
+    /// With software tracing, bounce rays stop after this many metres, and
+    /// those that reach no surface leave the texel's mean. A few rays across
+    /// the whole scene otherwise set the update's time. Zero: no limit.
+    /// Hardware rays always go on.
+    pub surface_software_reach: f32,
+    /// Hits in this cascade and beyond take their whole outgoing light from
+    /// the cache instead of shading direct light; [`LEVELS`] keeps every hit
+    /// shaded and uses the cache for further bounces only.
+    pub surface_from_level: u32,
+    /// Trace with hardware ray queries where the GPU has them; off, rays walk
+    /// the GI scene's own tree. Changing it recompiles the passes, and GI shows
+    /// the hemisphere until they are ready, as when it starts.
+    pub hardware_rays: bool,
 }
 
 impl Default for Settings {
@@ -76,6 +101,13 @@ impl Default for Settings {
             spatial_filter_steps: 3,
             emissive_samples: 16,
             multi_bounce: true,
+            surface_cache: true,
+            surface_texel: 0.3,
+            surface_updates: 32_768,
+            surface_bounce_rays: 2,
+            surface_software_reach: 0.0,
+            surface_from_level: 3,
+            hardware_rays: true,
         }
     }
 }
@@ -99,8 +131,14 @@ impl Settings {
     /// place of the uncapped default. On Sponza a coarser grid and half-size
     /// resolve lost nothing, and what they save buys a cache that keeps probes:
     /// against a path-traced reference, a smaller one is what costs accuracy.
+    /// Half-metre probes, with intervals scaled to match, keep the update budget
+    /// from spreading thin: in Sponza's courtyard they took the error from 0.30
+    /// to 0.26 and the frame from 9.9 ms to 4.9 ms (quarter-metre ones suit the
+    /// uncapped default).
     pub fn budgeted() -> Self {
         Self {
+            probe_spacing: 0.5,
+            interval_length: 0.8,
             sampling: Sampling {
                 grid_divisor: 4,
                 resolve_scale: 2,
@@ -168,6 +206,10 @@ pub struct Parameters {
     pub light_dirty_min: [f32; 4],
     pub light_dirty_max: [f32; 4],
     pub ray_traced: [u32; 4],
+    /// Surface cache: texels (0 = off), texels updated per frame, the first
+    /// cascade whose hits read the cache instead of shading, bounce rays per
+    /// texel (bits 0-7) and software reach in centimetres (bits 8-31).
+    pub surface: [u32; 4],
 }
 
 pub fn probe_directory_capacity(samples: u64) -> u64 {
@@ -363,8 +405,8 @@ mod tests {
 
     #[test]
     fn parameters_match_the_shader_block() {
-        // 4 matrices and 28 vec4s, no padding.
-        assert_eq!(std::mem::size_of::<Parameters>(), 4 * 64 + 28 * 16);
+        // 4 matrices and 29 vec4s, no padding.
+        assert_eq!(std::mem::size_of::<Parameters>(), 4 * 64 + 29 * 16);
     }
 
     #[test]

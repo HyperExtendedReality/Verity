@@ -416,14 +416,16 @@ impl ScreenVoxel {
             )
         };
         let (rgba, r) = (vk::Format::R16G16B16A16_SFLOAT, vk::Format::R32_SFLOAT);
+        // Everything bound at `out1` is rg32f: depth images carry a packed normal.
+        let rg = vk::Format::R32G32_SFLOAT;
         let trace_image = image("voxel gi trace", rgba, trace)?;
         let accum = [
             image("voxel gi accum", rgba, trace)?,
             image("voxel gi accum", rgba, trace)?,
         ];
         let accum_depth = [
-            image("voxel gi depth", r, trace)?,
-            image("voxel gi depth", r, trace)?,
+            image("voxel gi depth", rg, trace)?,
+            image("voxel gi depth", rg, trace)?,
         ];
         let moments = [
             image("voxel gi moments", rgba, trace)?,
@@ -435,8 +437,8 @@ impl ScreenVoxel {
             image("voxel gi filtered", rgba, trace)?,
         ];
         let filtered_variance = [
-            image("voxel gi variance", r, trace)?,
-            image("voxel gi variance", r, trace)?,
+            image("voxel gi variance", rg, trace)?,
+            image("voxel gi variance", rg, trace)?,
         ];
         let prev_color = image("voxel gi previous color", rgba, extent)?;
 
@@ -578,7 +580,7 @@ impl ScreenVoxel {
                         &s.filtered[i],
                         &s.filtered_variance[i],
                         &s.moments[prev],
-                        &s.accum_depth[prev],
+                        &s.variance,
                     ],
                 )
             };
@@ -592,9 +594,9 @@ impl ScreenVoxel {
                     ],
                     [
                         &s.trace,
-                        &s.variance,
-                        &s.filtered[0],
                         &s.filtered_variance[0],
+                        &s.filtered[0],
+                        &s.variance,
                     ],
                 ),
                 io(
@@ -619,9 +621,9 @@ impl ScreenVoxel {
                     [&s.trace, &s.trace, &s.trace, &s.trace],
                     [
                         &s.trace,
-                        &s.variance,
-                        &s.filtered[1],
                         &s.filtered_variance[1],
+                        &s.filtered[1],
+                        &s.variance,
                     ],
                 ),
             ];

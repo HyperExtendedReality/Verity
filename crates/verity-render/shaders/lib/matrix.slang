@@ -24,70 +24,6 @@ static const float IMPOSTER_MAX_LOD = 3.0;
 static const float IMPOSTER_PIXELS = 64.0;
 static const float IMPOSTER_FADE_PIXELS = 80.0;
 
-struct MatrixInstance {
-    Instance base;
-    float4x4 inverse;
-    /// World-space bounds: center, radius.
-    float4 sphere;
-    /// x: asset, y: 1 when two-sided, z: largest axis scale as float bits.
-    uint4 info;
-};
-
-struct MatrixAsset {
-    /// Object-space bounds: center, radius.
-    float4 sphere;
-    uint first_root;
-    uint root_count;
-    /// The imposter's bindless textures, or NO_TEXTURE.
-    uint imposter_albedo;
-    uint imposter_surface;
-    uint first_cluster;
-    uint cluster_count;
-    uint2 padding;
-};
-
-struct MatrixNode {
-    float4 sphere;
-    float error;
-    uint group;
-    uint first_child;
-    uint child_count;
-};
-
-struct MatrixGroup {
-    float4 sphere;
-    float error;
-    uint first_cluster;
-    uint cluster_count;
-    uint padding;
-};
-
-struct MatrixCluster {
-    float4 sphere;
-    uint refined;
-    uint first_index;
-    uint triangle_count;
-    uint first_brick;
-    uint brick_count;
-    uint depth;
-    uint2 padding;
-};
-
-struct MatrixBrick {
-    float3 origin;
-    float voxel_size;
-    uint2 mask;
-    uint first_voxel;
-    uint padding;
-};
-
-[[vk::binding(19)]] StructuredBuffer<MatrixInstance> matrix_instances;
-[[vk::binding(20)]] StructuredBuffer<MatrixAsset> matrix_assets;
-[[vk::binding(23)]] StructuredBuffer<MatrixCluster> matrix_clusters;
-[[vk::binding(24)]] StructuredBuffer<uint> matrix_indices;
-[[vk::binding(25)]] StructuredBuffer<MatrixBrick> matrix_bricks;
-[[vk::binding(26)]] StructuredBuffer<uint2> matrix_voxels;
-
 float matrix_pixels(MatrixInstance instance) {
     float distance = length(instance.sphere.xyz - globals.eye.xyz);
     return instance.sphere.w * abs(globals.projection.y) * globals.viewport.w
@@ -96,7 +32,7 @@ float matrix_pixels(MatrixInstance instance) {
 
 /// How far an instance has dissolved into its imposter, 0 to 1.
 float imposter_fade(MatrixInstance instance) {
-    if (matrix_assets[instance.info.x].imposter_albedo == NO_TEXTURE)
+    if (globals.matrix_assets[instance.info.x].imposter_albedo == NO_TEXTURE)
         return 0.0;
     return saturate((IMPOSTER_FADE_PIXELS - matrix_pixels(instance)) / (IMPOSTER_FADE_PIXELS - IMPOSTER_PIXELS));
 }
@@ -109,7 +45,7 @@ bool imposter_pixel(float2 pixel, float fade) {
 }
 
 Vertex matrix_vertex(MatrixInstance instance, uint first_index, uint corner) {
-    return vertices[matrix_indices[first_index + corner] + instance.base.draw.y];
+    return globals.vertices[globals.matrix_indices[first_index + corner] + instance.base.draw.y];
 }
 
 bool brick_solid(MatrixBrick brick, uint bit) {

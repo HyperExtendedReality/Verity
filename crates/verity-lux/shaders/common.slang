@@ -57,6 +57,7 @@ struct Parameters {
     float4 lightDirtyMin; // finite punctual-light influence union; w > 0 marks local change
     float4 lightDirtyMax;
     uint4 rayTraced;      // multi-bounce, spatial samples, reservoir history, previous frame ray traced (history valid)
+    uint4 surface;        // surface cache texels (0 = off), texels updated per frame, first cascade read from the cache, bounce rays per texel (bits 0-7) and software bounce reach in cm (8-31, 0 = none)
 };
 
 [ForceInline]
@@ -111,13 +112,15 @@ struct Light { float4 position, color, direction, edge1, edge2; uint4 source; };
 
 // One bounded node per ray/cascade, rather than a worst-case directional atlas.
 // Full keys are compared, so hash collisions never blend unrelated probes.
+// The emissive source has no fields: Verity's materials do not emit, so it is
+// never active, and entries carry only what the passes move.
 struct Entry {
     int4 key;
     float4 interval; // J.rgb, beta (paper Eq. 6)
     float4 merged;   // I.rgb, valid
     float4 origin;   // canonical world-grid center.xyz, retained transmittance sample count.w
     uint next, valid, lastSample, samples;
-    uint2 identity; // reserved; probe identity is the world-grid key
+    uint2 identity; // x: retained sample mass; y: unchanged history slot + 1 (see commitCache)
     uint2 padding; // x: selected-descriptor / retained-cache remap; y: visible-init marker
     // Primary interval segment sphere (center.xyz, radius.w); zero/malformed is unknown.
     float4 normal;
@@ -129,9 +132,7 @@ struct Entry {
     float4 dependencyMax; // xyz: union maximum, w: 1 when the measured union is nonempty
     float4 mergedDependencyMin; // Full I includes child/visibility dependencies.
     float4 mergedDependencyMax;
-    float4 emissiveInterval; // J.rgb, independent radiance mass.w
     float4 punctualInterval; // J.rgb, independent radiance mass.w
-    float4 emissiveMerged; // conditional I.rgb, independent support.w
     float4 punctualMerged; // conditional I.rgb, independent support.w
 };
 
@@ -505,6 +506,11 @@ uint traceSamplesHead(Parameters p) {
 // Mirrors DEFERRED_TRACE_* in render.rs.
 static const uint DEFERRED_TRACE_RECEIVERS = 8192u;
 static const uint DEFERRED_VISIBILITY_QUERIES = 4u; // per receiver variant
+// Set while surfaceUpdate shades a texel: outgoing light leaves self-emission out.
+static bool surfaceShading = false;
+// Hits at least this far along a transport ray take their light from the
+// surface cache instead of shading; set per ray from params.surface.z.
+static float surfaceFarDistance = 1e30;
 static const uint DEFERRED_SLOT_WORDS = 32u;
 static const uint DEFERRED_QUERY_WORDS = 12u;
 uint deferredTraceCapacity(Parameters p) {

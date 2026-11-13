@@ -20,6 +20,7 @@ gltf = { version = "1.4.1", default-features = false, features = ["KHR_lights_pu
 ktx2 = "0.5"
 ruzstd = "0.8"
 basis-universal = "0.3"
+memmap2 = "0.9"
 rayon = "1"
 
 [build-dependencies]

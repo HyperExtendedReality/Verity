@@ -3,7 +3,8 @@
 //! Each frame a compute pass bins point lights into view-space clusters, a
 //! raster pass writes depth and (instance, triangle) IDs, a compute resolve
 //! rebuilds every pixel's surface from its triangle and shades it with
-//! multiple-scattering GGX and Hammon diffuse into an HDR target, and a
+//! multiple-scattering GGX and energy-preserving Oren–Nayar (EON) diffuse into
+//! an HDR target, and a
 //! composite pass tonemaps into the swapchain beneath egui. Two frames are in
 //! flight. Shaders live in `shaders/` as Slang; `shaders/lib` is the shared
 //! engine library other crates' passes include.
@@ -19,16 +20,20 @@ mod embedded;
 mod retained;
 mod gpu_culling;
 mod meshlets;
+mod profiler;
 mod scene;
 mod upload;
+mod virtual_texture;
 
 pub use asset::{Sun, TextureFormat};
 pub use matrix::MatrixStats;
 pub use extension::{FrameContext, Gpu, RenderExtension, RetainedChange, Targets};
 pub use embedded::{Dent, EmbeddedInstanceId, EmbeddedModel, EmbeddedModelId, MAX_DENTS};
 pub use retained::RetainedMesh;
-pub use scene::{Camera, DeformingMesh, GpuMaterial, Vertex, UP};
+pub use scene::{entity_matrix, Camera, DeformingMesh, GpuMaterial, Vertex, UP};
 pub use upload::SceneStats;
+pub use virtual_texture::{TerrainLayer, TerrainRole, TerrainTextureStats, TERRAIN_ROLES};
+pub use profiler::GPU_STAGE_NAMES;
 
 use ash::{vk, Entry};
 use gpu::{Buffer, Image};
@@ -42,6 +47,7 @@ use std::{
     ffi::{CStr, CString},
     io, mem,
     sync::Arc,
+    time::{Duration, Instant},
 };
 use verity_core::{Material, PointLight, Scene, Transform, World};
 use winit::window::Window;
@@ -72,7 +78,11 @@ macro_rules! spirv {
 }
 
 pub mod breaker;
+mod clouds;
 mod matrix;
+mod taa;
+
+pub use taa::AntiAliasing;
 
 /// Tessellated UI and the physical-pixel scene viewport within the swapchain.
 pub struct UiFrame {
@@ -80,6 +90,31 @@ pub struct UiFrame {
     pub textures_delta: egui::TexturesDelta,
     pub pixels_per_point: f32,
     pub viewport: [u32; 4],
+}
+
+/// CPU time spent in the renderer. GPU work runs asynchronously and is not
+/// measured by these stages.
+pub const RENDER_STAGE_NAMES: [&str; 16] = [
+    "Swapchain setup", "Wait for frame", "Acquire image", "Prepare and upload",
+    "Record geometry uploads", "Record scene", "Record GI", "Record water",
+    "Record composite and UI", "Submit", "Present", "  Scene setup and light bins",
+    "  Shadows", "  Depth and occlusion", "  Visibility", "  Resolve",
+];
+
+#[derive(Clone, Copy, Default)]
+pub struct RenderProfile {
+    pub stages: [Duration; RENDER_STAGE_NAMES.len()],
+    pub gpu_ms: Option<[f32; GPU_STAGE_NAMES.len()]>,
+}
+
+impl RenderProfile {
+    fn mark(&mut self, start: &mut Option<Instant>, stage: usize) {
+        if let Some(previous) = start {
+            let now = Instant::now();
+            self.stages[stage] = now.duration_since(*previous);
+            *previous = now;
+        }
+    }
 }
 
 enum RenderInput<'a> {
@@ -117,6 +152,15 @@ impl RenderInput<'_> {
     }
 }
 
+/// Back-face culling for one-sided materials; none for two-sided ones.
+pub(crate) fn cull_sides(two_sided: bool) -> vk::CullModeFlags {
+    if two_sided {
+        vk::CullModeFlags::NONE
+    } else {
+        vk::CullModeFlags::BACK
+    }
+}
+
 fn failure(message: impl Into<String>) -> Box<dyn Error> {
     Box::new(io::Error::other(message.into()))
 }
@@ -138,6 +182,14 @@ fn append_lod_range(
     Some((first, count))
 }
 
+/// One draw's visible meshlet runs, and the primitive and placement they
+/// were culled for.
+#[derive(Default)]
+struct MeshletRuns {
+    draw: Option<(usize, [[f32; 4]; 4])>,
+    runs: Vec<(u32, u32)>,
+}
+
 /// Per-frame CPU-written data and the commands that read it.
 #[derive(Default)]
 struct Frame {
@@ -146,14 +198,22 @@ struct Frame {
     acquired: vk::Semaphore,
     set: vk::DescriptorSet,
     globals: Buffer,
-    instances: Buffer,
+    /// Instances, lights, instance motion and last frame's deforming vertex
+    /// positions, reached through the pointers in `globals`.
+    arena: gpu::FrameArena,
     indices: Buffer,
-    lights: Buffer,
+    /// The `model_indices_key` whose model prefix `indices` already holds.
+    indices_prefix: Option<(u64, bool)>,
     materials: Buffer,
     /// This frame's deforming vertices, on their way into `Renderer::vertices`.
     deforming: Buffer,
     /// New retained vertices, on their way into `Renderer::vertices`.
     retained: Buffer,
+    /// Terrain layer page table, the pages the resolve wanted, and new pages
+    /// on their way to the atlases (see `virtual_texture.rs`).
+    layer_table: Buffer,
+    layer_feedback: Buffer,
+    layer_staging: Buffer,
     /// egui textures to free once this frame's fence signals.
     frees: Vec<egui::TextureId>,
 }
@@ -171,6 +231,10 @@ struct Swapchain {
     srgb: bool,
     depth: Option<Image>,
     visibility: Option<Image>,
+    /// 4x MSAA visibility and depth, resolved from sample 0 into the two
+    /// above; only while an MSAA mode is chosen.
+    visibility_msaa: Option<Image>,
+    depth_msaa: Option<Image>,
     hdr: Option<Image>,
     gbuffer: Option<Image>,
     receiver: Option<Image>,
@@ -199,6 +263,12 @@ struct DeviceChoice {
 
 /// Owns all Vulkan resources and the window for the lifetime of its surface.
 pub struct Renderer {
+    profiling: bool,
+    render_profile: Option<RenderProfile>,
+    gpu_timer: Option<profiler::GpuTimer>,
+    gpu_timer_attempted: bool,
+    /// CPU recording time of `record_scene`'s sub-stages (render stages 11..16).
+    scene_stages: [Duration; 5],
     _entry: Entry,
     instance: ash::Instance,
     surface_loader: ash::khr::surface::Instance,
@@ -218,11 +288,11 @@ pub struct Renderer {
     descriptor_pool: vk::DescriptorPool,
     cluster_pipeline: vk::Pipeline,
     visibility_pipeline: vk::Pipeline,
-    /// Same as `visibility_pipeline` without back-face culling.
-    visibility_two_sided: vk::Pipeline,
     depth_prepass: vk::Pipeline,
-    depth_prepass_two_sided: vk::Pipeline,
     resolve_pipeline: vk::Pipeline,
+    /// Null when the GPU cannot multisample the visibility pass.
+    visibility_msaa_pipeline: vk::Pipeline,
+    resolve_msaa_pipeline: vk::Pipeline,
     /// Built for the swapchain format, so rebuilt when that changes.
     composite_pipeline: vk::Pipeline,
     composite_format: vk::Format,
@@ -252,7 +322,20 @@ pub struct Renderer {
     primitive_meshlets: Vec<Option<Vec<meshlets::Meshlet>>>,
     /// Original indices remain available for exact fallback.
     source_indices: Vec<u32>,
+    /// Starts with the model draws' indices, built once per `model_indices_key`
+    /// and kept across frames; each frame appends its own after them.
     frame_indices: Vec<u32>,
+    /// Each model draw's range in `frame_indices`, or `None` when not drawn.
+    model_index_ranges: Vec<Option<(u32, u32)>>,
+    model_indices_len: usize,
+    /// The `model_generation` and Matrix state the model prefix was built for.
+    model_indices_key: Option<(u64, bool)>,
+    /// Changes whenever model draws or primitives do.
+    model_generation: u64,
+    /// What the shadow maps were last drawn from, and whether this frame
+    /// must draw them again.
+    shadow_key: Vec<u8>,
+    shadows_stale: bool,
     /// Meshes drawn as set by `set_deforming_meshes`, and the space reserved
     /// for their vertices at `deforming_base` of the shared vertex buffer.
     deforming: Vec<DeformingMesh>,
@@ -263,6 +346,7 @@ pub struct Renderer {
     clear_color: [f32; 4],
     shadow_distance: f32,
     embedded: Option<embedded::Embedded>,
+    terrain_layers: Option<virtual_texture::TerrainLayers>,
     /// This frame's embedded draws, in draw order.
     embedded_bounds: Vec<(glam::Vec3, glam::Vec3)>,
     matrix: matrix::Matrix,
@@ -285,6 +369,14 @@ pub struct Renderer {
     frame_number: u64,
     extension: Option<Box<dyn RenderExtension>>,
     breakers: breaker::BreakerPass,
+    clouds: clouds::CloudPass,
+    taa: taa::TaaPass,
+    anti_aliasing: AntiAliasing,
+    sharpening: f32,
+    /// Sunlight let through the clouds, sampled by the resolve.
+    cloud_shadow: Option<gpu::Image>,
+    /// This frame's cloud layer, from the scene's lighting.
+    frame_clouds: Option<verity_core::Clouds>,
     requested_size: (u32, u32),
     recreate: bool,
     /// Present as fast as frames finish instead of waiting for vsync.
@@ -294,6 +386,17 @@ pub struct Renderer {
     ui_format: Option<vk::Format>,
     pending_textures: Vec<egui::TexturesDelta>,
     instance_data: Vec<scene::Instance>,
+    /// Last frame's model and base vertex per draw index (`Instance::draw[3]`).
+    previous_models: std::collections::HashMap<u32, (glam::Mat4, u32)>,
+    /// This frame's `Frame::instance_motion`, in `instance_data` order.
+    motion_data: Vec<InstanceMotion>,
+    /// Each deforming mesh's vertex positions last frame, by slot.
+    previous_deforming: Vec<Vec<[f32; 4]>>,
+    /// This frame's `Frame::previous_positions`.
+    previous_positions: Vec<[f32; 4]>,
+    /// Deforming instances: their index in `instance_data` and first vertex
+    /// in `previous_positions`.
+    deforming_motion: Vec<(usize, u32)>,
     light_data: Vec<scene::Light>,
     material_data: Vec<scene::GpuMaterial>,
     /// Index count, two-sidedness, and primitive index for each instance.
@@ -301,6 +404,10 @@ pub struct Renderer {
     shadow_calls: Vec<(u32, u32)>,
     culler: Option<gpu_culling::Culler>,
     culling_ranges: Vec<Option<(usize, usize)>>,
+    /// Each draw's meshlet runs that pass the frustum, for the camera and
+    /// models in `meshlet_runs_key`; a draw keeps its runs while it stays put.
+    meshlet_runs: Vec<MeshletRuns>,
+    meshlet_runs_key: Option<(glam::Mat4, u64, bool)>,
     culling_active: bool,
     hiz_active: bool,
     depth_sampled: bool,
@@ -401,14 +508,19 @@ impl Renderer {
                 cluster_pipeline: vk::Pipeline::null(),
                 visibility_pipeline: vk::Pipeline::null(),
                 depth_prepass: vk::Pipeline::null(),
-                depth_prepass_two_sided: vk::Pipeline::null(),
-                visibility_two_sided: vk::Pipeline::null(),
                 resolve_pipeline: vk::Pipeline::null(),
+                visibility_msaa_pipeline: vk::Pipeline::null(),
+                resolve_msaa_pipeline: vk::Pipeline::null(),
                 composite_pipeline: vk::Pipeline::null(),
                 composite_format: vk::Format::UNDEFINED,
                 command_pool: vk::CommandPool::null(),
                 frames: Vec::new(),
                 frame: 0,
+                profiling: false,
+                render_profile: None,
+                gpu_timer: None,
+                gpu_timer_attempted: false,
+                scene_stages: [Duration::ZERO; 5],
                 clusters: Buffer::default(),
                 vertices: Buffer::default(),
                 brdf_lut: Buffer::default(),
@@ -429,6 +541,12 @@ impl Renderer {
                 primitive_meshlets: Vec::new(),
                 source_indices: Vec::new(),
                 frame_indices: Vec::new(),
+                model_index_ranges: Vec::new(),
+                model_indices_len: 0,
+                model_indices_key: None,
+                model_generation: 0,
+                shadow_key: Vec::new(),
+                shadows_stale: true,
                 deforming: Vec::new(),
                 deforming_vertices: Vec::new(),
                 deforming_base: 0,
@@ -437,6 +555,7 @@ impl Renderer {
                 clear_color: CLEAR_COLOR,
                 shadow_distance: scene::SHADOW_DISTANCE,
                 embedded: None,
+                terrain_layers: None,
                 embedded_bounds: Vec::new(),
                 matrix: Default::default(),
                 matrix_enabled: false,
@@ -455,6 +574,12 @@ impl Renderer {
                 frame_number: 0,
                 extension: None,
                 breakers: breaker::BreakerPass::default(),
+                clouds: clouds::CloudPass::default(),
+                taa: taa::TaaPass::default(),
+                anti_aliasing: AntiAliasing::default(),
+                sharpening: 0.5,
+                cloud_shadow: None,
+                frame_clouds: None,
                 requested_size: (size.width, size.height),
                 recreate: true,
                 uncapped: false,
@@ -462,12 +587,19 @@ impl Renderer {
                 ui_format: None,
                 pending_textures: Vec::new(),
                 instance_data: Vec::new(),
+                previous_models: Default::default(),
+                motion_data: Vec::new(),
+                previous_deforming: Vec::new(),
+                previous_positions: Vec::new(),
+                deforming_motion: Vec::new(),
                 light_data: Vec::new(),
                 material_data: Vec::new(),
                 draw_calls: Vec::new(),
                 shadow_calls: Vec::new(),
                 culler: None,
                 culling_ranges: Vec::new(),
+                meshlet_runs: Vec::new(),
+                meshlet_runs_key: None,
                 hiz_active: false,
                 depth_sampled: false,
                 culling_active: false,
@@ -499,7 +631,7 @@ impl Renderer {
             device: device.clone(),
             physical_device: self.physical,
             debug_settings: AllocatorDebugSettings::default(),
-            buffer_device_address: self.ray_query,
+            buffer_device_address: true,
             allocation_sizes: AllocationSizes::default(),
         })?);
 
@@ -527,7 +659,7 @@ impl Renderer {
             D::SAMPLED_IMAGE,
             D::SAMPLER,
             D::SAMPLED_IMAGE,
-            // Matrix: see `matrix.rs`.
+            // Matrix (freed below).
             D::STORAGE_BUFFER,
             D::STORAGE_BUFFER,
             D::STORAGE_BUFFER,
@@ -539,7 +671,22 @@ impl Renderer {
             D::STORAGE_BUFFER,
             D::STORAGE_BUFFER,
             D::STORAGE_BUFFER,
+            // Terrain layers: page table, then feedback.
+            D::STORAGE_BUFFER,
+            D::STORAGE_BUFFER,
+            // Cloud shadows: see `clouds.rs`.
+            D::SAMPLED_IMAGE,
+            // Scene depth, for `taa.rs`.
+            D::SAMPLED_IMAGE,
+            // Every visibility sample, for the MSAA resolve; unwritten without MSAA.
+            D::SAMPLED_IMAGE,
         ];
+        // Instances, lights, vertices, indices and Matrix's buffers: now
+        // pointers in `Globals`. Their slots stay empty so no other binding renumbers.
+        let freed = |i: usize| matches!(i, 1 | 2 | 4 | 5 | 19..=29);
+        let slots: Vec<_> = (kinds.iter().copied().enumerate())
+            .filter(|&(i, _)| !freed(i))
+            .collect();
         let textures_binding = 12;
         let count = |i: usize| {
             if i == textures_binding {
@@ -548,10 +695,9 @@ impl Renderer {
                 1
             }
         };
-        let bindings: Vec<_> = kinds
+        let bindings: Vec<_> = slots
             .iter()
-            .enumerate()
-            .map(|(i, &kind)| {
+            .map(|&(i, kind)| {
                 vk::DescriptorSetLayoutBinding::default()
                     .binding(i as u32)
                     .descriptor_type(kind)
@@ -560,8 +706,9 @@ impl Renderer {
             })
             .collect();
         // Texture slots past the loaded ones stay unwritten.
-        let flags: Vec<_> = (0..kinds.len())
-            .map(|i| {
+        let flags: Vec<_> = slots
+            .iter()
+            .map(|&(i, _)| {
                 if i == textures_binding {
                     vk::DescriptorBindingFlags::PARTIALLY_BOUND
                 } else {
@@ -601,9 +748,9 @@ impl Renderer {
             D::SAMPLER,
         ]
         .map(|ty| {
-            let per_set: u32 = (0..kinds.len())
-                .filter(|&i| kinds[i] == ty)
-                .map(count)
+            let per_set: u32 = (slots.iter())
+                .filter(|&&(_, kind)| kind == ty)
+                .map(|&(i, _)| count(i))
                 .sum();
             vk::DescriptorPoolSize::default()
                 .ty(ty)
@@ -631,11 +778,28 @@ impl Renderer {
             spirv!("resolve.resolveMain"),
             c"resolveMain",
         )?;
-        for (pipeline, cull) in [
-            (&mut self.visibility_pipeline, vk::CullModeFlags::BACK),
-            (&mut self.visibility_two_sided, vk::CullModeFlags::NONE),
-        ] {
-            *pipeline = gpu::graphics_pipeline(
+        // Cull mode is dynamic: `cull_sides` sets it per draw.
+        self.visibility_pipeline = gpu::graphics_pipeline(
+            device,
+            layout,
+            &gpu::Raster {
+                vertex: spirv!("visibility.vertexMain"),
+                fragment: spirv!("visibility.fragmentMain"),
+                color: Some(VISIBILITY_FORMAT),
+                depth: Some((self.depth_format, vk::CompareOp::GREATER)),
+                cull: None,
+                depth_bias: None,
+            },
+        )?;
+        if let Some(samples) = self.msaa_samples() {
+            self.resolve_msaa_pipeline = gpu::compute_pipeline(
+                device,
+                vk::PipelineCache::null(),
+                layout,
+                spirv!("resolve.resolveMsaaMain"),
+                c"resolveMsaaMain",
+            )?;
+            self.visibility_msaa_pipeline = gpu::graphics_pipeline_samples(
                 device,
                 layout,
                 &gpu::Raster {
@@ -643,28 +807,24 @@ impl Renderer {
                     fragment: spirv!("visibility.fragmentMain"),
                     color: Some(VISIBILITY_FORMAT),
                     depth: Some((self.depth_format, vk::CompareOp::GREATER)),
-                    cull,
+                    cull: None,
                     depth_bias: None,
                 },
+                samples,
             )?;
         }
-        for (pipeline, cull) in [
-            (&mut self.depth_prepass, vk::CullModeFlags::BACK),
-            (&mut self.depth_prepass_two_sided, vk::CullModeFlags::NONE),
-        ] {
-            *pipeline = gpu::graphics_pipeline(
-                device,
-                layout,
-                &gpu::Raster {
-                    vertex: spirv!("visibility.vertexMain"),
-                    fragment: spirv!("depth_prepass.fragmentMain"),
-                    color: None,
-                    depth: Some((self.depth_format, vk::CompareOp::GREATER)),
-                    cull,
-                    depth_bias: None,
-                },
-            )?;
-        }
+        self.depth_prepass = gpu::graphics_pipeline(
+            device,
+            layout,
+            &gpu::Raster {
+                vertex: spirv!("visibility.vertexMain"),
+                fragment: spirv!("depth_prepass.fragmentMain"),
+                color: None,
+                depth: Some((self.depth_format, vk::CompareOp::GREATER)),
+                cull: None,
+                depth_bias: None,
+            },
+        )?;
         let mut sampler = vk::SamplerCreateInfo::default()
             .mag_filter(vk::Filter::LINEAR)
             .min_filter(vk::Filter::LINEAR)
@@ -711,6 +871,10 @@ impl Renderer {
             (scene::MAX_POINT_SHADOWS * scene::POINT_SHADOW_FACES) as u32,
         )?;
         self.point_shadow_map = Some(point_shadow_map);
+        self.cloud_shadow = Some(clouds::create_shadow_map(
+            device,
+            self.allocator.as_mut().unwrap(),
+        )?);
         self.point_shadow_layers = point_shadow_layers;
         self.shadow_pipeline = gpu::graphics_pipeline(
             device,
@@ -721,7 +885,7 @@ impl Renderer {
                 color: None,
                 depth: Some((self.depth_format, vk::CompareOp::LESS)),
                 // Both faces cast: thin and double-sided geometry stays opaque to the sun.
-                cull: vk::CullModeFlags::NONE,
+                cull: Some(vk::CullModeFlags::NONE),
                 depth_bias: Some((1.25, 1.75)),
             },
         )?;
@@ -744,6 +908,7 @@ impl Renderer {
                 .set_layouts(&[self.set_layout; FRAMES]),
         )?;
 
+        let msaa_samples = self.msaa_samples();
         let allocator = self.allocator.as_mut().unwrap();
         let storage = vk::BufferUsageFlags::STORAGE_BUFFER;
         let lut = scene::brdf_lut();
@@ -790,27 +955,11 @@ impl Renderer {
                 vk::BufferUsageFlags::UNIFORM_BUFFER,
                 MemoryLocation::CpuToGpu,
             )?;
-            frame.instances = gpu::create_buffer(
-                device,
-                allocator,
-                "instances",
-                64 * mem::size_of::<scene::Instance>() as u64,
-                storage,
-                MemoryLocation::CpuToGpu,
-            )?;
             frame.indices = gpu::create_buffer(
                 device,
                 allocator,
                 "frame indices",
                 16,
-                storage,
-                MemoryLocation::CpuToGpu,
-            )?;
-            frame.lights = gpu::create_buffer(
-                device,
-                allocator,
-                "lights",
-                64 * mem::size_of::<scene::Light>() as u64,
                 storage,
                 MemoryLocation::CpuToGpu,
             )?;
@@ -822,8 +971,24 @@ impl Renderer {
                 storage,
                 MemoryLocation::CpuToGpu,
             )?;
+            // A zero layer count turns layered terrain off until layers are set.
+            for (buffer, name, location) in [
+                (
+                    &mut frame.layer_table,
+                    "terrain layer table",
+                    MemoryLocation::CpuToGpu,
+                ),
+                (
+                    &mut frame.layer_feedback,
+                    "terrain layer feedback",
+                    MemoryLocation::GpuToCpu,
+                ),
+            ] {
+                *buffer = gpu::create_buffer(device, allocator, name, 16, storage, location)?;
+                buffer.write(&[0; 16]);
+            }
         }
-        self.matrix = matrix::Matrix::new(device, allocator, layout, self.depth_format)?;
+        self.matrix = matrix::Matrix::new(device, allocator, layout, self.depth_format, msaa_samples)?;
         // Appending the cube also writes every frame's buffer descriptors.
         let (vertices, indices) = scene::cube();
         self.append_geometry(&vertices, &indices)?;
@@ -857,6 +1022,11 @@ impl Renderer {
             [vk::DescriptorImageInfo::default()
                 .image_view(map.view)
                 .image_layout(vk::ImageLayout::DEPTH_READ_ONLY_OPTIMAL)]
+        });
+        let cloud_shadow = self.cloud_shadow.as_ref().map(|map| {
+            [vk::DescriptorImageInfo::default()
+                .image_view(map.view)
+                .image_layout(vk::ImageLayout::GENERAL)]
         });
         let images: Vec<_> = self
             .textures
@@ -896,6 +1066,15 @@ impl Renderer {
                         .dst_binding(18)
                         .descriptor_type(vk::DescriptorType::SAMPLED_IMAGE)
                         .image_info(point_shadow_map),
+                );
+            }
+            if let Some(cloud_shadow) = &cloud_shadow {
+                writes.push(
+                    vk::WriteDescriptorSet::default()
+                        .dst_set(frame.set)
+                        .dst_binding(32)
+                        .descriptor_type(vk::DescriptorType::SAMPLED_IMAGE)
+                        .image_info(cloud_shadow),
                 );
             }
             if !images.is_empty() {
@@ -1058,6 +1237,18 @@ impl Renderer {
         self.uncapped = uncapped;
     }
 
+    /// Choose how the scene is anti-aliased; [`AntiAliasing::Desktop`] by default.
+    pub fn set_anti_aliasing(&mut self, mode: AntiAliasing) {
+        // The multisampled targets come and go with the swapchain's.
+        self.recreate |= mode.msaa() != self.anti_aliasing.msaa();
+        self.anti_aliasing = mode;
+    }
+
+    /// How much temporal anti-aliasing sharpens, from 0 (off) to 1; 0.5 by default.
+    pub fn set_sharpening(&mut self, amount: f32) {
+        self.sharpening = amount.clamp(0.0, 1.0);
+    }
+
     /// Color visible surfaces by the LOD actually selected for that frame.
     pub fn set_matrix_debug(&mut self, enabled: bool) {
         self.matrix_debug = enabled;
@@ -1066,22 +1257,14 @@ impl Renderer {
     /// Point a frame's descriptor set at its buffers and the shared ones.
     unsafe fn write_buffer_descriptors(&self, index: usize) {
         let frame = &self.frames[index];
-        let buffers = [
-            &frame.globals,
-            &frame.instances,
-            &frame.lights,
-            &self.clusters,
-            &self.vertices,
-            &frame.indices,
-            &self.brdf_lut,
+        let mut infos: Vec<(u32, [vk::DescriptorBufferInfo; 1])> = vec![
+            (0, [frame.globals.info()]),
+            (3, [self.clusters.info()]),
+            (6, [self.brdf_lut.info()]),
+            (10, [frame.materials.info()]),
         ];
-        let mut infos: Vec<(u32, [vk::DescriptorBufferInfo; 1])> = buffers
-            .iter()
-            .enumerate()
-            .map(|(binding, b)| (binding as u32, [b.info()]))
-            .collect();
-        infos.push((10, [frame.materials.info()]));
-        infos.extend(self.matrix.buffers().map(|(binding, b)| (binding, [b.info()])));
+        infos.push((30, [frame.layer_table.info()]));
+        infos.push((31, [frame.layer_feedback.info()]));
         let writes: Vec<_> = infos
             .iter()
             .map(|(binding, info)| {
@@ -1100,14 +1283,27 @@ impl Renderer {
         self.device.update_descriptor_sets(&writes, &[]);
     }
 
+    /// 4x, when the GPU can render the visibility pass multisampled and
+    /// sample the integer IDs back.
+    fn msaa_samples(&self) -> Option<vk::SampleCountFlags> {
+        let samples = vk::SampleCountFlags::TYPE_4;
+        let limits = unsafe { self.instance.get_physical_device_properties(self.physical) }.limits;
+        (limits.framebuffer_color_sample_counts
+            & limits.framebuffer_depth_sample_counts
+            & limits.sampled_image_integer_sample_counts)
+            .contains(samples)
+            .then_some(samples)
+    }
+
     /// Point every frame's set at the current render targets.
     unsafe fn write_image_descriptors(&self) {
-        let (Some(visibility), Some(hdr), Some(gbuffer), Some(receiver), Some(motion)) = (
+        let (Some(visibility), Some(hdr), Some(gbuffer), Some(receiver), Some(motion), Some(depth)) = (
             &self.swap.visibility,
             &self.swap.hdr,
             &self.swap.gbuffer,
             &self.swap.receiver,
             &self.swap.motion,
+            &self.swap.depth,
         ) else {
             return;
         };
@@ -1141,14 +1337,25 @@ impl Renderer {
             storage(13, gbuffer.view),
             storage(14, receiver.view),
             storage(15, motion.view),
+            (
+                33,
+                vk::DescriptorType::SAMPLED_IMAGE,
+                depth.view,
+                vk::ImageLayout::DEPTH_READ_ONLY_OPTIMAL,
+            ),
         ];
         let infos = images.map(|(_, _, view, layout)| {
             [vk::DescriptorImageInfo::default()
                 .image_view(view)
                 .image_layout(layout)]
         });
+        let samples = self.swap.visibility_msaa.as_ref().map(|image| {
+            [vk::DescriptorImageInfo::default()
+                .image_view(image.view)
+                .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)]
+        });
         for frame in &self.frames {
-            let writes: Vec<_> = images
+            let mut writes: Vec<_> = images
                 .iter()
                 .zip(&infos)
                 .map(|(&(binding, kind, _, _), info)| {
@@ -1159,6 +1366,15 @@ impl Renderer {
                         .image_info(info)
                 })
                 .collect();
+            if let Some(info) = &samples {
+                writes.push(
+                    vk::WriteDescriptorSet::default()
+                        .dst_set(frame.set)
+                        .dst_binding(34)
+                        .descriptor_type(vk::DescriptorType::SAMPLED_IMAGE)
+                        .image_info(info),
+                );
+            }
             self.device.update_descriptor_sets(&writes, &[]);
         }
     }
@@ -1169,6 +1385,8 @@ impl Renderer {
         for image in [
             self.swap.depth.take(),
             self.swap.visibility.take(),
+            self.swap.visibility_msaa.take(),
+            self.swap.depth_msaa.take(),
             self.swap.hdr.take(),
             self.swap.gbuffer.take(),
             self.swap.receiver.take(),
@@ -1315,6 +1533,7 @@ impl Renderer {
                 .rendered
                 .push(device.create_semaphore(&vk::SemaphoreCreateInfo::default(), None)?);
         }
+        let msaa_samples = self.msaa_samples().filter(|_| self.anti_aliasing.msaa());
         let allocator = self.allocator.as_mut().unwrap();
         use vk::ImageUsageFlags as U;
         self.swap.depth = Some(gpu::create_image(
@@ -1337,6 +1556,28 @@ impl Renderer {
             U::COLOR_ATTACHMENT | U::SAMPLED,
             vk::ImageAspectFlags::COLOR,
         )?);
+        if let Some(samples) = msaa_samples {
+            self.swap.visibility_msaa = Some(gpu::create_multisampled_image(
+                device,
+                allocator,
+                "visibility msaa",
+                VISIBILITY_FORMAT,
+                extent,
+                samples,
+                U::COLOR_ATTACHMENT | U::SAMPLED,
+                vk::ImageAspectFlags::COLOR,
+            )?);
+            self.swap.depth_msaa = Some(gpu::create_multisampled_image(
+                device,
+                allocator,
+                "depth msaa",
+                self.depth_format,
+                extent,
+                samples,
+                U::DEPTH_STENCIL_ATTACHMENT,
+                vk::ImageAspectFlags::DEPTH,
+            )?);
+        }
         self.swap.hdr = Some(gpu::create_image(
             device,
             allocator,
@@ -1384,7 +1625,7 @@ impl Renderer {
                     fragment: spirv!("composite.fragmentMain"),
                     color: Some(chosen),
                     depth: None,
-                    cull: vk::CullModeFlags::NONE,
+                    cull: Some(vk::CullModeFlags::NONE),
                     depth_bias: None,
                 },
             )?;
@@ -1456,7 +1697,30 @@ impl Renderer {
         self.draw_inner(RenderInput::Scene(scene), Some(frame))
     }
 
+    /// Enable CPU stage timing for subsequent frames.
+    pub fn set_profiling(&mut self, enabled: bool) {
+        self.profiling = enabled;
+        if !enabled {
+            self.render_profile = None;
+        }
+    }
+
+    /// CPU timings for the last completed profiled frame.
+    pub fn profile(&self) -> Option<RenderProfile> {
+        self.render_profile
+    }
+
+    /// Close GPU stage `i - 1` when profiling with a working timer.
+    unsafe fn gpu_stamp(&self, cmd: vk::CommandBuffer, i: u32) {
+        if let Some(timer) = self.gpu_timer.as_ref().filter(|_| self.profiling) {
+            timer.stamp(&self.device, cmd, self.frame, i);
+        }
+    }
+
     fn draw_inner(&mut self, scene: RenderInput<'_>, ui: Option<UiFrame>) -> Result<()> {
+        let mut profile = RenderProfile::default();
+        let mut timing = self.profiling.then(Instant::now);
+        self.render_profile = None;
         if scene.lights().len() + self.scene_lights.len() > MAX_LIGHTS {
             return Err(failure(format!(
                 "renderer supports at most {MAX_LIGHTS} point lights"
@@ -1472,6 +1736,7 @@ impl Renderer {
             if self.swap.swapchain == vk::SwapchainKHR::null() {
                 return Ok(());
             }
+            profile.mark(&mut timing, 0);
             let device = &self.device;
             let frame_index = self.frame;
             let frame = &mut self.frames[frame_index];
@@ -1479,6 +1744,16 @@ impl Renderer {
             for id in frame.frees.drain(..) {
                 self.ui_renderer.as_mut().unwrap().free_texture(id)?;
             }
+            if self.profiling && !self.gpu_timer_attempted {
+                self.gpu_timer_attempted = true;
+                self.gpu_timer =
+                    profiler::GpuTimer::new(&self.instance, device, self.physical, self.queue_family);
+            }
+            if let Some(timer) = &mut self.gpu_timer {
+                timer.poll(device, frame_index);
+                profile.gpu_ms = timer.times;
+            }
+            profile.mark(&mut timing, 1);
             let (image, suboptimal) = match self.swap_loader.acquire_next_image(
                 self.swap.swapchain,
                 u64::MAX,
@@ -1492,6 +1767,7 @@ impl Renderer {
                 }
                 Err(e) => return Err(e.into()),
             };
+            profile.mark(&mut timing, 2);
 
             self.update_textures(ui.is_some())?;
             let extent = self.swap.extent;
@@ -1507,6 +1783,12 @@ impl Renderer {
                 viewport[3].min(extent.height - y),
             ];
             self.upload_frame(&scene, viewport)?;
+            if let Some(mut extension) = self.extension.take() {
+                let result = extension.prepare(&mut self.gpu(), viewport);
+                self.extension = Some(extension);
+                result?;
+            }
+            profile.mark(&mut timing, 3);
 
             let (fence, command, set, acquired) = {
                 let frame = &self.frames[frame_index];
@@ -1520,8 +1802,12 @@ impl Renderer {
                 &vk::CommandBufferBeginInfo::default()
                     .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
             )?;
+            let gpu_timing = self.gpu_timer.as_ref().filter(|_| self.profiling).is_some();
+            if gpu_timing {
+                self.gpu_timer.as_ref().unwrap().begin(&self.device, command, frame_index);
+            }
             if let Some(embedded) = &mut self.embedded {
-                embedded.record(&self.device, command, frame_index, self.vertices.buffer);
+                embedded.record(&self.device, command, frame_index);
             }
             self.record_vertex_copies(
                 command,
@@ -1533,8 +1819,35 @@ impl Renderer {
                 self.frames[self.frame].retained.buffer,
                 &self.retained.copies,
             );
+            self.record_terrain_pages(command);
+            self.gpu_stamp(command, 1);
+            profile.mark(&mut timing, 4);
+            self.clouds.record_shadow(
+                &self.device,
+                self.allocator.as_mut().unwrap(),
+                self.set_layout,
+                command,
+                set,
+                self.cloud_shadow.as_ref().unwrap(),
+                self.frame_clouds.filter(|_| self.frame_sun.is_some()),
+                self.camera.eye,
+            )?;
             self.record_scene(command, set, viewport)?;
+            profile.stages[11..16].copy_from_slice(&self.scene_stages);
+            profile.mark(&mut timing, 5);
             self.record_extension(command, set, viewport)?;
+            self.clouds.record(
+                &self.device,
+                self.allocator.as_mut().unwrap(),
+                command,
+                set,
+                self.frame_number,
+                viewport,
+                self.camera.eye,
+                self.frame_clouds,
+            )?;
+            self.gpu_stamp(command, 7);
+            profile.mark(&mut timing, 6);
             self.breakers.record(
                 &self.device,
                 self.allocator.as_mut().unwrap(),
@@ -1546,7 +1859,22 @@ impl Renderer {
                 self.swap.hdr.as_ref().unwrap(),
                 self.swap.depth.as_ref().unwrap(),
             )?;
+            self.taa.record(
+                &self.device,
+                self.allocator.as_mut().unwrap(),
+                self.set_layout,
+                command,
+                set,
+                viewport,
+                self.anti_aliasing,
+                self.swap.visibility_msaa.is_some(),
+                self.sharpening,
+            )?;
+            self.gpu_stamp(command, 8);
+            profile.mark(&mut timing, 7);
             self.record_present(command, set, image as usize, viewport, ui.as_ref())?;
+            self.gpu_stamp(command, 9);
+            profile.mark(&mut timing, 8);
             self.frame_number += 1;
             let device = &self.device;
             device.end_command_buffer(command)?;
@@ -1567,6 +1895,10 @@ impl Renderer {
                     .signal_semaphore_infos(&signal)],
                 fence,
             )?;
+            if gpu_timing {
+                self.gpu_timer.as_mut().unwrap().submitted(frame_index);
+            }
+            profile.mark(&mut timing, 9);
             let swapchains = [self.swap.swapchain];
             let indices = [image];
             let waits = [rendered];
@@ -1577,6 +1909,8 @@ impl Renderer {
                     .swapchains(&swapchains)
                     .image_indices(&indices),
             );
+            profile.mark(&mut timing, 10);
+            self.render_profile = self.profiling.then_some(profile);
             self.frame = (self.frame + 1) % FRAMES;
             match result {
                 Ok(present_suboptimal) => self.recreate |= suboptimal || present_suboptimal,
@@ -1623,42 +1957,77 @@ impl Renderer {
         result
     }
 
+    /// Map each instance from this frame's world space to last frame's, by
+    /// draw index, and remember this frame's models for the next.
+    fn track_instance_motion(&mut self) {
+        self.motion_data.clear();
+        self.previous_models =
+            instance_motion(&self.previous_models, &self.instance_data, &mut self.motion_data);
+        for &(instance, first) in &self.deforming_motion {
+            self.motion_data[instance].info = [1, first, 0, 0];
+        }
+        self.previous_deforming.clear();
+        self.previous_deforming.extend(
+            (self.deforming.iter()).map(|mesh| mesh.vertices.iter().map(|v| v.position).collect()),
+        );
+    }
+
     /// Build this frame's draws, materials and lights and write them with the
     /// globals, growing buffers as needed.
     unsafe fn upload_frame(&mut self, scene: &RenderInput<'_>, viewport: [u32; 4]) -> Result<()> {
         self.place_retained()?;
+        self.stream_terrain_pages()?;
         self.instance_data.clear();
         self.draw_calls.clear();
         self.shadow_calls.clear();
-        self.frame_indices.clear();
-        let mut ranges = std::collections::HashMap::<(usize, usize), (u32, u32)>::new();
         self.matrix.read_stats(self.frame);
         self.matrix.set_active(self.matrix_enabled);
         self.material_data.clear();
         self.material_data
             .extend(self.materials.iter().map(|m| m.gpu));
-        for (index, draw) in self.model_draws.iter().enumerate() {
+        // Model indices only change with the models: copying them every frame
+        // cost Sponza 18 ms, so they are built once and kept as the prefix.
+        let key = (self.model_generation, self.matrix_enabled);
+        if self.model_indices_key != Some(key) {
+            self.frame_indices.clear();
+            self.model_index_ranges.clear();
+            let mut ranges = std::collections::HashMap::<(usize, usize), (u32, u32)>::new();
+            for draw in &self.model_draws {
+                let primitive = self.primitives[draw.primitive as usize];
+                let material = &self.materials[primitive.material as usize];
+                let primitive_index = draw.primitive as usize;
+                if material.hidden || (self.matrix_enabled && self.matrix.owns(primitive_index)) {
+                    self.model_index_ranges.push(None);
+                    continue;
+                }
+                let start = primitive.first_index as usize;
+                let end = start + primitive.index_count as usize;
+                let range = append_lod_range(
+                    &mut self.frame_indices,
+                    &mut ranges,
+                    (primitive_index, 0),
+                    &self.source_indices[start..end],
+                )
+                .ok_or_else(|| failure("too many frame geometry indices"))?;
+                self.model_index_ranges.push(Some(range));
+            }
+            self.model_indices_len = self.frame_indices.len();
+            self.model_indices_key = Some(key);
+        }
+        self.frame_indices.truncate(self.model_indices_len);
+        let mut ranges = std::collections::HashMap::<(usize, usize), (u32, u32)>::new();
+        for (index, (draw, range)) in self.model_draws.iter().zip(&self.model_index_ranges).enumerate() {
+            let Some((first, index_count)) = *range else {
+                continue;
+            };
             let primitive = self.primitives[draw.primitive as usize];
             let material = &self.materials[primitive.material as usize];
-            let primitive_index = draw.primitive as usize;
-            if material.hidden || (self.matrix_enabled && self.matrix.owns(primitive_index)) {
-                continue;
-            }
             let mut instance = scene::instance(
                 draw.transform,
                 primitive.first_index,
                 primitive.base_vertex,
                 primitive.material,
             );
-            let original_start = primitive.first_index as usize;
-            let original_end = original_start + primitive.index_count as usize;
-            let (first, index_count) = append_lod_range(
-                &mut self.frame_indices,
-                &mut ranges,
-                (primitive_index, 0),
-                &self.source_indices[original_start..original_end],
-            )
-            .ok_or_else(|| failure("too many frame geometry indices"))?;
             instance.draw[0] = first;
             // The stable draw index extensions know from `scene_loaded`.
             instance.draw[3] = index as u32;
@@ -1702,7 +2071,20 @@ impl Renderer {
             }
         }
         let entities = self.instance_data.len() as u32;
+        self.previous_positions.clear();
+        self.deforming_motion.clear();
         for (slot, mesh) in self.deforming.iter().enumerate() {
+            // A mesh whose vertex count changed has no usable last frame: it holds still.
+            self.deforming_motion
+                .push((self.instance_data.len(), self.previous_positions.len() as u32));
+            match self.previous_deforming.get(slot) {
+                Some(last) if last.len() == mesh.vertices.len() => {
+                    self.previous_positions.extend_from_slice(last)
+                }
+                _ => self
+                    .previous_positions
+                    .extend(mesh.vertices.iter().map(|v| v.position)),
+            }
             let index = self.material_data.len() as u32;
             let plain = || scene::GpuMaterial::plain(&mesh.material);
             self.material_data.push(mesh.textured.unwrap_or_else(plain));
@@ -1757,6 +2139,7 @@ impl Renderer {
         );
         self.frame_sun = scene.sun().or(self.sun);
         let lighting = scene.lighting();
+        self.frame_clouds = lighting.clouds;
         let (sky, ground) = if lighting.method == verity_core::LightingMethod::DirectOnly {
             (glam::Vec3::ZERO, glam::Vec3::ZERO)
         } else {
@@ -1788,6 +2171,9 @@ impl Renderer {
             self.swap.srgb,
         );
         globals.counts[3] = u32::from(self.matrix_debug);
+        if self.frame_clouds.is_some() && self.frame_sun.is_some() {
+            globals.cloud_shadow = clouds::shadow_region(self.camera.eye);
+        }
         for (slot, light) in self.frame_lights.iter().take(MAX_POINT_SHADOWS).enumerate() {
             if light.radius.is_finite()
                 && light.radius > 0.0
@@ -1799,9 +2185,43 @@ impl Renderer {
                 }
             }
         }
-        let view_proj = glam::Mat4::from_cols_array_2d(&globals.view_proj);
-        self.frame_view_proj = (view_proj, self.previous_view_proj.unwrap_or(view_proj));
-        self.previous_view_proj = Some(view_proj);
+        // The shadow maps outlive frames: redraw them only when what they
+        // show can have changed. Moving geometry always redraws them.
+        let mut key = Vec::with_capacity(self.shadow_key.len());
+        key.extend_from_slice(bytemuck::bytes_of(&globals.sun_direction));
+        key.extend_from_slice(bytemuck::bytes_of(&globals.shadow_view_proj));
+        key.extend_from_slice(bytemuck::bytes_of(&globals.point_shadow_view_proj));
+        key.extend_from_slice(bytemuck::cast_slice(&self.light_data));
+        key.extend_from_slice(bytemuck::cast_slice(&self.instance_data));
+        for &(instance, count) in &self.shadow_calls {
+            key.extend_from_slice(bytemuck::bytes_of(&[instance, count]));
+        }
+        key.extend_from_slice(&self.model_generation.to_ne_bytes());
+        let moving = self.matrix_enabled
+            || !self.deforming.is_empty()
+            || !self.retained.copies.is_empty()
+            || self.embedded.as_ref().is_some_and(|e| e.reshaping());
+        self.shadows_stale = moving || key != self.shadow_key;
+        self.shadow_key = key;
+        let unjittered = glam::Mat4::from_cols_array_2d(&globals.view_proj);
+        let jitter = if !self.anti_aliasing.temporal() {
+            glam::Mat4::IDENTITY
+        } else {
+            // Sub-pixel offset in NDC.
+            let [x, y] = taa::jitter(self.frame_number);
+            let size = [viewport[2].max(1) as f32, viewport[3].max(1) as f32];
+            glam::Mat4::from_translation(glam::Vec3::new(2.0 * x / size[0], 2.0 * y / size[1], 0.0))
+        };
+        let view_proj = jitter * unjittered;
+        // Last frame seen through this frame's jitter: surfaces reconstructed
+        // from jittered pixels then get motion without the jitter in it, which
+        // otherwise shifts the history by the jitter every frame.
+        let previous = jitter * self.previous_view_proj.unwrap_or(unjittered);
+        globals.view_proj = view_proj.to_cols_array_2d();
+        globals.inverse_view_proj = view_proj.inverse().to_cols_array_2d();
+        globals.previous_view_proj = previous.to_cols_array_2d();
+        self.frame_view_proj = (view_proj, previous);
+        self.previous_view_proj = Some(unjittered);
         self.culling_ranges.clear();
         let mut jobs = Vec::new();
         let use_culling = self.matrix_enabled && self.culler.is_some();
@@ -1866,34 +2286,48 @@ impl Renderer {
                     .unwrap_or(false)
             });
 
+        self.track_instance_motion();
         let device = &self.device;
         let allocator = self.allocator.as_mut().unwrap();
         let frame = &mut self.frames[self.frame];
-        frame.globals.write(bytemuck::bytes_of(&globals));
+        // This frame's fence has signaled, so nothing still reads the arena.
+        let needed = gpu::FrameArena::needed([
+            mem::size_of_val(self.instance_data.as_slice()),
+            mem::size_of_val(self.light_data.as_slice()),
+            mem::size_of_val(self.motion_data.as_slice()),
+            mem::size_of_val(self.previous_positions.as_slice()),
+        ]);
+        frame.arena.reset(device, allocator, needed)?;
+        let arena = &mut frame.arena;
+        let full = || failure("frame arena smaller than `needed`");
+        globals.instances = arena.push(&self.instance_data).ok_or_else(full)?;
+        globals.lights = arena.push(&self.light_data).ok_or_else(full)?;
+        globals.instance_motion = arena.push(&self.motion_data).ok_or_else(full)?;
+        globals.previous_positions = arena.push(&self.previous_positions).ok_or_else(full)?;
         let mut grown = false;
-        for (buffer, name, bytes) in [
-            (
-                &mut frame.instances,
-                "instances",
-                bytemuck::cast_slice::<_, u8>(&self.instance_data),
-            ),
+        // The model prefix is rewritten only into frames that lack this one.
+        let kept = if frame.indices_prefix == self.model_indices_key {
+            self.model_indices_len * mem::size_of::<u32>()
+        } else {
+            0
+        };
+        frame.indices_prefix = self.model_indices_key;
+        for (buffer, name, bytes, mut skip) in [
             (
                 &mut frame.indices,
                 "frame indices",
                 bytemuck::cast_slice::<_, u8>(&self.frame_indices),
-            ),
-            (
-                &mut frame.lights,
-                "lights",
-                bytemuck::cast_slice(&self.light_data),
+                kept,
             ),
             (
                 &mut frame.materials,
                 "materials",
                 bytemuck::cast_slice(&self.material_data),
+                0,
             ),
         ] {
             if bytes.len() as u64 > buffer.size {
+                skip = 0;
                 // This frame's fence has signaled, so nothing still reads the old buffer.
                 gpu::destroy_buffer(device, allocator, mem::take(buffer));
                 let size = (bytes.len() as u64).next_power_of_two();
@@ -1907,8 +2341,13 @@ impl Renderer {
                 )?;
                 grown = true;
             }
-            buffer.write(bytes);
+            buffer.write_at(skip, &bytes[skip..]);
         }
+        // Written last: growing a buffer above moves its address.
+        globals.vertices = gpu::DeviceAddress::new(self.vertices.address);
+        globals.indices = gpu::DeviceAddress::new(frame.indices.address);
+        globals.matrix = self.matrix.addresses();
+        frame.globals.write(bytemuck::bytes_of(&globals));
         for (buffer, name, vertices) in [
             (
                 &mut frame.deforming,
@@ -1973,24 +2412,68 @@ impl Renderer {
         use vk::AccessFlags2 as A;
         use vk::PipelineStageFlags2 as S;
         let barrier = |src_stage, src_access, dst_stage, dst_access| {
-            let barrier = vk::BufferMemoryBarrier2::default()
-                .src_stage_mask(src_stage)
-                .src_access_mask(src_access)
-                .dst_stage_mask(dst_stage)
-                .dst_access_mask(dst_access)
-                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                .buffer(self.vertices.buffer)
-                .size(vk::WHOLE_SIZE);
-            self.device.cmd_pipeline_barrier2(
-                cmd,
-                &vk::DependencyInfo::default().buffer_memory_barriers(&[barrier]),
-            );
+            let (src, dst) = ((src_stage, src_access), (dst_stage, dst_access));
+            gpu::memory_barrier(&self.device, cmd, src, dst);
         };
         barrier(S::ALL_COMMANDS, A::MEMORY_READ, S::COPY, A::TRANSFER_WRITE);
         self.device
             .cmd_copy_buffer(cmd, source, self.vertices.buffer, copies);
         barrier(S::COPY, A::TRANSFER_WRITE, S::ALL_COMMANDS, A::MEMORY_READ);
+    }
+
+    /// Bring `meshlet_runs` up to this frame's draws and camera. Culling 100k+
+    /// meshlets each frame cost Sponza 2-5 ms, so only draws that moved, or a
+    /// camera that did, cull again, in chunks across threads.
+    fn cull_meshlets(&mut self) {
+        // Chunks of meshlets, so a few huge draws still spread across threads.
+        const CHUNK: usize = 1024;
+        // GPU culling takes over draws, which then keep no runs here.
+        let key = (self.frame_view_proj.0, self.model_generation, self.culling_active);
+        if self.meshlet_runs_key != Some(key) {
+            self.meshlet_runs.clear();
+            self.meshlet_runs_key = Some(key);
+        }
+        self.meshlet_runs
+            .resize_with(self.draw_calls.len(), MeshletRuns::default);
+        let mut chunks = Vec::new();
+        for (instance, cached) in self.meshlet_runs.iter_mut().enumerate() {
+            let primitive = self.draw_calls[instance].2;
+            let model = self.instance_data[instance].model;
+            if cached.draw == Some((primitive, model)) {
+                continue;
+            }
+            cached.draw = Some((primitive, model));
+            cached.runs.clear();
+            let culled_on_gpu = self.culling_active
+                && self.culling_ranges.get(instance).is_some_and(Option::is_some);
+            let meshlets = self.primitive_meshlets.get(primitive).and_then(Option::as_ref);
+            if let Some(meshlets) = meshlets.filter(|_| !culled_on_gpu) {
+                let model = glam::Mat4::from_cols_array_2d(&model);
+                chunks.extend(meshlets.chunks(CHUNK).map(|chunk| (instance, chunk, model)));
+            }
+        }
+        let clip = self.frame_view_proj.0;
+        use rayon::prelude::*;
+        let culled: Vec<Vec<(u32, u32)>> = chunks
+            .par_iter()
+            .map(|&(_, chunk, model)| {
+                let mut runs = Vec::new();
+                meshlets::visible_runs(chunk, clip, model, |first, count| {
+                    runs.push((first, count));
+                });
+                runs
+            })
+            .collect();
+        for (&(instance, _, _), runs) in chunks.iter().zip(culled) {
+            let all = &mut self.meshlet_runs[instance].runs;
+            for (first, count) in runs {
+                // Join runs that a chunk boundary split.
+                match all.last_mut() {
+                    Some((start, length)) if *start + *length == first => *length += count,
+                    _ => all.push((first, count)),
+                }
+            }
+        }
     }
 
     /// Clusters, visibility and resolve: direct light into HDR plus the G-buffer.
@@ -2004,6 +2487,9 @@ impl Renderer {
         use vk::ImageLayout as L;
         use vk::PipelineStageFlags2 as S;
         self.record_bakes(cmd, set);
+        let culling = Instant::now();
+        self.cull_meshlets();
+        let culling = culling.elapsed();
         let device = &self.device;
         let extent = self.swap.extent;
         let (depth, visibility, hdr, gbuffer, receiver, motion) = (
@@ -2015,18 +2501,16 @@ impl Renderer {
             self.swap.motion.as_ref().unwrap(),
         );
         let color = vk::ImageAspectFlags::COLOR;
-        let barrier = |images: &[vk::ImageMemoryBarrier2], buffers: &[vk::BufferMemoryBarrier2]| {
+        let barrier = |images: &[vk::ImageMemoryBarrier2], memory: &[vk::MemoryBarrier2]| {
             device.cmd_pipeline_barrier2(
                 cmd,
                 &vk::DependencyInfo::default()
                     .image_memory_barriers(images)
-                    .buffer_memory_barriers(buffers),
+                    .memory_barriers(memory),
             );
         };
-        let clusters = |src_stage, src_access, dst_stage, dst_access| {
-            vk::BufferMemoryBarrier2::default()
-                .buffer(self.clusters.buffer)
-                .size(vk::WHOLE_SIZE)
+        let memory = |src_stage, src_access, dst_stage, dst_access| {
+            vk::MemoryBarrier2::default()
                 .src_stage_mask(src_stage)
                 .src_access_mask(src_access)
                 .dst_stage_mask(dst_stage)
@@ -2047,13 +2531,25 @@ impl Renderer {
             extent: vk::Extent2D { width, height },
         };
         let visible = width > 0 && height > 0;
+        let timer = self.gpu_timer.as_ref().filter(|_| self.profiling);
+        let mut stages = [Duration::ZERO; 5];
+        let mut last = Instant::now();
+        // Ends sub-stage `i` (0-based) on the CPU and GPU timelines.
+        let mut split = |i: usize| {
+            let now = Instant::now();
+            stages[i] = now - last;
+            last = now;
+            if let Some(timer) = timer {
+                timer.stamp(device, cmd, self.frame, i as u32 + 2);
+            }
+        };
         self.matrix
             .record_select(device, cmd, self.pipeline_layout, self.frame);
 
         // Bin lights. The previous frame's resolve may still read the clusters.
         barrier(
             &[],
-            &[clusters(
+            &[memory(
                 S::COMPUTE_SHADER,
                 A::SHADER_STORAGE_READ,
                 S::COMPUTE_SHADER,
@@ -2081,9 +2577,11 @@ impl Renderer {
                 &[],
             );
         }
+        split(0);
 
         // Both images are shared across frames. The queue dependency protects the
         // prior resolve's sampled reads before discarding and rewriting the maps.
+        // Unchanged maps stay read-only from the frame that drew them.
         for (map, layers, size, point) in [
             (
                 self.shadow_map.as_ref().unwrap(),
@@ -2097,7 +2595,10 @@ impl Renderer {
                 scene::POINT_SHADOW_SIZE,
                 true,
             ),
-        ] {
+        ]
+        .into_iter()
+        .filter(|_| self.shadows_stale)
+        {
             let all_layers =
                 gpu::subresource(vk::ImageAspectFlags::DEPTH).layer_count(layers.len() as u32);
             let shadow_barrier = |src_stage, src_access, dst_stage, dst_access, old, new| {
@@ -2198,6 +2699,7 @@ impl Renderer {
                 &[],
             );
         }
+        split(1);
         if self.hiz_active {
             barrier(
                 &[gpu::image_barrier(
@@ -2234,18 +2736,11 @@ impl Renderer {
                     .depth_attachment(&depth_attachment),
             );
             set_viewport(device, cmd, area);
+            device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, self.depth_prepass);
             let mut bound = None;
             for (instance, &(count, two_sided, _)) in self.draw_calls.iter().enumerate() {
                 if bound != Some(two_sided) {
-                    device.cmd_bind_pipeline(
-                        cmd,
-                        vk::PipelineBindPoint::GRAPHICS,
-                        if two_sided {
-                            self.depth_prepass_two_sided
-                        } else {
-                            self.depth_prepass
-                        },
-                    );
+                    device.cmd_set_cull_mode(cmd, cull_sides(two_sided));
                     bound = Some(two_sided);
                 }
                 device.cmd_push_constants(
@@ -2303,8 +2798,34 @@ impl Renderer {
                 &[],
             );
         }
+        split(2);
 
         // Visibility: depth plus (instance, triangle) IDs.
+        let msaa = self.swap.visibility_msaa.as_ref().zip(self.swap.depth_msaa.as_ref());
+        if let Some((ids, depths)) = msaa {
+            let attachment = |image, aspect, stage, access, layout| {
+                gpu::image_barrier(image, aspect, S::ALL_COMMANDS, A::NONE, stage, access, L::UNDEFINED, layout)
+            };
+            barrier(
+                &[
+                    attachment(
+                        ids.image,
+                        color,
+                        S::COLOR_ATTACHMENT_OUTPUT,
+                        A::COLOR_ATTACHMENT_WRITE,
+                        L::COLOR_ATTACHMENT_OPTIMAL,
+                    ),
+                    attachment(
+                        depths.image,
+                        vk::ImageAspectFlags::DEPTH,
+                        S::EARLY_FRAGMENT_TESTS | S::LATE_FRAGMENT_TESTS,
+                        A::DEPTH_STENCIL_ATTACHMENT_READ | A::DEPTH_STENCIL_ATTACHMENT_WRITE,
+                        L::DEPTH_ATTACHMENT_OPTIMAL,
+                    ),
+                ],
+                &[],
+            );
+        }
         barrier(
             &[
                 gpu::image_barrier(
@@ -2338,7 +2859,7 @@ impl Renderer {
             offset: vk::Offset2D::default(),
             extent,
         };
-        let id_attachment = [vk::RenderingAttachmentInfo::default()
+        let mut id_attachment = [vk::RenderingAttachmentInfo::default()
             .image_view(visibility.view)
             .image_layout(L::COLOR_ATTACHMENT_OPTIMAL)
             .load_op(vk::AttachmentLoadOp::CLEAR)
@@ -2348,7 +2869,7 @@ impl Renderer {
                     uint32: [u32::MAX; 4],
                 },
             })];
-        let depth_attachment = vk::RenderingAttachmentInfo::default()
+        let mut depth_attachment = vk::RenderingAttachmentInfo::default()
             .image_view(depth.view)
             .image_layout(L::DEPTH_ATTACHMENT_OPTIMAL)
             .load_op(vk::AttachmentLoadOp::CLEAR)
@@ -2359,6 +2880,21 @@ impl Renderer {
                     stencil: 0,
                 },
             });
+        if let Some((ids, depths)) = msaa {
+            // Sample 0 lands in the single-sample targets every other pass reads.
+            let zero = vk::ResolveModeFlags::SAMPLE_ZERO;
+            id_attachment[0] = id_attachment[0]
+                .image_view(ids.view)
+                .resolve_mode(zero)
+                .resolve_image_view(visibility.view)
+                .resolve_image_layout(L::COLOR_ATTACHMENT_OPTIMAL);
+            depth_attachment = depth_attachment
+                .image_view(depths.view)
+                .store_op(vk::AttachmentStoreOp::DONT_CARE)
+                .resolve_mode(zero)
+                .resolve_image_view(depth.view)
+                .resolve_image_layout(L::DEPTH_ATTACHMENT_OPTIMAL);
+        }
         device.cmd_begin_rendering(
             cmd,
             &vk::RenderingInfo::default()
@@ -2369,17 +2905,18 @@ impl Renderer {
         );
         if visible {
             set_viewport(device, cmd, area);
+            let pipeline = if msaa.is_some() {
+                self.visibility_msaa_pipeline
+            } else {
+                self.visibility_pipeline
+            };
+            device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, pipeline);
             let mut bound = None;
             for (instance, &(index_count, two_sided, primitive)) in
                 self.draw_calls.iter().enumerate()
             {
                 if bound != Some(two_sided) {
-                    let pipeline = if two_sided {
-                        self.visibility_two_sided
-                    } else {
-                        self.visibility_pipeline
-                    };
-                    device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, pipeline);
+                    device.cmd_set_cull_mode(cmd, cull_sides(two_sided));
                     bound = Some(two_sided);
                 }
                 device.cmd_push_constants(
@@ -2395,30 +2932,24 @@ impl Renderer {
                     for job in start..end {
                         culler.draw(device, cmd, self.frame, job);
                     }
-                } else if let Some(meshlets) =
-                    (self.primitive_meshlets.get(primitive)).and_then(Option::as_ref)
-                {
-                    let model = glam::Mat4::from_cols_array_2d(&self.instance_data[instance].model);
-                    meshlets::visible_runs(
-                        meshlets,
-                        self.frame_view_proj.0,
-                        model,
-                        |first, count| {
-                            device.cmd_draw(cmd, count, 1, first, 0);
-                        },
-                    );
+                } else if (self.primitive_meshlets.get(primitive)).is_some_and(Option::is_some) {
+                    for &(first, count) in &self.meshlet_runs[instance].runs {
+                        device.cmd_draw(cmd, count, 1, first, 0);
+                    }
                 } else {
                     device.cmd_draw(cmd, index_count, 1, 0, 0);
                 }
             }
-            self.matrix.record_draws(
-                device,
-                cmd,
-                self.pipeline_layout,
-                matrix::Target::Visibility,
-            );
+            let target = if msaa.is_some() {
+                matrix::Target::VisibilityMsaa
+            } else {
+                matrix::Target::Visibility
+            };
+            self.matrix
+                .record_draws(device, cmd, self.pipeline_layout, target);
         }
         device.cmd_end_rendering(cmd);
+        split(3);
 
         // Resolve and shade into the HDR target.
         barrier(
@@ -2477,38 +3008,62 @@ impl Renderer {
                 gpu::image_barrier(
                     depth.image,
                     vk::ImageAspectFlags::DEPTH,
-                    S::LATE_FRAGMENT_TESTS,
-                    A::DEPTH_STENCIL_ATTACHMENT_WRITE,
+                    // Multisample resolves write in the color output stage.
+                    S::LATE_FRAGMENT_TESTS | S::COLOR_ATTACHMENT_OUTPUT,
+                    A::DEPTH_STENCIL_ATTACHMENT_WRITE | A::COLOR_ATTACHMENT_WRITE,
                     S::COMPUTE_SHADER,
                     A::SHADER_SAMPLED_READ,
                     L::DEPTH_ATTACHMENT_OPTIMAL,
                     L::DEPTH_READ_ONLY_OPTIMAL,
                 ),
             ],
-            &[clusters(
+            &[memory(
                 S::COMPUTE_SHADER,
                 A::SHADER_STORAGE_WRITE,
                 S::COMPUTE_SHADER,
                 A::SHADER_STORAGE_READ,
             )],
         );
+        if let Some((ids, _)) = msaa {
+            barrier(
+                &[gpu::image_barrier(
+                    ids.image,
+                    color,
+                    S::COLOR_ATTACHMENT_OUTPUT,
+                    A::COLOR_ATTACHMENT_WRITE,
+                    S::COMPUTE_SHADER,
+                    A::SHADER_SAMPLED_READ,
+                    L::COLOR_ATTACHMENT_OPTIMAL,
+                    L::SHADER_READ_ONLY_OPTIMAL,
+                )],
+                &[],
+            );
+        }
         if visible {
-            device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, self.resolve_pipeline);
+            let resolve = if msaa.is_some() {
+                self.resolve_msaa_pipeline
+            } else {
+                self.resolve_pipeline
+            };
+            device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, resolve);
             device.cmd_dispatch(cmd, width.div_ceil(8), height.div_ceil(8), 1);
+            if self.terrain_layers.is_some() {
+                // The CPU reads the wanted pages once this frame's fence signals.
+                let written = (S::COMPUTE_SHADER, A::SHADER_STORAGE_WRITE);
+                gpu::memory_barrier(device, cmd, written, (S::HOST, A::HOST_READ));
+            }
         }
         if self.extension.is_some() {
             // Extensions read the resolve's outputs and add to HDR in compute.
-            device.cmd_pipeline_barrier2(
-                cmd,
-                &vk::DependencyInfo::default().memory_barriers(&[vk::MemoryBarrier2::default()
-                    .src_stage_mask(S::COMPUTE_SHADER)
-                    .src_access_mask(A::SHADER_STORAGE_WRITE)
-                    .dst_stage_mask(S::COMPUTE_SHADER)
-                    .dst_access_mask(
-                        A::SHADER_STORAGE_READ | A::SHADER_SAMPLED_READ | A::SHADER_STORAGE_WRITE,
-                    )]),
-            );
+            let read_write =
+                A::SHADER_STORAGE_READ | A::SHADER_SAMPLED_READ | A::SHADER_STORAGE_WRITE;
+            let written = (S::COMPUTE_SHADER, A::SHADER_STORAGE_WRITE);
+            gpu::memory_barrier(device, cmd, written, (S::COMPUTE_SHADER, read_write));
         }
+        split(4);
+        // Culling ran before the timeline started; it belongs to visibility.
+        stages[3] += culling;
+        self.scene_stages = stages;
         Ok(())
     }
 
@@ -2562,12 +3117,12 @@ impl Renderer {
         let extent = self.swap.extent;
         let hdr = self.swap.hdr.as_ref().unwrap();
         let color = vk::ImageAspectFlags::COLOR;
-        let barrier = |images: &[vk::ImageMemoryBarrier2], buffers: &[vk::BufferMemoryBarrier2]| {
+        let barrier = |images: &[vk::ImageMemoryBarrier2], memory: &[vk::MemoryBarrier2]| {
             device.cmd_pipeline_barrier2(
                 cmd,
                 &vk::DependencyInfo::default()
                     .image_memory_barriers(images)
-                    .buffer_memory_barriers(buffers),
+                    .memory_barriers(memory),
             );
         };
         // An extension may have bound its own graphics state.
@@ -2751,6 +3306,7 @@ unsafe fn pick_device(
         if v11.shader_draw_parameters == 0
             || v12.shader_sampled_image_array_non_uniform_indexing == 0
             || v12.descriptor_binding_partially_bound == 0
+            || v12.buffer_device_address == 0
             || v13.dynamic_rendering == 0
             || v13.synchronization2 == 0
         {
@@ -2815,8 +3371,7 @@ unsafe fn pick_device(
             let ray_query = std::env::var_os("VERITY_NO_RAY_QUERY").is_none()
                 && ray_extensions.iter().all(|name| has(name))
                 && accel.acceleration_structure != 0
-                && query.ray_query != 0
-                && v12.buffer_device_address != 0;
+                && query.ray_query != 0;
             if ray_query {
                 names.extend(ray_extensions.map(CStr::as_ptr));
             }
@@ -2832,7 +3387,7 @@ unsafe fn pick_device(
             let mut v12 = vk::PhysicalDeviceVulkan12Features::default()
                 .shader_sampled_image_array_non_uniform_indexing(true)
                 .descriptor_binding_partially_bound(true)
-                .buffer_device_address(ray_query);
+                .buffer_device_address(true);
             let mut v13 = vk::PhysicalDeviceVulkan13Features::default()
                 .dynamic_rendering(true)
                 .synchronization2(true);
@@ -2862,7 +3417,7 @@ unsafe fn pick_device(
     }
     Err(failure(
         "no Vulkan 1.3 device supports dynamic rendering, synchronization2, draw parameters, \
-         non-uniform texture indexing, BC7/ASTC/ETC2 textures, and graphics, compute and \
+         buffer device address, non-uniform texture indexing, BC7/ASTC/ETC2 textures, and graphics, compute and \
          presentation on one queue",
     ))
 }
@@ -2872,6 +3427,9 @@ impl Drop for Renderer {
         // Destroying a null handle is a no-op, so partially built renderers drop cleanly.
         unsafe {
             let _ = self.device.device_wait_idle();
+            if let Some(timer) = self.gpu_timer.take() {
+                timer.destroy(&self.device);
+            }
             self.ui_renderer.take();
             for delta in &mut self.pending_textures {
                 delta.clear();
@@ -2887,6 +3445,8 @@ impl Drop for Renderer {
                 }
                 mem::take(&mut self.matrix).destroy(&self.device, allocator);
                 self.breakers.destroy(&self.device, allocator);
+                self.clouds.destroy(&self.device, allocator);
+                self.taa.destroy(&self.device, allocator);
             }
             if self.allocator.is_some() {
                 self.clear_swapchain();
@@ -2908,12 +3468,14 @@ impl Drop for Renderer {
                     device.destroy_semaphore(frame.acquired, None);
                     for buffer in [
                         frame.globals,
-                        frame.instances,
+                        frame.arena.buffer,
                         frame.indices,
-                        frame.lights,
                         frame.materials,
                         frame.deforming,
                         frame.retained,
+                        frame.layer_table,
+                        frame.layer_feedback,
+                        frame.layer_staging,
                     ] {
                         gpu::destroy_buffer(device, allocator, buffer);
                     }
@@ -2930,6 +3492,7 @@ impl Drop for Renderer {
                     .drain(..)
                     .chain(self.shadow_map.take())
                     .chain(self.point_shadow_map.take())
+                    .chain(self.cloud_shadow.take())
                 {
                     gpu::destroy_image(device, allocator, texture);
                 }
@@ -2939,10 +3502,10 @@ impl Drop for Renderer {
             for pipeline in [
                 self.cluster_pipeline,
                 self.visibility_pipeline,
-                self.visibility_two_sided,
                 self.depth_prepass,
-                self.depth_prepass_two_sided,
                 self.resolve_pipeline,
+                self.visibility_msaa_pipeline,
+                self.resolve_msaa_pipeline,
                 self.composite_pipeline,
             ] {
                 device.destroy_pipeline(pipeline, None);
@@ -2958,6 +3521,70 @@ impl Drop for Renderer {
             self.surface_loader.destroy_surface(self.surface, None);
             self.instance.destroy_instance(None);
         }
+    }
+}
+
+/// How a surface moved since last frame; mirrors `InstanceMotion` in `common.slang`.
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct InstanceMotion {
+    /// This frame's world space to last frame's.
+    to_previous: [[f32; 4]; 4],
+    /// x: 1 when vertices move on their own (soft bodies, cloth); y: then their
+    /// first entry in `Frame::previous_positions`.
+    info: [u32; 4],
+}
+
+/// Append each instance's map from this frame's world space to last frame's
+/// to `motion`, matching draws by draw index; returns this frame's models.
+fn instance_motion(
+    previous: &std::collections::HashMap<u32, (glam::Mat4, u32)>,
+    instances: &[scene::Instance],
+    motion: &mut Vec<InstanceMotion>,
+) -> std::collections::HashMap<u32, (glam::Mat4, u32)> {
+    // shortcut: world entities and embedded draws take their draw index from
+    // their order, so adding or removing one gives its neighbours one frame
+    // of wrong motion (TAA's clip absorbs it); key them by entity if that shows.
+    let mut current = std::collections::HashMap::with_capacity(instances.len());
+    for instance in instances {
+        let model = glam::Mat4::from_cols_array_2d(&instance.model);
+        let [_, base_vertex, _, slot] = instance.draw;
+        let to_previous = match previous.get(&slot) {
+            // The same mesh in the same slot: the same object.
+            Some(&(last, base)) if base == base_vertex && last != model => last * model.inverse(),
+            _ => glam::Mat4::IDENTITY,
+        };
+        motion.push(InstanceMotion {
+            to_previous: to_previous.to_cols_array_2d(),
+            info: [0; 4],
+        });
+        current.insert(slot, (model, base_vertex));
+    }
+    current
+}
+
+#[cfg(test)]
+mod motion_tests {
+    use super::*;
+    use glam::{Mat4, Vec3};
+
+    #[test]
+    fn moved_instance_maps_points_back_to_last_frame() {
+        let at = |x: f32, slot: u32| {
+            let mut instance = scene::instance(Mat4::from_translation(Vec3::new(x, 0.0, 0.0)), 0, 7, 0);
+            instance.draw[3] = slot;
+            instance
+        };
+        let mut motion = Vec::new();
+        let first = instance_motion(&Default::default(), &[at(0.0, 0)], &mut motion);
+        assert_eq!(motion[0].to_previous, Mat4::IDENTITY.to_cols_array_2d());
+        motion.clear();
+        instance_motion(&first, &[at(2.0, 0), at(5.0, 1)], &mut motion);
+        let back = Mat4::from_cols_array_2d(&motion[0].to_previous)
+            .transform_point3(Vec3::new(2.5, 1.0, 0.0));
+        assert!(back.abs_diff_eq(Vec3::new(0.5, 1.0, 0.0), 1.0e-5));
+        // A slot with no previous frame does not move.
+        assert_eq!(motion[1].to_previous, Mat4::IDENTITY.to_cols_array_2d());
     }
 }
 

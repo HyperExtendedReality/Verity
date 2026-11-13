@@ -13,10 +13,11 @@
 mod accel;
 pub mod scene;
 pub mod settings;
+pub mod surface;
 
 use self::{
     accel::SceneAccel,
-    scene::{GiScene, LAYER_MASK},
+    scene::{GiScene, LAYER_MASK, SurfaceWords},
     settings::*,
 };
 use crate::{
@@ -74,6 +75,7 @@ const PASSES: &[(&str, &[u8], &[u8])] = &[
     ("traceRecord", spirv!("cascades", "traceRecord"), spirv!("cascades", "traceRecord", rq)),
     ("traceVisibility", spirv!("cascades", "traceVisibility"), spirv!("cascades", "traceVisibility", rq)),
     ("traceResolve", spirv!("cascades", "traceResolve"), spirv!("cascades", "traceResolve", rq)),
+    ("surfaceUpdate", spirv!("cascades", "surfaceUpdate"), spirv!("cascades", "surfaceUpdate", rq)),
     ("compositeAnchors", spirv!("composite", "compositeAnchors"), spirv!("composite", "compositeAnchors")),
     ("compositeCompute", spirv!("composite", "compositeCompute"), spirv!("composite", "compositeCompute")),
     ("compositeCapture", spirv!("composite", "compositeCapture"), spirv!("composite", "compositeCapture")),
@@ -118,6 +120,10 @@ const MAIN_BINDINGS: &[(u32, D)] = &[
     (47, D::SAMPLED_IMAGE),
     (48, D::STORAGE_BUFFER),
     (49, D::STORAGE_BUFFER),
+    (51, D::STORAGE_BUFFER),
+    (52, D::STORAGE_BUFFER),
+    (53, D::STORAGE_BUFFER),
+    (54, D::STORAGE_BUFFER),
 ];
 /// The scene TLAS, in set 0 only for the `GI_RAY_QUERY` passes.
 const TLAS_BINDING: (u32, D) = (50, D::ACCELERATION_STRUCTURE_KHR);
@@ -164,6 +170,42 @@ struct GiLight {
     edge1: [f32; 4],
     edge2: [f32; 4],
     source: [u32; 4],
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SunChange {
+    None,
+    /// Small enough that the cache keeps blending its history (time of day).
+    Gradual,
+    /// Appeared, vanished or jumped: its bounce history is dropped.
+    Hard,
+}
+
+/// How the sun and the point lights changed since the previous frame.
+fn light_changes(lights: &[GiLight], previous: &[GiLight]) -> (SunChange, bool) {
+    // The sun is the one directional record with light; the mask record has none.
+    let sun = |ls: &[GiLight]| {
+        ls.iter()
+            .find(|l| l.position[3] == 0.0 && l.color != [0.0; 4])
+            .copied()
+    };
+    fn points(ls: &[GiLight]) -> impl Iterator<Item = &[u8]> {
+        ls.iter().filter(|l| l.position[3] > 0.0).map(bytemuck::bytes_of)
+    }
+    let sun_change = match (sun(lights), sun(previous)) {
+        (None, None) => SunChange::None,
+        (Some(a), Some(b)) if bytemuck::bytes_of(&a) == bytemuck::bytes_of(&b) => SunChange::None,
+        (Some(a), Some(b)) => {
+            let (da, db) = (Vec3::from_slice(&a.position[..3]), Vec3::from_slice(&b.position[..3]));
+            let (ca, cb) = (Vec3::from_slice(&a.color[..3]), Vec3::from_slice(&b.color[..3]));
+            // About 2.6 degrees and 5% of the brightest channel.
+            let small = da.normalize().dot(db.normalize()) > 0.999
+                && (ca - cb).abs().max_element() <= 0.05 * cb.max_element();
+            if small { SunChange::Gradual } else { SunChange::Hard }
+        }
+        _ => SunChange::Hard,
+    };
+    (sun_change, !points(lights).eq(points(previous)))
 }
 
 struct Pipelines {
@@ -286,6 +328,11 @@ pub struct SplitRadianceCascades {
     scene: GiScene,
     geometry: Buffer,
     words: Buffer,
+    /// Surface cache: triangle charts, island rects, texel records, and the
+    /// texels' radiance (three words each), bindings 51 to 54.
+    surface: [Buffer; 4],
+    /// Texels in the surface atlas; zero when the cache is off.
+    surface_texels: u32,
     blue_noise: Buffer,
     /// The scene for hardware ray queries, on GPUs with them.
     accel: Option<SceneAccel>,
@@ -299,6 +346,8 @@ pub struct SplitRadianceCascades {
     schedule: CandidateSchedule,
     history_valid: bool,
     scene_changed: bool,
+    /// Models added since the scene was last uploaded.
+    upload_pending: bool,
     previous_clip: Option<Mat4>,
     previous_lights: Vec<GiLight>,
     started: Instant,
@@ -313,11 +362,15 @@ pub struct SplitRadianceCascades {
 
 impl SplitRadianceCascades {
     pub fn new(settings: Settings) -> Self {
+        let mut scene = GiScene::default();
+        scene.set_surface_texel(if settings.surface_cache { settings.surface_texel } else { 0.0 });
         Self {
             settings,
-            scene: GiScene::default(),
+            scene,
             geometry: Buffer::default(),
             words: Buffer::default(),
+            surface: Default::default(),
+            surface_texels: 0,
             blue_noise: Buffer::default(),
             accel: None,
             instances: 0,
@@ -332,6 +385,7 @@ impl SplitRadianceCascades {
             schedule: CandidateSchedule::default(),
             history_valid: false,
             scene_changed: true,
+            upload_pending: false,
             previous_clip: None,
             previous_lights: Vec::new(),
             started: Instant::now(),
@@ -502,6 +556,29 @@ impl SplitRadianceCascades {
         upload(gpu, &mut self.command_pool, target, name, bytes)
     }
 
+    /// Start over in the other tracing mode: the passes, their descriptor sets
+    /// and the acceleration structures all depend on it.
+    unsafe fn switch_tracing(&mut self, gpu: &mut Gpu, targets: &Targets) -> Result<()> {
+        gpu.device.device_wait_idle()?;
+        // A compile in flight still owns pipelines: wait, then release them.
+        if let Some(compile) = self.compile.take()
+            && let Ok(Ok(passes)) = compile.join()
+            && let Some(pipelines) = self.pipelines.as_mut()
+        {
+            pipelines.passes.extend(passes);
+        }
+        if let Some(pipelines) = self.pipelines.take() {
+            Self::destroy_pipelines(gpu.device, pipelines);
+        }
+        if let Some(view) = self.view.take() {
+            Self::destroy_view(gpu.device, gpu.allocator, view);
+        }
+        if let Some(accel) = self.accel.take() {
+            accel.destroy(gpu);
+        }
+        self.targets_changed(gpu, targets)
+    }
+
     /// Bring the acceleration structures, if any, up to the packed words; see
     /// [`SceneAccel::update`]. Creates them on the first call on a GPU with
     /// ray queries.
@@ -510,13 +587,24 @@ impl SplitRadianceCascades {
         gpu: &mut Gpu,
         changed: Option<&[Range<usize>]>,
     ) -> Result<()> {
-        if gpu.ray_query && self.accel.is_none() {
+        if gpu.ray_query && self.settings.hardware_rays && self.accel.is_none() {
             self.accel = Some(SceneAccel::new(gpu));
         }
         match &mut self.accel {
             Some(accel) => accel.update(gpu, &mut self.command_pool, self.scene.words(), changed),
             None => Ok(()),
         }
+    }
+
+    /// Upload models added since the last upload. Earlier frames may still
+    /// read the buffers this replaces, so it waits for the GPU first.
+    unsafe fn flush_scene(&mut self, gpu: &mut Gpu) -> Result<()> {
+        if !self.upload_pending {
+            return Ok(());
+        }
+        self.upload_pending = false;
+        gpu.device.device_wait_idle()?;
+        self.upload_scene(gpu)
     }
 
     /// Pack the scene and upload it.
@@ -548,6 +636,7 @@ impl SplitRadianceCascades {
                 )
             });
         (self.geometry, self.words) = (geometry, scene_words);
+        let result = result.and_then(|()| self.upload_surface(gpu, &scene.words().surface));
         self.scene = mem::take(&mut scene);
         result?;
         self.update_accel(gpu, None)?;
@@ -555,6 +644,30 @@ impl SplitRadianceCascades {
             self.write_sets(gpu.device, &targets);
         }
         Ok(())
+    }
+
+    /// Upload the surface cache's words with every texel's radiance cleared,
+    /// since a new atlas moves texels. Each buffer holds at least one word.
+    unsafe fn upload_surface(&mut self, gpu: &mut Gpu, surface: &SurfaceWords) -> Result<()> {
+        self.surface_texels = surface.texels.len() as u32;
+        let radiance = vec![glam::UVec4::ZERO; 3 * surface.texels.len().max(1)];
+        let one = [glam::UVec4::ZERO];
+        let words = |w: &[glam::UVec4]| -> Vec<u8> {
+            bytemuck::cast_slice(if w.is_empty() { &one } else { w }).to_vec()
+        };
+        let payloads = [
+            ("gi surface triangles", words(&surface.triangles)),
+            ("gi surface islands", words(&surface.islands)),
+            ("gi surface texels", words(&surface.texels)),
+            ("gi surface radiance", words(&radiance)),
+        ];
+        let mut buffers = mem::take(&mut self.surface);
+        let mut result = Ok(());
+        for (buffer, (name, bytes)) in buffers.iter_mut().zip(&payloads) {
+            result = result.and_then(|()| self.upload(gpu, buffer, name, bytes));
+        }
+        self.surface = buffers;
+        result
     }
 
     unsafe fn create_view(&self, gpu: &mut Gpu, targets: &Targets) -> Result<View> {
@@ -810,6 +923,10 @@ impl SplitRadianceCascades {
                     (47, placeholder),
                     (48, Res::Buffer(view.merge_list.buffer)),
                     (49, Res::Buffer(self.blue_noise.buffer)),
+                    (51, Res::Buffer(self.surface[0].buffer)),
+                    (52, Res::Buffer(self.surface[1].buffer)),
+                    (53, Res::Buffer(self.surface[2].buffer)),
+                    (54, Res::Buffer(self.surface[3].buffer)),
                 ]
             };
             let (irr, meta, bg) = (&view.irradiance, &view.metadata, &view.background);
@@ -1015,13 +1132,15 @@ impl SplitRadianceCascades {
         let budget = update_budget(&settings);
         let (phase, quota) = self.schedule.next(samples, budget);
         let active = SOURCE_BACKGROUND | if conventional > 0 { SOURCE_PUNCTUAL } else { 0 };
+        // Sunlight is stored in the background group, point lights in punctual.
+        let (sun_change, points_changed) = light_changes(&lights, &self.previous_lights);
         let changed = if first {
             active
-        } else if lights_changed {
-            SOURCE_PUNCTUAL
         } else {
-            0
+            (if points_changed { SOURCE_PUNCTUAL } else { 0 })
+                | (if sun_change != SunChange::None { SOURCE_BACKGROUND } else { 0 })
         };
+        let gradual_sun = !first && sun_change == SunChange::Gradual;
         let [r, g, b] = settings.environment;
         let params = Parameters {
             world_from_clip: clip.inverse().to_cols_array_2d(),
@@ -1062,7 +1181,8 @@ impl SplitRadianceCascades {
             layers: [conventional, 1, 1, 0],
             environment_rotation: [0.0, 0.0, 0.0, 1.0],
             environment_scale: [1.0, 0.0, 0.0, 0.0],
-            source_history: [active, changed, 0, 0],
+            // z bit 0: the sun moved a little, so the shaders blend its history rather than drop it.
+            source_history: [active, changed, u32::from(gradual_sun), 0],
             sampling: [
                 budget,
                 settings.sampling.max_traversal_queries,
@@ -1080,6 +1200,13 @@ impl SplitRadianceCascades {
                 u32::MAX,
                 u32::from(settings.multi_bounce),
                 0,
+            ],
+            surface: [
+                self.surface_texels,
+                settings.surface_updates.min(self.surface_texels),
+                settings.surface_from_level,
+                settings.surface_bounce_rays.min(8)
+                    | ((settings.surface_software_reach.max(0.0) * 100.0) as u32).min(0xff_ffff) << 8,
             ],
             ..Parameters::default()
         };
@@ -1226,6 +1353,11 @@ impl SplitRadianceCascades {
         }
         dispatch("generateDirections", compute[0], image[0], image[1]);
         dispatch("clear", clear[1], clear_groups, 1);
+        // Surface cache texels this frame, before any hit reads them.
+        let surface_updates = settings.surface_updates.min(self.surface_texels);
+        if surface_updates > 0 {
+            dispatch("surfaceUpdate", compute[0], surface_updates.div_ceil(64), 1);
+        }
         // Transport: closest hits, recorded visibility queries, the queries in
         // parallel, shading and deposit; the immediate kernel takes overflow.
         dispatch("traceDeferred", compute[0], trace_groups, 1);
@@ -1338,6 +1470,10 @@ impl GiMethod for SplitRadianceCascades {
         self.status.clone()
     }
 
+    fn set_hardware_rays(&mut self, on: bool) {
+        self.settings.hardware_rays = on;
+    }
+
     fn gpu_time(&self) -> Option<std::time::Duration> {
         self.timer.as_ref().and_then(PassTimer::total)
     }
@@ -1370,14 +1506,17 @@ impl RenderExtension for SplitRadianceCascades {
 
     fn scene_loaded(
         &mut self,
-        gpu: &mut Gpu,
+        _gpu: &mut Gpu,
         scene: &SceneData,
         material_base: u32,
         _draw_base: u32,
     ) -> Result<()> {
         self.scene.add(scene, material_base);
         self.scene_changed = true;
-        unsafe { self.upload_scene(gpu) }
+        // Packing and uploading covers every model so far: doing it once when
+        // GI next needs the scene, not per model, saved seconds on Sponza.
+        self.upload_pending = true;
+        Ok(())
     }
 
     fn retained_changed(
@@ -1386,6 +1525,7 @@ impl RenderExtension for SplitRadianceCascades {
         changes: &[RetainedChange],
         material: u32,
     ) -> Result<()> {
+        unsafe { self.flush_scene(gpu)? };
         self.scene.set_retained(changes, material);
         // History stays: it refines toward the new geometry, where dropping it
         // would flash the whole view on every brush stroke.
@@ -1461,6 +1601,7 @@ impl RenderExtension for SplitRadianceCascades {
                     bytemuck::cast_slice(&empty.scene_words),
                 )?;
                 (self.geometry, self.words) = (geometry, words);
+                self.upload_surface(gpu, &SurfaceWords::default())?;
             }
             if self.blue_noise.buffer == vk::Buffer::null() {
                 let mut blue_noise = mem::take(&mut self.blue_noise);
@@ -1478,7 +1619,23 @@ impl RenderExtension for SplitRadianceCascades {
         Ok(())
     }
 
+    fn prepare(&mut self, gpu: &mut Gpu, viewport: [u32; 4]) -> Result<()> {
+        // Frames that draw no 3D view, like the editor's loading frames, leave
+        // models to gather so they upload once.
+        if viewport[2] == 0 || viewport[3] == 0 {
+            return Ok(());
+        }
+        unsafe { self.flush_scene(gpu) }
+    }
+
     fn record(&mut self, gpu: &mut Gpu, frame: &FrameContext) -> Result<()> {
+        let hardware = gpu.ray_query && self.settings.hardware_rays;
+        if self.pipelines.is_some()
+            && hardware != self.accel.is_some()
+            && let Some(targets) = self.targets
+        {
+            unsafe { self.switch_tracing(gpu, &targets)? };
+        }
         self.poll_compile();
         if !self.active() || self.view.is_none() || frame.viewport[2] == 0 || frame.viewport[3] == 0
         {
@@ -1510,6 +1667,9 @@ impl RenderExtension for SplitRadianceCascades {
             }
             gpu::destroy_buffer(gpu.device, gpu.allocator, mem::take(&mut self.geometry));
             gpu::destroy_buffer(gpu.device, gpu.allocator, mem::take(&mut self.words));
+            for buffer in &mut self.surface {
+                gpu::destroy_buffer(gpu.device, gpu.allocator, mem::take(buffer));
+            }
             gpu::destroy_buffer(gpu.device, gpu.allocator, mem::take(&mut self.blue_noise));
             if let Some(accel) = self.accel.take() {
                 accel.destroy(gpu);
@@ -1517,5 +1677,38 @@ impl RenderExtension for SplitRadianceCascades {
             gpu.device.destroy_command_pool(self.command_pool, None);
             self.command_pool = vk::CommandPool::null();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sun(direction: [f32; 3], color: [f32; 3]) -> GiLight {
+        GiLight {
+            position: [direction[0], direction[1], direction[2], 0.0],
+            color: [color[0], color[1], color[2], 0.0],
+            ..GiLight::default()
+        }
+    }
+
+    #[test]
+    fn sun_changes_are_background_changes() {
+        let point = GiLight { position: [0.0, 1.0, 0.0, 2.0], color: [1.0; 4], ..GiLight::default() };
+        let mask = GiLight { source: [1, 2, 3, 4], ..GiLight::default() };
+        let base = [point, sun([0.0, 1.0, 0.0], [3.0; 3]), mask];
+        assert_eq!(light_changes(&base, &base), (SunChange::None, false));
+
+        let nudged = [point, sun([0.01, 1.0, 0.0], [3.0; 3]), mask];
+        assert_eq!(light_changes(&nudged, &base), (SunChange::Gradual, false));
+
+        let set = [point, sun([1.0, 0.2, 0.0], [3.0; 3]), mask];
+        assert_eq!(light_changes(&set, &base), (SunChange::Hard, false));
+
+        let gone = [point, mask];
+        assert_eq!(light_changes(&gone, &base), (SunChange::Hard, false));
+
+        let moved = [GiLight { position: [1.0, 1.0, 0.0, 2.0], ..point }, base[1], mask];
+        assert_eq!(light_changes(&moved, &base), (SunChange::None, true));
     }
 }

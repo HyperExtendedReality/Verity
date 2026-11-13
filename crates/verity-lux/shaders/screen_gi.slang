@@ -6,6 +6,8 @@
 
 static const float PI = 3.14159265;
 static const int STEPS = 24;
+// Frames of history a `HISTORY_PRIOR` estimate counts for.
+static const float PRIOR_FRAMES = 2.0;
 static const int MAX_MOVED = 16;
 
 
@@ -60,7 +62,8 @@ struct Light {
 [[vk::binding(2, 1)]] Texture2D<float4> in2;
 [[vk::binding(3, 1)]] Texture2D<float4> in3;
 [[vk::binding(4, 1)]] [format("rgba16f")] WTexture2D<float4> out0;
-[[vk::binding(5, 1)]] [format("r32f")] WTexture2D<float> out1;
+// rg32f: depth passes write (linear depth, packed normal), see `guide`.
+[[vk::binding(5, 1)]] [format("rg32f")] WTexture2D<float2> out1;
 [[vk::binding(6, 1)]] [format("rgba16f")] WTexture2D<float4> out2;
 [[vk::binding(7, 1)]] [format("r32f")] WTexture2D<float> out3;
 // The composite's inputs: filtered light and its linear depth, and the
@@ -120,6 +123,11 @@ float3 decodeNormal(float2 packed) {
 float3 gbufferNormal(uint4 g) {
     return decodeNormal(float2(float(g.w & 4095u), float((g.w >> 12u) & 4095u)) / 4095.0);
 }
+
+// The G-buffer's 24-bit normal as a float, exact in fp32, so a quarter-size
+// depth image carries it and filters need not reload the full-size G-buffer.
+float packedNormal(uint4 g) { return float(g.w & 0xffffffu); }
+float3 guideNormal(float packed) { return gbufferNormal(uint4(0u, 0u, 0u, uint(packed))); }
 
 float3 gbufferBase(uint4 g) {
     float3 base = float3(float(g.x & 255u), float((g.x >> 8u) & 255u), float((g.x >> 16u) & 255u)) / 255.0;
@@ -235,7 +243,7 @@ float3 diffuseLit(float3 lit, Brdf b, float roughness, float3 n, float3 view) {
     float3 sun = f.sunDirection.xyz;
     if (f.sunDirection.w < 0.5 || dot(n, sun) <= 0.0) return lit;
     float3 full = brdf_value(b, n, view, sun);
-    return lit * saturate(b.diffuse_color * hammon_diffuse(n, view, sun, roughness) / max(full, 1e-6));
+    return lit * saturate(brdf_diffuse(b, n, view, sun) / max(full, 1e-6));
 }
 
 bool cameraStill() {
@@ -372,7 +380,8 @@ void temporal(uint3 id : SV_DispatchThreadID) {
     if (any(px >= size)) return;
     int2 fp = framePixel(px, size);
     float depth = loadDepth(fp);
-    if (!receives(depth, loadGbuffer(fp))) {
+    uint4 g = loadGbuffer(fp);
+    if (!receives(depth, g)) {
         out0.Store(px, 0.0);
         out1.Store(px, 0.0);
         out2.Store(px, 0.0);
@@ -384,6 +393,16 @@ void temporal(uint3 id : SV_DispatchThreadID) {
     float l = luminance(now.rgb);
     float4 result = now;
     float3 m = float3(l, l * l, 1.0); // mean, mean of the square, frames of history
+#ifdef HISTORY_PRIOR
+    // No history yet: a method's world-space estimate stands in for a couple
+    // of frames, so a texel coming into view starts near the answer.
+    float4 prior;
+    if (historyPrior(p, gbufferNormal(g), prior)) {
+        result = lerp(prior, now, 1.0 / (PRIOR_FRAMES + 1.0));
+        float lp = luminance(prior.rgb);
+        m = float3(lerp(float2(lp, lp * lp), float2(l, l * l), 1.0 / (PRIOR_FRAMES + 1.0)), PRIOR_FRAMES + 1.0);
+    }
+#endif
     if (f.extra.z > 0.5) {
         float3 pp = project(f.prevClipFromWorld, p);
         if (onScreen(pp.xy)) {
@@ -413,24 +432,27 @@ void temporal(uint3 id : SV_DispatchThreadID) {
             }
         }
     }
-    // A young history hasn't seen enough frames to tell: taken as noisy.
-    float variance = max(m.y - m.x * m.x, 0.0);
+    // The filter stops at edges by the noise left in the accumulated light: one
+    // frame's variance over the frames averaged. A young history hasn't seen
+    // enough frames to tell: taken as noisy.
+    float variance = max(m.y - m.x * m.x, 0.0) / m.z;
     if (m.z < 4.0) variance = max(variance, 0.25 * m.x * m.x + 0.01);
     out0.Store(px, result);
-    out1.Store(px, linearDepth(depth));
+    out1.Store(px, float2(linearDepth(depth), packedNormal(g)));
     out2.Store(px, float4(m, 0.0));
     out3.Store(px, variance);
 }
 
 // One pass of an edge-aware a-trous filter: neighbours on the same plane and
 // facing the same way, averaged more where still noisy.
-// in0 light, in1 variance, in2 linear depth; out0 light, out1 variance.
+// in0 light, in1 variance, in2 depth and normal; out0 light, out1 variance.
 void atrous(int2 px, int step) {
     int2 size = traceSize();
     if (any(px >= size)) return;
     float4 c = in0.Load(int3(px, 0));
     float v = in1.Load(int3(px, 0)).r;
-    float z = in2.Load(int3(px, 0)).r;
+    float2 guide = in2.Load(int3(px, 0)).rg;
+    float z = guide.x;
     if (z <= 0.0) {
         out0.Store(px, c);
         out1.Store(px, v);
@@ -438,7 +460,7 @@ void atrous(int2 px, int step) {
     }
     int2 fp = framePixel(px, size);
     float3 pos = worldFromPixel(float2(fp) + 0.5, f.camera.w / z);
-    float3 n = gbufferNormal(loadGbuffer(fp));
+    float3 n = guideNormal(guide.y);
     float lc = luminance(c.rgb);
     float sigma = 4.0 * sqrt(v) + 1e-3;
     float4 sum = 0.0;
@@ -448,10 +470,11 @@ void atrous(int2 px, int step) {
         [loop] for (int x = -2; x <= 2; x++) {
             int2 q = px + int2(x, y) * step;
             if (any(q < 0) || any(q >= size)) continue;
-            float zq = in2.Load(int3(q, 0)).r;
+            float2 gq = in2.Load(int3(q, 0)).rg;
+            float zq = gq.x;
             if (zq <= 0.0) continue;
             int2 fq = framePixel(q, size);
-            float3 nq = gbufferNormal(loadGbuffer(fq));
+            float3 nq = guideNormal(gq.y);
             float4 cq = in0.Load(int3(q, 0));
             float plane = abs(dot(n, worldFromPixel(float2(fq) + 0.5, f.camera.w / zq) - pos));
             float w = kernelTap(abs(x)) * kernelTap(abs(y));
@@ -492,9 +515,10 @@ float4 upsampleGi(int2 fp, float3 n, float d) {
     [loop] for (int y = -1; y <= 2; y++) {
         [loop] for (int x = -1; x <= 2; x++) {
             int2 t = clamp(base + int2(x, y), 0, size - 1);
-            float tz = giDepth.Load(int3(t, 0)).r;
+            float2 tg = giDepth.Load(int3(t, 0)).rg;
+            float tz = tg.x;
             if (tz <= 0.0) continue;
-            float3 tn = gbufferNormal(loadGbuffer(framePixel(t, size)));
+            float3 tn = guideNormal(tg.y);
             float2 o = float2(t) - tc;
             float w = exp(-dot(o, o) * 0.5) * exp(-abs(tz - d) / (0.03 * d + 0.01)) * pow(max(dot(tn, n), 0.0), 8.0);
             sum += giLight.Load(int3(t, 0)) * w;

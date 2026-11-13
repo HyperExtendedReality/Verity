@@ -246,6 +246,55 @@ experiment also reached up to 8.6% error at incident-light peaks for a constant
 input. No normal atlas has been implemented or GPU-measured; the diffuse-only
 fit is not the selected full-BRDF representation.
 
+## Surface cache
+
+Ray hits on charted surfaces read an outgoing-light atlas instead of world
+probes for their further bounces (`cascades/surface.rs`,
+`shaders/surface_cache.slang`; see the README for measurements). Each texel
+keeps direct light, the mean incoming bounce light and diffuse reflectance,
+blended over updates, plus a dependency box. Geometry, emissive and light dirty
+regions, and any source change, drop a texel's history. Records name instances
+in load order. The words after the scene's layer mask map that order to TLAS
+slots, because each TLAS rebuild reorders instances.
+
+Known limits: bounce rays that hit uncharted surfaces are left out of the mean
+rather than shaded, which biases bright when much of the scene is foliage.
+Texels refresh in a rolling sweep (about 15 frames on Sponza) with a 0.1 blend
+floor, so gradual lighting changes lag. Retained meshes are not charted.
+
+Merge interpolation: the Split RC paper (§8.1) names light leaking from
+interpolation during merging as a limitation; it uses the same renormalized
+sparse trilinear blend as `interpolateMergedChildSources`, and Holographic RC
+is a 2D construction it does not carry to 3D. Merging from the nearest child
+probe alone, as a bound on what removing interpolation leaks can gain, moved
+error from 0.329 to 0.424 on the Bistro street, 0.378 to 0.412 on the Sponza
+corridor (with twice the flicker) and 0.251 to 0.233 in the courtyard. The
+blend does more good than its leaks cost, so a geometry-aware weight could
+gain at most a few percent where corners straddle walls; it is not pursued.
+
+Cone tracing was tried and removed. Texels filled a camera-snapped 128³ grid of 0.5 m voxels with light and opacity each
+frame, three mips average it, and the last cascade marches cones as wide as
+its direction bins instead of tracing BVH rays past its start. Against the
+reference (error / GI time, 4-frame means):
+
+| View | Hardware rays | Hardware + cones | Software rays | Software + cones (bounces too) |
+| --- | --- | --- | --- | --- |
+| Bistro street | 0.329 / 5.13 ms | 0.534 / 8.08 ms | 0.481 / 20.6 ms | 0.553 / 18.1 ms |
+| Sponza corridor | 0.378 / 3.30 ms | 0.377 / 4.45 ms | 0.370 / 6.95 ms | 0.356 / 7.75 ms |
+| Sponza courtyard | 0.251 / 4.29 ms | 0.238 / 5.40 ms | 0.256 / 8.22 ms | 0.238 / 8.96 ms |
+
+Building the grid costs about 1.5 ms (texel injection 0.8 ms, resolving 2M
+voxels 0.7 ms), more than the far BVH rays it replaces (0.1 ms in hardware,
+1.2 ms in software). Outdoors the 64 m grid loses the street's farther
+buildings to sky: Bistro's bounced light falls to 0.55-0.57×. Enclosed views
+gain a little. In software the surface cache's own bounce rays dominate: its
+update costs 10.3 ms on Bistro (2.1 ms without bounce rays); cones past 2 m cut
+that to 7.1 ms at the same quality loss outdoors.
+
+It lost outdoors and saved no time, so the code was removed. The software
+update cost remains open: fewer updates or shorter bounce rays in software
+mode would address it without a grid.
+
 ## Validation and timing boundaries
 
 Split's primary G-buffer resolve convolves the same complete world incident

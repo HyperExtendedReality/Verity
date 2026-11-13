@@ -46,13 +46,14 @@ pub use component::{
     SoftPreset, SoftShape,
 };
 use glam::{Mat3, Quat, Vec3, Vec3A};
-use rayon::prelude::*;
 pub use query::{
     Bounds, Bvh, BvhNode, RayHit, RayItem, RayScene, RayShape, RaySource, RaySync, TriMesh,
 };
+use rayon::prelude::*;
 pub use soft::{Impact, Interest, SoftBody, SoftMaterial};
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 use verity_core::{EntityHandle, Transform, World};
 
 /// Solver parameters. The caller supplies the fixed timestep to [`PhysicsWorld::step`].
@@ -119,6 +120,12 @@ pub enum Collider {
     Sphere {
         radius: f32,
     },
+    /// Z-aligned, as Z is up. `half_height` is half the distance between the
+    /// cap centers.
+    Capsule {
+        radius: f32,
+        half_height: f32,
+    },
     /// The shape given to [`PhysicsWorld::set_ground`], in this body's frame.
     /// Ground is solid and unbounded: give it to one static body.
     Ground,
@@ -158,14 +165,37 @@ impl Collider {
                 let mass = 4.0 / 3.0 * std::f32::consts::PI * radius.powi(3) * density;
                 (mass, Vec3::splat(0.4 * mass * radius * radius))
             }
+            Self::Capsule {
+                radius: r,
+                half_height: h,
+            } => {
+                assert!(
+                    r.is_finite() && r > 0.0 && h.is_finite() && h > 0.0,
+                    "capsule radius and half height must be finite and positive"
+                );
+                let pi = std::f32::consts::PI;
+                let (cylinder, caps) = (
+                    pi * r * r * 2.0 * h * density,
+                    4.0 / 3.0 * pi * r.powi(3) * density,
+                );
+                let r2 = r * r;
+                // The caps sit h from the center, plus their own centroid offset.
+                let across =
+                    cylinder * (r2 / 4.0 + h * h / 3.0) + caps * (0.4 * r2 + h * h + 0.75 * h * r);
+                let along = cylinder * r2 / 2.0 + caps * 0.4 * r2;
+                (cylinder + caps, Vec3::new(across, across, along))
+            }
             // Massless, so it never moves, whatever the body's type.
             Self::Ground => (0.0, Vec3::ZERO),
         }
     }
 }
 
-/// Density in kg/m³ and friction coefficients. Density must be positive and
-/// the coefficients nonnegative; all finite. Contacts use geometric means.
+/// Density in kg/m³, friction coefficients and restitution. Density must be
+/// positive and the coefficients nonnegative; all finite. Contacts use the
+/// geometric mean of friction and the larger restitution, so one bouncy ball
+/// bounces off anything. Restitution 0 stops dead, 1 bounces back whole; it
+/// applies only to impacts faster than about 1 m/s, so resting bodies settle.
 /// A contact that held last frame uses `static_friction`, and switches to
 /// the kinetic `friction` once it has to slide (AVBD Sec. 3.3).
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -173,6 +203,7 @@ pub struct PhysicsMaterial {
     pub density: f32,
     pub friction: f32,
     pub static_friction: f32,
+    pub restitution: f32,
 }
 
 impl Default for PhysicsMaterial {
@@ -181,6 +212,7 @@ impl Default for PhysicsMaterial {
             density: 1000.0,
             friction: 0.6,
             static_friction: 0.6,
+            restitution: 0.0,
         }
     }
 }
@@ -532,6 +564,42 @@ impl Slot {
     }
 }
 
+/// Where the last [`PhysicsWorld::step`] spent its time, and what it held.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct StepProfile {
+    /// Syncing bodies and links from the world into the solver.
+    pub setup: Duration,
+    pub broad_phase: Duration,
+    pub narrow_phase: Duration,
+    /// The solver's iterations, restitution and sleeping.
+    pub solve: Duration,
+    /// Writing poses, velocities and joint events back.
+    pub write_back: Duration,
+    pub soft: Duration,
+    pub bodies: usize,
+    pub contacts: usize,
+    pub joints: usize,
+    pub soft_particles: usize,
+}
+
+impl StepProfile {
+    pub fn total(&self) -> Duration {
+        self.setup + self.broad_phase + self.narrow_phase + self.solve + self.write_back + self.soft
+    }
+
+    /// Add `other`'s times and keep its counts, for summing several steps.
+    pub fn accumulate(&mut self, other: &Self) {
+        self.setup += other.setup;
+        self.broad_phase += other.broad_phase;
+        self.narrow_phase += other.narrow_phase;
+        self.solve += other.solve;
+        self.write_back += other.write_back;
+        self.soft += other.soft;
+        (self.bodies, self.contacts, self.joints, self.soft_particles) =
+            (other.bodies, other.contacts, other.joints, other.soft_particles);
+    }
+}
+
 /// Owns entity-associated physics data and solver state. Use each instance
 /// with one `World` only: handles are world-local.
 #[derive(Default)]
@@ -549,6 +617,7 @@ pub struct PhysicsWorld {
     joint_events: Vec<JointEvent>,
     soft: Vec<SoftBody>,
     interests: Vec<Interest>,
+    profile: StepProfile,
 }
 
 /// Identifies a soft body in its [`PhysicsWorld`].
@@ -975,8 +1044,20 @@ impl PhysicsWorld {
     /// Advance by one positive fixed timestep in seconds, then write moved
     /// transforms and velocities back. Bodies of despawned entities are dropped.
     pub fn step(&mut self, world: &mut World, settings: &PhysicsSettings, dt: f32) {
+        self.profile = StepProfile::default();
         self.step_rigid(world, settings, dt);
+        let soft = Instant::now();
         self.step_soft(settings, dt);
+        self.profile.soft = soft.elapsed();
+        self.profile.bodies = self.slots.len();
+        self.profile.contacts = self.solver.contact_count();
+        self.profile.joints = self.links.len();
+        self.profile.soft_particles = self.soft.iter().map(|b| b.positions().len()).sum();
+    }
+
+    /// Phase times and counts of the last [`step`](Self::step).
+    pub fn last_profile(&self) -> StepProfile {
+        self.profile
     }
 
     fn step_rigid(&mut self, world: &mut World, settings: &PhysicsSettings, dt: f32) {
@@ -999,6 +1080,7 @@ impl PhysicsWorld {
             "physics timestep must be finite and positive"
         );
         self.joint_events.clear();
+        let setup = Instant::now();
 
         if self.slots.iter().any(|slot| !world.contains(slot.entity)) {
             let (gone, kept): (Vec<_>, Vec<_>) = std::mem::take(&mut self.slots)
@@ -1092,6 +1174,8 @@ impl PhysicsWorld {
             .next_power_of_two()
             .min(rayon::current_num_threads())
             .min(*PHYSICAL_CORES);
+        let solve = Instant::now();
+        self.profile.setup = solve - setup;
         let solver = &mut self.solver;
         if threads == 1 {
             // Avoid dispatching the entire step to a one-worker pool.
@@ -1113,6 +1197,10 @@ impl PhysicsWorld {
                 None => solver.step(settings, dt, false, false),
             }
         }
+        let write_back = Instant::now();
+        self.profile.broad_phase = self.solver.broad_time;
+        self.profile.narrow_phase = self.solver.narrow_time;
+        self.profile.solve = (write_back - solve).saturating_sub(self.solver.broad_time + self.solver.narrow_time);
         for (i, stage) in self.solver.joint_changes.drain(..) {
             let (link, body_a, body_b) = self.links[i];
             let load = self.solver.links[i].load;
@@ -1147,6 +1235,7 @@ impl PhysicsWorld {
                 slot.rest = (item.transform.translation, item.transform.rotation);
             }
         }
+        self.profile.write_back = write_back.elapsed();
     }
 }
 
@@ -1170,6 +1259,7 @@ fn solver_body(slot: &mut Slot, transform: &Transform, dt: f32) -> solver::Body 
         density,
         friction,
         static_friction,
+        restitution,
     } = body.material;
     assert!(
         density.is_finite() && density > 0.0,
@@ -1181,6 +1271,10 @@ fn solver_body(slot: &mut Slot, transform: &Transform, dt: f32) -> solver::Body 
             && static_friction.is_finite()
             && static_friction >= 0.0,
         "friction coefficients must be finite and nonnegative"
+    );
+    assert!(
+        restitution.is_finite() && restitution >= 0.0,
+        "restitution must be finite and nonnegative"
     );
     let (v, f) = (body.velocity, body.force);
     assert!(
@@ -1271,6 +1365,7 @@ fn solver_body(slot: &mut Slot, transform: &Transform, dt: f32) -> solver::Body 
         inertia: inertia.into(),
         friction,
         static_friction,
+        restitution,
         kinematic: body.body_type == RigidBody::Kinematic,
         asleep: slot.asleep,
         // A caller's change to a sleeping body wakes its island.

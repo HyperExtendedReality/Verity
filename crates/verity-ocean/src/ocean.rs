@@ -1,8 +1,5 @@
 use crate::fft::{Fft2, cis, conj, mul, negated, signed, times_i};
-use crate::{
-    GRAIN, GRAVITY, Rng, Water, WaterSample, angular_frequency, bilinear, group_velocity,
-    undisplace,
-};
+use crate::{GRAIN, GRAVITY, Rng, Water, WaterSample, angular_frequency, bilinear, group_velocity};
 use glam::{Vec2, Vec3};
 use rayon::prelude::*;
 use std::f32::consts::{PI, TAU};
@@ -145,9 +142,10 @@ pub struct OceanSettings {
     /// Horizontal displacement λ: 0 gives rounded crests, 1 the sharp
     /// physical ones; above 1 crests fold over.
     pub choppiness: f32,
-    /// Surface compression (Jacobian) of a single cascade below which whitecaps
-    /// form. The default tracks the coverage Monahan & Muircheartaigh 1980
-    /// measured against wind speed, within a factor of about three.
+    /// Surface compression (Jacobian) below which whitecaps form, judged per
+    /// cascade and on the summed surface. The default tracks the coverage
+    /// Monahan & Muircheartaigh 1980 measured against wind speed, within a
+    /// factor of about three.
     pub foam_threshold: f32,
     /// Seconds for whitecaps to fade to 1/e.
     pub foam_lifetime: f32,
@@ -158,7 +156,8 @@ impl Default for OceanSettings {
     fn default() -> Self {
         Self {
             resolution: 128,
-            cascades: vec![256.0, 48.0, 9.0],
+            // Non-integer ratios, so no two cascades repeat in step.
+            cascades: vec![1400.0, 256.0, 48.0, 9.0],
             depth: f32::INFINITY,
             spectra: vec![
                 Spectrum::default(),
@@ -172,7 +171,7 @@ impl Default for OceanSettings {
                 },
             ],
             choppiness: 0.9,
-            foam_threshold: 0.745,
+            foam_threshold: 0.76,
             foam_lifetime: 2.0,
             seed: 1,
         }
@@ -191,7 +190,11 @@ pub struct Cascade {
     pub slope: Vec<Vec2>,
     /// Whitecap coverage in [0, 1].
     pub foam: Vec<f32>,
-    previous: Vec<Vec3>,
+    /// Surface velocity, m/s.
+    velocity: Vec<Vec3>,
+    /// Displacement gradient (∂Dx/∂x, ∂Dy/∂y, ∂Dx/∂y): summed over cascades
+    /// it gives the whole surface's compression.
+    gradient: Vec<Vec3>,
     k: Vec<Vec2>,
     omega: Vec<f32>,
     h0: Vec<Vec2>,
@@ -200,12 +203,15 @@ pub struct Cascade {
     scratch: [Vec<Vec2>; 4],
 }
 
+/// Newton steps per surface query; each costs two lookups per cascade.
+const NEWTON_STEPS: usize = 3;
+
 /// Jacobian drop below the threshold that takes whitecaps to full strength.
 const FOAM_RAMP: f32 = 0.2;
 
 impl Cascade {
     fn update(&mut self, fft: &Fft2, time: f32, lambda: f32, fade: f32, threshold: f32) {
-        let [a, b, s, j] = &mut self.scratch;
+        let [a, b, s, v] = &mut self.scratch;
         // Whole turns go first, in f64: at f32 the phase of the shortest
         // waves turns to noise within hours of `time`.
         let turns = f64::from(time) / std::f64::consts::TAU;
@@ -213,7 +219,7 @@ impl Cascade {
             &mut *a,
             &mut *b,
             &mut *s,
-            &mut *j,
+            &mut *v,
             &self.k,
             &self.omega,
             &self.h0,
@@ -221,49 +227,70 @@ impl Cascade {
         )
             .into_par_iter()
             .with_min_len(GRAIN)
-            .for_each(|(a, b, s, j, &k, &omega, &h0, &h0_negated)| {
+            .for_each(|(a, b, s, v, &k, &omega, &h0, &h0_negated)| {
                 // The inverse FFT uses exp(+i k·x), so exp(-i ωt)
                 // propagates the directional spectrum along +k.
                 let phase = f64::from(omega) * turns;
                 let e = cis(-((phase - phase.floor()) as f32) * TAU);
-                let h = mul(h0, e) + mul(h0_negated, conj(e));
+                let (ahead, mirror) = (mul(h0, e), mul(h0_negated, conj(e)));
+                let h = ahead + mirror;
+                // ∂h/∂t, exact at any time, so velocity needs no previous frame.
+                let dh = times_i(mirror - ahead) * omega;
                 let kl = k.length().max(f32::MIN_POSITIVE);
-                // Choppy displacement D = i k/|k| h pulls surface points toward crests.
-                let ih = times_i(h);
-                let (dx, dy) = (ih * (k.x / kl), ih * (k.y / kl));
-                let (jxx, jyy, jxy) = (
-                    h * (-k.x * k.x / kl),
-                    h * (-k.y * k.y / kl),
-                    h * (-k.x * k.y / kl),
-                );
+                // Choppy displacement D = i k/|k| h pulls surface points toward
+                // crests; it moves at i k/|k| ∂h/∂t.
+                let (ih, idh) = (times_i(h), times_i(dh));
                 // Real fields packed in pairs: F(A + iB) = F(A) + i F(B).
-                *a = dx + times_i(dy);
-                *b = h + times_i(jxy);
+                *a = ih * (k.x / kl) + times_i(ih * (k.y / kl));
+                *b = h + times_i(dh);
                 *s = ih * k.x + times_i(ih * k.y);
-                *j = jxx + times_i(jyy);
+                *v = idh * (k.x / kl) + times_i(idh * (k.y / kl));
             });
-        [&mut *a, &mut *b, &mut *s, &mut *j]
+        [&mut *a, &mut *b, &mut *s, &mut *v]
             .into_par_iter()
             .for_each(|field| fft.run(field, true));
-        std::mem::swap(&mut self.previous, &mut self.displacement);
         (
             &mut self.displacement,
             &mut self.slope,
-            &mut self.foam,
+            &mut self.velocity,
             &*a,
             &*b,
             &*s,
-            &*j,
+            &*v,
         )
             .into_par_iter()
             .with_min_len(GRAIN)
-            .for_each(|(displacement, slope, foam, a, b, s, j)| {
+            .for_each(|(displacement, slope, velocity, a, b, s, v)| {
                 *displacement = Vec3::new(lambda * a.x, lambda * a.y, b.x);
                 *slope = *s;
-                let jacobian = (1.0 + lambda * j.x) * (1.0 + lambda * j.y) - (lambda * b.y).powi(2);
-                *foam = (*foam * fade).max(((threshold - jacobian) / FOAM_RAMP).clamp(0.0, 1.0));
+                *velocity = Vec3::new(lambda * v.x, lambda * v.y, b.y);
+            });
+        // The Jacobian by central differences rather than three more FFTs.
+        let n = (self.displacement.len() as f64).sqrt() as usize;
+        let scale = n as f32 / (2.0 * self.size);
+        let d = &self.displacement;
+        self.gradient
+            .par_chunks_mut(n)
+            .zip(self.foam.par_chunks_mut(n))
+            .enumerate()
+            .with_min_len(GRAIN / n)
+            .for_each(|(y, (gradient, foam))| {
+                let (up, down) = ((y + 1) % n * n, (y + n - 1) % n * n);
+                for (x, (gradient, foam)) in gradient.iter_mut().zip(foam).enumerate() {
+                    let (right, left) = ((x + 1) % n, (x + n - 1) % n);
+                    let dx = (d[right + y * n] - d[left + y * n]) * scale;
+                    let dy = (d[x + up] - d[x + down]) * scale;
+                    *gradient = Vec3::new(dx.x, dy.y, 0.5 * (dy.x + dx.y));
+                    *foam = (*foam * fade).max(whitecap(*gradient, threshold));
+                }
             });
     }
+}
+
+/// Whitecap strength where the displacement has `gradient`.
+fn whitecap(gradient: Vec3, threshold: f32) -> f32 {
+    let jacobian = (1.0 + gradient.x) * (1.0 + gradient.y) - gradient.z * gradient.z;
+    ((threshold - jacobian) / FOAM_RAMP).clamp(0.0, 1.0)
 }
 
 pub struct Ocean {
@@ -272,7 +299,6 @@ pub struct Ocean {
     cascades: Vec<Cascade>,
     significant_height: f32,
     time: f32,
-    dt: f32,
 }
 
 impl Ocean {
@@ -328,7 +354,8 @@ impl Ocean {
                     displacement: vec![Vec3::ZERO; n * n],
                     slope: vec![Vec2::ZERO; n * n],
                     foam: vec![0.0; n * n],
-                    previous: vec![Vec3::ZERO; n * n],
+                    velocity: vec![Vec3::ZERO; n * n],
+                    gradient: vec![Vec3::ZERO; n * n],
                     omega: k.iter().map(|k| angular_frequency(k.length(), settings.depth)).collect(),
                     k,
                     h0_negated: (0..n * n).map(|i| conj(h0[negated(i, n)])).collect(),
@@ -348,11 +375,9 @@ impl Ocean {
             cascades,
             significant_height: 4.0 * variance.sqrt(),
             time: 0.0,
-            dt: 0.0,
             settings,
         };
         ocean.update(0.0);
-        ocean.dt = 0.0;
         ocean
     }
 
@@ -384,7 +409,6 @@ impl Ocean {
         self.cascades
             .par_iter_mut()
             .for_each(|c| c.update(fft, time, lambda, fade, threshold));
-        self.dt = dt;
         self.time = time;
     }
 
@@ -393,14 +417,40 @@ impl Ocean {
         self.sum(rest, |c| &c.displacement)
     }
 
-    /// Whitecap coverage at a world point.
+    /// Whitecap coverage at a world point: lingering foam from any cascade,
+    /// or a crest that only the cascades together steepen enough to break.
     pub fn foam(&self, point: Vec2) -> f32 {
-        let rest = undisplace(point, |p| self.displacement(p));
+        let rest = self.rest(point);
         let n = self.settings.resolution;
-        self.cascades
+        let lingering = self
+            .cascades
             .iter()
             .map(|c| bilinear(&c.foam, n, rest / c.size * n as f32, true))
-            .fold(0.0, f32::max)
+            .fold(0.0, f32::max);
+        let summed = self.sum(rest, |c| &c.gradient);
+        lingering.max(whitecap(summed, self.settings.foam_threshold))
+    }
+
+    /// The rest position whose surface point is displaced onto `point`.
+    /// Newton's method on the displacement and its gradient converges in a
+    /// few steps where plain fixed-point iteration crawls near steep crests;
+    /// where the surface folds over, the fixed-point step stands in.
+    fn rest(&self, point: Vec2) -> Vec2 {
+        let mut rest = point;
+        for _ in 0..NEWTON_STEPS {
+            let miss = rest + self.displacement(rest).truncate() - point;
+            let g = self.sum(rest, |c| &c.gradient);
+            let det = (1.0 + g.x) * (1.0 + g.y) - g.z * g.z;
+            rest -= if det > 0.1 {
+                Vec2::new(
+                    (1.0 + g.y) * miss.x - g.z * miss.y,
+                    (1.0 + g.x) * miss.y - g.z * miss.x,
+                ) / det
+            } else {
+                miss
+            };
+        }
+        rest
     }
 
     fn sum(&self, rest: Vec2, field: impl Fn(&Cascade) -> &Vec<Vec3>) -> Vec3 {
@@ -414,16 +464,10 @@ impl Ocean {
 
 impl Water for Ocean {
     fn sample(&self, point: Vec2) -> WaterSample {
-        let rest = undisplace(point, |p| self.displacement(p));
-        let now = self.displacement(rest);
-        let velocity = if self.dt != 0.0 {
-            (now - self.sum(rest, |c| &c.previous)) / self.dt
-        } else {
-            Vec3::ZERO
-        };
+        let rest = self.rest(point);
         WaterSample {
-            height: now.z,
-            velocity,
+            height: self.displacement(rest).z,
+            velocity: self.sum(rest, |c| &c.velocity),
         }
     }
 }

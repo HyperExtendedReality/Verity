@@ -1,17 +1,22 @@
 //! PXTGI: global illumination traced against the physics scene, as a render
 //! extension of its own beside [`crate::cascades::SplitRadianceCascades`].
 //!
-//! A few rays per quarter-resolution texel follow what is on screen, then
-//! continue against a [`RayScene`]: the rigid colliders and soft bodies of a
-//! [`PhysicsWorld`], plus static meshes from loaded glTF scenes. Off-screen hits
-//! light themselves from a hashed radiance cache, which also carries further
-//! bounces. Filtering is temporal then a-trous, and reflections run the same way
-//! at half resolution.
+//! A few rays per quarter-resolution texel run against a [`RayScene`]: the rigid
+//! colliders and soft bodies of a [`PhysicsWorld`], plus static meshes from
+//! loaded glTF scenes (following the screen first only if
+//! [`PxtgiSettings::max_distance`] asks). Hits light themselves from a hashed
+//! radiance cache, which also carries further bounces. Filtering is temporal
+//! then a-trous, and reflections run the same way at half resolution, looking
+//! at the screen before the scene.
 //!
 //! Physics drives more than the geometry. A resting scene uploads nothing and
 //! refits nothing. Moving bodies report the region they disturbed, and only
 //! there does the GI drop its history and refresh its cache every frame, so a
 //! falling box changes the light around it without noise anywhere else.
+//!
+//! On GPUs with ray queries the passes trace acceleration structures built over
+//! the same scene (`pxtgi_accel.rs`) unless [`PxtgiSettings::hardware_rays`] is
+//! off; elsewhere they walk the scene's own tree.
 //!
 //! Install with `Renderer::set_extension` before loading scenes, and call
 //! [`Pxtgi::sync`] after each physics step. Everything is in `shaders/pxtgi.slang`.
@@ -21,6 +26,7 @@
 
 use crate::{
     GiMethod, GiStatus,
+    pxtgi_accel::{Hardware, Instance},
     shared::{BLUE_NOISE, PassTimer, Patch, Res, upload, upload_ranges, write_set},
 };
 use ash::vk;
@@ -75,12 +81,14 @@ macro_rules! spirv {
         (
             $entry,
             include_bytes!(concat!(env!("OUT_DIR"), "/pxtgi.", $entry, ".spv")).as_slice(),
+            include_bytes!(concat!(env!("OUT_DIR"), "/pxtgi.", $entry, ".rq.spv")).as_slice(),
         )
     };
 }
 
-/// Every pass of a frame, by entry point.
-const PASSES: &[(&str, &[u8])] = &[
+/// Every pass of a frame, by entry point: tracing in software, and with
+/// hardware ray queries.
+const PASSES: &[(&str, &[u8], &[u8])] = &[
     spirv!("cache_gather"),
     spirv!("cache_shade"),
     spirv!("trace"),
@@ -115,7 +123,16 @@ const SCENE_BINDINGS: &[(u32, D)] = &[
     (12, D::STORAGE_IMAGE),
     (13, D::STORAGE_BUFFER),
     (14, D::STORAGE_BUFFER),
+    (16, D::STORAGE_BUFFER),
 ];
+/// The scene TLAS, in set 0 on GPUs with ray queries.
+const TLAS_BINDING: (u32, D) = (15, D::ACCELERATION_STRUCTURE_KHR);
+
+fn scene_bindings(ray_query: bool) -> Vec<(u32, D)> {
+    let mut bindings = SCENE_BINDINGS.to_vec();
+    bindings.extend(ray_query.then_some(TLAS_BINDING));
+    bindings
+}
 /// Set 1: one pass's inputs and outputs.
 pub(crate) const IO_BINDINGS: &[(u32, D)] = &[
     (0, D::SAMPLED_IMAGE),
@@ -170,7 +187,12 @@ pub enum PxtgiDebug {
 /// PXTGI controls. Distances are in metres.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct PxtgiSettings {
-    /// How far rays follow what is on screen before continuing against the scene.
+    /// How far diffuse rays follow what is on screen before continuing against
+    /// the scene. 0, the default, traces the scene alone: the screen's shading
+    /// runs brighter than the scene's Lambertian light, and against a path-traced
+    /// reference error grew with the reach (0.074 at 0, 0.094 at 0.1 m, 0.11 at
+    /// 1 m). Give it a short reach for geometry drawn but missing from the scene.
+    /// Reflections always look at the screen first.
     pub max_distance: f32,
     /// How far rays go against the scene. Surfaces further away do not bounce light.
     pub world_ray_distance: f32,
@@ -187,12 +209,16 @@ pub struct PxtgiSettings {
     /// Scale of the bounce light.
     pub intensity: f32,
     pub debug: PxtgiDebug,
+    /// Trace the scene with hardware ray queries where the GPU has them, from
+    /// acceleration structures built over the same physics scene; off, rays walk
+    /// PXTGI's own tree. Takes effect from the next frame.
+    pub hardware_rays: bool,
 }
 
 impl Default for PxtgiSettings {
     fn default() -> Self {
         Self {
-            max_distance: 8.0,
+            max_distance: 0.0,
             world_ray_distance: 30.0,
             rays_per_texel: 2,
             multi_bounce: true,
@@ -200,6 +226,7 @@ impl Default for PxtgiSettings {
             reflection_roughness_cutoff: 0.5,
             intensity: 1.0,
             debug: PxtgiDebug::Off,
+            hardware_rays: true,
         }
     }
 }
@@ -276,6 +303,8 @@ struct Packed {
     primitives: Vec<GpuPrimitive>,
     nodes: Vec<[[f32; 4]; 2]>,
     soft: Vec<[f32; 4]>,
+    /// Each primitive's TLAS instance, in the same order.
+    instances: Vec<Instance>,
     revision: u64,
 }
 
@@ -284,6 +313,7 @@ struct Packed {
 struct StaticMesh {
     nodes_at: i32,
     triangles_at: i32,
+    triangles: u32,
     material: u32,
 }
 
@@ -296,10 +326,14 @@ struct RetainedSlot {
 }
 
 struct Pipelines {
+    /// Set 0 has the TLAS binding: the GPU has ray queries.
+    ray_query: bool,
     scene_layout: vk::DescriptorSetLayout,
     io_layout: vk::DescriptorSetLayout,
     layout: vk::PipelineLayout,
     passes: HashMap<&'static str, vk::Pipeline>,
+    /// The same passes tracing with ray queries; empty without them.
+    hardware: HashMap<&'static str, vk::Pipeline>,
 }
 
 /// Everything sized to the render targets.
@@ -318,6 +352,8 @@ struct View {
     reflect_depth: [Image; 2],
     reflect_filtered: [Image; 2],
     prev_color: Image,
+    /// The reference's fp32 sum per traced texel.
+    reference_sum: Buffer,
     frame: [Buffer; SLOTS],
     lights: [Buffer; SLOTS],
     pool: vk::DescriptorPool,
@@ -367,6 +403,8 @@ pub struct Pxtgi {
     no_capture: Buffer,
     blue_noise: Buffer,
     pipelines: Option<Pipelines>,
+    /// The scene's acceleration structures, on GPUs with ray queries.
+    hardware: Option<Hardware>,
     view: Option<View>,
     targets: Option<Targets>,
     command_pool: vk::CommandPool,
@@ -411,6 +449,7 @@ impl Pxtgi {
             no_capture: Buffer::default(),
             blue_noise: Buffer::default(),
             pipelines: None,
+            hardware: None,
             view: None,
             targets: None,
             command_pool: vk::CommandPool::null(),
@@ -477,6 +516,16 @@ impl Pxtgi {
         Ok(())
     }
 
+    /// Keep a BLAS for every static mesh, rebuilding those over `rewritten`
+    /// geometry words. The GPU must be idle.
+    unsafe fn sync_hardware(&mut self, gpu: &mut Gpu, rewritten: &[std::ops::Range<usize>]) -> Result<()> {
+        let Some(hardware) = &mut self.hardware else {
+            return Ok(());
+        };
+        let wanted = self.statics.iter().map(|m| (m.triangles_at, m.triangles));
+        hardware.sync_meshes(gpu, &mut self.command_pool, &self.geometry, wanted, rewritten)
+    }
+
     /// The scene rays run against, for tests and CPU queries.
     pub fn ray_scene(&self) -> &RayScene {
         &self.scene
@@ -502,6 +551,7 @@ impl Pxtgi {
         let packed = &mut self.packed;
         packed.primitives.clear();
         packed.soft.clear();
+        packed.instances.clear();
         let tree = self.scene.tree();
         for &item in tree.order() {
             let item = &self.scene.items()[item as usize];
@@ -510,29 +560,52 @@ impl Pxtgi {
             let ints = |a: i32, b: i32| (f32::from_bits(a as u32), f32::from_bits(b as u32));
             let [r, g, b] = self.albedos.get(&item.source).copied().unwrap_or(GREY);
             let mut albedo = [r, g, b, f32::from_bits(NO_MATERIAL)];
-            let shape = match (&item.shape, item.source) {
+            let world_from_local = item.local_from_world.inverse();
+            // What a primitive's unit box is scaled to, about its centre.
+            let unit = |center: Vec3, half: Vec3| {
+                world_from_local
+                    * Affine3A::from_scale_rotation_translation(
+                        half.max(Vec3::splat(1e-4)),
+                        glam::Quat::IDENTITY,
+                        center,
+                    )
+            };
+            let (shape, instance) = match (&item.shape, item.source) {
                 (RayShape::Collider(verity_physics::Collider::Cuboid { half_extents: h }), _) => {
-                    [KIND_BOX, h.x, h.y, h.z]
+                    ([KIND_BOX, h.x, h.y, h.z], Instance::boxed(unit(Vec3::ZERO, *h)))
                 }
                 // Ground never reaches the scene: rays see the mesh drawn for it.
                 (RayShape::Collider(verity_physics::Collider::Ground), _) => continue,
-                (RayShape::Collider(verity_physics::Collider::Sphere { radius }), _) => {
-                    [KIND_SPHERE, *radius, 0.0, 0.0]
-                }
+                // shortcut: the GI shader has no capsule primitive, so capsules
+                // cast no GI; add a KIND_CAPSULE to pxtgi.slang when one needs to.
+                (RayShape::Collider(verity_physics::Collider::Capsule { .. }), _) => continue,
+                (RayShape::Collider(verity_physics::Collider::Sphere { radius }), _) => (
+                    [KIND_SPHERE, *radius, 0.0, 0.0],
+                    Instance::boxed(unit(Vec3::ZERO, Vec3::splat(*radius))),
+                ),
                 (RayShape::Mesh(_), RaySource::Static(number)) => {
                     let mesh = self.statics[number as usize];
                     albedo[3] = f32::from_bits(mesh.material);
                     let (nodes, triangles) = ints(mesh.nodes_at, mesh.triangles_at);
-                    [KIND_MESH, nodes, triangles, 0.0]
+                    let instance = Instance {
+                        world_from_local,
+                        blas: Some((mesh.triangles_at, mesh.triangles)),
+                    };
+                    ([KIND_MESH, nodes, triangles, 0.0], instance)
                 }
                 (RayShape::Mesh(mesh), _) => {
                     let at = packed.soft.len() as i32;
                     append_mesh(&mut packed.soft, mesh);
                     let (nodes, triangles) = ints(at, at + mesh.nodes().len() as i32 * 2);
-                    [KIND_SOFT, nodes, triangles, 0.0]
+                    // The root node bounds the mesh in its own space.
+                    let [lo, hi] = mesh.nodes().first().copied().unwrap_or_default();
+                    let (lo, hi) = (Vec3::from_slice(&lo), Vec3::from_slice(&hi));
+                    let instance = Instance::boxed(unit((lo + hi) * 0.5, (hi - lo) * 0.5));
+                    ([KIND_SOFT, nodes, triangles, 0.0], instance)
                 }
             };
             packed.primitives.push([r0, r1, r2, shape, albedo]);
+            packed.instances.push(instance);
         }
         packed.nodes.clear();
         packed.nodes.extend_from_slice(tree.nodes());
@@ -557,7 +630,8 @@ impl Pxtgi {
                 None,
             )
         };
-        let scene_layout = set_layout(SCENE_BINDINGS)?;
+        let ray_query = gpu.ray_query;
+        let scene_layout = set_layout(&scene_bindings(ray_query))?;
         let io_layout = set_layout(IO_BINDINGS)?;
         // Set 2 is the renderer's frame set: materials and textures.
         let layout = device.create_pipeline_layout(
@@ -568,18 +642,22 @@ impl Pxtgi {
             ]),
             None,
         )?;
-        let mut passes = HashMap::new();
-        for &(name, spirv) in PASSES {
+        let (mut passes, mut hardware) = (HashMap::new(), HashMap::new());
+        for &(name, software, traced) in PASSES {
             let entry = CString::new(name)?;
-            let pipeline =
-                gpu::compute_pipeline(device, vk::PipelineCache::null(), layout, spirv, &entry)?;
-            passes.insert(name, pipeline);
+            let cache = vk::PipelineCache::null();
+            passes.insert(name, gpu::compute_pipeline(device, cache, layout, software, &entry)?);
+            if ray_query {
+                hardware.insert(name, gpu::compute_pipeline(device, cache, layout, traced, &entry)?);
+            }
         }
         Ok(Pipelines {
+            ray_query,
             scene_layout,
             io_layout,
             layout,
             passes,
+            hardware,
         })
     }
 
@@ -607,6 +685,8 @@ impl Pxtgi {
             )
         };
         let (rgba, r) = (vk::Format::R16G16B16A16_SFLOAT, vk::Format::R32_SFLOAT);
+        // Everything bound at `out1` is rg32f: depth images carry a packed normal.
+        let rg = vk::Format::R32G32_SFLOAT;
         let pair = |image: &mut dyn FnMut(&str, vk::Format, vk::Extent2D) -> Result<Image>,
                     name: &str,
                     format,
@@ -616,16 +696,24 @@ impl Pxtgi {
         };
         let trace_image = image("pxtgi trace", rgba, trace)?;
         let accum = pair(&mut image, "pxtgi accum", rgba, trace)?;
-        let accum_depth = pair(&mut image, "pxtgi accum depth", r, trace)?;
+        let accum_depth = pair(&mut image, "pxtgi accum depth", rg, trace)?;
         let moments = pair(&mut image, "pxtgi moments", rgba, trace)?;
         let variance = image("pxtgi variance", r, trace)?;
         let filtered = pair(&mut image, "pxtgi filtered", rgba, trace)?;
-        let filtered_variance = pair(&mut image, "pxtgi filtered variance", r, trace)?;
+        let filtered_variance = pair(&mut image, "pxtgi filtered variance", rg, trace)?;
         let reflect_trace = image("pxtgi reflect trace", rgba, reflect)?;
         let reflect_accum = pair(&mut image, "pxtgi reflect accum", rgba, reflect)?;
-        let reflect_depth = pair(&mut image, "pxtgi reflect depth", r, reflect)?;
+        let reflect_depth = pair(&mut image, "pxtgi reflect depth", rg, reflect)?;
         let reflect_filtered = pair(&mut image, "pxtgi reflect filtered", rgba, reflect)?;
         let prev_color = image("pxtgi previous color", rgba, extent)?;
+        let reference_sum = gpu::create_buffer(
+            device,
+            gpu.allocator,
+            "pxtgi reference sum",
+            u64::from(trace.width * trace.height) * 16,
+            vk::BufferUsageFlags::STORAGE_BUFFER,
+            MemoryLocation::GpuOnly,
+        )?;
 
         let mut host = |name: &str, size: usize, usage| {
             gpu::create_buffer(
@@ -652,16 +740,18 @@ impl Pxtgi {
 
         let count =
             |list: &[(u32, D)], kind: D| list.iter().filter(|(_, k)| *k == kind).count() as u32;
+        let scene_bindings = scene_bindings(pipelines.ray_query);
         let sizes = [
             D::UNIFORM_BUFFER,
             D::STORAGE_BUFFER,
             D::SAMPLED_IMAGE,
             D::STORAGE_IMAGE,
+            D::ACCELERATION_STRUCTURE_KHR,
         ]
         .map(|kind| {
             vk::DescriptorPoolSize::default().ty(kind).descriptor_count(
                 SLOTS as u32
-                    * (count(SCENE_BINDINGS, kind) + IO_SETS as u32 * count(IO_BINDINGS, kind)),
+                    * (count(&scene_bindings, kind) + IO_SETS as u32 * count(IO_BINDINGS, kind)),
             )
         });
         let sizes: Vec<_> = sizes
@@ -705,6 +795,7 @@ impl Pxtgi {
             reflect_depth,
             reflect_filtered,
             prev_color,
+            reference_sum,
             frame,
             lights,
             pool,
@@ -721,6 +812,17 @@ impl Pxtgi {
         let scene = &self.slots[slot];
         let general = vk::ImageLayout::GENERAL;
         let color = Res::View(view.prev_color.view, general);
+        let ray_query = self.pipelines.as_ref().is_some_and(|p| p.ray_query);
+        // Until a slot first traces in hardware it has no TLAS; nothing reads it.
+        let tlas = (self.hardware.as_ref()).and_then(|h| h.tlas(slot));
+        if let Some(tlas) = tlas.filter(|_| ray_query) {
+            write_set(
+                device,
+                view.scene_sets[slot],
+                &scene_bindings(true),
+                &[(TLAS_BINDING.0, Res::Accel(tlas))],
+            );
+        }
         write_set(
             device,
             view.scene_sets[slot],
@@ -744,6 +846,7 @@ impl Pxtgi {
                 (12, color),
                 (13, Res::Buffer(capture)),
                 (14, Res::Buffer(self.blue_noise.buffer)),
+                (16, Res::Buffer(view.reference_sum.buffer)),
             ],
         );
     }
@@ -773,11 +876,12 @@ impl Pxtgi {
                         &s.filtered[i],
                         &s.filtered_variance[i],
                         &s.moments[prev],
-                        &s.accum_depth[prev],
+                        &s.variance,
                     ],
                 )
             };
-            let spare = [&s.variance, &s.filtered[1], &s.filtered_variance[1]];
+            // Unused outputs, rg32f at out1 and r32f at out3.
+            let spare = [&s.filtered_variance[1], &s.filtered[1], &s.variance];
             let groups = [
                 io(
                     [
@@ -788,9 +892,9 @@ impl Pxtgi {
                     ],
                     [
                         &s.trace,
-                        &s.variance,
-                        &s.filtered[0],
                         &s.filtered_variance[0],
+                        &s.filtered[0],
+                        &s.variance,
                     ],
                 ),
                 io(
@@ -869,7 +973,8 @@ impl Pxtgi {
         view: View,
     ) {
         device.destroy_descriptor_pool(view.pool, None);
-        for buffer in view.frame.into_iter().chain(view.lights) {
+        let buffers = view.frame.into_iter().chain(view.lights);
+        for buffer in buffers.chain([view.reference_sum]) {
             gpu::destroy_buffer(device, allocator, buffer);
         }
         let groups = [
@@ -1099,6 +1204,7 @@ impl Pxtgi {
         self.last_reflections = settings.reflections;
         let view = self.view.as_mut().unwrap();
         let pipelines = self.pipelines.as_ref().unwrap();
+        let hardware = settings.hardware_rays && pipelines.ray_query && primitives > 0;
 
         // The shaders' clip space is Y-up; the renderer's is flipped for Vulkan.
         let flip = Mat4::from_scale(Vec3::new(1.0, -1.0, 1.0));
@@ -1142,7 +1248,7 @@ impl Pxtgi {
             origin: [x, y, reflect[0], reflect[1]],
             misc: [
                 (self.frame % 65536) as f32,
-                settings.max_distance.max(0.1),
+                settings.max_distance.max(0.0),
                 settings.intensity,
                 settings.debug as u32 as f32,
             ],
@@ -1194,6 +1300,20 @@ impl Pxtgi {
         let cmd = frame.cmd;
         let timer = std::cell::RefCell::new(self.timer.as_mut().unwrap());
         timer.borrow_mut().begin(device, cmd, slot)?;
+        if hardware {
+            let built = self.hardware.as_mut().expect("made with the pipelines");
+            if built.record(gpu, cmd, slot, &self.packed.instances, self.packed.revision)? {
+                let tlas = built.tlas(slot).expect("just built");
+                let set = view.scene_sets[slot];
+                write_set(device, set, &scene_bindings(true), &[(TLAS_BINDING.0, Res::Accel(tlas))]);
+            }
+            timer.borrow_mut().stamp(device, cmd, slot, "tlas");
+        }
+        let passes = if hardware {
+            &pipelines.hardware
+        } else {
+            &pipelines.passes
+        };
         let barrier = || {
             let barrier = [vk::MemoryBarrier2::default()
                 .src_stage_mask(S::COMPUTE_SHADER | S::TRANSFER)
@@ -1232,7 +1352,7 @@ impl Pxtgi {
         barrier();
 
         let dispatch = |name: &'static str, set: vk::DescriptorSet, [x, y]: [u32; 2]| {
-            device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, pipelines.passes[name]);
+            device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, passes[name]);
             device.cmd_bind_descriptor_sets(
                 cmd,
                 vk::PipelineBindPoint::COMPUTE,
@@ -1348,6 +1468,10 @@ impl GiMethod for Pxtgi {
         self.timer.as_ref().map_or(&[], |t| &t.times)
     }
 
+    fn set_hardware_rays(&mut self, on: bool) {
+        self.settings.hardware_rays = on;
+    }
+
     fn request_capture(&mut self) {
         Pxtgi::request_capture(self);
     }
@@ -1437,13 +1561,17 @@ impl RenderExtension for Pxtgi {
             self.statics.push(StaticMesh {
                 nodes_at: *nodes_at,
                 triangles_at: *triangles_at,
+                triangles: mesh.triangles().len() as u32,
                 material,
             });
             items.push((mesh.clone(), Affine3A::from_mat4(draw.transform), number));
         }
         self.scene.add_statics(items);
         self.pack();
-        unsafe { self.upload_geometry(gpu) }
+        unsafe {
+            self.upload_geometry(gpu)?;
+            self.sync_hardware(gpu, &[])
+        }
     }
 
     fn retained_changed(
@@ -1500,6 +1628,7 @@ impl RenderExtension for Pxtgi {
             self.statics[slot.number as usize] = StaticMesh {
                 nodes_at,
                 triangles_at: nodes_at + mesh.nodes().len() as i32 * 2,
+                triangles: mesh.triangles().len() as u32,
                 material,
             };
             items.push((slot.number, Some((mesh, Affine3A::IDENTITY))));
@@ -1510,7 +1639,10 @@ impl RenderExtension for Pxtgi {
         self.pack();
         let bytes: &[u8] = bytemuck::cast_slice(&self.geometry);
         if bytes.len() as u64 > self.geometry_buffer.size {
-            return unsafe { self.upload_geometry(gpu) };
+            return unsafe {
+                self.upload_geometry(gpu)?;
+                self.sync_hardware(gpu, &written)
+            };
         }
         // Only what changed: the rest of the geometry is already there.
         let word = mem::size_of::<[f32; 4]>();
@@ -1533,6 +1665,7 @@ impl RenderExtension for Pxtgi {
                     self.write_scene_set(gpu.device, slot, self.no_capture.buffer);
                 }
             }
+            self.sync_hardware(gpu, &written)?;
         }
         Ok(())
     }
@@ -1542,6 +1675,10 @@ impl RenderExtension for Pxtgi {
             if self.pipelines.is_none() {
                 self.pipelines = Some(Self::create_pipelines(gpu)?);
                 self.timer = Some(PassTimer::new(gpu)?);
+            }
+            if gpu.ray_query && self.hardware.is_none() {
+                self.hardware = Some(Hardware::new(gpu, &mut self.command_pool)?);
+                self.sync_hardware(gpu, &[])?;
             }
             let storage = vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::TRANSFER_DST;
             let device = gpu.device;
@@ -1612,8 +1749,11 @@ impl RenderExtension for Pxtgi {
             if let Some(view) = self.view.take() {
                 Self::destroy_view(device, gpu.allocator, view);
             }
+            if let Some(hardware) = self.hardware.take() {
+                hardware.destroy(gpu);
+            }
             if let Some(pipelines) = self.pipelines.take() {
-                for pipeline in pipelines.passes.into_values() {
+                for pipeline in pipelines.passes.into_values().chain(pipelines.hardware.into_values()) {
                     device.destroy_pipeline(pipeline, None);
                 }
                 device.destroy_pipeline_layout(pipelines.layout, None);
@@ -1666,6 +1806,7 @@ mod ground_tests {
             ],
             indices: vec![0, 1, 2],
             bounds: (Vec3::ZERO, Vec3::ONE),
+            plain: false,
         };
         let positions = [Vec3::Z, Vec3::new(1.0, 0.0, 1.0), Vec3::new(0.0, 1.0, 1.0)];
         let mesh = TriMesh::new(&positions, &[[0, 1, 2]]);

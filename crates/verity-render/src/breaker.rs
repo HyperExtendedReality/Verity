@@ -233,7 +233,7 @@ impl BreakerPass {
                 fragment: spirv!("breaker.fragmentMain"),
                 color: Some(HDR_FORMAT),
                 depth: Some((depth_format, vk::CompareOp::GREATER)),
-                cull: vk::CullModeFlags::NONE,
+                cull: Some(vk::CullModeFlags::NONE),
                 depth_bias: None,
             },
         )?;

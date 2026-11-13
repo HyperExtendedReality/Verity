@@ -697,6 +697,10 @@ impl Obstacle {
         match self.shape {
             Collider::Cuboid { half_extents } => half_extents.length(),
             Collider::Sphere { radius } => radius,
+            Collider::Capsule {
+                radius,
+                half_height,
+            } => radius + half_height,
             Collider::Ground => UNBOUNDED,
         }
     }
@@ -717,6 +721,23 @@ impl Obstacle {
                     Vec3::Z
                 };
                 (normal * radius, normal)
+            }
+            Collider::Capsule {
+                radius,
+                half_height,
+            } => {
+                let core = Vec3::new(0.0, 0.0, local.z.clamp(-half_height, half_height));
+                let offset = local - core;
+                let length = offset.length();
+                if length > radius + reach {
+                    return None;
+                }
+                let normal = if length > 1.0e-6 {
+                    offset / length
+                } else {
+                    Vec3::X
+                };
+                (core + normal * radius, normal)
             }
             Collider::Cuboid { half_extents: h } => {
                 let clamped = local.clamp(-h, h);
@@ -774,6 +795,13 @@ impl Obstacle {
                 let t = ((-qb - discriminant.sqrt()) / qa).max(0.0);
                 (t, (a + d * t).normalize_or_zero())
             }
+            Collider::Capsule {
+                radius,
+                half_height,
+            } => {
+                let (t, normal) = crate::query::capsule_ray(a, d, radius + pad, half_height)?;
+                (t.max(0.0), normal)
+            }
             Collider::Cuboid { half_extents } => {
                 let h = half_extents + pad;
                 let (mut enter, mut leave, mut normal) = (f32::MIN, f32::MAX, Vec3::ZERO);
@@ -819,7 +847,7 @@ impl Obstacle {
     fn narrowest(&self) -> f32 {
         match self.shape {
             Collider::Cuboid { half_extents } => half_extents.min_element(),
-            Collider::Sphere { radius } => radius,
+            Collider::Sphere { radius } | Collider::Capsule { radius, .. } => radius,
             Collider::Ground => UNBOUNDED,
         }
     }

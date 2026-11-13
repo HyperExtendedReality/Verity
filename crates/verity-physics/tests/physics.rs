@@ -1790,3 +1790,168 @@ fn a_compliant_stop_spreads_an_impact_a_rigid_one_takes_at_once() {
     assert!(soft < 0.7 * rigid, "peak {soft} against {rigid}");
     assert!(furthest > 0.55 && furthest < 1.0, "gave to {furthest}");
 }
+
+/// Highest center height after the first bounce of a ball dropped from 2 m.
+fn bounce_peak(restitution: f32) -> f32 {
+    let (mut world, mut physics) = (World::new(), PhysicsWorld::default());
+    ground(&mut world, &mut physics);
+    let mut ball = PhysicsBody::new(RigidBody::Dynamic, Collider::Sphere { radius: 0.5 });
+    ball.material.restitution = restitution;
+    let entity = spawn(&mut world, &mut physics, Vec3::new(0.0, 0.0, 2.5), ball);
+    let (mut bounced, mut peak) = (false, 0.0f32);
+    for _ in 0..240 {
+        run(&mut world, &mut physics, 1);
+        let v = physics.get(entity).unwrap().velocity.linear.z;
+        bounced |= v > 0.5;
+        if bounced {
+            peak = peak.max(position(&world, entity).z - 0.5);
+        }
+    }
+    peak
+}
+
+#[test]
+fn restitution_bounces_a_ball_to_its_squared_share_of_the_drop() {
+    for e in [0.5f32, 0.8] {
+        let peak = bounce_peak(e);
+        let expected = e * e * 2.0;
+        assert!((peak - expected).abs() < 0.15 * expected, "{e}: {peak} for {expected}");
+    }
+    assert!(bounce_peak(0.0) < 0.02, "no restitution, no bounce");
+}
+
+/// A capsule dropped onto the floor, with its core along `axis`.
+fn dropped_capsule(axis: Vec3) -> (World, PhysicsWorld, EntityHandle) {
+    let (mut world, mut physics) = (World::new(), PhysicsWorld::default());
+    ground(&mut world, &mut physics);
+    let capsule = Collider::Capsule {
+        radius: 0.3,
+        half_height: 0.6,
+    };
+    let entity = spawn(
+        &mut world,
+        &mut physics,
+        Vec3::new(0.0, 0.0, 1.5),
+        PhysicsBody::new(RigidBody::Dynamic, capsule),
+    );
+    world.get_mut(entity).unwrap().transform.rotation =
+        Quat::from_rotation_arc(Vec3::Z, axis).to_array();
+    run(&mut world, &mut physics, 240);
+    (world, physics, entity)
+}
+
+#[test]
+fn a_capsule_rests_lying_on_its_side_and_standing_on_a_cap() {
+    let (world, physics, entity) = dropped_capsule(Vec3::Y);
+    let z = position(&world, entity).z;
+    assert!((z - 0.3).abs() < 0.01, "lying at {z}");
+    let rotation = Quat::from_array(world.get(entity).unwrap().transform.rotation);
+    assert!((rotation * Vec3::Z).z.abs() < 0.01, "stays level");
+    assert!(physics.get(entity).unwrap().velocity.linear.length() < 0.01);
+
+    let (world, _, entity) = dropped_capsule(Vec3::Z);
+    let z = position(&world, entity).z;
+    assert!((z - 0.9).abs() < 0.01, "standing at {z}");
+}
+
+#[test]
+fn capsules_rest_crossed_on_capsules_and_hold_spheres() {
+    let (mut world, mut physics) = (World::new(), PhysicsWorld::default());
+    let capsule = Collider::Capsule {
+        radius: 0.3,
+        half_height: 0.6,
+    };
+    let log = spawn(
+        &mut world,
+        &mut physics,
+        Vec3::ZERO,
+        PhysicsBody::new(RigidBody::Static, capsule),
+    );
+    world.get_mut(log).unwrap().transform.rotation =
+        Quat::from_rotation_arc(Vec3::Z, Vec3::X).to_array();
+    let top = spawn(
+        &mut world,
+        &mut physics,
+        Vec3::new(0.0, 0.0, 1.0),
+        PhysicsBody::new(RigidBody::Dynamic, capsule),
+    );
+    world.get_mut(top).unwrap().transform.rotation =
+        Quat::from_rotation_arc(Vec3::Z, Vec3::Y).to_array();
+    run(&mut world, &mut physics, 180);
+    let z = position(&world, top).z;
+    assert!((z - 0.6).abs() < 0.01, "crossed at {z}");
+
+    let ball = spawn(
+        &mut world,
+        &mut physics,
+        Vec3::new(0.0, 0.0, 2.0),
+        PhysicsBody::new(RigidBody::Dynamic, Collider::Sphere { radius: 0.2 }),
+    );
+    run(&mut world, &mut physics, 30);
+    let z = position(&world, ball).z;
+    assert!(z > 0.6 + 0.3 + 0.2 - 0.02, "ball held at {z}");
+}
+
+/// Exact flat ground at z = 0.
+struct Flat;
+
+impl Ground for Flat {
+    fn distance(&self, p: Vec3) -> f32 {
+        p.z
+    }
+    fn normal(&self, _: Vec3) -> Vec3 {
+        Vec3::Z
+    }
+}
+
+#[test]
+fn a_capsule_lies_level_on_ground() {
+    let (mut world, mut physics) = (World::new(), PhysicsWorld::default());
+    let field = PhysicsBody::new(RigidBody::Static, Collider::Ground);
+    spawn(&mut world, &mut physics, Vec3::ZERO, field);
+    physics.set_ground(std::sync::Arc::new(Flat), Bounds::EMPTY);
+    let capsule = Collider::Capsule {
+        radius: 0.3,
+        half_height: 1.0,
+    };
+    let entity = spawn(
+        &mut world,
+        &mut physics,
+        Vec3::new(0.0, 0.0, 1.0),
+        PhysicsBody::new(RigidBody::Dynamic, capsule),
+    );
+    world.get_mut(entity).unwrap().transform.rotation =
+        Quat::from_rotation_arc(Vec3::Z, Vec3::X).to_array();
+    run(&mut world, &mut physics, 240);
+    let z = position(&world, entity).z;
+    assert!((z - 0.3).abs() < 0.01, "lying at {z}");
+    let rotation = Quat::from_array(world.get(entity).unwrap().transform.rotation);
+    assert!((rotation * Vec3::Z).z.abs() < 0.01, "stays level");
+    assert!(physics.is_sleeping(entity), "a capsule at rest must sleep");
+}
+
+#[test]
+fn step_profile_times_each_phase_within_the_step() {
+    let (mut world, mut physics) = (World::new(), PhysicsWorld::default());
+    ground(&mut world, &mut physics);
+    // Enough touching boxes that every phase takes measurable time.
+    for i in 0..64 {
+        let at = Vec3::new((i % 8) as f32 * 1.5, (i / 8) as f32 * 1.5, 0.49);
+        spawn(&mut world, &mut physics, at, cube(0.5));
+    }
+    run(&mut world, &mut physics, 2);
+    let start = std::time::Instant::now();
+    run(&mut world, &mut physics, 1);
+    let measured = start.elapsed();
+    let profile = physics.last_profile();
+    assert!(profile.contacts > 0, "boxes rest on the ground");
+    assert_eq!(profile.bodies, 65);
+    for (name, time) in [
+        ("broad", profile.broad_phase),
+        ("narrow", profile.narrow_phase),
+        ("solve", profile.solve),
+    ] {
+        assert!(!time.is_zero(), "{name} phase was not timed");
+    }
+    assert!(profile.total() <= measured, "{:?} > {measured:?}", profile.total());
+}

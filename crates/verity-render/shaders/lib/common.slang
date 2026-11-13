@@ -17,6 +17,42 @@ static const uint MAX_POINT_SHADOWS = 4;
 static const uint POINT_SHADOW_FACES = 6;
 static const float POINT_SHADOW_SIZE = 512.0;
 
+/// One draw: a primitive's index range, placement and material.
+struct Instance {
+    float4x4 model;
+    /// Inverse-transpose of the model's upper 3x3, as columns.
+    float4 normal_columns[3];
+    /// x: first index, y: base vertex, z: material, w: draw index (model draws
+    /// in load order, then world entities).
+    uint4 draw;
+};
+
+struct Light {
+    float4 position_radius;
+    float4 color_intensity;
+};
+
+struct Vertex {
+    /// xyz position, w: texture u.
+    float4 position;
+    /// xyz normal, w: texture v.
+    float4 normal;
+    /// xyz tangent, w bitangent sign; zero when the mesh has none.
+    float4 tangent;
+    float4 color;
+};
+
+/// How an instance moved since last frame; mirrors `InstanceMotion` in `lib.rs`.
+struct InstanceMotion {
+    /// This frame's world space to last frame's.
+    float4x4 to_previous;
+    /// x: 1 when vertices move on their own (soft bodies, cloth); y: then their
+    /// first entry in `previous_positions`.
+    uint4 info;
+};
+
+#include "matrix_types.slang"
+
 struct Globals {
     float4x4 view_proj;
     float4x4 view;
@@ -47,39 +83,32 @@ struct Globals {
     /// Ground hemisphere radiance.
     float4 ground;
     float4x4 point_shadow_view_proj[MAX_POINT_SHADOWS * POINT_SHADOW_FACES];
-};
-
-/// One draw: a primitive's index range, placement and material.
-struct Instance {
-    float4x4 model;
-    /// Inverse-transpose of the model's upper 3x3, as columns.
-    float4 normal_columns[3];
-    /// x: first index, y: base vertex, z: material, w: draw index (model draws
-    /// in load order, then world entities).
-    uint4 draw;
-};
-
-struct Light {
-    float4 position_radius;
-    float4 color_intensity;
-};
-
-struct Vertex {
-    /// xyz position, w: texture u.
-    float4 position;
-    /// xyz normal, w: texture v.
-    float4 normal;
-    /// xyz tangent, w bitangent sign; zero when the mesh has none.
-    float4 tangent;
-    float4 color;
+    /// Cloud shadow map: world xy of its corner, its size; w: 1 when in use.
+    float4 cloud_shadow;
+    // GPU pointers to this frame's arrays; set in `upload_frame` (lib.rs).
+    Instance* instances;
+    Light* lights;
+    InstanceMotion* instance_motion;
+    /// Last frame's world position of each deforming vertex.
+    float4* previous_positions;
+    Vertex* vertices;
+    uint* indices;
+    // Matrix's buffers, in `Matrix::addresses` order.
+    MatrixInstance* matrix_instances;
+    MatrixAsset* matrix_assets;
+    MatrixNode* matrix_nodes;
+    MatrixGroup* matrix_groups;
+    MatrixCluster* matrix_clusters;
+    uint* matrix_indices;
+    MatrixBrick* matrix_bricks;
+    uint2* matrix_voxels;
+    uint2* matrix_entries;
+    uint2* matrix_queue;
+    uint* matrix_counters;
 };
 
 [[vk::binding(0)]] ConstantBuffer<Globals> globals;
-[[vk::binding(1)]] StructuredBuffer<Instance> instances;
-[[vk::binding(2)]] StructuredBuffer<Light> lights;
 [[vk::binding(3)]] RWStructuredBuffer<uint> clusters;
-[[vk::binding(4)]] StructuredBuffer<Vertex> vertices;
-[[vk::binding(5)]] StructuredBuffer<uint> indices;
 [[vk::binding(7)]] Texture2D<uint2> visibility;
 [[vk::binding(8)]] [[vk::image_format("rgba16f")]] RWTexture2D<float4> hdr_output;
 [[vk::binding(9)]] Texture2D<float4> hdr;
@@ -93,7 +122,7 @@ struct Vertex {
 
 /// Vertex of an instance's triangle corner, through its index range.
 Vertex instance_vertex(Instance instance, uint corner) {
-    return vertices[indices[instance.draw.x + corner] + instance.draw.y];
+    return globals.vertices[globals.indices[instance.draw.x + corner] + instance.draw.y];
 }
 
 uint cluster_index(uint3 cluster) {

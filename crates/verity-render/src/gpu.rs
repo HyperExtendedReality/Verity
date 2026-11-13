@@ -5,7 +5,7 @@ use gpu_allocator::{
     vulkan::{Allocation, AllocationCreateDesc, AllocationScheme, Allocator},
     MemoryLocation,
 };
-use std::{error::Error, ffi::CStr};
+use std::{error::Error, ffi::CStr, marker::PhantomData};
 
 type Result<T, E = Box<dyn Error>> = std::result::Result<T, E>;
 
@@ -14,18 +14,116 @@ type Result<T, E = Box<dyn Error>> = std::result::Result<T, E>;
 pub struct Buffer {
     pub buffer: vk::Buffer,
     pub size: u64,
+    /// Where shaders reach the buffer through a pointer; 0 for the null buffer.
+    pub address: vk::DeviceAddress,
     allocation: Option<Allocation>,
+}
+
+/// A GPU pointer to `T`s, laid out as a Slang `T*`.
+#[repr(transparent)]
+pub struct DeviceAddress<T>(pub vk::DeviceAddress, PhantomData<fn() -> T>);
+
+impl<T> DeviceAddress<T> {
+    pub fn new(address: vk::DeviceAddress) -> Self {
+        Self(address, PhantomData)
+    }
+}
+
+impl<T> Clone for DeviceAddress<T> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+impl<T> Copy for DeviceAddress<T> {}
+impl<T> std::fmt::Debug for DeviceAddress<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "DeviceAddress({:#x})", self.0)
+    }
+}
+// SAFETY: a plain u64; the marker is zero-sized.
+unsafe impl<T: 'static> bytemuck::Zeroable for DeviceAddress<T> {}
+unsafe impl<T: 'static> bytemuck::Pod for DeviceAddress<T> {}
+
+/// One host-visible buffer per frame that this frame's CPU-written arrays are
+/// packed into; shaders find each array through its address. Reset once the
+/// frame's fence has signaled.
+#[derive(Default)]
+pub struct FrameArena {
+    pub buffer: Buffer,
+    used: u64,
+}
+
+/// Every array starts 16-byte aligned, for 128-bit loads.
+const ARENA_ALIGN: u64 = 16;
+
+/// The byte range a `size`-byte array takes after `used` bytes, if it fits in `capacity`.
+fn bump(used: u64, size: u64, capacity: u64) -> Option<(u64, u64)> {
+    let start = used.checked_next_multiple_of(ARENA_ALIGN)?;
+    let end = start.checked_add(size)?;
+    (end <= capacity).then_some((start, end))
+}
+
+impl FrameArena {
+    /// Bytes an arena needs to hold arrays of these sizes.
+    pub fn needed(sizes: impl IntoIterator<Item = usize>) -> u64 {
+        sizes
+            .into_iter()
+            .map(|size| (size as u64).next_multiple_of(ARENA_ALIGN))
+            .sum()
+    }
+
+    /// Empty the arena, growing it first to at least `capacity` bytes.
+    ///
+    /// # Safety
+    /// The GPU must be done with the arena's buffer.
+    pub unsafe fn reset(
+        &mut self,
+        device: &ash::Device,
+        allocator: &mut Allocator,
+        capacity: u64,
+    ) -> Result<()> {
+        self.used = 0;
+        if capacity > self.buffer.size {
+            destroy_buffer(device, allocator, std::mem::take(&mut self.buffer));
+            self.buffer = create_buffer(
+                device,
+                allocator,
+                "frame arena",
+                capacity.next_power_of_two(),
+                vk::BufferUsageFlags::STORAGE_BUFFER,
+                MemoryLocation::CpuToGpu,
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Copy `items` into the arena; `None` when they do not fit.
+    pub fn push<T: bytemuck::Pod>(&mut self, items: &[T]) -> Option<DeviceAddress<T>> {
+        let bytes: &[u8] = bytemuck::cast_slice(items);
+        let (start, end) = bump(self.used, bytes.len() as u64, self.buffer.size)?;
+        // An empty frame leaves the arena unallocated: nothing to map or copy.
+        if !bytes.is_empty() {
+            self.buffer.write_at(start as usize, bytes);
+        }
+        self.used = end;
+        Some(DeviceAddress(self.buffer.address + start, PhantomData))
+    }
 }
 
 impl Buffer {
     /// Copy `bytes` to the start of a host-visible buffer.
     pub fn write(&mut self, bytes: &[u8]) {
+        self.write_at(0, bytes);
+    }
+
+    /// Copy `bytes` to `offset` bytes into a host-visible buffer.
+    pub fn write_at(&mut self, offset: usize, bytes: &[u8]) {
         let mapped = self
             .allocation
             .as_mut()
             .and_then(Allocation::mapped_slice_mut)
             .expect("buffer is host visible");
-        mapped[..bytes.len()].copy_from_slice(bytes);
+        mapped[offset..offset + bytes.len()].copy_from_slice(bytes);
     }
 
     /// The contents of a host-visible buffer.
@@ -62,7 +160,8 @@ pub unsafe fn create_buffer(
     let buffer = device.create_buffer(
         &vk::BufferCreateInfo::default()
             .size(size.max(16))
-            .usage(usage)
+            // Every buffer has an address, so any can be read through a pointer.
+            .usage(usage | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS)
             .sharing_mode(vk::SharingMode::EXCLUSIVE),
         None,
     )?;
@@ -86,9 +185,12 @@ pub unsafe fn create_buffer(
         allocator.free(allocation)?;
         return Err(error.into());
     }
+    let address =
+        device.get_buffer_device_address(&vk::BufferDeviceAddressInfo::default().buffer(buffer));
     Ok(Buffer {
         buffer,
         size,
+        address,
         allocation: Some(allocation),
     })
 }
@@ -129,14 +231,75 @@ pub unsafe fn create_image(
     usage: vk::ImageUsageFlags,
     aspect: vk::ImageAspectFlags,
 ) -> Result<Image> {
+    let samples = vk::SampleCountFlags::TYPE_1;
+    create_image_of(device, allocator, name, format, extent.into(), levels, usage, aspect, samples)
+}
+
+/// A single-level 2D image with `samples` samples per texel.
+///
+/// # Safety
+/// `device` must be the device `allocator` was created for.
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn create_multisampled_image(
+    device: &ash::Device,
+    allocator: &mut Allocator,
+    name: &str,
+    format: vk::Format,
+    extent: vk::Extent2D,
+    samples: vk::SampleCountFlags,
+    usage: vk::ImageUsageFlags,
+    aspect: vk::ImageAspectFlags,
+) -> Result<Image> {
+    create_image_of(device, allocator, name, format, extent.into(), 1, usage, aspect, samples)
+}
+
+/// A single-level color volume of `size`³ texels.
+///
+/// # Safety
+/// `device` must be the device `allocator` was created for.
+pub unsafe fn create_volume(
+    device: &ash::Device,
+    allocator: &mut Allocator,
+    name: &str,
+    format: vk::Format,
+    size: u32,
+    usage: vk::ImageUsageFlags,
+) -> Result<Image> {
+    let extent = vk::Extent3D {
+        width: size,
+        height: size,
+        depth: size,
+    };
+    let samples = vk::SampleCountFlags::TYPE_1;
+    create_image_of(device, allocator, name, format, extent, 1, usage, vk::ImageAspectFlags::COLOR, samples)
+}
+
+/// A 2D image when `extent.depth` is 1, otherwise a 3D one.
+#[allow(clippy::too_many_arguments)]
+unsafe fn create_image_of(
+    device: &ash::Device,
+    allocator: &mut Allocator,
+    name: &str,
+    format: vk::Format,
+    extent: vk::Extent3D,
+    levels: u32,
+    usage: vk::ImageUsageFlags,
+    aspect: vk::ImageAspectFlags,
+    samples: vk::SampleCountFlags,
+) -> Result<Image> {
+    let (image_type, view_type) = if extent.depth > 1 {
+        (vk::ImageType::TYPE_3D, vk::ImageViewType::TYPE_3D)
+    } else {
+        (vk::ImageType::TYPE_2D, vk::ImageViewType::TYPE_2D)
+    };
     let image = device.create_image(
         &vk::ImageCreateInfo::default()
-            .image_type(vk::ImageType::TYPE_2D)
+            .image_type(image_type)
             .format(format)
-            .extent(extent.into())
+            .extent(extent)
             .mip_levels(levels)
             .array_layers(1)
-            .samples(vk::SampleCountFlags::TYPE_1)
+            .samples(samples)
             .tiling(vk::ImageTiling::OPTIMAL)
             .usage(usage)
             .sharing_mode(vk::SharingMode::EXCLUSIVE)
@@ -163,7 +326,7 @@ pub unsafe fn create_image(
             device.create_image_view(
                 &vk::ImageViewCreateInfo::default()
                     .image(image)
-                    .view_type(vk::ImageViewType::TYPE_2D)
+                    .view_type(view_type)
                     .format(format)
                     .subresource_range(subresource(aspect).level_count(levels)),
                 None,
@@ -252,6 +415,25 @@ pub unsafe fn compute_pipeline(
     Ok(result.map_err(|(_, error)| error)?[0])
 }
 
+/// One global memory barrier: orders all memory, not one buffer. Caches are
+/// coherent, so naming the resource buys nothing and only has to be tracked.
+///
+/// # Safety
+/// `cmd` must be recording.
+pub unsafe fn memory_barrier(
+    device: &ash::Device,
+    cmd: vk::CommandBuffer,
+    src: (vk::PipelineStageFlags2, vk::AccessFlags2),
+    dst: (vk::PipelineStageFlags2, vk::AccessFlags2),
+) {
+    let barrier = [vk::MemoryBarrier2::default()
+        .src_stage_mask(src.0)
+        .src_access_mask(src.1)
+        .dst_stage_mask(dst.0)
+        .dst_access_mask(dst.1)];
+    device.cmd_pipeline_barrier2(cmd, &vk::DependencyInfo::default().memory_barriers(&barrier));
+}
+
 /// What a graphics pipeline renders into and how it tests depth.
 pub struct Raster<'a> {
     pub vertex: &'a [u8],
@@ -259,7 +441,9 @@ pub struct Raster<'a> {
     /// `None` for depth-only passes such as shadows.
     pub color: Option<vk::Format>,
     pub depth: Option<(vk::Format, vk::CompareOp)>,
-    pub cull: vk::CullModeFlags,
+    /// `None`: dynamic, set with `cmd_set_cull_mode` before drawing, so one
+    /// pipeline serves both one- and two-sided materials.
+    pub cull: Option<vk::CullModeFlags>,
     /// Constant and slope-scaled depth bias, for shadow maps.
     pub depth_bias: Option<(f32, f32)>,
 }
@@ -285,6 +469,29 @@ pub unsafe fn graphics_pipeline_targets(
     layout: vk::PipelineLayout,
     raster: &Raster<'_>,
     extra_colors: &[vk::Format],
+) -> Result<vk::Pipeline> {
+    pipeline_with(device, layout, raster, extra_colors, vk::SampleCountFlags::TYPE_1)
+}
+
+/// [`graphics_pipeline`] for attachments with `samples` samples each.
+///
+/// # Safety
+/// As for [`graphics_pipeline`].
+pub unsafe fn graphics_pipeline_samples(
+    device: &ash::Device,
+    layout: vk::PipelineLayout,
+    raster: &Raster<'_>,
+    samples: vk::SampleCountFlags,
+) -> Result<vk::Pipeline> {
+    pipeline_with(device, layout, raster, &[], samples)
+}
+
+unsafe fn pipeline_with(
+    device: &ash::Device,
+    layout: vk::PipelineLayout,
+    raster: &Raster<'_>,
+    extra_colors: &[vk::Format],
+    samples: vk::SampleCountFlags,
 ) -> Result<vk::Pipeline> {
     let vs = shader_module(device, raster.vertex)?;
     let fs = match shader_module(device, raster.fragment) {
@@ -327,7 +534,7 @@ pub unsafe fn graphics_pipeline_targets(
         .scissor_count(1);
     let mut rasterization = vk::PipelineRasterizationStateCreateInfo::default()
         .polygon_mode(vk::PolygonMode::FILL)
-        .cull_mode(raster.cull)
+        .cull_mode(raster.cull.unwrap_or_default())
         .front_face(vk::FrontFace::COUNTER_CLOCKWISE)
         .line_width(1.0);
     if let Some((constant, slope)) = raster.depth_bias {
@@ -337,7 +544,7 @@ pub unsafe fn graphics_pipeline_targets(
             .depth_bias_slope_factor(slope);
     }
     let multisample = vk::PipelineMultisampleStateCreateInfo::default()
-        .rasterization_samples(vk::SampleCountFlags::TYPE_1);
+        .rasterization_samples(samples);
     let blend_attachment: Vec<_> = colors
         .iter()
         .map(|_| {
@@ -346,8 +553,14 @@ pub unsafe fn graphics_pipeline_targets(
         })
         .collect();
     let blend = vk::PipelineColorBlendStateCreateInfo::default().attachments(&blend_attachment);
-    let dynamic_states = [vk::DynamicState::VIEWPORT, vk::DynamicState::SCISSOR];
-    let dynamic = vk::PipelineDynamicStateCreateInfo::default().dynamic_states(&dynamic_states);
+    let dynamic_states = [
+        vk::DynamicState::VIEWPORT,
+        vk::DynamicState::SCISSOR,
+        vk::DynamicState::CULL_MODE,
+    ];
+    let dynamic_count = if raster.cull.is_some() { 2 } else { 3 };
+    let dynamic = vk::PipelineDynamicStateCreateInfo::default()
+        .dynamic_states(&dynamic_states[..dynamic_count]);
     let info = [vk::GraphicsPipelineCreateInfo::default()
         .push_next(&mut rendering)
         .stages(&stages)
@@ -465,5 +678,24 @@ mod tests {
         assert_eq!(present_mode(&all, true), P::IMMEDIATE);
         assert_eq!(present_mode(&[P::FIFO, P::MAILBOX], true), P::MAILBOX);
         assert_eq!(present_mode(&[P::FIFO], true), P::FIFO);
+    }
+
+    #[test]
+    fn arena_aligns_every_array_and_refuses_overflow() {
+        assert_eq!(bump(0, 12, 64), Some((0, 12)));
+        assert_eq!(bump(12, 4, 64), Some((16, 20)));
+        assert_eq!(bump(20, 44, 64), None, "48 + 44 > 64");
+        assert_eq!(bump(16, 48, 64), Some((16, 64)));
+        assert_eq!(bump(u64::MAX - 3, 1, u64::MAX), None);
+        // `needed` reserves what `bump` takes for the same arrays.
+        assert_eq!(FrameArena::needed([12, 4, 33]), 16 + 16 + 48);
+    }
+
+    #[test]
+    fn empty_arena_takes_empty_arrays() {
+        // A frame with nothing to upload never allocates the arena's buffer.
+        let mut arena = FrameArena::default();
+        assert_eq!(arena.push::<u32>(&[]).map(|a| a.0), Some(0));
+        assert!(arena.push(&[1u32]).is_none());
     }
 }

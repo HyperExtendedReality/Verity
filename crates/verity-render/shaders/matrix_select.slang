@@ -10,12 +10,6 @@
 #include "lib/matrix.slang"
 #include "lib/matrix_lists.slang"
 
-[[vk::binding(21)]] StructuredBuffer<MatrixNode> matrix_nodes;
-[[vk::binding(22)]] StructuredBuffer<MatrixGroup> matrix_groups;
-[[vk::binding(27)]] RWStructuredBuffer<uint2> matrix_entries;
-[[vk::binding(28)]] RWStructuredBuffer<uint2> matrix_queue;
-[[vk::binding(29)]] RWStructuredBuffer<uint> matrix_counters;
-
 // The first eight bytes are the graphics stages' push range.
 struct SelectConstants {
     [[vk::offset(8)]] uint pass;
@@ -63,21 +57,21 @@ bool sphere_visible(float3 center, float radius) {
 void push_item(uint pass, uint2 item) {
     uint arguments = MATRIX_PASS_WORDS + pass * 4;
     uint slot;
-    InterlockedAdd(matrix_counters[arguments + 3], 1, slot);
+    InterlockedAdd(globals.matrix_counters[arguments + 3], 1, slot);
     if (slot < MATRIX_QUEUE) {
-        matrix_queue[(pass & 1) * MATRIX_QUEUE + slot] = item;
+        globals.matrix_queue[(pass & 1) * MATRIX_QUEUE + slot] = item;
         if (slot % 64 == 0)
-            InterlockedAdd(matrix_counters[arguments], 1);
+            InterlockedAdd(globals.matrix_counters[arguments], 1);
     }
 }
 
 void push_entries(uint list, uint2 entry, uint count) {
     uint slot;
-    InterlockedAdd(matrix_counters[list * 4 + 1], count, slot);
+    InterlockedAdd(globals.matrix_counters[list * 4 + 1], count, slot);
     uint end = min(slot + count, matrix_list_capacity(list));
     uint base = matrix_list_base(list);
     for (uint i = slot; i < end; ++i)
-        matrix_entries[base + i] = uint2(entry.x, entry.y + i - slot);
+        globals.matrix_entries[base + i] = uint2(entry.x, entry.y + i - slot);
 }
 
 void push_layer(uint layer, uint instance, uint cluster, uint first_brick, uint brick_count, bool triangles) {
@@ -99,7 +93,7 @@ void push_shadow_layers(uint instance, uint cluster, uint first_brick, uint bric
     }
     uint lit = min(globals.counts.x, MAX_POINT_SHADOWS);
     for (uint light = 0; light < lit; ++light) {
-        float4 reach = lights[light].position_radius;
+        float4 reach = globals.lights[light].position_radius;
         float3 offset = sphere.xyz - reach.xyz;
         float range = reach.w + sphere.w;
         if (reach.w <= 0.0 || dot(offset, offset) > range * range)
@@ -117,8 +111,8 @@ void push_shadow_layers(uint instance, uint cluster, uint first_brick, uint bric
 void instanceMain(uint3 id: SV_DispatchThreadID) {
     if (id.x >= select_constants.instance_count)
         return;
-    MatrixInstance instance = matrix_instances[id.x];
-    MatrixAsset asset = matrix_assets[instance.info.x];
+    MatrixInstance instance = globals.matrix_instances[id.x];
+    MatrixAsset asset = globals.matrix_assets[instance.info.x];
     float3 center = instance.sphere.xyz;
     float radius = instance.sphere.w;
     float distance = length(center - globals.eye.xyz);
@@ -145,12 +139,12 @@ void instanceMain(uint3 id: SV_DispatchThreadID) {
 [numthreads(64, 1, 1)]
 void nodeMain(uint3 id: SV_DispatchThreadID) {
     uint pass = select_constants.pass;
-    uint count = min(matrix_counters[MATRIX_PASS_WORDS + pass * 4 + 3], MATRIX_QUEUE);
+    uint count = min(globals.matrix_counters[MATRIX_PASS_WORDS + pass * 4 + 3], MATRIX_QUEUE);
     if (id.x >= count)
         return;
-    uint2 item = matrix_queue[(pass & 1) * MATRIX_QUEUE + id.x];
-    MatrixInstance instance = matrix_instances[item.x & ITEM_INSTANCE];
-    MatrixNode node = matrix_nodes[item.y];
+    uint2 item = globals.matrix_queue[(pass & 1) * MATRIX_QUEUE + id.x];
+    MatrixInstance instance = globals.matrix_instances[item.x & ITEM_INSTANCE];
+    MatrixNode node = globals.matrix_nodes[item.y];
     bool coarse = (item.x & ITEM_COARSE) != 0;
     float threshold = coarse ? COARSE_THRESHOLD : ERROR_PIXELS;
     float node_error = coarse ? node.error : projected_error(instance, node.sphere, node.error);
@@ -161,14 +155,14 @@ void nodeMain(uint3 id: SV_DispatchThreadID) {
             push_item(pass + 1, uint2(item.x, node.first_child + child));
         return;
     }
-    MatrixGroup group = matrix_groups[node.group];
+    MatrixGroup group = globals.matrix_groups[node.group];
     uint index = item.x & ITEM_INSTANCE;
     bool two_sided = instance.info.y != 0;
     for (uint i = 0; i < group.cluster_count; ++i) {
         uint cluster_index = group.first_cluster + i;
-        MatrixCluster cluster = matrix_clusters[cluster_index];
+        MatrixCluster cluster = globals.matrix_clusters[cluster_index];
         if (cluster.refined != MATRIX_NONE) {
-            MatrixGroup refined = matrix_groups[cluster.refined];
+            MatrixGroup refined = globals.matrix_groups[cluster.refined];
             float refined_error = coarse ? refined.error
                                          : projected_error(instance, refined.sphere, refined.error);
             if (refined_error > threshold)

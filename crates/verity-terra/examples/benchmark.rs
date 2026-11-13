@@ -9,7 +9,10 @@ fn main() {
     let start = Instant::now();
     let mut terrain = Terrain::new(Landscape::generate(Settings::default()));
     println!("Generation: {:.3}s", start.elapsed().as_secs_f64());
-    let coords = terrain.initial_coords();
+    // What the editor streams: the surface chunks within 250 m of the centre.
+    let coords: Vec<_> = (terrain.initial_coords().into_iter())
+        .filter(|c| chunk_origin(*c).truncate().length() < 250.0)
+        .collect();
     let start = Instant::now();
     terrain.ensure_chunks(&coords);
     let triangles: usize = coords
@@ -54,5 +57,31 @@ fn main() {
     println!(
         "Raycast: {:.1}us each",
         start.elapsed().as_secs_f64() * 1000.0
+    );
+    let start = Instant::now();
+    let far = Far::new(terrain.landscape.clone());
+    let leaves = far.leaves(eye);
+    let patches: usize = (leaves.par_iter())
+        .map(|p| far.mesh(*p).indices.len() / 3)
+        .sum();
+    println!(
+        "Far patches: {:.3}s; {} patches, {} triangles",
+        start.elapsed().as_secs_f64(),
+        leaves.len(),
+        patches
+    );
+    let start = Instant::now();
+    let planet = planet::Planet::new(planet::PlanetSettings::default());
+    println!("Planet generation: {:.3}s", start.elapsed().as_secs_f64());
+    let start = Instant::now();
+    let leaves = planet.leaves(Vec3::new(0.0, 0.0, 20.0));
+    let triangles: usize = (leaves.par_iter())
+        .map(|p| planet.mesh(*p).indices.len() / 3)
+        .sum();
+    println!(
+        "Planet patches near the ground: {:.3}s; {} patches, {} triangles",
+        start.elapsed().as_secs_f64(),
+        leaves.len(),
+        triangles
     );
 }

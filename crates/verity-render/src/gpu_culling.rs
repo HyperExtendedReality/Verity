@@ -7,6 +7,7 @@
 
 use crate::{gpu, Result, FRAMES};
 use ash::vk;
+use ash::vk::{AccessFlags2 as A, PipelineStageFlags2 as S};
 use bytemuck::{Pod, Zeroable};
 use glam::Mat4;
 use gpu_allocator::{vulkan::Allocator, MemoryLocation};
@@ -386,17 +387,11 @@ impl Culler {
                 bytemuck::cast_slice(&params),
             );
             device.cmd_dispatch(cmd, width.div_ceil(8), height.div_ceil(8), 1);
-            let barrier = [vk::BufferMemoryBarrier2::default()
-                .src_stage_mask(vk::PipelineStageFlags2::COMPUTE_SHADER)
-                .src_access_mask(vk::AccessFlags2::SHADER_STORAGE_WRITE)
-                .dst_stage_mask(vk::PipelineStageFlags2::COMPUTE_SHADER)
-                .dst_access_mask(vk::AccessFlags2::SHADER_STORAGE_READ)
-                .buffer(f.pyramid.buffer)
-                .offset(0)
-                .size(vk::WHOLE_SIZE)];
-            device.cmd_pipeline_barrier2(
+            gpu::memory_barrier(
+                device,
                 cmd,
-                &vk::DependencyInfo::default().buffer_memory_barriers(&barrier),
+                (S::COMPUTE_SHADER, A::SHADER_STORAGE_WRITE),
+                (S::COMPUTE_SHADER, A::SHADER_STORAGE_READ),
             );
             previous_offset = offset;
             offset += width * height;
@@ -405,17 +400,11 @@ impl Culler {
             width = width.div_ceil(2);
             height = height.div_ceil(2);
         }
-        let before = [vk::BufferMemoryBarrier2::default()
-            .src_stage_mask(vk::PipelineStageFlags2::COMPUTE_SHADER)
-            .src_access_mask(vk::AccessFlags2::SHADER_STORAGE_WRITE)
-            .dst_stage_mask(vk::PipelineStageFlags2::COMPUTE_SHADER)
-            .dst_access_mask(vk::AccessFlags2::SHADER_STORAGE_WRITE)
-            .buffer(f.commands.buffer)
-            .offset(0)
-            .size(vk::WHOLE_SIZE)];
-        device.cmd_pipeline_barrier2(
+        gpu::memory_barrier(
+            device,
             cmd,
-            &vk::DependencyInfo::default().buffer_memory_barriers(&before),
+            (S::COMPUTE_SHADER, A::SHADER_STORAGE_WRITE),
+            (S::COMPUTE_SHADER, A::SHADER_STORAGE_WRITE),
         );
         device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, self.occlusion_pipeline);
         let params = [
@@ -440,17 +429,11 @@ impl Culler {
             bytemuck::cast_slice(&params),
         );
         device.cmd_dispatch(cmd, f.count.div_ceil(WORKGROUP_SIZE), 1, 1);
-        let after = [vk::BufferMemoryBarrier2::default()
-            .src_stage_mask(vk::PipelineStageFlags2::COMPUTE_SHADER)
-            .src_access_mask(vk::AccessFlags2::SHADER_STORAGE_WRITE)
-            .dst_stage_mask(vk::PipelineStageFlags2::DRAW_INDIRECT)
-            .dst_access_mask(vk::AccessFlags2::INDIRECT_COMMAND_READ)
-            .buffer(f.commands.buffer)
-            .offset(0)
-            .size(vk::WHOLE_SIZE)];
-        device.cmd_pipeline_barrier2(
+        gpu::memory_barrier(
+            device,
             cmd,
-            &vk::DependencyInfo::default().buffer_memory_barriers(&after),
+            (S::COMPUTE_SHADER, A::SHADER_STORAGE_WRITE),
+            (S::DRAW_INDIRECT, A::INDIRECT_COMMAND_READ),
         );
     }
 
@@ -478,17 +461,11 @@ impl Culler {
             &f.count.to_ne_bytes(),
         );
         device.cmd_dispatch(cmd, f.count.div_ceil(WORKGROUP_SIZE), 1, 1);
-        let barriers = [vk::BufferMemoryBarrier2::default()
-            .src_stage_mask(vk::PipelineStageFlags2::COMPUTE_SHADER)
-            .src_access_mask(vk::AccessFlags2::SHADER_STORAGE_WRITE)
-            .dst_stage_mask(vk::PipelineStageFlags2::DRAW_INDIRECT)
-            .dst_access_mask(vk::AccessFlags2::INDIRECT_COMMAND_READ)
-            .buffer(f.commands.buffer)
-            .offset(0)
-            .size(vk::WHOLE_SIZE)];
-        device.cmd_pipeline_barrier2(
+        gpu::memory_barrier(
+            device,
             cmd,
-            &vk::DependencyInfo::default().buffer_memory_barriers(&barriers),
+            (S::COMPUTE_SHADER, A::SHADER_STORAGE_WRITE),
+            (S::DRAW_INDIRECT, A::INDIRECT_COMMAND_READ),
         );
     }
 

@@ -157,6 +157,8 @@ struct GpuCluster {
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Target {
     Visibility,
+    /// The visibility pass into multisampled attachments.
+    VisibilityMsaa,
     Depth,
 }
 
@@ -168,20 +170,23 @@ struct Bake {
     views: [vk::ImageView; 2],
 }
 
-/// Graphics and compute state, the CPU copy of everything uploaded, and buffers
-/// indexed by descriptor binding minus [`FIRST_BINDING`].
+/// Graphics and compute state, the CPU copy of everything uploaded, and the
+/// buffers shaders reach through `Globals::matrix`.
 #[derive(Default)]
 pub(crate) struct Matrix {
     select_instances: vk::Pipeline,
     select_nodes: vk::Pipeline,
-    clusters: [vk::Pipeline; 2],
-    clusters_depth: [vk::Pipeline; 2],
+    /// Dynamic cull mode: `record_draws` sets it per list.
+    clusters: vk::Pipeline,
+    clusters_depth: vk::Pipeline,
     clusters_shadow: vk::Pipeline,
     voxels: vk::Pipeline,
     voxels_depth: vk::Pipeline,
     voxels_shadow: vk::Pipeline,
     imposters: vk::Pipeline,
     imposters_depth: vk::Pipeline,
+    /// Visibility pipelines for multisampled attachments; null without MSAA.
+    multisampled: [vk::Pipeline; 3],
     bake: vk::Pipeline,
     bake_depth: Option<Image>,
     /// Single-mip views of baked atlases, since attachments allow no more.
@@ -205,8 +210,7 @@ pub(crate) struct Matrix {
     active: bool,
 }
 
-pub(crate) const FIRST_BINDING: usize = 19;
-const BINDINGS: usize = 11;
+pub(crate) const BINDINGS: usize = 11;
 const INSTANCES: usize = 0;
 const ASSETS: usize = 1;
 const NODES: usize = 2;
@@ -226,9 +230,10 @@ impl Matrix {
         allocator: &mut Allocator,
         layout: vk::PipelineLayout,
         depth_format: vk::Format,
+        msaa_samples: Option<vk::SampleCountFlags>,
     ) -> Result<Self> {
         let mut matrix = Self::default();
-        matrix.create_pipelines(device, layout, depth_format)?;
+        matrix.create_pipelines(device, layout, depth_format, msaa_samples)?;
         use vk::BufferUsageFlags as U;
         for (index, buffer) in matrix.buffers.iter_mut().enumerate() {
             let usage = U::STORAGE_BUFFER | U::TRANSFER_DST;
@@ -271,6 +276,7 @@ impl Matrix {
         device: &ash::Device,
         layout: vk::PipelineLayout,
         depth_format: vk::Format,
+        msaa_samples: Option<vk::SampleCountFlags>,
     ) -> Result<()> {
         let cache = vk::PipelineCache::null();
         self.select_instances = gpu::compute_pipeline(
@@ -298,32 +304,31 @@ impl Matrix {
         let greater = vk::CompareOp::GREATER;
         let visible = Some(VISIBILITY_FORMAT);
         use vk::CullModeFlags as Cull;
-        for (index, cull) in [Cull::BACK, Cull::NONE].into_iter().enumerate() {
-            self.clusters[index] = gpu::graphics_pipeline(
-                device,
-                layout,
-                &raster(
-                    spirv!("matrix_clusters.vertexMain"),
-                    spirv!("matrix_clusters.fragmentMain"),
-                    visible,
-                    greater,
-                    cull,
-                    None,
-                ),
-            )?;
-            self.clusters_depth[index] = gpu::graphics_pipeline(
-                device,
-                layout,
-                &raster(
-                    spirv!("matrix_clusters_depth.vertexMain"),
-                    spirv!("matrix_clusters_depth.fragmentMain"),
-                    None,
-                    greater,
-                    cull,
-                    None,
-                ),
-            )?;
-        }
+        self.clusters = gpu::graphics_pipeline(
+            device,
+            layout,
+            &raster(
+                spirv!("matrix_clusters.vertexMain"),
+                spirv!("matrix_clusters.fragmentMain"),
+                visible,
+                greater,
+                None,
+                None,
+            ),
+        )?;
+        self.clusters_depth = gpu::graphics_pipeline(
+            device,
+            layout,
+            &raster(
+                spirv!("matrix_clusters_depth.vertexMain"),
+                spirv!("matrix_clusters_depth.fragmentMain"),
+                None,
+                greater,
+                None,
+                None,
+            ),
+        )?;
+        let none = Some(Cull::NONE);
         let less = vk::CompareOp::LESS;
         self.clusters_shadow = gpu::graphics_pipeline(
             device,
@@ -333,7 +338,7 @@ impl Matrix {
                 spirv!("matrix_clusters_shadow.fragmentMain"),
                 None,
                 less,
-                Cull::NONE,
+                none,
                 Some((1.25, 1.75)),
             ),
         )?;
@@ -346,7 +351,7 @@ impl Matrix {
                 spirv!("matrix_voxels.fragmentMain"),
                 visible,
                 greater,
-                Cull::NONE,
+                none,
                 None,
             ),
         )?;
@@ -358,7 +363,7 @@ impl Matrix {
                 spirv!("matrix_voxels_depth.fragmentMain"),
                 None,
                 greater,
-                Cull::NONE,
+                none,
                 None,
             ),
         )?;
@@ -370,7 +375,7 @@ impl Matrix {
                 spirv!("matrix_voxels_shadow.fragmentMain"),
                 None,
                 less,
-                Cull::NONE,
+                none,
                 None,
             ),
         )?;
@@ -382,7 +387,7 @@ impl Matrix {
                 spirv!("matrix_imposters.fragmentMain"),
                 visible,
                 greater,
-                Cull::NONE,
+                none,
                 None,
             ),
         )?;
@@ -394,10 +399,21 @@ impl Matrix {
                 spirv!("matrix_imposters_depth.fragmentMain"),
                 None,
                 greater,
-                Cull::NONE,
+                none,
                 None,
             ),
         )?;
+        if let Some(samples) = msaa_samples {
+            let shaders: [(&[u8], &[u8], _); 3] = [
+                (spirv!("matrix_clusters.vertexMain"), spirv!("matrix_clusters.fragmentMain"), None),
+                (spirv!("matrix_voxels.vertexMain"), spirv!("matrix_voxels.fragmentMain"), none),
+                (spirv!("matrix_imposters.vertexMain"), spirv!("matrix_imposters.fragmentMain"), none),
+            ];
+            for (slot, (vertex, fragment, cull)) in self.multisampled.iter_mut().zip(shaders) {
+                let raster = raster(vertex, fragment, visible, greater, cull, None);
+                *slot = gpu::graphics_pipeline_samples(device, layout, &raster, samples)?;
+            }
+        }
         self.bake = gpu::graphics_pipeline_targets(
             device,
             layout,
@@ -406,7 +422,7 @@ impl Matrix {
                 spirv!("matrix_bake.fragmentMain"),
                 Some(ALBEDO_FORMAT),
                 greater,
-                Cull::NONE,
+                none,
                 None,
             ),
             &[SURFACE_FORMAT],
@@ -418,10 +434,8 @@ impl Matrix {
         for pipeline in [
             self.select_instances,
             self.select_nodes,
-            self.clusters[0],
-            self.clusters[1],
-            self.clusters_depth[0],
-            self.clusters_depth[1],
+            self.clusters,
+            self.clusters_depth,
             self.clusters_shadow,
             self.voxels,
             self.voxels_depth,
@@ -429,7 +443,10 @@ impl Matrix {
             self.imposters,
             self.imposters_depth,
             self.bake,
-        ] {
+        ]
+        .into_iter()
+        .chain(self.multisampled)
+        {
             device.destroy_pipeline(pipeline, None);
         }
         self.destroy_bake_targets(device, allocator);
@@ -452,11 +469,9 @@ impl Matrix {
         }
     }
 
-    pub(crate) fn buffers(&self) -> impl Iterator<Item = (u32, &Buffer)> {
-        self.buffers
-            .iter()
-            .enumerate()
-            .map(|(index, buffer)| ((FIRST_BINDING + index) as u32, buffer))
+    /// Where shaders find each buffer, in the order of `Globals::matrix`.
+    pub(crate) fn addresses(&self) -> [vk::DeviceAddress; BINDINGS] {
+        self.buffers.each_ref().map(|buffer| buffer.address)
     }
 
     /// Whether a primitive's draws go through selection rather than the CPU.
@@ -628,14 +643,7 @@ impl Matrix {
         use vk::PipelineStageFlags2 as S;
         let counters = self.buffers[COUNTERS].buffer;
         let barrier = |src_stage, src_access, dst_stage, dst_access| {
-            device.cmd_pipeline_barrier2(
-                cmd,
-                &vk::DependencyInfo::default().memory_barriers(&[vk::MemoryBarrier2::default()
-                    .src_stage_mask(src_stage)
-                    .src_access_mask(src_access)
-                    .dst_stage_mask(dst_stage)
-                    .dst_access_mask(dst_access)]),
-            );
+            gpu::memory_barrier(device, cmd, (src_stage, src_access), (dst_stage, dst_access));
         };
         // Last frame's draws may still read the lists and commands.
         barrier(
@@ -742,10 +750,14 @@ impl Matrix {
         }
         let (clusters, voxels, imposters) = match target {
             Target::Visibility => (self.clusters, self.voxels, self.imposters),
+            Target::VisibilityMsaa => self.multisampled.into(),
             Target::Depth => (self.clusters_depth, self.voxels_depth, self.imposters_depth),
         };
-        self.draw_list(device, cmd, layout, clusters[0], LIST_ONE_SIDED, 0);
-        self.draw_list(device, cmd, layout, clusters[1], LIST_TWO_SIDED, 0);
+        // Dynamic state outlives the bind in `draw_list`.
+        device.cmd_set_cull_mode(cmd, crate::cull_sides(false));
+        self.draw_list(device, cmd, layout, clusters, LIST_ONE_SIDED, 0);
+        device.cmd_set_cull_mode(cmd, crate::cull_sides(true));
+        self.draw_list(device, cmd, layout, clusters, LIST_TWO_SIDED, 0);
         self.draw_list(device, cmd, layout, voxels, LIST_VOXELS, 0);
         self.draw_list(device, cmd, layout, imposters, LIST_IMPOSTER, 0);
     }
@@ -797,6 +809,7 @@ impl Renderer {
                     primitive: source.primitive,
                 };
                 self.model_draws.push(copy);
+                self.model_generation += 1;
                 self.add_matrix_instance(copy, index);
             }
         }
@@ -1012,9 +1025,7 @@ impl Renderer {
                 gpu::destroy_buffer(device, allocator, old);
             }
         }
-        for frame in 0..self.frames.len() {
-            self.write_buffer_descriptors(frame);
-        }
+        // Shaders pick up the new addresses with the next frame's globals.
         Ok(())
     }
 

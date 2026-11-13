@@ -131,6 +131,25 @@ fn colliders_answer_rays_like_their_closed_forms() {
         "from inside"
     );
 
+    let capsule = Collider::Capsule {
+        radius: 0.5,
+        half_height: 1.0,
+    };
+    let side = capsule.ray(Vec3::new(-5.0, 0.0, 0.8), Vec3::X, 100.0);
+    let (t, n) = side.unwrap();
+    assert!((t - 4.5).abs() < 1e-5 && n.abs_diff_eq(-Vec3::X, 1e-5));
+    let (t, n) = capsule.ray(Vec3::new(0.0, 0.0, 5.0), -Vec3::Z, 100.0).unwrap();
+    assert!((t - 3.5).abs() < 1e-5 && n.abs_diff_eq(Vec3::Z, 1e-5), "cap");
+    let (t, _) = capsule
+        .ray(Vec3::new(-5.0, 0.0, 1.3), Vec3::X, 100.0)
+        .unwrap();
+    assert!((t - (5.0 - 0.4)).abs() < 1e-4, "cap rim at {t}");
+    assert!(
+        capsule
+            .ray(Vec3::new(-5.0, 0.0, 1.6), Vec3::X, 100.0)
+            .is_none()
+    );
+
     let cuboid = Collider::Cuboid {
         half_extents: Vec3::new(1.0, 2.0, 3.0),
     };

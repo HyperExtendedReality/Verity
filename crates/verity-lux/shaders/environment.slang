@@ -2,7 +2,7 @@
 float3 scatteringResponse(float3 normal, float3 view, float3 light, float roughness,
                           bool fullBsdf, SurfaceBsdf material, float2 ab) {
     return fullBsdf ? bsdfEvaluate(material, normal, view, light, ab)
-        : float3(hammon_diffuse(normal, view, light, roughness));
+        : float3(diffuse_unit(normal, view, light, roughness));
 }
 [[vk::binding(22,0)]] Texture2D<float4> environmentTexture;
 float3 environmentRotate(float3 d, float4 q) {
@@ -131,7 +131,7 @@ float3 environmentNeeSampleContribution(float3 radiance,
     float cosine = max(0.0, dot(normal, direction));
     if (cosine <= 0.0 || dot(geometricNormal, direction) <= 0.0 ||
         pdf <= 0.0 || !isfinite(pdf)) return 0.0;
-    float diffuse = hammon_diffuse(normal, view, direction, roughness);
+    float diffuse = diffuse_unit(normal, view, direction, roughness);
     return radiance * (diffuse * cosine / pdf);
 }
 

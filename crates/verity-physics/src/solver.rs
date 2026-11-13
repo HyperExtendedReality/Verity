@@ -54,6 +54,11 @@ const PREFETCH_LINES: usize = 2;
 const TIME_TO_SLEEP: f32 = 0.5;
 /// Closing speed (m/s) of free bodies above which forces set their velocities.
 const IMPACT_SPEED: f32 = 1.0;
+/// Closing speed (m/s) below which contacts do not bounce, so resting and
+/// gently landing bodies settle instead of jittering (Box2D's threshold).
+const BOUNCE_SPEED: f32 = 1.0;
+/// Velocity passes over bouncing manifolds.
+const BOUNCE_ITERATIONS: usize = 4;
 /// Rotation per step (rad) above which the gyroscopic predictor is held to
 /// the body's energy.
 const GYROSCOPIC_TURN: f32 = 0.25;
@@ -128,6 +133,7 @@ pub(crate) struct Body {
     pub inertia: Mat3A,
     pub friction: f32,
     pub static_friction: f32,
+    pub restitution: f32,
     pub kinematic: bool,
     /// Frozen until a moving body touches its island or the caller wakes it;
     /// asleep bodies cost no broadphase, narrowphase or solver work.
@@ -153,6 +159,7 @@ impl Body {
             // Spinning moves only what sticks out past the inscribed sphere.
             let swing = match self.shape {
                 Collider::Cuboid { half_extents } => self.bound() - half_extents.min_element(),
+                Collider::Capsule { radius, .. } => self.bound() - radius,
                 Collider::Sphere { .. } | Collider::Ground => 0.0,
             };
             (
@@ -222,7 +229,11 @@ impl Body {
     }
     /// Equal principal moments have no gyroscopic term.
     fn gyroscopic(&self) -> bool {
-        matches!(self.shape, Collider::Cuboid { half_extents: h } if h.x != h.y || h.y != h.z)
+        match self.shape {
+            Collider::Cuboid { half_extents: h } => h.x != h.y || h.y != h.z,
+            Collider::Capsule { .. } => true,
+            Collider::Sphere { .. } | Collider::Ground => false,
+        }
     }
     /// World inertia after the rotation `w` from the step start.
     fn inertia_after(&self, w: Vec3A) -> Mat3A {
@@ -246,8 +257,19 @@ impl Body {
         match self.shape {
             Collider::Cuboid { half_extents } => half_extents.length(),
             Collider::Sphere { radius } => radius,
+            Collider::Capsule {
+                radius,
+                half_height,
+            } => radius + half_height,
             Collider::Ground => 0.0,
         }
+    }
+    /// Rolls over its surface, so contact anchors must not stick.
+    fn rolls(&self) -> bool {
+        matches!(
+            self.shape,
+            Collider::Sphere { .. } | Collider::Capsule { .. }
+        )
     }
 }
 
@@ -320,6 +342,8 @@ pub(crate) struct Manifold {
     /// Kinetic and static friction coefficients.
     friction: f32,
     static_friction: f32,
+    /// The larger of the bodies' restitutions.
+    restitution: f32,
     /// Heavier body's mass: penalties are per kilogram so tuning is unit-free.
     scale: f32,
     /// The largest penalty that helps this pair converge.
@@ -345,6 +369,9 @@ struct CollisionData {
     deep: bool,
     /// The narrowphase pass that last matched this manifold to a pair.
     seen: u32,
+    /// Step-start normal velocity of A from B at each contact, negative when
+    /// closing: what restitution reverses. Only kept with restitution.
+    approach: Vec4,
 }
 
 /// A manifold's contacts in structure-of-arrays form for the solver: each
@@ -1190,11 +1217,13 @@ impl Manifold {
                 error: [Vec4::ZERO; 3],
                 deep: false,
                 seen: 0,
+                approach: Vec4::ZERO,
             }),
             first_is_a: true,
             len,
             friction: 0.0,
             static_friction: 0.0,
+            restitution: 0.0,
             scale: 0.0,
             limit: 0.0,
             impact: false,
@@ -1236,9 +1265,7 @@ impl Manifold {
             {
                 // Identical feature order already has the correct solver lanes.
                 // Keep sticking anchors, except for rolling spheres.
-                if !matches!(ba.shape, Collider::Sphere { .. })
-                    && !matches!(bb.shape, Collider::Sphere { .. })
-                {
+                if !ba.rolls() && !bb.rolls() {
                     for (i, (new, old)) in contacts[..len]
                         .iter_mut()
                         .zip(&self.cold.contacts[..len])
@@ -1271,8 +1298,7 @@ impl Manifold {
     fn warm(&self, ba: &Body, bb: &Body, contacts: &mut [Contact]) -> Warm {
         // A rolling sphere's contact point moves over its surface: its
         // anchors never stick, only its forces warm start.
-        let rolls = matches!(ba.shape, Collider::Sphere { .. })
-            || matches!(bb.shape, Collider::Sphere { .. });
+        let rolls = ba.rolls() || bb.rolls();
         let mut warm = Warm::default();
         for (i, contact) in contacts.iter_mut().enumerate() {
             // A new contact starts static and turns kinetic once it slides.
@@ -1356,6 +1382,16 @@ impl Manifold {
         l.c0 = regularize(l.c0, alpha);
         self.friction = (ba.friction * bb.friction).sqrt();
         self.static_friction = (ba.static_friction * bb.static_friction).sqrt();
+        self.restitution = ba.restitution.max(bb.restitution);
+        if self.restitution > 0.0 {
+            let (va, vb) = (ba.velocity, bb.velocity);
+            let (wa, wb) = (ba.angular_velocity, bb.angular_velocity);
+            for i in 0..self.len {
+                let lane = |r: &[Vec4; 3]| Vec3::new(r[0][i], r[1][i], r[2][i]);
+                let relative = va + wa.cross(lane(&l.ra)) - vb - wb.cross(lane(&l.rb));
+                self.cold.approach[i] = relative.dot(basis[0]);
+            }
+        }
         self.scale = scale;
     }
 }
@@ -2206,6 +2242,9 @@ pub(crate) struct Solver {
     found: Vec<Option<Manifold>>,
     /// Counts narrowphase passes, to spot manifolds no pair matched.
     pass: u32,
+    /// Time in the broadphase and narrowphase during the last step.
+    pub broad_time: std::time::Duration,
+    pub narrow_time: std::time::Duration,
 }
 
 impl Solver {
@@ -2262,6 +2301,8 @@ impl Solver {
             })
             .collect();
         let mut woken = self.wake_islands(&requested);
+        self.broad_time = std::time::Duration::ZERO;
+        self.narrow_time = std::time::Duration::ZERO;
         self.linked.clear();
         for link in self.links.iter().filter(|l| !l.broken) {
             if let Some(a) = link.a {
@@ -2279,13 +2320,17 @@ impl Solver {
         for body in &mut self.bodies {
             body.predict(dt);
         }
+        let start = std::time::Instant::now();
         self.broadphase(serial);
+        let broad = std::time::Instant::now();
+        self.broad_time += broad - start;
         // If no island is asleep, collision detection cannot require a second
         // pass, so warm starting can be prepared during the first pass. With
         // sleepers, retain unscaled lanes until both passes finish: preparing
         // during each pass would decay the same warm start more than once.
         let prepare_now = !has_sleepers;
         self.narrowphase(serial, prepare_now.then_some(settings));
+        self.narrow_time += broad.elapsed();
         // Real contact with a moving body wakes an asleep island; collide
         // again so the island's own contacts join this step.
         let linked_pairs =
@@ -2299,8 +2344,12 @@ impl Solver {
         let also = self.wake_islands(&touched);
         if !also.is_empty() {
             woken.extend(also);
+            let start = std::time::Instant::now();
             self.broadphase(serial);
+            let broad = std::time::Instant::now();
+            self.broad_time += broad - start;
             self.narrowphase(serial, None);
+            self.narrow_time += broad.elapsed();
         }
         if !woken.is_empty() {
             self.stash.retain(|(island, _)| !woken.contains(island));
@@ -2430,7 +2479,70 @@ impl Solver {
                 }
             }
         }
+        self.bounce();
         self.sleep(dt);
+    }
+
+    /// Restitution, as a velocity pass after the solve (as Box2D does): each
+    /// pushing contact that closed faster than `BOUNCE_SPEED` leaves at
+    /// `restitution` times that speed. Positions are already solved, so this
+    /// changes only where bodies go next step.
+    fn bounce(&mut self) {
+        let bodies = &mut self.bodies;
+        let mut springy: Vec<(usize, Vec4)> = (self.manifolds.iter().enumerate())
+            .filter(|(_, m)| {
+                m.restitution > 0.0
+                    && (0..m.len)
+                        .any(|i| m.lanes.lambda[0][i] < 0.0 && m.cold.approach[i] < -BOUNCE_SPEED)
+            })
+            .map(|(i, _)| (i, Vec4::ZERO))
+            .collect();
+        if springy.is_empty() {
+            return;
+        }
+        let inverse = |b: &Body| {
+            if b.dynamic() {
+                (1.0 / b.mass, Mat3::from(b.inertia.inverse()))
+            } else {
+                (0.0, Mat3::ZERO)
+            }
+        };
+        // Several passes share impulses between a manifold's contacts.
+        for _ in 0..BOUNCE_ITERATIONS {
+            for (index, total) in &mut springy {
+                let m = &self.manifolds[*index];
+                let normal = Vec3::from(m.rows.row(0));
+                let ((ma, ia), (mb, ib)) = (inverse(&bodies[m.a]), inverse(&bodies[m.b]));
+                for i in 0..m.len {
+                    let approach = m.cold.approach[i];
+                    if m.lanes.lambda[0][i] >= 0.0 || approach >= -BOUNCE_SPEED {
+                        continue;
+                    }
+                    let lane = |r: &[Vec4; 3]| Vec3::new(r[0][i], r[1][i], r[2][i]);
+                    let (ra, rb) = (lane(&m.lanes.ra), lane(&m.lanes.rb));
+                    let (a, b) = (&bodies[m.a], &bodies[m.b]);
+                    let speed = (a.velocity + a.angular_velocity.cross(ra)
+                        - b.velocity
+                        - b.angular_velocity.cross(rb))
+                    .dot(normal);
+                    let (na, nb) = (ra.cross(normal), rb.cross(normal));
+                    let k = ma + mb + na.dot(ia * na) + nb.dot(ib * nb);
+                    if k <= 0.0 {
+                        continue;
+                    }
+                    let target = -m.restitution * approach;
+                    let accumulated = (total[i] + (target - speed) / k).max(0.0);
+                    let impulse = accumulated - total[i];
+                    total[i] = accumulated;
+                    let a = &mut bodies[m.a];
+                    a.velocity += normal * (impulse * ma);
+                    a.angular_velocity += ia * na * impulse;
+                    let b = &mut bodies[m.b];
+                    b.velocity -= normal * (impulse * mb);
+                    b.angular_velocity -= ib * nb * impulse;
+                }
+            }
+        }
     }
 
     /// Sleeping islands with a contact on any of these bodies, which are
@@ -2699,6 +2811,10 @@ impl Solver {
                     Vec3::new(abs(m.row(0)), abs(m.row(1)), abs(m.row(2)))
                 }
                 Collider::Sphere { radius } => Vec3::splat(radius),
+                Collider::Capsule {
+                    radius,
+                    half_height,
+                } => b.initial_basis.z_axis.abs() * half_height + radius,
                 // Everything near it pairs with it; the shape then says what touches.
                 Collider::Ground => Vec3::splat(UNBOUNDED),
             } + (0.5 * CONTACT_DISTANCE + b.reach);
@@ -3269,6 +3385,7 @@ mod tests {
             inertia: Mat3A::IDENTITY,
             friction: 0.5,
             static_friction: 0.5,
+            restitution: 0.0,
             kinematic: false,
             asleep: false,
             wake: false,
@@ -3329,11 +3446,13 @@ mod tests {
                 error: [Vec4::ZERO; 3],
                 deep: false,
                 seen: 0,
+                approach: Vec4::ZERO,
             }),
             first_is_a: true,
             len,
             friction,
             static_friction,
+            restitution: 0.0,
             scale: 1.0,
             limit: PENALTY_MAX,
             impact: false,

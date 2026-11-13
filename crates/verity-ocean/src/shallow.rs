@@ -71,6 +71,17 @@ const STEEPNESS_PENALTY: f32 = 0.64;
 /// γ); Airy waves cannot break, so full shoaling would overshoot.
 const CONVERGENCE_GROWTH: f32 = 0.25;
 
+/// Surface-wave height (m) and speed (m/s) below which the dispersive layer
+/// is not worth its FFTs.
+const QUIET: f32 = 1e-5;
+
+/// Elements per task for passes doing a few flops each: they stream memory,
+/// so splitting them finer costs more in hand-offs than it saves.
+const STREAM: usize = 8 * GRAIN;
+
+/// Cells over which the edge sponge ramps up.
+const SPONGE: f32 = 4.0;
+
 /// Surface-wave amplitude over depth above which waves break (McCowan: height
 /// 0.78 of the depth).
 const BREAKING_AMPLITUDE: f32 = 0.39;
@@ -84,15 +95,37 @@ struct Mode {
     shift: [Vec2; 2],
 }
 
-/// Buffers of the dispersive step, kept because a fresh allocation this size
-/// costs more in page faults than the arithmetic done with it.
+/// Buffers kept across substeps, because a fresh allocation this size costs
+/// more in page faults than the arithmetic done with it.
 #[derive(Default)]
-struct Spectra {
+struct Scratch {
     height: Vec<Vec2>,
     flux: Vec<Vec2>,
     /// Height, x-flux and y-flux coefficients at the origin.
     origin: Vec<[Vec2; 3]>,
     levels: Vec<(Vec<Vec2>, Vec<Vec2>)>,
+    /// Spare fields, handed out and given back within a step.
+    spare: Vec<Vec<f32>>,
+}
+
+impl Scratch {
+    fn zeroed(&mut self, len: usize) -> Vec<f32> {
+        let mut field = self.spare.pop().unwrap_or_default();
+        field.clear();
+        field.resize(len, 0.0);
+        field
+    }
+
+    fn copy(&mut self, from: &[f32]) -> Vec<f32> {
+        let mut field = self.spare.pop().unwrap_or_default();
+        field.clear();
+        field.extend_from_slice(from);
+        field
+    }
+
+    fn give<const N: usize>(&mut self, fields: [Vec<f32>; N]) {
+        self.spare.extend(fields);
+    }
 }
 
 /// Shallow water over a square power-of-two [`Seabed`]. Depth and foam live
@@ -118,7 +151,7 @@ pub struct ShallowWater {
     rise: Vec<f32>,
     fft: Fft2,
     modes: Vec<Mode>,
-    spectra: Spectra,
+    scratch: Scratch,
 }
 
 impl ShallowWater {
@@ -164,7 +197,7 @@ impl ShallowWater {
             rise: vec![0.0; n * n],
             fft: Fft2::new(n),
             modes,
-            spectra: Spectra::default(),
+            scratch: Scratch::default(),
         }
     }
 
@@ -206,67 +239,195 @@ impl ShallowWater {
                 && settings.manning >= 0.0,
             "courant must be in (0, 1], depth levels positive, manning nonnegative"
         );
-        let mut left = dt;
-        while left > 0.0 {
-            let flow = self
-                .u
-                .iter()
-                .chain(&self.v)
-                .fold(0.0f32, |m, v| m.max(v.abs()));
-            let deepest = self.depth.iter().fold(0.0f32, |m, &d| m.max(d));
-            let limit =
-                settings.courant * self.cell / (flow + (GRAVITY * deepest).sqrt()).max(1e-6);
-            // Even shares, or the remainder pays for a whole substep of its own.
-            let h = left / (left / limit).ceil().max(1.0);
-            self.substep(h, settings);
-            left -= h;
+        if dt == 0.0 {
+            return;
         }
+        let mut scratch = std::mem::take(&mut self.scratch);
+        if settings.dispersion && self.depth.par_iter().with_min_len(STREAM).any(|&d| d > DRY) {
+            self.dispersive_step(dt, settings, &mut scratch);
+        } else {
+            let mut left = dt;
+            while left > 0.0 {
+                let h = self.substep(left, settings);
+                let before = scratch.copy(&self.depth);
+                self.bulk(h, settings, &mut scratch);
+                self.settle(h, before, settings, &mut scratch);
+                left -= h;
+            }
+        }
+        self.scratch = scratch;
     }
 
-    fn substep(&mut self, dt: f32, settings: &ShallowWaterSettings) {
-        let before = self.depth.clone();
-        if settings.dispersion && self.depth.iter().any(|&d| d > DRY) {
-            // Jeschke & Wojtan 2023: bulk flow stays shallow water, the
-            // high-frequency remainder is propagated by Airy theory and
-            // carried by the bulk flow.
-            let (hb, ub, vb) = self.split(settings.split_iterations);
-            let mut hs: Vec<f32> = self.depth.iter().zip(&hb).map(|(h, b)| h - b).collect();
-            let mut us: Vec<f32> = self.u.iter().zip(&ub).map(|(u, b)| u - b).collect();
-            let mut vs: Vec<f32> = self.v.iter().zip(&vb).map(|(v, b)| v - b).collect();
-            let volume: f32 = hs.iter().sum();
-            (self.depth, self.u, self.v) = (hb, ub, vb);
-            self.airy(&mut hs, &mut us, &mut vs, dt, settings.depth_levels);
-            self.bulk(dt, settings);
-            self.transport(&mut hs, &mut us, &mut vs, dt);
-            for (s, h) in hs.iter_mut().zip(&self.depth) {
+    /// Length of the next stable bulk substep with `left` seconds to go.
+    fn substep(&self, left: f32, settings: &ShallowWaterSettings) -> f32 {
+        let fastest = |field: &[f32]| {
+            field
+                .par_iter()
+                .with_min_len(STREAM)
+                .map(|v| v.abs())
+                .reduce(|| 0.0, f32::max)
+        };
+        let flow = fastest(&self.u).max(fastest(&self.v));
+        let deepest = fastest(&self.depth);
+        let limit = settings.courant * self.cell / (flow + (GRAVITY * deepest).sqrt()).max(1e-6);
+        // Even shares, or the remainder pays for a whole substep of its own.
+        left / (left / limit).ceil().max(1.0)
+    }
+
+    /// Jeschke & Wojtan 2023: bulk flow stays shallow water, the
+    /// high-frequency remainder is propagated by Airy theory and carried by
+    /// the bulk flow. Airy propagation is exact for any `dt` and transport is
+    /// semi-Lagrangian, so only the bulk needs stable substeps.
+    fn dispersive_step(&mut self, dt: f32, settings: &ShallowWaterSettings, scratch: &mut Scratch) {
+        let before = scratch.copy(&self.depth);
+        let (hb, ub, vb) = self.split(settings.split_iterations, scratch);
+        // The surface layer is what the split took out, made in the old fields.
+        let mut hs = std::mem::replace(&mut self.depth, hb);
+        let mut us = std::mem::replace(&mut self.u, ub);
+        let mut vs = std::mem::replace(&mut self.v, vb);
+        let subtract = |s: &mut [f32], b: &[f32]| {
+            s.par_iter_mut()
+                .with_min_len(STREAM)
+                .zip(b)
+                .for_each(|(s, b)| *s -= b)
+        };
+        subtract(&mut hs, &self.depth);
+        subtract(&mut us, &self.u);
+        subtract(&mut vs, &self.v);
+        let volume: f32 = hs.par_iter().with_min_len(STREAM).sum();
+        let largest = hs
+            .par_iter()
+            .with_min_len(STREAM)
+            .chain(&us)
+            .chain(&vs)
+            .map(|s| s.abs())
+            .reduce(|| 0.0, f32::max);
+        // Still lakes and steady rivers carry no surface waves: skip the FFTs.
+        let waves = largest > QUIET;
+        if waves {
+            self.absorb_at_edges(&settings.edges, &mut hs, &mut us, &mut vs, dt);
+            self.airy(
+                scratch,
+                &mut hs,
+                &mut us,
+                &mut vs,
+                dt,
+                settings.depth_levels,
+            );
+        }
+        let mut left = dt;
+        while left > 0.0 {
+            let h = self.substep(left, settings);
+            self.bulk(h, settings, scratch);
+            left -= h;
+        }
+        if waves {
+            self.transport(scratch, &mut hs, &mut us, &mut vs, dt);
+        }
+        hs.par_iter_mut()
+            .with_min_len(STREAM)
+            .zip(&self.depth)
+            .for_each(|(s, h)| {
                 let limit = BREAKING_AMPLITUDE * h;
                 *s = s.clamp(-limit, limit);
-            }
-            // Blending levels, masking land, advection and breaking all move
-            // a little water; give it back.
-            // shortcut: the FFT is periodic, so surface waves wrap across domain
-            // edges and pass under thin walls; keep a margin or relax the edges.
-            let wet = self.depth.iter().filter(|&&h| h > DRY).count();
-            if wet > 0 {
-                let fix = (volume - hs.iter().sum::<f32>()) / wet as f32;
-                hs.iter_mut()
-                    .zip(&self.depth)
-                    .filter(|(_, h)| **h > DRY)
-                    .for_each(|(s, _)| *s += fix);
-            }
-            self.depth
-                .iter_mut()
-                .zip(&hs)
-                .for_each(|(h, s)| *h = (*h + s).max(0.0));
-            self.u.iter_mut().zip(&us).for_each(|(u, s)| *u += s);
-            self.v.iter_mut().zip(&vs).for_each(|(v, s)| *v += s);
-        } else {
-            self.bulk(dt, settings);
+            });
+        // Blending levels, masking land, advection, breaking and the edge
+        // sponge all move a little water; give it back.
+        let wet = self
+            .depth
+            .par_iter()
+            .with_min_len(STREAM)
+            .filter(|&&h| h > DRY)
+            .count();
+        if wet > 0 {
+            let fix = (volume - hs.par_iter().with_min_len(STREAM).sum::<f32>()) / wet as f32;
+            hs.par_iter_mut()
+                .with_min_len(STREAM)
+                .zip(&self.depth)
+                .filter(|(_, h)| **h > DRY)
+                .for_each(|(s, _)| *s += fix);
         }
-        for (rise, (now, was)) in self.rise.iter_mut().zip(self.depth.iter().zip(&before)) {
-            *rise = (now - was) / dt;
+        self.depth
+            .par_iter_mut()
+            .with_min_len(STREAM)
+            .zip(&hs)
+            .for_each(|(h, s)| *h = (*h + s).max(0.0));
+        let add = |f: &mut [f32], s: &[f32]| {
+            f.par_iter_mut()
+                .with_min_len(STREAM)
+                .zip(s)
+                .for_each(|(f, s)| *f += s)
+        };
+        add(&mut self.u, &us);
+        add(&mut self.v, &vs);
+        scratch.give([hs, us, vs]);
+        self.settle(dt, before, settings, scratch);
+    }
+
+    /// The surface rise since `before`, then foam, after `dt` seconds.
+    fn settle(
+        &mut self,
+        dt: f32,
+        before: Vec<f32>,
+        settings: &ShallowWaterSettings,
+        scratch: &mut Scratch,
+    ) {
+        (&mut self.rise, &self.depth, &before)
+            .into_par_iter()
+            .with_min_len(STREAM)
+            .for_each(|(rise, now, was)| *rise = (now - was) / dt);
+        scratch.give([before]);
+        self.update_foam(dt, settings, scratch);
+    }
+
+    /// Sponge over the cells nearest the edges water can leave by. The Airy
+    /// step's FFT is periodic, so without it surface waves leaving one edge
+    /// would come back in at the opposite one.
+    /// shortcut: walls keep that wrap, since a sponge would stop them
+    /// reflecting; mirror the domain in the FFT if waves must bounce off walls.
+    fn absorb_at_edges(
+        &self,
+        edges: &[Edge; 4],
+        hs: &mut [f32],
+        us: &mut [f32],
+        vs: &mut [f32],
+        dt: f32,
+    ) {
+        let open = edges.map(|e| e != Edge::Wall);
+        if !open.contains(&true) {
+            return;
         }
-        self.update_foam(dt, settings);
+        let n = self.n as f32;
+        // Fastest a surface wave can travel, in cells per second.
+        let deepest = self
+            .depth
+            .par_iter()
+            .with_min_len(STREAM)
+            .copied()
+            .reduce(|| 0.0, f32::max);
+        let speed = (GRAVITY * deepest).sqrt() / self.cell;
+        let keep = |x: f32, y: f32| {
+            let edge = [x, n - x, y, n - y]
+                .into_iter()
+                .zip(open)
+                .filter_map(|(d, open)| open.then_some(d))
+                .fold(f32::MAX, f32::min);
+            (-(1.0 - edge / SPONGE).max(0.0) * speed * dt).exp()
+        };
+        let sponge = |field: &mut [f32], width: usize, offset: Vec2| {
+            field
+                .par_chunks_mut(width)
+                .with_min_len(STREAM / width)
+                .enumerate()
+                .for_each(|(j, row)| {
+                    for (i, s) in row.iter_mut().enumerate() {
+                        *s *= keep(i as f32 + offset.x, j as f32 + offset.y);
+                    }
+                });
+        };
+        sponge(hs, self.n, Vec2::splat(0.5));
+        sponge(us, self.n + 1, Vec2::new(0.0, 0.5));
+        sponge(vs, self.n, Vec2::new(0.5, 0.0));
     }
 
     /// Smooth the free surface and velocities where water is deep, giving the
@@ -275,30 +436,30 @@ impl ShallowWater {
     /// surface waves. Shallow and dry faces don't diffuse, so shorelines and
     /// nonlinear bores stay in the bulk, and still water over any bed splits
     /// into no surface waves at all.
-    fn split(&self, iterations: usize) -> (Vec<f32>, Vec<f32>, Vec<f32>) {
+    fn split(&self, iterations: usize, scratch: &mut Scratch) -> (Vec<f32>, Vec<f32>, Vec<f32>) {
         let n = self.n;
-        let mut eta: Vec<f32> = self
-            .bed
-            .iter()
-            .zip(&self.depth)
-            .map(|(b, h)| b + h)
-            .collect();
-        // Filter variance wanted at each cell, in cells².
-        let variance: Vec<f32> = (0..n * n)
+        let mut eta = scratch.zeroed(n * n);
+        (&mut eta, &self.bed, &self.depth)
             .into_par_iter()
+            .with_min_len(STREAM)
+            .for_each(|(e, b, h)| *e = b + h);
+        // Filter variance wanted at each cell, in cells².
+        let mut variance = scratch.zeroed(n * n);
+        variance
+            .par_iter_mut()
+            .enumerate()
             .with_min_len(GRAIN)
-            .map(|c| {
+            .for_each(|(c, out)| {
                 let (i, j) = (c % n, c / n);
                 let slope = Vec2::new(
                     eta[(i + 1).min(n - 1) + j * n] - eta[i.saturating_sub(1) + j * n],
                     eta[i + (j + 1).min(n - 1) * n] - eta[i + j.saturating_sub(1) * n],
                 ) / (2.0 * self.cell);
                 let depth = self.depth[c] / self.cell;
-                (depth * depth - STEEPNESS_PENALTY * slope.length_squared()).max(0.0)
-            })
-            .collect();
-        let (fx, fy) = self.face_depths(&variance, f32::min);
-        let (mut ub, mut vb) = (self.u.clone(), self.v.clone());
+                *out = (depth * depth - STEEPNESS_PENALTY * slope.length_squared()).max(0.0);
+            });
+        let (fx, fy) = self.face_depths(&variance, f32::min, scratch);
+        let (mut ub, mut vb) = (scratch.copy(&self.u), scratch.copy(&self.v));
         rayon::join(
             || diffuse(&mut eta, n, &variance, iterations),
             || {
@@ -308,26 +469,43 @@ impl ShallowWater {
                 )
             },
         );
-        let hb = eta
-            .iter()
+        scratch.give([variance, fx, fy]);
+        eta.par_iter_mut()
+            .with_min_len(STREAM)
             .zip(&self.bed)
-            .map(|(e, b)| (e - b).max(0.0))
-            .collect();
-        (hb, ub, vb)
+            .for_each(|(e, b)| *e = (*e - b).max(0.0));
+        (eta, ub, vb)
     }
 
     /// Per-face depths combining the two cells each interior face separates;
     /// zero on the boundary.
-    fn face_depths(&self, h: &[f32], combine: fn(f32, f32) -> f32) -> (Vec<f32>, Vec<f32>) {
+    fn face_depths(
+        &self,
+        h: &[f32],
+        combine: fn(f32, f32) -> f32,
+        scratch: &mut Scratch,
+    ) -> (Vec<f32>, Vec<f32>) {
         let n = self.n;
-        let mut fx = vec![0.0; (n + 1) * n];
-        let mut fy = vec![0.0; n * (n + 1)];
-        for j in 0..n {
-            for i in 1..n {
-                fx[self.xu(i, j)] = combine(h[i - 1 + j * n], h[i + j * n]);
-                fy[j + i * n] = combine(h[j + (i - 1) * n], h[j + i * n]);
-            }
-        }
+        let mut fx = scratch.zeroed((n + 1) * n);
+        let mut fy = scratch.zeroed(n * (n + 1));
+        fx.par_chunks_mut(n + 1)
+            .with_min_len(STREAM / (n + 1))
+            .enumerate()
+            .for_each(|(j, row)| {
+                for i in 1..n {
+                    row[i] = combine(h[i - 1 + j * n], h[i + j * n]);
+                }
+            });
+        fy[n..n * n]
+            .par_chunks_mut(n)
+            .with_min_len(STREAM / n)
+            .enumerate()
+            .for_each(|(row, out)| {
+                let i = row + 1;
+                for (j, out) in out.iter_mut().enumerate() {
+                    *out = combine(h[j + (i - 1) * n], h[j + i * n]);
+                }
+            });
         (fx, fy)
     }
 
@@ -337,15 +515,9 @@ impl ShallowWater {
     /// Modes on either Nyquist axis are retained without propagation: their
     /// staggered-grid phase is ambiguous, but discarding them would change the
     /// state even in the limit of a zero-length step.
-    fn airy(&mut self, hs: &mut [f32], us: &mut [f32], vs: &mut [f32], dt: f32, levels: usize) {
-        let mut spectra = std::mem::take(&mut self.spectra);
-        self.airy_with(&mut spectra, hs, us, vs, dt, levels);
-        self.spectra = spectra;
-    }
-
-    fn airy_with(
+    fn airy(
         &self,
-        spectra: &mut Spectra,
+        scratch: &mut Scratch,
         hs: &mut [f32],
         us: &mut [f32],
         vs: &mut [f32],
@@ -354,7 +526,7 @@ impl ShallowWater {
     ) {
         let n = self.n;
         let hb = &self.depth;
-        let (fx, fy) = self.face_depths(hb, |a, b| 0.5 * (a + b));
+        let (fx, fy) = self.face_depths(hb, |a, b| 0.5 * (a + b), scratch);
         let lo = hb
             .iter()
             .copied()
@@ -362,15 +534,22 @@ impl ShallowWater {
             .fold(f32::INFINITY, f32::min);
         let hi = hb.iter().copied().fold(0.0, f32::max);
         if hi <= DRY {
+            scratch.give([fx, fy]);
             return;
         }
+        let (mut out_h, mut out_qx, mut out_qy) = (
+            scratch.zeroed(n * n),
+            scratch.zeroed(n * n),
+            scratch.zeroed(n * n),
+        );
 
-        let Spectra {
+        let Scratch {
             height: hk,
             flux: qk,
             origin,
             levels: planes,
-        } = spectra;
+            ..
+        } = scratch;
         hk.clear();
         hk.extend(hs.iter().map(|&h| Vec2::new(h, 0.0)));
         qk.clear();
@@ -445,72 +624,120 @@ impl ShallowWater {
                     *ph = mul(h, mul(sx, sy));
                     *pq = mul(qx, sy) + times_i(mul(qy, sx));
                 });
-            rayon::join(|| self.fft.run(ph, true), || self.fft.run(pq, true));
         });
+        // Each level's height spectrum is Hermitian, so its surface is real:
+        // pairs of levels share one transform as real and imaginary parts.
+        planes.par_chunks_mut(2).for_each(|pair| {
+            if let [(even, _), (odd, _)] = pair {
+                even.par_iter_mut()
+                    .with_min_len(STREAM)
+                    .zip(&*odd)
+                    .for_each(|(e, o)| *e += times_i(*o));
+            }
+        });
+        planes
+            .par_iter_mut()
+            .enumerate()
+            .flat_map_iter(|(l, (ph, pq))| {
+                [(l % 2 == 0).then_some(ph), Some(pq)].into_iter().flatten()
+            })
+            .for_each(|field| self.fft.run(field, true));
         let levels = &*planes;
         let scale = 1.0 / (n * n) as f32;
-        let (mut out_h, mut out_qx, mut out_qy) =
-            (vec![0.0; n * n], vec![0.0; n * n], vec![0.0; n * n]);
         (&mut out_h, &mut out_qx, &mut out_qy, 0..n * n)
             .into_par_iter()
             .with_min_len(GRAIN)
             .for_each(|(h, qx, qy, c)| {
                 let x = self.xu(c % n, c / n);
                 let (th, tx, ty) = (level(hb[c]), level(fx[x]), level(fy[c]));
-                for (l, (ph, pq)) in levels.iter().enumerate() {
-                    *h += weight(th, l) * ph[c].x * scale;
+                for (l, (_, pq)) in levels.iter().enumerate() {
+                    let packed = levels[l & !1].0[c];
+                    let height = if l % 2 == 0 { packed.x } else { packed.y };
+                    *h += weight(th, l) * height * scale;
                     *qx += weight(tx, l) * pq[c].x * scale;
                     *qy += weight(ty, l) * pq[c].y * scale;
                 }
             });
 
-        for c in 0..n * n {
-            hs[c] = if hb[c] > DRY { out_h[c] } else { 0.0 };
-        }
-        for j in 0..n {
-            for i in 0..=n {
-                let x = self.xu(i, j);
-                us[x] = if i > 0 && i < n && fx[x] > DRY {
-                    out_qx[i + j * n] / fx[x]
-                } else {
-                    0.0
-                };
-                let y = j + i * n;
-                vs[y] = if i > 0 && i < n && fy[y] > DRY {
-                    out_qy[y] / fy[y]
-                } else {
-                    0.0
-                };
-            }
-        }
+        hs.par_iter_mut()
+            .with_min_len(STREAM)
+            .zip(&out_h)
+            .zip(hb)
+            .for_each(|((s, &o), &h)| *s = if h > DRY { o } else { 0.0 });
+        us.par_chunks_mut(n + 1)
+            .with_min_len(STREAM / (n + 1))
+            .enumerate()
+            .for_each(|(j, row)| {
+                for (i, s) in row.iter_mut().enumerate() {
+                    let x = i + j * (n + 1);
+                    *s = if i > 0 && i < n && fx[x] > DRY {
+                        out_qx[i + j * n] / fx[x]
+                    } else {
+                        0.0
+                    };
+                }
+            });
+        vs.par_chunks_mut(n)
+            .with_min_len(STREAM / n)
+            .enumerate()
+            .for_each(|(i, row)| {
+                for (j, s) in row.iter_mut().enumerate() {
+                    let y = j + i * n;
+                    *s = if i > 0 && i < n && fy[y] > DRY {
+                        out_qy[y] / fy[y]
+                    } else {
+                        0.0
+                    };
+                }
+            });
+        scratch.give([fx, fy, out_h, out_qx, out_qy]);
     }
 
     /// Carry surface waves on the bulk flow (Jeschke & Wojtan's section 4.4):
     /// waves ride a current, and steepen or relax where it converges or
     /// diverges. Cubic, since linear interpolation would smear short waves
     /// away. Still water needs none of this and is left bit-exact.
-    fn transport(&self, hs: &mut Vec<f32>, us: &mut [f32], vs: &mut [f32], dt: f32) {
+    fn transport(
+        &self,
+        scratch: &mut Scratch,
+        hs: &mut Vec<f32>,
+        us: &mut [f32],
+        vs: &mut [f32],
+        dt: f32,
+    ) {
         let (n, dx) = (self.n, self.cell);
         let flow = self
             .u
-            .iter()
+            .par_iter()
+            .with_min_len(STREAM)
             .chain(&self.v)
-            .fold(0.0f32, |m, v| m.max(v.abs()));
+            .map(|v| v.abs())
+            .reduce(|| 0.0, f32::max);
         if flow * dt / dx < 1e-3 {
             return;
         }
-        let growth: Vec<f32> = (0..n * n)
-            .map(|c| {
-                let (i, j) = (c % n, c / n);
-                let divergence = self.u[self.xu(i + 1, j)] - self.u[self.xu(i, j)]
-                    + self.v[i + (j + 1) * n]
-                    - self.v[i + j * n];
-                let rate = -divergence * dt / dx;
-                rate.min(CONVERGENCE_GROWTH * rate).exp()
-            })
-            .collect();
+        let mut growth = scratch.zeroed(n * n);
+        growth
+            .par_iter_mut()
+            .with_min_len(STREAM)
+            .enumerate()
+            .for_each(|(c, out)| {
+                *out = {
+                    let (i, j) = (c % n, c / n);
+                    let divergence = self.u[self.xu(i + 1, j)] - self.u[self.xu(i, j)]
+                        + self.v[i + (j + 1) * n]
+                        - self.v[i + j * n];
+                    let rate = -divergence * dt / dx;
+                    rate.min(CONVERGENCE_GROWTH * rate).exp()
+                };
+            });
         let back = |p: Vec2| p - self.velocity_at(p) * (dt / dx);
-        let heights: Vec<f32> = hs.iter().zip(&growth).map(|(h, g)| h * g).collect();
+        let mut heights = scratch.copy(hs);
+        heights
+            .par_iter_mut()
+            .with_min_len(STREAM)
+            .zip(&growth)
+            .for_each(|(h, g)| *h *= g);
         (0..n * n)
             .into_par_iter()
             .with_min_len(GRAIN)
@@ -519,7 +746,7 @@ impl ShallowWater {
                 cubic(&heights, n, back(p) - 0.5)
             })
             .collect_into_vec(hs);
-        let old = us.to_vec();
+        let old = scratch.copy(us);
         us.par_chunks_mut(n + 1)
             .enumerate()
             .with_min_len(GRAIN / n)
@@ -530,7 +757,8 @@ impl ShallowWater {
                     *out = g * cubic(&old, n + 1, at);
                 }
             });
-        let old = vs.to_vec();
+        scratch.give([heights, old]);
+        let old = scratch.copy(vs);
         vs[n..n * n]
             .par_chunks_mut(n)
             .enumerate()
@@ -543,20 +771,25 @@ impl ShallowWater {
                     *out = g * cubic(&old, n, at);
                 }
             });
+        scratch.give([growth, old]);
     }
 
     /// One shallow-water step: semi-Lagrangian momentum advection, surface
     /// pressure, Manning friction, then upwind fluxes limited so no cell
     /// drains below empty (Stelling & Duinmeijer 2003). Mass is conserved
     /// exactly and still water over any bed stays still.
-    fn bulk(&mut self, dt: f32, settings: &ShallowWaterSettings) {
+    fn bulk(&mut self, dt: f32, settings: &ShallowWaterSettings, scratch: &mut Scratch) {
         let manning = settings.manning;
         let (n, dx) = (self.n, self.cell);
         let Self {
             bed, depth, u, v, ..
         } = self;
-        let (u0, v0) = (u.clone(), v.clone());
-        let eta: Vec<f32> = bed.iter().zip(depth.iter()).map(|(b, h)| b + h).collect();
+        let (u0, v0) = (scratch.copy(u), scratch.copy(v));
+        let mut eta = scratch.zeroed(n * n);
+        (&mut eta, &*bed, &*depth)
+            .into_par_iter()
+            .with_min_len(STREAM)
+            .for_each(|(e, b, h)| *e = b + h);
         let limit = 0.5 * dx / dt;
         // Pressure and friction on an advected face velocity.
         let accelerate = |vel: f32, l: usize, r: usize| {
@@ -570,7 +803,7 @@ impl ShallowWater {
             w.clamp(-limit, limit)
         };
         let upwind = |vel: f32, l: usize, r: usize| vel * depth[if vel > 0.0 { l } else { r }];
-        let (mut fu, mut fv) = (vec![0.0; u.len()], vec![0.0; v.len()]);
+        let (mut fu, mut fv) = (scratch.zeroed(u.len()), scratch.zeroed(v.len()));
         u.par_chunks_mut(n + 1)
             .zip(fu.par_chunks_mut(n + 1))
             .enumerate()
@@ -634,22 +867,23 @@ impl ShallowWater {
             }
         }
         // Shrink what leaves each cell so that none drains below empty.
-        let scale: Vec<f32> = (0..n * n)
-            .into_par_iter()
+        let mut scale = scratch.zeroed(n * n);
+        scale
+            .par_iter_mut()
+            .enumerate()
             .with_min_len(GRAIN)
-            .map(|c| {
+            .for_each(|(c, scale)| {
                 let (i, j) = (c % n, c / n);
                 let out = fu[i + 1 + j * (n + 1)].max(0.0)
                     + (-fu[i + j * (n + 1)]).max(0.0)
                     + fv[i + (j + 1) * n].max(0.0)
                     + (-fv[i + j * n]).max(0.0);
-                if out * dt / dx > depth[c] {
+                *scale = if out * dt / dx > depth[c] {
                     depth[c] / (out * dt / dx)
                 } else {
                     1.0
-                }
-            })
-            .collect();
+                };
+            });
         fu.par_chunks_mut(n + 1)
             .enumerate()
             .with_min_len(GRAIN / n)
@@ -706,14 +940,15 @@ impl ShallowWater {
                     row[i] = (row[i] - dt / dx * divergence).max(0.0);
                 }
             });
+        scratch.give([u0, v0, eta, fu, fv, scale]);
     }
 
-    fn update_foam(&mut self, dt: f32, settings: &ShallowWaterSettings) {
+    fn update_foam(&mut self, dt: f32, settings: &ShallowWaterSettings, scratch: &mut Scratch) {
         let (n, dx) = (self.n, self.cell);
         let fade = (-dt / settings.foam_lifetime.max(f32::MIN_POSITIVE)).exp();
         let drying = (-dt / settings.wetness_lifetime.max(f32::MIN_POSITIVE)).exp();
         let eta = |i: usize, j: usize| self.bed[i + j * n] + self.depth[i + j * n];
-        let mut foam = self.foam.clone();
+        let mut foam = scratch.copy(&self.foam);
         let mut wetness = std::mem::take(&mut self.wetness);
         foam.par_chunks_mut(n)
             .zip(wetness.par_chunks_mut(n))
@@ -759,6 +994,7 @@ impl ShallowWater {
                 }
             });
         self.foam = advected;
+        scratch.give([foam]);
     }
 
     /// Flow velocity at a point in cell units.
@@ -819,52 +1055,86 @@ impl ShallowWater {
     /// generates the target's waves and absorbs outgoing ones; with an
     /// [`Ocean`](crate::Ocean) or [`ShoreWaves`](crate::ShoreWaves) target it
     /// blends the open sea into the simulation. Call once per step.
-    pub fn relax_edges(&mut self, target: &impl Water, width: f32) {
-        let n = self.n;
-        let (size, origin) = (n as f32 * self.cell, self.origin);
-        let ramp = |p: Vec2| {
-            let local = p - origin;
-            let edge = local.x.min(local.y).min(size - local.x).min(size - local.y);
+    pub fn relax_edges(&mut self, target: &(impl Water + Sync), width: f32) {
+        let (n, cell) = (self.n, self.cell);
+        // Blend weight at a point in cell units.
+        let ramp = |x: f32, y: f32| {
+            let edge = x.min(y).min(n as f32 - x).min(n as f32 - y) * cell;
             (1.0 - edge / width).max(0.0).powi(2)
         };
-        for j in 0..n {
-            for i in 0..n {
-                let p = self.center(i, j);
-                let w = ramp(p);
-                if w == 0.0 {
-                    continue;
+        // The target, sampled once per cell inside the zone: the costly part.
+        let samples: Vec<Option<WaterSample>> = (0..n * n)
+            .into_par_iter()
+            .with_min_len(GRAIN / 8)
+            .map(|c| {
+                let (i, j) = (c % n, c / n);
+                (ramp(i as f32 + 0.5, j as f32 + 0.5) > 0.0)
+                    .then(|| target.sample(self.center(i, j)))
+            })
+            .collect();
+        let bed = &self.bed;
+        self.depth
+            .par_iter_mut()
+            .enumerate()
+            .with_min_len(STREAM)
+            .for_each(|(c, depth)| {
+                if let Some(s) = samples[c] {
+                    let w = ramp((c % n) as f32 + 0.5, (c / n) as f32 + 0.5);
+                    *depth += ((s.height - bed[c]).max(0.0) - *depth) * w;
                 }
-                let s = target.sample(p);
-                let c = i + j * n;
-                self.depth[c] += ((s.height - self.bed[c]).max(0.0) - self.depth[c]) * w;
-                // shortcut: drives depth-averaged flow with the target's surface
-                // velocity, which overstates it in deep water.
-                let corner = Vec2::new(i as f32, j as f32);
-                for (x, at) in [
-                    (self.xu(i, j), Vec2::new(0.0, 0.5)),
-                    (self.xu(i + 1, j), Vec2::new(1.0, 0.5)),
-                ] {
-                    self.u[x] +=
-                        (s.velocity.x - self.u[x]) * ramp(origin + (corner + at) * self.cell);
+            });
+        // Each face is pulled by the cells on either side, lower one first.
+        // shortcut: drives depth-averaged flow with the target's surface
+        // velocity, which overstates it in deep water.
+        self.u
+            .par_chunks_mut(n + 1)
+            .enumerate()
+            .with_min_len(STREAM / (n + 1))
+            .for_each(|(j, row)| {
+                for (i, u) in row.iter_mut().enumerate() {
+                    let w = ramp(i as f32, j as f32 + 0.5);
+                    for c in [i.checked_sub(1), (i < n).then_some(i)]
+                        .into_iter()
+                        .flatten()
+                    {
+                        if let Some(s) = samples[c + j * n] {
+                            *u += (s.velocity.x - *u) * w;
+                        }
+                    }
                 }
-                for (y, at) in [
-                    (c, Vec2::new(0.5, 0.0)),
-                    (i + (j + 1) * n, Vec2::new(0.5, 1.0)),
-                ] {
-                    self.v[y] +=
-                        (s.velocity.y - self.v[y]) * ramp(origin + (corner + at) * self.cell);
+            });
+        self.v
+            .par_chunks_mut(n)
+            .enumerate()
+            .with_min_len(STREAM / n)
+            .for_each(|(j, row)| {
+                for (i, v) in row.iter_mut().enumerate() {
+                    let w = ramp(i as f32 + 0.5, j as f32);
+                    for r in [j.checked_sub(1), (j < n).then_some(j)]
+                        .into_iter()
+                        .flatten()
+                    {
+                        if let Some(s) = samples[i + r * n] {
+                            *v += (s.velocity.y - *v) * w;
+                        }
+                    }
                 }
-            }
-        }
+            });
     }
 
     /// Cells within a disc with smooth falloff weights.
     fn disc(&self, center: Vec2, radius: f32) -> impl Iterator<Item = (usize, f32)> + '_ {
-        (0..self.n * self.n).filter_map(move |c| {
-            let d =
-                self.center(c % self.n, c / self.n).distance(center) / radius.max(self.cell * 0.5);
-            (d < 1.0).then(|| (c, (1.0 - d * d).powi(2)))
-        })
+        let (n, radius) = (self.n, radius.max(self.cell * 0.5));
+        // Only the cells under the disc's bounding square.
+        let cell =
+            |p: Vec2| ((p - self.origin) / self.cell).clamp(Vec2::ZERO, Vec2::splat(n as f32));
+        let (lo, hi) = (cell(center - radius).floor(), cell(center + radius).ceil());
+        (lo.y as usize..hi.y as usize)
+            .flat_map(move |j| (lo.x as usize..hi.x as usize).map(move |i| i + j * n))
+            .filter_map(move |c| {
+                let d = self.center(c % n, c / n).distance(center) / radius;
+                (d < 1.0).then(|| (c, (1.0 - d * d).powi(2)))
+            })
     }
 }
 
@@ -957,8 +1227,6 @@ fn diffuse(field: &mut Vec<f32>, width: usize, variance: &[f32], iterations: usi
         }
         let share = 1.0 / (2.0 * (passes * stride * stride * STRIDES.len()) as f32);
         let weight = |v: f32| (v * share).min(0.25);
-        let wx = pairs(len, |i| Some(weight(along_x[i])));
-        let wy = pairs(len, |i| Some(weight(along_y[i])));
         let reach = stride * width;
         // The domain edge mirrors the field: a pair that would cross it folds
         // back onto a cell inside, or edge cells would be filtered less than
@@ -1000,7 +1268,10 @@ fn diffuse(field: &mut Vec<f32>, width: usize, variance: &[f32], iterations: usi
                     let center = &source[row..row + width];
                     // Rows past the edge pair with themselves: a zero difference.
                     let (down, up) = (&source[below..below + width], &source[above..above + width]);
-                    let (w_down, w_up) = (&wy[below..below + width], &wy[row..row + width]);
+                    // Weights come from the pair variances inline: a table
+                    // of them costs a pass of its own.
+                    let (w_down, w_up) =
+                        (&along_y[below..below + width], &along_y[row..row + width]);
                     for (((((out, &c), &d), &u), &wd), &wu) in out
                         .iter_mut()
                         .zip(center)
@@ -1009,18 +1280,18 @@ fn diffuse(field: &mut Vec<f32>, width: usize, variance: &[f32], iterations: usi
                         .zip(w_down)
                         .zip(w_up)
                     {
-                        *out = c + wd * (d - c) + wu * (u - c);
+                        *out = c + weight(wd) * (d - c) + weight(wu) * (u - c);
                     }
                     let span = width.saturating_sub(stride);
-                    let w_right = &wx[row..row + span];
+                    let w_right = &along_x[row..row + span];
                     let (near, far) = (&center[..span], &center[width - span..]);
                     for (((out, &w), &a), &b) in out.iter_mut().zip(w_right).zip(near).zip(far) {
-                        *out += w * (b - a);
+                        *out += weight(w) * (b - a);
                     }
                     let shifted = &mut out[width - span..];
                     for (((out, &w), &a), &b) in shifted.iter_mut().zip(w_right).zip(near).zip(far)
                     {
-                        *out -= w * (b - a);
+                        *out -= weight(w) * (b - a);
                     }
                 });
             for &(a, b, w) in &folded {

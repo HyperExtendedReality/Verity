@@ -227,6 +227,11 @@ impl Embedded {
         self.dispatches.clear();
     }
 
+    /// Whether an instance changed shape and this frame redraws its vertices.
+    pub(crate) fn reshaping(&self) -> bool {
+        self.instances.iter().any(|i| i.dirty)
+    }
+
     /// Queue this frame's changed instances and upload what they need. The
     /// frame's fence must have signaled.
     pub(crate) unsafe fn prepare(
@@ -293,7 +298,6 @@ impl Embedded {
         device: &ash::Device,
         cmd: vk::CommandBuffer,
         frame: usize,
-        vertices: vk::Buffer,
     ) {
         if self.dispatches.is_empty() {
             return;
@@ -301,19 +305,7 @@ impl Embedded {
         use vk::AccessFlags2 as A;
         use vk::PipelineStageFlags2 as S;
         let barrier = |src_stage, src_access, dst_stage, dst_access| {
-            let barrier = vk::BufferMemoryBarrier2::default()
-                .src_stage_mask(src_stage)
-                .src_access_mask(src_access)
-                .dst_stage_mask(dst_stage)
-                .dst_access_mask(dst_access)
-                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                .buffer(vertices)
-                .size(vk::WHOLE_SIZE);
-            device.cmd_pipeline_barrier2(
-                cmd,
-                &vk::DependencyInfo::default().buffer_memory_barriers(&[barrier]),
-            );
+            gpu::memory_barrier(device, cmd, (src_stage, src_access), (dst_stage, dst_access));
         };
         barrier(
             S::ALL_COMMANDS,

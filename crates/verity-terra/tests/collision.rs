@@ -1,6 +1,5 @@
 //! Rigid and soft bodies on terrain, through the real solver.
 use glam::Vec3;
-use noise::Perlin;
 use std::sync::Arc;
 use verity_core::{Entity, EntityHandle, Material, Transform, World};
 use verity_physics::{
@@ -13,11 +12,7 @@ const STEP: f32 = 1.0 / 60.0;
 
 /// Ground with these heights, and no surface noise worth the name.
 fn flat(height: f32) -> Terrain {
-    Terrain::new(Landscape {
-        heights: vec![height; SIDE * SIDE],
-        flow: vec![0.0; SIDE * SIDE],
-        noise: Perlin::new(1337),
-    })
+    Terrain::new(Landscape::flat(height, 385, 1.0))
 }
 
 /// A plane tilted by `slope` along x, exact, for what a slope should do.
@@ -187,6 +182,10 @@ fn eroded_landscape_holds_a_pile_of_bodies() {
     let settings = Settings {
         droplets: 500,
         thermal_steps: 3,
+        // A 384 m map, as the spots below expect.
+        size: 257,
+        cell: 1.5,
+        mountains: 95.0,
         ..Landform::Mountains.into()
     };
     let terrain = Terrain::new(Landscape::generate(settings));
@@ -257,6 +256,8 @@ fn bodies_settle_and_sleep_wherever_they_land() {
         Terrain::new(Landscape::generate(Settings {
             droplets: 500,
             thermal_steps: 3,
+            size: 257,
+            cell: 1.5,
             ..Landform::Plains.into()
         })),
     ] {
@@ -278,4 +279,24 @@ fn bodies_settle_and_sleep_wherever_they_land() {
         let awake = bodies.iter().filter(|b| !physics.is_sleeping(**b)).count();
         assert!(awake <= 2, "{awake} of 100 bodies never settled");
     }
+}
+
+#[test]
+fn bodies_land_on_a_planet() {
+    let planet = planet::Planet::new(planet::PlanetSettings::default());
+    let at = Vec3::new(30.0, 20.0, 0.0);
+    let surface = |p: Vec3| p.z - planet.distance(p);
+    let ground = surface(at.with_z(200.0)).max(surface(at));
+    let (mut world, mut physics) = scene(Arc::new(planet));
+    let cube = Collider::Cuboid {
+        half_extents: Vec3::splat(0.5),
+    };
+    let body = drop(&mut world, &mut physics, cube, at.with_z(ground + 6.0));
+    run(&mut world, &mut physics, 4.0);
+    let rest = position(&world, body);
+    assert!(rest.is_finite());
+    assert!(
+        rest.z > ground - 2.0 && rest.z < ground + 2.5,
+        "{rest} over {ground}"
+    );
 }

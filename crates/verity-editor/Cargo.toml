@@ -10,6 +10,10 @@ verity-render = { path = "../verity-render" }
 verity-lux = { path = "../verity-lux" }
 verity-physics = { path = "../verity-physics" }
 verity-runtime = { path = "../verity-runtime" }
+verity-terra = { path = "../verity-terra" }
+verity-ui = { path = "../verity-ui" }
+verity-nav = { path = "../verity-nav" }
+verity-pcg = { path = "../verity-pcg" }
 winit = "0.30"
 rfd = "0.15"
 arboard = "3"
@@ -17,4 +21,6 @@ serde_json = "1"
 egui = "0.36"
 egui-winit = "0.36"
 glam = "0.29"
+egui_dock = { version = "0.21.1", features = ["serde"] }
+serde = { version = "1", features = ["derive"] }
 

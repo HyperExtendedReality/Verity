@@ -57,7 +57,7 @@ Primary diffuse shading uses the paper's Lambertian preintegration. Each world
 probe stores three 6×6 octahedral irradiance fields: directional/environment,
 emissive, and finite punctual. Each RGBA32F texel carries conditional irradiance
 and its own angular support. Two aggregate dependency float4s bring the probe
-record to 1,760 bytes; each interval entry occupies 272 bytes.
+record to 1,760 bytes; each interval entry occupies 240 bytes.
 Probe-directory identity includes position, cascade level, and LOD, but not
 ray direction; the canonical representative may be any traced direction.
 

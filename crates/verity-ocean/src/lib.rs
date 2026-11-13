@@ -35,6 +35,8 @@
 //! - [`Ripples`]: a small window that scrolls with a character, advanced
 //!   exactly by the gravity-capillary dispersion relation (eWave), so wakes
 //!   and splashes disperse as real ones do, at almost no cost.
+//! - [`stir`]: the other direction, bodies making wakes and splashes in
+//!   [`Ripples`] or [`ShallowWater`] from how they move through the water.
 //!
 //! Everything runs on CPU threads with fields laid out as the textures a GPU
 //! port or the renderer uploads (displacement, slope, foam per texel).
@@ -201,26 +203,100 @@ pub fn buoyancy(
     fluid: &Fluid,
     gravity: Vec3,
 ) -> ExternalForce {
-    let center = Vec3::from_array(transform.translation);
-    let rotation = Quat::from_array(transform.rotation).normalize();
     let mut out = ExternalForce::default();
-    let mut apply = |offset: Vec3, submerged: f32, water_velocity: Vec3| {
+    submerged(water, transform, &body.collider, |offset, volume, s| {
         let velocity = body.velocity.linear + body.velocity.angular.cross(offset);
-        let force =
-            (-gravity * fluid.density - (velocity - water_velocity) * fluid.drag) * submerged;
+        let force = (-gravity * fluid.density - (velocity - s.velocity) * fluid.drag) * volume;
         out.force += force;
         out.torque += offset.cross(force);
+    });
+    out
+}
+
+/// Water a body can stir: see [`stir`].
+pub trait Stir {
+    /// A body whose waterline spans `radius` m around `center`, reaching
+    /// `draft` m below the surface on average, moving at `velocity` relative
+    /// to the water for `dt` seconds.
+    fn stir(&mut self, center: Vec2, radius: f32, draft: f32, velocity: Vec3, dt: f32);
+}
+
+/// A hull pushes a share of its draft aside for each footprint it moves, and
+/// a falling body presses the surface down as it goes in.
+impl Stir for Ripples {
+    fn stir(&mut self, center: Vec2, radius: f32, draft: f32, velocity: Vec3, dt: f32) {
+        let swept = velocity.truncate().length() * dt / (2.0 * radius);
+        self.disturb(center, radius, draft * swept - velocity.z * dt);
+    }
+}
+
+/// A hull drags the share of the water column it reaches along with it.
+impl Stir for ShallowWater {
+    fn stir(&mut self, center: Vec2, radius: f32, draft: f32, velocity: Vec3, _: f32) {
+        let at = (center - self.origin()) / self.cell() - 0.5;
+        let column = bilinear(&self.depth, self.resolution(), at, false);
+        if column > 0.0 {
+            let target = self.sample(center).velocity.truncate() + velocity.truncate();
+            self.push(center, radius, target, (draft / column).min(1.0));
+        }
+    }
+}
+
+/// Wakes and splashes from a body moving through `water`, so they come from
+/// physics rather than game code: call once per step next to [`buoyancy`],
+/// with the same water, to disturb `target` (such as [`Ripples`] layered over
+/// an [`Ocean`], or the [`ShallowWater`] it floats on).
+pub fn stir(
+    target: &mut impl Stir,
+    water: &impl Water,
+    transform: &Transform,
+    body: &PhysicsBody,
+    dt: f32,
+) {
+    let (mut volume, mut centroid, mut relative) = (0.0, Vec3::ZERO, Vec3::ZERO);
+    submerged(water, transform, &body.collider, |offset, v, s| {
+        let velocity = body.velocity.linear + body.velocity.angular.cross(offset);
+        volume += v;
+        centroid += offset * v;
+        relative += (velocity - s.velocity) * v;
+    });
+    if volume <= 0.0 {
+        return;
+    }
+    // shortcut: sizes the waterline as a hemisphere holding the submerged
+    // volume; use the hull's real waterplane if long hulls need narrow wakes.
+    let radius = (1.5 * volume / PI).cbrt();
+    let center = Vec3::from_array(transform.translation) + centroid / volume;
+    target.stir(
+        center.truncate(),
+        radius,
+        2.0 * radius / 3.0,
+        relative / volume,
+        dt,
+    );
+}
+
+/// Each submerged part of a collider: its offset from the body's center, the
+/// volume under water, and the water above it.
+fn submerged(
+    water: &impl Water,
+    transform: &Transform,
+    collider: &Collider,
+    mut part: impl FnMut(Vec3, f32, WaterSample),
+) {
+    let center = Vec3::from_array(transform.translation);
+    let rotation = Quat::from_array(transform.rotation).normalize();
+    let mut apply = |offset: Vec3, volume: f32, s: WaterSample| {
+        if volume > 0.0 {
+            part(offset, volume, s);
+        }
     };
-    match body.collider {
+    match *collider {
         Collider::Sphere { radius } => {
             // Exact cap volume under a surface flat across the sphere.
             let s = water.sample(center.truncate());
             let d = (s.height - (center.z - radius)).clamp(0.0, 2.0 * radius);
-            apply(
-                Vec3::ZERO,
-                PI * d * d * (3.0 * radius - d) / 3.0,
-                s.velocity,
-            );
+            apply(Vec3::ZERO, PI * d * d * (3.0 * radius - d) / 3.0, s);
         }
         Collider::Cuboid { half_extents } => {
             // 3³ sub-boxes, each submerged by how far the surface covers its
@@ -235,15 +311,28 @@ pub fn buoyancy(
                 let s = water.sample((center + offset).truncate());
                 let covered =
                     ((s.height - center.z - offset.z) / (2.0 * reach) + 0.5).clamp(0.0, 1.0);
-                if covered > 0.0 {
-                    apply(offset, covered * volume, s.velocity);
-                }
+                apply(offset, covered * volume, s);
+            }
+        }
+        Collider::Capsule {
+            radius,
+            half_height,
+        } => {
+            // Spheres along the core, each with its share of the volume.
+            const N: usize = 4;
+            let volume = PI * radius * radius * (2.0 * half_height + 4.0 / 3.0 * radius);
+            let axis = rotation * Vec3::Z * half_height;
+            for i in 0..N {
+                let offset = axis * ((2 * i + 1) as f32 / N as f32 - 1.0);
+                let s = water.sample((center + offset).truncate());
+                let d = (s.height - (center.z + offset.z - radius)).clamp(0.0, 2.0 * radius);
+                let share = d * d * (3.0 * radius - d) / (4.0 * radius.powi(3));
+                apply(offset, share * volume / N as f32, s);
             }
         }
         // Ground is not something water lifts.
         Collider::Ground => {}
     }
-    out
 }
 
 /// Bilinear sample of a row-major grid at grid coordinates `q` (texel

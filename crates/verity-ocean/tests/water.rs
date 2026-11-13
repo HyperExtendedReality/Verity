@@ -778,3 +778,103 @@ fn ripples_spread_and_layer_over_water() {
     let layered = (Flat(1.0), &ripples).sample(Vec2::new(10.2, 10.0));
     assert_eq!(layered.height, 1.0 + ring);
 }
+
+#[test]
+fn ocean_velocity_is_the_surface_rate_of_change_even_after_a_time_jump() {
+    let mut ocean = Ocean::new(OceanSettings::default());
+    let (time, h) = (1000.0, 2e-3);
+    let rest = Vec2::new(3.0, 7.0);
+    let at = |ocean: &mut Ocean, t: f32| {
+        ocean.update(t);
+        ocean.displacement(rest)
+    };
+    let rate = (at(&mut ocean, time + h) - at(&mut ocean, time - h)) / (2.0 * h);
+    let now = at(&mut ocean, time);
+    let velocity = ocean.sample(rest + now.truncate()).velocity;
+    assert!(
+        (velocity - rate).length() < 0.03 * rate.length() + 1e-3,
+        "{velocity} vs {rate}"
+    );
+}
+
+/// Surface-wave disturbance left in the far half of a 64 m pool after a
+/// splash near the −X edge, as a share of the splash.
+fn far_side_after_splash(edges: [Edge; 4]) -> f32 {
+    let n = 64;
+    let mut water = ShallowWater::new(&Seabed::flat(n, n, 1.0, -5.0), 0.0);
+    for j in 0..n {
+        for i in 0..n {
+            let d = Vec2::new(i as f32 - 6.0, j as f32 - 32.0).length();
+            water.depth[i + j * n] += 0.05 * (-d * d / 4.0).exp();
+        }
+    }
+    let settings = ShallowWaterSettings {
+        edges,
+        ..ShallowWaterSettings::default()
+    };
+    for _ in 0..240 {
+        water.step(1.0 / 60.0, &settings);
+    }
+    let far = (0..n * n)
+        .filter(|c| c % n >= 48)
+        .map(|c| (water.depth[c] - 5.0).abs())
+        .fold(0.0, f32::max);
+    far / 0.05
+}
+
+#[test]
+fn waves_leave_by_an_open_edge_instead_of_wrapping_round() {
+    let open = far_side_after_splash([Edge::Open, Edge::Wall, Edge::Wall, Edge::Wall]);
+    let walled = far_side_after_splash([Edge::Wall; 4]);
+    assert!(open < 0.3 * walled, "open {open} vs walled {walled}");
+}
+
+#[test]
+fn moving_bodies_stir_the_water_they_move_through() {
+    let ball = |velocity: Vec3| {
+        let mut body = PhysicsBody::new(RigidBody::Dynamic, Collider::Sphere { radius: 1.5 });
+        body.velocity.linear = velocity;
+        body
+    };
+    let afloat = Transform::default();
+    let mut ripples = Ripples::new(RipplesSettings::default());
+    stir(
+        &mut ripples,
+        &Flat(0.0),
+        &afloat,
+        &ball(Vec3::ZERO),
+        1.0 / 60.0,
+    );
+    assert_eq!(
+        ripples.sample(Vec2::ZERO).height,
+        0.0,
+        "resting makes no wake"
+    );
+    stir(
+        &mut ripples,
+        &Flat(0.0),
+        &afloat,
+        &ball(Vec3::X * 3.0),
+        1.0 / 60.0,
+    );
+    assert!(
+        ripples.sample(Vec2::ZERO).height < -1e-3,
+        "moving presses a wake"
+    );
+    let mut lake = ShallowWater::new(&Seabed::flat(32, 32, 1.0, -2.0), 0.0);
+    let boat = Transform {
+        translation: [16.0, 16.0, 0.0],
+        ..Default::default()
+    };
+    stir(
+        &mut lake,
+        &Flat(0.0),
+        &boat,
+        &ball(Vec3::X * 2.0),
+        1.0 / 60.0,
+    );
+    assert!(
+        lake.sample(Vec2::splat(16.0)).velocity.x > 0.3,
+        "drags the shallows"
+    );
+}

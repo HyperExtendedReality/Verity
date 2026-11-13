@@ -30,6 +30,13 @@ a method under **Scene lighting**: models reload behind the change, because a
 method only learns about geometry loaded after it starts. Reach what only one
 method offers through `Lux::method_mut`.
 
+Split Radiance Cascades and PXTGI trace with Vulkan hardware ray queries where
+the GPU has them, and otherwise walk their own BVH. `hardware_rays` in either
+method's settings, or `Lux::set_hardware_rays` while running, picks software
+tracing on any GPU. PXTGI switches from the next frame. Split recompiles its passes
+and shows the hemisphere until they are ready, as it does when it starts. In
+`examples/sponza_gi.rs`, `--software` starts in software and H switches.
+
 To add a method, implement `GiMethod`, add a `Method` variant and a row in
 `METHODS`, and give it a `LightingMethod` so scenes can name it. The editor lists
 whatever `METHODS` holds. Follow terrain through
@@ -54,12 +61,46 @@ keep the cost of a frame down:
   of scanning the whole pool once per level.
 - Entries with no new sample merge every fourth frame. Any change to lights or
   geometry merges them all.
-- `seed` writes only the fields descriptors use, not whole 272-byte entries.
+- `seed` writes only the fields descriptors use, not whole 240-byte entries.
 
 `Settings::multi_bounce`, on by default, carries light past the first bounce: a
 ray's hit reflects the irradiance last frame's probes hold there. Each bounce
 takes about one trip through the receivers, and hits outside every probe, off
 screen, stay at one bounce.
+
+`Settings::surface_cache`, on by default, keeps outgoing light on the surfaces
+themselves. Each glTF mesh is cut into islands of nearly flat, connected
+triangles (`cascades/surface.rs`). Each instance packs its islands into an atlas
+of `surface_texel` (0.3 m) texels. `surfaceUpdate` shades `surface_updates`
+texels a frame with direct light and `surface_bounce_rays` (2) rays that read other texels, so
+bounces build up across the scene, on screen or not. A ray hit reads its
+texel's bounce light, where it used to read world probes, which leak through
+walls. From `surface_from_level` (3) on, a hit takes all of its light from the
+texel and skips shading. Blended and double-sided surfaces such as foliage are
+not charted and still read the probes. So are retained meshes such as terrain.
+
+Against the path-traced reference (RTX 4070 Laptop, 1280×720, 600 frames).
+The renderer's TAA cycles a 4-frame jitter, so error compares the mean of the
+last four frames with the reference's; single frames swing by up to 0.14.
+
+| View | Cache | GI time | Mean bounced light | Error | Flicker |
+| --- | --- | --- | --- | --- | --- |
+| Bistro street, `--scene=BistroExterior.glb --eye=-2,-13,2 --target=40,60,2.5` | off | 4.68 ms | 0.60× | 0.424 | 0.0037 |
+| | on | 5.13 ms | 0.72× | 0.329 | 0.0048 |
+| Sponza corridor | off | 3.09 ms | 0.77× | 0.397 | 0.0105 |
+| | on | 3.30 ms | 1.09× | 0.378 | 0.0050–0.0147 |
+| Sponza courtyard, `--eye=4,0,1.7 --target=-4,1.5,2.5` | off | 3.91 ms | 0.91× | 0.249 | 0.0068 |
+| | on | 4.29 ms | 0.97× | 0.251 | 0.0066 |
+
+Tuning moved nothing past run-to-run noise (about ±0.01 error; corridor
+flicker varies threefold between identical runs). Texels of 0.15 or 0.5 m,
+twice the updates, four bounce rays, or reading the cache from cascade 2 all
+landed within it, and the last two cost 0.2–0.4 ms. Shading bounce hits on
+uncharted surfaces, instead of leaving them out, brought the corridor to
+1.00× and 0.354 but Bistro to 0.345 for 0.3 ms more, so it was dropped.
+
+Sponza charts its 3.7 million triangles into 133 thousand islands and 485
+thousand texels: about 31 MB of texels and 59 MB of per-triangle chart words.
 
 `examples/sponza_gi.rs --bench=DIR` prints GPU time per pass and saves frames as
 PFM. In code, `SplitRadianceCascades::profile` and `request_capture` do the same.
@@ -92,10 +133,153 @@ error by much, so what remains is bias rather than slow convergence.
 | Corridor | Screen and voxel | 1.6 ms | 0.74× | 0.30 | 0.010 |
 
 The atrium is `--eye=8,0,2 --target=-6,0,4` and the corridor the default view.
-PXTGI takes 4.1 ms in the atrium with reflections. These are two views of one
-scene on one device. The reference shares PXTGI's geometry and mean colours, which
-favours it slightly, and a screen ray's light includes the renderer's Hammon
-diffuse where the reference is Lambertian.
+PXTGI took 4.1 ms in the atrium with reflections. These rows predate everything
+below, and were measured against the reference before its fix, which read dark.
+
+### The reference
+
+The reference used to keep its running mean in a half-float image, which stops
+taking small steps after a few hundred frames: it drifted 4% bright at 40 frames
+and 13% dark at 1200 relative to 300, and the 600-frame images behind earlier
+tables read 11% dark. It now sums in fp32, and 100 and 1200 frames agree to
+0.009 error. Its model holds up too: every Sponza material's last mip, the mean
+colour hits take, is within about 1% of its texture's linear mean. What it leaves
+out is the renderer's own direct shading, which runs brighter than ray-traced
+Lambertian light: shadow maps, its diffuse model and the spread normal maps give.
+
+### The courtyard
+
+The courtyard to the right of the corridor, `--eye=4,0,1.7 --target=-4,1.5,2.5`,
+looks along the sunlit strip of floor with the right-hand arcade in shadow. Same
+device and protocol, against a 1200-frame reference:
+
+| Method | Rays | GPU time | Mean bounced light | Error | Flicker |
+| --- | --- | --- | --- | --- | --- |
+| Split, before | Hardware | 9.9 ms | 1.05× | 0.30 | 0.002 |
+| Split | Hardware | 4.9 ms | 1.06× | 0.26 | 0.003 |
+| Split | Software | 5.8 ms | 1.05× | 0.26 | 0.003 |
+| PXTGI, before | Software | 4.4 ms | 1.14× | 0.22 | 0.006 |
+| PXTGI | Hardware | 0.8 ms | 1.00× | 0.077 | 0.006 |
+| PXTGI | Software | 4.3 ms | 0.99× | 0.077 | 0.006 |
+
+What changed:
+
+- PXTGI traces with hardware ray queries where it can (see below).
+- PXTGI's diffuse rays take the scene's light, not the screen's. Each metre of
+  screen march added error (0.074 with none, 0.094 at 0.1 m, 0.11 at 1 m,
+  0.17 at the old 8 m), as did reading the screen at hits; neither saved time
+  once rays were hardware. Reflections still take the screen first.
+- Rays that leave the scene take the sky along the ray, as the cache and
+  reference do, not the hemisphere at the surface normal.
+- `Settings::budgeted` uses half-metre probes and 0.8 m intervals. Finer probes
+  spread the update budget thin: 0.125 m gave 0.44 error in 19 ms.
+- Software traversal: PXTGI's box test is one multiply-add a slab (Aila and Laine
+  2009), 15% off its trace, and each mesh walk reads one buffer. Split's box test
+  multiplies by a reciprocal instead of dividing, 8% off its closest-hit pass.
+  Traversal stacks in groupshared memory and a world box per primitive both
+  measured slower, so neither stayed.
+
+With traced reflections PXTGI takes 1.0 ms in hardware. `--rays=4` brings its
+flicker to 0.004 for another 0.3 ms. Split spends most of its time in `retain`,
+`reduce`, `merge` and `commitCache`, which move cache entries and barely depend
+on how rays are traced. These are one view of one scene on one device.
+
+### Since then
+
+Same view, now with the renderer's TAA in the image. Its 4-frame jitter makes
+neighbouring frames differ, so flicker compares frames four apart, and error and
+flicker read higher than the table above; compare these with each other only.
+
+| Change | Method | GPU time | Error | Flicker |
+| --- | --- | --- | --- | --- |
+| Before | Split | 4.66 ms | 0.276 | 0.008 |
+| Entries 272 → 240 bytes | Split | 4.42 ms | 0.275 | 0.009 |
+| Unchanged entries stay in their history slot | Split | 3.87 ms | 0.278 | 0.009 |
+| Before | PXTGI | 0.79 ms | 0.164 | 0.015 |
+| Filters read normals from the depth image | PXTGI | 0.67 ms | 0.161 | 0.015 |
+| Hits take their own direct light; filter by the mean's noise | PXTGI | about 0.70 ms | 0.146 | 0.016 |
+| Before | Screen and voxel | 2.01 ms | 0.278 | 0.010 |
+| All of the above | Screen and voxel | 1.88 ms | 0.275 | 0.010 |
+
+The last PXTGI time adds the measured 0.03 ms of the hits' shadow rays to the
+row above: by then other work shared the GPU, and passes no change touched
+read up to 0.05 ms slower. Split's cache passes, before and after: `retain` 0.58 to 0.23 ms, `reduce` 0.50
+to 0.30, `commitCache` 0.44 to 0.19, `merge` 0.43 to 0.44.
+
+- Entries dropped the emissive fields: Verity's materials do not emit, so that
+  source is never active.
+- An entry with no new sample and nothing changed is a 48-byte stub in the
+  working list: key, links, counts. Its radiance stays in its history slot,
+  which `commitCache` keeps, rewriting only its links, and which readers reach
+  through the stub (`loadEntry`, `mergedOf`). When no geometry or light changed,
+  `retain` writes stubs from the header alone. A stub is only made for a slot
+  commit gives the same bucket, so commit never has to move one.
+- `temporal` writes the G-buffer's 24-bit normal beside linear depth (rg32f), so
+  `atrous` and the composite's upsample stop reloading the full-size G-buffer at
+  each tap: 0.18 to 0.07 ms and 0.18 to 0.14 ms. Screen and voxel GI shares
+  these passes.
+- A pixel's diffuse ray lights its hit with its own shadow ray and takes only
+  the cache cell's bounce light. The cell's outgoing light is the direct light
+  where the cell was claimed, which leaked sun across the shadow edges a cell
+  straddles: 0.155 to 0.146 error for about 0.03 ms. The cache's own rays
+  gained nothing from the same change, so they keep the cell's light.
+- The à-trous filter stops at edges by the variance of the accumulated mean
+  (one frame's variance over the frames averaged), not of a single frame,
+  which over-blurred settled texels: 0.163 to 0.155 error, flicker 0.015 to 0.016.
+- `--uncapped` (25.6 ms) gave 0.288 error, no better than the budget: Split's
+  bias is its probe grid and directions, not its update budget.
+- Nor is it the probe grid alone, nor the hits' BSDF. Split, same view, scored
+  on the mean of four frames (one TAA jitter period) with the sun's single-pixel
+  glints and a 2-pixel margin masked: glints of up to 90 shift a pixel between
+  runs, and on single frames they decided the score. Before: 4.1 ms, 0.28 error
+  (0.21 over 80-pixel blocks), 0.009 flicker; two runs of one build differ by
+  0.006.
+  - A ray per shaded pixel across the first interval, adding the difference
+    between the hit's light and what the probes hold in that direction,
+    clamped to four times the pixel's mean: 0.277 error, 0.027 flicker, 6.2 ms.
+    Taking a miss's light from level 1 instead gave 0.334 and 0.12 flicker.
+  - Lambertian hits with base colour, to match the reference's diffuse model:
+    0.51 error at 0.81× the light. The full BSDF is the closer of the two.
+  - Quarter-metre probes 0.296, 3.2 m intervals 0.292, 2400 warm-up frames 0.274.
+  Most of the error is broad, not contact detail, and its cause is still open.
+- Nor is it light leaking between probes, nor the probes' data being attributed
+  to cell centres. Courtyard, scored on bounced light (each image minus a
+  `--no-gi-light` run) over the mean of four frames, four runs each, which read
+  0.245 ± 0.002 error and 0.007 flicker for the code as it stands. This scoring
+  reads higher than the tables above, so compare these rows with each other only.
+  None of these stayed in the code.
+  - Probe visibility by oracle: `worldResolve` dropped each probe corner whose
+    centre the receiver could not see by a traced ray: 0.286, worse. So visibility
+    data per probe (moment or DDGI-style depth) would not help either.
+  - Merging from the parent cell that holds the entry instead of trilinear over 8:
+    0.233, flicker 0.0085, `merge` 0.50 to 0.21 ms. In the corridor it gave 0.39
+    against 0.39 and tripled flicker.
+  - Probe-centred shells, after polygonal radiance cascades' rule that stored
+    regions tile space: each interval ends where the ray leaves a sphere around the
+    cell centre, the bin is the direction from the centre, and merge looks each
+    corner up from its own centre (parallax correction): 0.358, at 1.02× the
+    light. Centring levels 1 to 3 and keeping level 0 ray-relative: 0.335. The
+    ray-relative bins already hold what receivers in a cell see, which is what
+    the resolve wants.
+- A change of sun now counts as a change of the background source, which holds
+  sunlight: before, only point lights' group was told. Small steps, up to about
+  2.6° and 5% of the light a frame, keep the cache's history blending as time of
+  day moves; larger ones drop it.
+- The shared BSDF's diffuse is now energy-preserving Oren–Nayar (EON, Portsmouth,
+  Kutz and Hill 2025), and its multiple scattering scales the GGX lobe rather
+  than adding a uniform term. Hammon's diffuse divided by N·H and gave 262
+  pixels of 17 to 41 in the direct image beside neighbours near 0.05; those were
+  the "glints" the comparison above masks. Same view, against a reference
+  re-captured with the new direct light, three runs: 0.248 to 0.253 error (0.18
+  over 80-pixel blocks), 0.006 to 0.007 flicker, 0.91× the light. The passes that
+  shade with it took the same time to within 0.01 ms.
+- What PXTGI's error leaves is fine detail: 0.146 over 8-pixel blocks, 0.030
+  over 80. Shaded areas still read about a quarter bright, and neither halving
+  the cache cells nor turning the filter off changed that.
+- Tried and dropped: capping each new sample at its history's mean + 3σ cut
+  PXTGI's flicker 12% but lost 5% of its light (error 0.170); at 5σ it changed
+  nothing. Fewer rays for settled texels: still-camera flicker *is* the settled
+  texels' noise, and one ray there took it from 0.015 to 0.022.
 
 ## Screen and voxel GI
 
@@ -129,10 +313,15 @@ PXTGI traces the physics scene rather than a GI scene of its own, and runs none
 of the cascade passes. `Lux::sync` keeps it following the physics world.
 
 Rays run against a `verity_physics::RayScene`: rigid colliders, the surfaces of
-soft bodies, and loaded glTF meshes as static trace geometry. The same scene
-answers CPU rays with `RayScene::ray`. A ray follows what is on screen first,
-taking its light from the previous frame's lit image, then continues against
-the scene, where a hashed radiance cache carries further bounces.
+soft bodies, and loaded glTF meshes as static trace geometry. With hardware ray
+queries the same scene becomes acceleration structures: a BLAS per static mesh,
+built when it loads, and a box per body or soft body that the shader tests as
+before. The TLAS is rebuilt inside the frame's commands whenever the scene
+changes, so moving bodies cost no stall. The same scene
+answers CPU rays with `RayScene::ray`. Diffuse rays trace the scene, where a
+hashed radiance cache carries further bounces; `max_distance` lets them follow
+the screen first for geometry drawn but missing from it. Reflection rays follow
+the screen first, taking their light from the previous frame's lit image.
 
 Physics supplies more than geometry:
 
@@ -172,8 +361,8 @@ measurement below, taken on an RTX 4070 Laptop GPU:
 | Measurement | Result |
 | --- | --- |
 | GPU time, the room at 1600×900 | 1.3 ms |
-| GPU time, the room plus Sponza's main scene | 5 to 7 ms |
-| Bounce light against a CPU path tracer on the same scene (`--reference`) | 9.6% mean error |
+| GPU time, the room plus Sponza's main scene | 1.3 ms (4.4 ms in software), measured with the old 8 m screen march |
+| Bounce light against a CPU path tracer on the same scene (`--reference`) | 9.9% mean error in hardware, 9.7% in software (9.4% with the old screen march) |
 | Light left one frame after it goes out (`--extinction`) | 0.0% (the Bevy build: 68.4% after 100 ms) |
 | Light dimmed to half (`--extinction=half`) | 50.8% after three frames |
 | Residual 10 frames after a wall panel moves | 13%, against 29% without moved regions |

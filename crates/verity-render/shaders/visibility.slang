@@ -20,7 +20,7 @@ struct VertexOutput {
 
 [shader("vertex")]
 VertexOutput vertexMain(uint vertex: SV_VulkanVertexID) {
-    Instance instance = instances[draw.instance];
+    Instance instance = globals.instances[draw.instance];
     Vertex v = instance_vertex(instance, vertex);
     VertexOutput output;
     output.position = mul(globals.view_proj, mul(instance.model, float4(v.position.xyz, 1.0)));
@@ -31,7 +31,7 @@ VertexOutput vertexMain(uint vertex: SV_VulkanVertexID) {
 }
 
 void alphaTest(VertexOutput input) {
-    Material material = materials[instances[draw.instance].draw.z];
+    Material material = materials[globals.instances[draw.instance].draw.z];
     if ((material.textures.w & ALPHA_MASK) != 0) {
         float alpha = material.base_color.a * input.alpha;
         if (material.textures.x != NO_TEXTURE)

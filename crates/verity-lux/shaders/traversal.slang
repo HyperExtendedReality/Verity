@@ -350,6 +350,9 @@ void addConventionalLightRadiance(inout float3 background, inout float3 punctual
 bool boxRayInterval(float3 origin, float3 direction, BvhNode node, float limit,
                     out float entry, out float exit) {
     float near = 0.0, far = limit;
+    // One reciprocal per ray once inlined and hoisted out of the walk, not six
+    // divides per box; the far margin below covers its extra roundoff.
+    float3 inverse = 1.0 / direction;
     [unroll] for (uint axis = 0; axis < 3; ++axis) {
         if (direction[axis] == 0) {
             if (origin[axis] < node.minimum[axis] || origin[axis] > node.maximum[axis]) {
@@ -357,8 +360,8 @@ bool boxRayInterval(float3 origin, float3 direction, BvhNode node, float limit,
                 return false;
             }
         } else {
-            float a = (node.minimum[axis] - origin[axis]) / direction[axis];
-            float b = (node.maximum[axis] - origin[axis]) / direction[axis];
+            float a = (node.minimum[axis] - origin[axis]) * inverse[axis];
+            float b = (node.maximum[axis] - origin[axis]) * inverse[axis];
             float axisExit = max(a, b);
             // Conservative far endpoint accounts for slab division roundoff.
             near = max(near, min(a, b)); far = min(far, axisExit + abs(axisExit) * 3.5762791e-7);

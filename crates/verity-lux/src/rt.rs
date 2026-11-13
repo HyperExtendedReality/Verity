@@ -22,7 +22,8 @@ pub(crate) struct Accel {
 /// What one acceleration structure is built over; addresses are device addresses.
 #[derive(Clone, Copy)]
 pub(crate) enum Geometry {
-    /// `count` triangles of `u32` index triples into float3 positions `stride` apart.
+    /// `count` triangles of `u32` index triples into float3 positions `stride`
+    /// apart; with `indices` 0, every three positions in a row are one triangle.
     Triangles {
         vertices: vk::DeviceAddress,
         stride: u64,
@@ -31,6 +32,11 @@ pub(crate) enum Geometry {
         count: u32,
         /// Opaque triangles commit without the shader seeing them as candidates.
         opaque: bool,
+    },
+    /// `count` boxes, six floats each (min then max), for shaders to test.
+    Aabbs {
+        address: vk::DeviceAddress,
+        count: u32,
     },
     /// A TLAS over `count` `vk::AccelerationStructureInstanceKHR`.
     Instances {
@@ -72,8 +78,24 @@ impl Geometry {
                             .vertex_data(at(vertices))
                             .vertex_stride(stride)
                             .max_vertex(max_vertex)
-                            .index_type(vk::IndexType::UINT32)
+                            .index_type(if indices == 0 {
+                                vk::IndexType::NONE_KHR
+                            } else {
+                                vk::IndexType::UINT32
+                            })
                             .index_data(at(indices)),
+                    }),
+                count,
+                vk::AccelerationStructureTypeKHR::BOTTOM_LEVEL,
+            ),
+            Geometry::Aabbs { address, count } => (
+                geometry
+                    .geometry_type(vk::GeometryTypeKHR::AABBS)
+                    .flags(F::NO_DUPLICATE_ANY_HIT_INVOCATION)
+                    .geometry(vk::AccelerationStructureGeometryDataKHR {
+                        aabbs: vk::AccelerationStructureGeometryAabbsDataKHR::default()
+                            .data(at(address))
+                            .stride(24),
                     }),
                 count,
                 vk::AccelerationStructureTypeKHR::BOTTOM_LEVEL,
@@ -246,6 +268,88 @@ impl RayTracing {
                 &vk::DependencyInfo::default().memory_barriers(&barrier),
             );
         })
+    }
+
+    /// A TLAS with room for `capacity` instances, and scratch to rebuild it in
+    /// a frame's commands with [`Self::record_tlas`].
+    pub unsafe fn tlas_target(&self, gpu: &mut Gpu, capacity: u32) -> Result<(Accel, Buffer)> {
+        let (geometry, _, ty) = Geometry::Instances {
+            address: 0,
+            count: capacity,
+        }
+        .describe();
+        let info = vk::AccelerationStructureBuildGeometryInfoKHR::default()
+            .ty(ty)
+            .flags(vk::BuildAccelerationStructureFlagsKHR::PREFER_FAST_TRACE)
+            .geometries(std::slice::from_ref(&geometry));
+        let mut sizes = vk::AccelerationStructureBuildSizesInfoKHR::default();
+        self.loader.get_acceleration_structure_build_sizes(
+            vk::AccelerationStructureBuildTypeKHR::DEVICE,
+            &info,
+            &[capacity],
+            &mut sizes,
+        );
+        let accel = self.create(gpu, ty, sizes.acceleration_structure_size)?;
+        let scratch = gpu::create_buffer(
+            gpu.device,
+            gpu.allocator,
+            "gi tlas scratch",
+            sizes.build_scratch_size + self.scratch_alignment,
+            vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS,
+            MemoryLocation::GpuOnly,
+        );
+        match scratch {
+            Ok(scratch) => Ok((accel, scratch)),
+            Err(error) => {
+                self.destroy(gpu, accel);
+                Err(error)
+            }
+        }
+    }
+
+    /// Rebuild `tlas` over `count` instances at `instances`, in `cmd`, and make
+    /// it visible to compute shaders after.
+    pub unsafe fn record_tlas(
+        &self,
+        gpu: &Gpu,
+        cmd: vk::CommandBuffer,
+        tlas: &Accel,
+        scratch: &Buffer,
+        instances: vk::DeviceAddress,
+        count: u32,
+    ) {
+        let (geometry, _, ty) = Geometry::Instances {
+            address: instances,
+            count,
+        }
+        .describe();
+        let scratch = address(gpu.device, scratch).next_multiple_of(self.scratch_alignment);
+        let info = vk::AccelerationStructureBuildGeometryInfoKHR::default()
+            .ty(ty)
+            .flags(vk::BuildAccelerationStructureFlagsKHR::PREFER_FAST_TRACE)
+            .mode(vk::BuildAccelerationStructureModeKHR::BUILD)
+            .geometries(std::slice::from_ref(&geometry))
+            .dst_acceleration_structure(tlas.handle)
+            .scratch_data(vk::DeviceOrHostAddressKHR {
+                device_address: scratch,
+            });
+        let range = [vk::AccelerationStructureBuildRangeInfoKHR::default().primitive_count(count)];
+        let before = [vk::MemoryBarrier2::default()
+            .src_stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS)
+            .src_access_mask(vk::AccessFlags2::MEMORY_READ | vk::AccessFlags2::MEMORY_WRITE)
+            .dst_stage_mask(vk::PipelineStageFlags2::ACCELERATION_STRUCTURE_BUILD_KHR)
+            .dst_access_mask(vk::AccessFlags2::ACCELERATION_STRUCTURE_WRITE_KHR)];
+        gpu.device
+            .cmd_pipeline_barrier2(cmd, &vk::DependencyInfo::default().memory_barriers(&before));
+        self.loader
+            .cmd_build_acceleration_structures(cmd, &[info], &[&range]);
+        let after = [vk::MemoryBarrier2::default()
+            .src_stage_mask(vk::PipelineStageFlags2::ACCELERATION_STRUCTURE_BUILD_KHR)
+            .src_access_mask(vk::AccessFlags2::ACCELERATION_STRUCTURE_WRITE_KHR)
+            .dst_stage_mask(vk::PipelineStageFlags2::COMPUTE_SHADER)
+            .dst_access_mask(vk::AccessFlags2::ACCELERATION_STRUCTURE_READ_KHR)];
+        gpu.device
+            .cmd_pipeline_barrier2(cmd, &vk::DependencyInfo::default().memory_barriers(&after));
     }
 
     unsafe fn create(

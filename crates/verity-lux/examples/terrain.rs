@@ -6,13 +6,21 @@
 //!
 //! Click to capture the mouse, then WASD to fly, Q/E to descend and rise, Shift
 //! to go faster, hold the left button to dig and the right to fill, F to throw
-//! a box, wheel for brush size, Esc to release. Set `VERITY_SMOKE` to drop boxes,
+//! a box, wheel for brush size, Esc to release. F5 saves edits and F9 loads
+//! them, from `--edits` (default `terrain.edits`), which also loads at start.
+//! Chunks stream in and out around the eye. The ground is textured with the
+//! virtual-textured layers in `assets/packed/terrain` when they exist (see
+//! `scripts/convert_terrain_layers.py`); `--no-layers` keeps it procedural.
+//! Set `VERITY_SMOKE` to drop boxes,
 //! dig under them through the real renderer, report and exit, pausing on each
 //! view.
 use glam::{IVec3, Vec3};
 use std::{
     collections::HashSet,
     error::Error,
+    fs::{self, File},
+    io::{BufReader, BufWriter},
+    path::PathBuf,
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -25,8 +33,12 @@ use verity_lux::{
 use verity_physics::{
     Bounds, Collider, PhysicsBody, PhysicsSettings, PhysicsWorld, RigidBody, Velocity,
 };
-use verity_render::{GpuMaterial, Renderer, RetainedMesh, Sun, Vertex};
-use verity_terra::{Landform, Landscape, MeshData, Mesher, Settings, Terrain};
+use verity_render::{
+    GpuMaterial, Renderer, RetainedMesh, Sun, TERRAIN_ROLES, TerrainLayer, TerrainRole, Vertex,
+};
+use verity_terra::{
+    CELLS, Landform, Landscape, MeshData, Mesher, Settings, Streamer, Terrain, VOXEL, chunk_origin,
+};
 use winit::{
     application::ApplicationHandler,
     dpi::PhysicalSize,
@@ -39,6 +51,8 @@ use winit::{
 /// Finished meshes accepted per frame, which bounds each frame's upload.
 const UPLOAD_BUDGET: usize = 64;
 const REACH: f32 = 90.0;
+/// How far from the eye chunks stay meshed.
+const STREAM_RADIUS: f32 = 200.0;
 /// Physics steps at this rate, however fast frames come.
 const PHYSICS_STEP: f32 = 1.0 / 60.0;
 /// Boxes in the world at most: a new one replaces the oldest.
@@ -54,6 +68,29 @@ const SKY: Vec3 = Vec3::new(0.42, 0.52, 0.68);
 const SMOKE_PAUSE: Duration = Duration::from_secs(4);
 /// Brush strokes in the smoke test's trench, 80 ms apart.
 const TRENCH_STROKES: u32 = 40;
+
+/// The converted layer for each role, and the metres it covers before repeating.
+fn terrain_layers() -> Option<[TerrainLayer; TERRAIN_ROLES]> {
+    let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../assets/packed/terrain");
+    let layers = TerrainRole::ALL.map(|role| {
+        let (name, size) = match role {
+            TerrainRole::Grass => ("Grass002", 3.0),
+            TerrainRole::Meadow => ("Grass003", 3.0),
+            TerrainRole::Soil => ("Ground051", 3.0),
+            TerrainRole::Loam => ("Ground110", 3.0),
+            TerrainRole::Subsoil => ("Ground112", 2.5),
+            TerrainRole::Rock => ("Rock031", 6.0),
+            TerrainRole::Scree => ("Ground003", 3.0),
+            TerrainRole::Gravel => ("Ground063", 2.5),
+            TerrainRole::Sand => ("Ground079S", 3.0),
+        };
+        TerrainLayer::converted(&dir, name, size)
+    });
+    layers
+        .iter()
+        .all(|l| l.albedo.exists() && l.surface.exists())
+        .then_some(layers)
+}
 
 fn key(coord: IVec3) -> u64 {
     let [x, y, z] = coord.to_array().map(|c| c as u16 as u64);
@@ -77,6 +114,7 @@ fn retained(mesh: MeshData) -> Option<RetainedMesh> {
         vertices,
         indices: mesh.indices,
         bounds: mesh.bounds,
+        plain: false,
     })
 }
 
@@ -101,6 +139,9 @@ enum Smoke {
 struct Viewer {
     terrain: Terrain,
     mesher: Mesher,
+    streamer: Streamer,
+    /// Where F5 saves edits and F9 loads them.
+    edits: PathBuf,
     world: World,
     physics: PhysicsWorld,
     physics_settings: PhysicsSettings,
@@ -108,6 +149,8 @@ struct Viewer {
     physics_time: f32,
     boxes: Vec<EntityHandle>,
     gi: Gi,
+    /// Terrain textures, or `None` for procedural ground.
+    layers: Option<[TerrainLayer; TERRAIN_ROLES]>,
     sea_level: Option<f32>,
     window: Option<Arc<Window>>,
     renderer: Option<Renderer>,
@@ -192,6 +235,51 @@ impl Viewer {
                 .set_ground(Arc::new(self.terrain.clone()), region);
         }
         changed
+    }
+
+    /// Written aside and renamed over the old save, so a failed save loses nothing.
+    fn save_edits(&self) {
+        let temporary = self.edits.with_extension("tmp");
+        let result = File::create(&temporary).and_then(|file| {
+            let mut out = BufWriter::new(file);
+            self.terrain.save_edits(&mut out)?;
+            out.into_inner()?.sync_all()?;
+            fs::rename(&temporary, &self.edits)
+        });
+        match result {
+            Ok(()) => println!(
+                "saved {} edited chunks to {}",
+                self.terrain.edited().count(),
+                self.edits.display()
+            ),
+            Err(error) => eprintln!("save {}: {error}", self.edits.display()),
+        }
+    }
+
+    fn load_edits(&mut self) {
+        let file = File::open(&self.edits).map(BufReader::new);
+        let changed = match file.and_then(|file| self.terrain.load_edits(file)) {
+            Ok(changed) => changed,
+            Err(error) => return eprintln!("load {}: {error}", self.edits.display()),
+        };
+        println!("loaded {} edited chunks", self.terrain.edited().count());
+        let Some(&first) = changed.first() else {
+            return;
+        };
+        let size = Vec3::splat((CELLS + 2) as f32 * VOXEL);
+        let mut region = Bounds {
+            min: chunk_origin(first),
+            max: chunk_origin(first) + size,
+        };
+        for &coord in &changed {
+            region.min = region.min.min(chunk_origin(coord));
+            region.max = region.max.max(chunk_origin(coord) + size);
+        }
+        // Chunks out of reach have no mesh, and get one when they come into it.
+        let streamer = &self.streamer;
+        (self.mesher).queue(changed.into_iter().filter(|c| streamer.is_resident(*c)));
+        self.physics
+            .set_ground(Arc::new(self.terrain.clone()), region);
     }
 
     fn step_physics(&mut self, seconds: f32) {
@@ -286,12 +374,18 @@ impl Viewer {
             .renderer
             .as_ref()
             .map_or((0, 0), |r| r.retained_drawn());
+        let pages = (self.renderer.as_ref())
+            .map(|r| r.terrain_texture_stats())
+            .unwrap_or_default();
         println!(
-            "{:.2} ms a frame, worst {:.1} ms, drawing {} meshes, {} triangles",
+            "{:.2} ms a frame, worst {:.1} ms, drawing {} meshes, {} triangles, {} of {} pages wanted resident, {} uploaded",
             self.frame_seconds * 1000.0,
             self.worst_frame * 1000.0,
             drawn.0,
-            drawn.1
+            drawn.1,
+            pages.resident,
+            pages.wanted,
+            pages.uploaded,
         );
         self.worst_frame = 0.0;
         match self.smoke {
@@ -392,9 +486,13 @@ impl Viewer {
         }
         self.sculpt();
         self.step_physics(seconds);
+        let unloaded = (self.streamer).update(&mut self.terrain, &mut self.mesher, self.eye);
         let ready = (self.mesher).update(&mut self.terrain, self.eye, UPLOAD_BUDGET);
         let (eye, forward) = (self.eye, self.forward());
         if let Some(renderer) = &mut self.renderer {
+            for coord in unloaded {
+                renderer.set_retained_mesh(key(coord), None);
+            }
             for (coord, mesh) in ready {
                 renderer.set_retained_mesh(key(coord), retained(mesh));
             }
@@ -414,13 +512,17 @@ impl Viewer {
             self.title_at = now;
             if let (Some(window), Some(renderer)) = (&self.window, &self.renderer) {
                 let (meshes, triangles) = renderer.retained_drawn();
+                let pages = renderer.terrain_texture_stats();
                 window.set_title(&format!(
-                    "Terra: {:.1} ms, {meshes} chunks, {}k triangles, {} pending, {} edits, brush {:.1} m",
+                    "Terra: {:.1} ms, {meshes} chunks, {}k triangles, {} pending, {} edits, brush {:.1} m, pages {}/{} ({} loading)",
                     self.frame_seconds * 1000.0,
                     triangles / 1000,
                     self.mesher.outstanding(),
                     self.strokes,
                     self.radius,
+                    pages.resident,
+                    pages.capacity,
+                    pages.loading,
                 ));
             }
         }
@@ -454,6 +556,11 @@ impl ApplicationHandler for Viewer {
                 // Sand needs a waterline: a dry world's sits below all of its ground.
                 let sea = self.sea_level.unwrap_or(-1.0e4);
                 renderer.set_retained_material(GpuMaterial::terrain(0.19, sea));
+                if let Some(layers) = &self.layers
+                    && let Err(error) = renderer.set_terrain_layers(layers)
+                {
+                    eprintln!("terrain layers: {error}; the ground stays procedural");
+                }
                 renderer.set_shadow_distance(260.0);
                 renderer.set_uncapped(self.smoke != Smoke::Off);
                 let method = match self.gi {
@@ -530,6 +637,12 @@ impl ApplicationHandler for Viewer {
                     if code == KeyCode::Escape {
                         self.set_grab(false);
                     }
+                    if !event.repeat && code == KeyCode::F5 {
+                        self.save_edits();
+                    }
+                    if !event.repeat && code == KeyCode::F9 {
+                        self.load_edits();
+                    }
                 } else {
                     self.keys.remove(&code);
                 }
@@ -594,7 +707,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     };
 
     let start = Instant::now();
-    let landscape = Landscape::generate(settings);
+    let landscape = Landscape::generate(settings.clone());
     println!(
         "generated in {:.0} ms",
         start.elapsed().as_secs_f64() * 1000.0
@@ -615,11 +728,10 @@ fn main() -> Result<(), Box<dyn Error>> {
     };
     let terrain = Terrain::new(landscape);
     let mut physics = PhysicsWorld::default();
-    let mut mesher = Mesher::default();
-    mesher.queue(terrain.initial_coords());
+    let streamer = Streamer::new(&terrain, STREAM_RADIUS);
     let mut world = World::new();
     if let Some(level) = settings.sea_level {
-        // Extends past the 384 m world so the sea reaches the horizon.
+        // Extends past the 4 km world so the sea reaches the horizon.
         world.spawn(Entity {
             name: "Sea".into(),
             transform: Transform {
@@ -651,13 +763,24 @@ fn main() -> Result<(), Box<dyn Error>> {
     let now = Instant::now();
     let mut viewer = Viewer {
         terrain,
-        mesher,
+        mesher: Mesher::default(),
+        streamer,
+        edits: PathBuf::from(value("--edits").unwrap_or("terrain.edits")),
         world,
         physics,
         physics_settings: PhysicsSettings::default(),
         physics_time: 0.0,
         boxes: Vec::new(),
         gi,
+        layers: if args.iter().any(|a| a == "--no-layers") {
+            None
+        } else {
+            let layers = terrain_layers();
+            if layers.is_none() {
+                println!("no terrain layers in assets/packed/terrain: the ground is procedural");
+            }
+            layers
+        },
         sea_level: settings.sea_level,
         window: None,
         renderer: None,
@@ -685,6 +808,9 @@ fn main() -> Result<(), Box<dyn Error>> {
         settled_at: None,
     };
     viewer.look_at(eye, target);
+    if viewer.smoke == Smoke::Off && viewer.edits.exists() {
+        viewer.load_edits();
+    }
     let event_loop = EventLoop::new()?;
     event_loop.run_app(&mut viewer)?;
     Ok(())

@@ -81,6 +81,29 @@ fn shallow_speed() {
             );
         }
     }
+    // Blending the open sea in over the edges, as a coast does every frame.
+    let mut coast = ShallowWater::new(&slope(256), 0.0);
+    let ocean = Ocean::new(OceanSettings::default());
+    report(
+        "ShallowWater::relax_edges 256",
+        time(|| coast.relax_edges(&ocean, 16.0)),
+    );
+    // Nothing moving: the dispersive layer should cost no FFTs.
+    let mut lake = ShallowWater::new(&slope(256), 0.0);
+    let settings = ShallowWaterSettings::default();
+    report(
+        "ShallowWater::step 256 still lake",
+        time(|| lake.step(1.0 / 60.0, &settings)),
+    );
+    // Quarter-metre cells need several bulk substeps per frame.
+    let mut seabed = slope(128);
+    seabed.cell = 0.25;
+    let mut fine = ShallowWater::new(&seabed, 0.0);
+    fine.add_water(Vec2::splat(10.0), 2.0, 2.0);
+    report(
+        "ShallowWater::step 128 cell 0.25",
+        time(|| fine.step(1.0 / 60.0, &settings)),
+    );
 }
 
 fn shore_speed() {
@@ -165,7 +188,13 @@ fn whitecap_coverage() {
                 format!("{:.2}%", 100.0 * foamy as f32 / c.foam.len() as f32)
             })
             .collect();
-        println!("whitecaps, wind {wind_speed} m/s: {coverage:?}");
+        let points = (0..10_000).map(|i| Vec2::new((i % 100) as f32, (i / 100) as f32) * 2.3);
+        let surface = points.filter(|p| ocean.foam(*p) > 0.1).count() as f32 / 100.0;
+        // Monahan & Muircheartaigh 1980.
+        let observed = 3.84e-4 * wind_speed.powf(3.41);
+        println!(
+            "whitecaps, wind {wind_speed} m/s: cascades {coverage:?}, surface {surface:.2}% (observed {observed:.2}%)"
+        );
     }
 }
 

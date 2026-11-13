@@ -1,5 +1,6 @@
 // Isotropic opaque-surface BSDF for GI transport: Verity's multiple-scattering
-// GGX with Hammon diffuse (`brdf.slang`), behind lux's original interface.
+// GGX with energy-preserving Oren–Nayar diffuse (`brdf.slang`), behind lux's
+// original interface.
 // Directions point away from the surface; evaluation returns BRDFs per
 // steradian (the caller multiplies by NdotL). Sampling stays GGX VNDF, the
 // importance sampler for the specular lobe.

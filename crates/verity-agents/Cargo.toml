@@ -1,0 +1,12 @@
+[package]
+name = "verity-agents"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Agents for Verity: crowds, hordes, flocks and lane-following traffic in structure-of-arrays form"
+publish = false
+
+[dependencies]
+glam = "0.29"
+rayon = "1"
+verity-nav = { path = "../verity-nav" }

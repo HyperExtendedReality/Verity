@@ -165,6 +165,11 @@ impl Renderer {
             for image in self.textures.drain(..) {
                 gpu::destroy_image(&self.device, allocator, image);
             }
+            // Terrain layer textures went with the rest: stop the resolve sampling them.
+            self.terrain_layers = None;
+            for frame in &mut self.frames {
+                frame.layer_table.write(&[0; 16]);
+            }
             self.primitives.truncate(1);
             self.primitive_meshlets.truncate(1);
             self.matrix.clear();
@@ -175,6 +180,7 @@ impl Renderer {
             self.source_indices.extend_from_slice(&indices);
             self.frame_indices.clear();
             self.model_draws.clear();
+            self.model_generation += 1;
             self.materials.clear();
             self.scene_lights.clear();
             if self.sun_is_imported {
@@ -266,15 +272,20 @@ impl Renderer {
             for lod in cooked {
                 self.matrix.add_primitive(lod);
             }
-            self.primitive_meshlets
-                .extend(loaded.primitives.iter().map(|p| {
+            let meshlets: Vec<_> = loaded
+                .primitives
+                .par_iter()
+                .map(|p| {
                     let start = p.first_index as usize;
                     let end = start + p.index_count as usize;
                     crate::meshlets::build(
                         &positions[p.base_vertex as usize..],
                         &loaded.indices[start..end],
                     )
-                }));
+                })
+                .collect();
+            self.primitive_meshlets.extend(meshlets);
+            self.model_generation += 1;
             let draw_base = self.model_draws.len() as u32;
             self.model_draws
                 .extend(loaded.draws.iter().map(|d| asset::Draw {
@@ -435,15 +446,8 @@ impl Renderer {
     }
 
     /// Copy a transcoded mip chain into a new sampled image.
-    unsafe fn upload_texture(&mut self, texture: &TextureData) -> Result<gpu::Image> {
-        let format = match (texture.format, texture.srgb) {
-            (TextureFormat::Bc7, true) => vk::Format::BC7_SRGB_BLOCK,
-            (TextureFormat::Bc7, false) => vk::Format::BC7_UNORM_BLOCK,
-            (TextureFormat::Astc4x4, true) => vk::Format::ASTC_4X4_SRGB_BLOCK,
-            (TextureFormat::Astc4x4, false) => vk::Format::ASTC_4X4_UNORM_BLOCK,
-            (TextureFormat::Etc2, true) => vk::Format::ETC2_R8G8B8A8_SRGB_BLOCK,
-            (TextureFormat::Etc2, false) => vk::Format::ETC2_R8G8B8A8_UNORM_BLOCK,
-        };
+    pub(crate) unsafe fn upload_texture(&mut self, texture: &TextureData) -> Result<gpu::Image> {
+        let format = vk_format(texture.format, texture.srgb);
         let device = &self.device;
         let allocator = self.allocator.as_mut().unwrap();
         let bytes = texture.levels.concat();
@@ -553,5 +557,17 @@ impl Renderer {
                 Err(e)
             }
         }
+    }
+}
+
+/// The image format a transcoded texture uploads as.
+pub(crate) fn vk_format(format: TextureFormat, srgb: bool) -> vk::Format {
+    match (format, srgb) {
+        (TextureFormat::Bc7, true) => vk::Format::BC7_SRGB_BLOCK,
+        (TextureFormat::Bc7, false) => vk::Format::BC7_UNORM_BLOCK,
+        (TextureFormat::Astc4x4, true) => vk::Format::ASTC_4X4_SRGB_BLOCK,
+        (TextureFormat::Astc4x4, false) => vk::Format::ASTC_4X4_UNORM_BLOCK,
+        (TextureFormat::Etc2, true) => vk::Format::ETC2_R8G8B8A8_SRGB_BLOCK,
+        (TextureFormat::Etc2, false) => vk::Format::ETC2_R8G8B8A8_UNORM_BLOCK,
     }
 }

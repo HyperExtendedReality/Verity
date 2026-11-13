@@ -9,8 +9,7 @@ use crate::{
     Strength,
 };
 
-/// The analytic collider shapes a scene can author. `Capsule` is here so
-/// scenes saved with one still load and report it, as Verity has no capsules.
+/// The analytic collider shapes a scene can author.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Shape {
     #[default]
@@ -125,22 +124,24 @@ impl RigidBodyComponent {
             Shape::Sphere => Collider::Sphere {
                 radius: positive("radius", self.radius)?,
             },
-            Shape::Capsule => {
-                return Err("Verity physics does not support this collider".into());
-            }
+            Shape::Capsule => Collider::Capsule {
+                radius: positive("radius", self.radius)?,
+                half_height: positive("half height", self.half_height)?,
+            },
         };
         positive("density", self.density)?;
         if !(self.friction.is_finite() && self.friction >= 0.0) {
             return Err("friction must be finite and nonnegative".into());
         }
-        if self.restitution != 0.0 {
-            return Err("Verity physics does not support restitution".into());
+        if !(self.restitution.is_finite() && self.restitution >= 0.0) {
+            return Err("restitution must be finite and nonnegative".into());
         }
         let mut body = PhysicsBody::new(self.body_type, collider);
         body.material = PhysicsMaterial {
             density: self.density,
             friction: self.friction,
             static_friction: self.friction,
+            restitution: self.restitution,
         };
         Ok(body)
     }

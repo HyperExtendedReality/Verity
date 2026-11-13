@@ -22,6 +22,7 @@ fn square(x: f32, z: f32) -> RetainedMesh {
         ],
         indices: vec![0, 1, 2, 0, 2, 3],
         bounds: (Vec3::new(x, 0.0, z), Vec3::new(x + 1.0, 1.0, z)),
+        plain: false,
     }
 }
 

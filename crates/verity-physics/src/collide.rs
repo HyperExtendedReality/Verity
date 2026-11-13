@@ -1,4 +1,4 @@
-//! Contact generation for cuboids, spheres and ground. Cuboid pairs use the
+//! Contact generation for cuboids, spheres, capsules and ground. Cuboid pairs use the
 //! separating axis test with reference-face clipping, ported from the AVBD 3D
 //! demo. Ground is a field, so a body asks it about points on its own surface.
 
@@ -62,7 +62,123 @@ fn touches(a: &Body, b: &Body, shift: Vec3, margin: f32, ground: Option<&dyn Gro
         (Collider::Cuboid { half_extents: ha }, Collider::Cuboid { half_extents: hb }) => {
             box_axes(&moved_obb(a, ha, shift), &obb(b, hb), margin).is_some()
         }
+        // Capsules are cheap enough to test by making their contacts.
+        (Collider::Capsule { .. }, _) | (_, Collider::Capsule { .. }) => {
+            capsule_contacts(a, b, shift, margin, &mut Points::default()).is_some()
+        }
     }
+}
+
+/// A sphere's or capsule's core, moved by `shift`: the segment its surface is
+/// `radius` from. A sphere's is a point.
+fn core(body: &Body, shift: Vec3) -> Option<(Vec3, Vec3, f32)> {
+    let center = body.position + shift;
+    match body.shape {
+        Collider::Sphere { radius } => Some((center, center, radius)),
+        Collider::Capsule {
+            radius,
+            half_height,
+        } => {
+            let axis = body.initial_basis.z_axis * half_height;
+            Some((center - axis, center + axis, radius))
+        }
+        Collider::Cuboid { .. } | Collider::Ground => None,
+    }
+}
+
+/// Contacts of pairs with a capsule and no ground, A moved by `shift`; the
+/// normal from B to A, if they meet.
+fn capsule_contacts(
+    a: &Body,
+    b: &Body,
+    shift: Vec3,
+    margin: f32,
+    points: &mut Points,
+) -> Option<Vec3> {
+    match (core(a, shift), core(b, Vec3::ZERO), a.shape, b.shape) {
+        (Some(ca), Some(cb), _, _) => round_round(ca, cb, margin, points),
+        (Some(ca), None, _, Collider::Cuboid { half_extents }) => {
+            round_box(ca, &obb(b, half_extents), margin, true, points)
+        }
+        (None, Some(cb), Collider::Cuboid { half_extents }, _) => {
+            let box_a = moved_obb(a, half_extents, shift);
+            round_box(cb, &box_a, margin, false, points).map(|n| -n)
+        }
+        _ => None,
+    }
+}
+
+/// Two round cores: their closest points and, where they run side by side,
+/// the ends of the stretch they share, so a capsule lying on another rests.
+fn round_round(
+    (a0, a1, ra): (Vec3, Vec3, f32),
+    (b0, b1, rb): (Vec3, Vec3, f32),
+    margin: f32,
+    points: &mut Points,
+) -> Option<Vec3> {
+    let reach = ra + rb + margin;
+    let (pa, pb) = closest_on_segments(a0, a1, b0, b1);
+    let d = pa - pb;
+    let distance_squared = d.length_squared();
+    if distance_squared > reach * reach {
+        return None;
+    }
+    let distance = distance_squared.sqrt();
+    let n = if distance > AXIS_EPSILON {
+        d / distance
+    } else {
+        // Crossing cores: any direction across both.
+        (a1 - a0).cross(b1 - b0).try_normalize().unwrap_or(Vec3::Z)
+    };
+    points.push(pa - n * ra, pb + n * rb, 0);
+    let ends = [
+        closest_on_segments(a0, a0, b0, b1),
+        closest_on_segments(a1, a1, b0, b1),
+        closest_on_segments(a0, a1, b0, b0),
+        closest_on_segments(a0, a1, b1, b1),
+    ];
+    for (feature, (pa, pb)) in (1..).zip(ends) {
+        if pa.distance_squared(pb) <= reach * reach {
+            points.push(pa - n * ra, pb + n * rb, feature);
+        }
+    }
+    Some(n)
+}
+
+/// A round core against a box: the core's point nearest the box and its ends
+/// where they lie against the same face, so a capsule lying on a box rests on
+/// both. The normal is from the box to the core.
+fn round_box(
+    (p0, p1, radius): (Vec3, Vec3, f32),
+    b: &Obb,
+    margin: f32,
+    round_is_a: bool,
+    points: &mut Points,
+) -> Option<Vec3> {
+    // Alternating projections converge on the closest points of two convex sets.
+    let mut p = 0.5 * (p0 + p1);
+    for _ in 0..8 {
+        let q = b.clamp(p);
+        p = closest_on_segments(q, q, p0, p1).1;
+    }
+    let (n, _, on_box) = sphere_box(p, radius, b, margin)?;
+    let mut push = |center: Vec3, on_box: Vec3, feature| {
+        let on_round = center - n * radius;
+        if round_is_a {
+            points.push(on_round, on_box, feature);
+        } else {
+            points.push(on_box, on_round, feature);
+        }
+    };
+    push(p, on_box, 0);
+    for (feature, end) in [(1, p0), (2, p1)] {
+        if let Some((end_n, _, on_box)) = sphere_box(end, radius, b, margin)
+            && end_n.dot(n) > 0.95
+        {
+            push(end, on_box, feature);
+        }
+    }
+    Some(n)
 }
 
 /// A's first pose this step that touches B, as a shift from now; `None` if it
@@ -76,7 +192,7 @@ fn predicted_hit(a: &Body, b: &Body, margin: f32, ground: Option<&dyn Ground>) -
     }
     let thickness = |shape| match shape {
         Collider::Cuboid { half_extents } => half_extents.min_element(),
-        Collider::Sphere { radius } => radius,
+        Collider::Sphere { radius } | Collider::Capsule { radius, .. } => radius,
         Collider::Ground => 0.0,
     };
     let spacing = 0.5 * (thickness(a.shape) + thickness(b.shape));
@@ -159,6 +275,9 @@ pub(crate) fn collide(
         (Collider::Cuboid { half_extents: ha }, Collider::Cuboid { half_extents: hb }) => {
             -box_box(&moved_obb(a, ha, shift), &obb(b, hb), margin, &mut points)?
         }
+        (Collider::Capsule { .. }, _) | (_, Collider::Capsule { .. }) => {
+            capsule_contacts(a, b, shift, margin, &mut points)?
+        }
     };
     let (t1, t2) = normal.any_orthonormal_pair();
     let (ia, ib) = (a.rotation.conjugate(), b.rotation.conjugate());
@@ -235,6 +354,8 @@ fn body_touches(
         Collider::Sphere { radius } => {
             ground.distance(to_ground(body.position + shift)) <= radius + margin
         }
+        Collider::Capsule { radius, .. } => (capsule_samples(body, shift).iter())
+            .any(|&p| ground.distance(to_ground(p)) <= radius + margin),
         Collider::Cuboid { half_extents } => {
             let box_ = moved_obb(body, half_extents, shift);
             let points = cuboid_points(&box_, to_ground);
@@ -271,20 +392,27 @@ fn ground_contacts(
     let center = to_ground(body.position + shift);
     match body.shape {
         Collider::Sphere { radius } => {
-            let distance = ground.distance(center);
-            // The estimate reads up to twice the truth.
-            if distance > 2.0 * (radius + margin) {
-                return None;
-            }
-            // Project onto the surface, twice, as distances are only estimates.
-            let surface = center - ground.normal(center) * distance;
-            let surface = surface - ground.normal(surface) * ground.distance(surface);
-            let normal = ground.normal(surface);
-            let gap = (center - surface).dot(normal) - radius;
-            if gap > margin {
-                return None;
-            }
+            let (normal, surface, _) = ground_sphere(ground, center, radius, margin)?;
             push(center - normal * radius, surface, 0);
+            Some(rotation * normal)
+        }
+        Collider::Capsule { radius, .. } => {
+            let mut hits = [None; MAX_CONTACTS];
+            let mut normal = Vec3::ZERO;
+            for (hit, p) in hits.iter_mut().zip(capsule_samples(body, shift)) {
+                let p = to_ground(p);
+                *hit = ground_sphere(ground, p, radius, margin).map(|(n, surface, gap)| {
+                    normal += n * (margin - gap + 1.0e-3);
+                    (p, surface)
+                });
+            }
+            // One normal for all, weighted by depth as for cuboids.
+            let normal = normal.try_normalize()?;
+            for (feature, hit) in (0..).zip(hits) {
+                if let Some((p, surface)) = hit {
+                    push(p - normal * radius, surface, feature);
+                }
+            }
             Some(rotation * normal)
         }
         Collider::Cuboid { half_extents } => {
@@ -320,6 +448,39 @@ fn ground_contacts(
         }
         Collider::Ground => None,
     }
+}
+
+/// A sphere's normal, surface point and gap on the ground, in the ground's
+/// frame, if within `margin`.
+fn ground_sphere(
+    ground: &dyn Ground,
+    center: Vec3,
+    radius: f32,
+    margin: f32,
+) -> Option<(Vec3, Vec3, f32)> {
+    let distance = ground.distance(center);
+    // The estimate reads up to twice the truth.
+    if distance > 2.0 * (radius + margin) {
+        return None;
+    }
+    // Project onto the surface, twice, as distances are only estimates.
+    let surface = center - ground.normal(center) * distance;
+    let surface = surface - ground.normal(surface) * ground.distance(surface);
+    let normal = ground.normal(surface);
+    let gap = (center - surface).dot(normal) - radius;
+    (gap <= margin).then_some((normal, surface, gap))
+}
+
+/// Sphere centers along a capsule's core for a ground test, at most
+/// `GROUND_SPACING` apart, ends included.
+fn capsule_samples(body: &Body, shift: Vec3) -> Vec<Vec3> {
+    let Some((p0, p1, _)) = core(body, shift) else {
+        return Vec::new();
+    };
+    let gaps = ((p0.distance(p1) / GROUND_SPACING).ceil() as usize).clamp(1, MAX_CONTACTS - 1);
+    (0..=gaps)
+        .map(|i| p0.lerp(p1, i as f32 / gaps as f32))
+        .collect()
 }
 
 /// Up to four points that hold a body up: for each corner of the plane of `u`
@@ -399,6 +560,14 @@ fn signum(x: f32) -> f32 {
 }
 
 impl Obb {
+    /// The point of the box nearest `p`.
+    fn clamp(&self, p: Vec3) -> Vec3 {
+        let d = p - self.center;
+        (0..3).fold(self.center, |q, i| {
+            q + self.axis[i] * d.dot(self.axis[i]).clamp(-self.half[i], self.half[i])
+        })
+    }
+
     fn support(&self, dir: Vec3) -> Vec3 {
         (0..3).fold(self.center, |p, i| {
             p + self.axis[i] * (self.half[i] * signum(dir.dot(self.axis[i])))

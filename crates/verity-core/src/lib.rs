@@ -125,6 +125,9 @@ pub struct Lighting {
     pub method: LightingMethod,
     pub sky: [f32; 3],
     pub ground: [f32; 3],
+    /// A physically based sky with a volumetric cloud layer; `None` keeps the
+    /// plain background.
+    pub clouds: Option<Clouds>,
 }
 
 impl Default for Lighting {
@@ -133,6 +136,42 @@ impl Default for Lighting {
             method: LightingMethod::default(),
             sky: [0.03, 0.035, 0.045],
             ground: [0.015; 3],
+            clouds: None,
+        }
+    }
+}
+
+/// A volumetric cloud layer. Altitudes are metres above z = 0 (the ground).
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Clouds {
+    /// Fraction of the sky covered, 0..1.
+    pub coverage: f32,
+    /// Cloud genus, 0..1: stratus, stratocumulus, cumulus.
+    pub kind: f32,
+    /// Extinction per metre inside the densest cloud.
+    pub density: f32,
+    pub bottom: f32,
+    pub thickness: f32,
+    /// Wind in metres per second along x and y.
+    pub wind: [f32; 2],
+    /// High cirrus streaks, 0..1.
+    pub cirrus: f32,
+    /// Picks one of many skies with the same settings.
+    pub seed: u32,
+}
+
+impl Default for Clouds {
+    fn default() -> Self {
+        Self {
+            coverage: 0.35,
+            kind: 0.85,
+            density: 0.012,
+            bottom: 1200.0,
+            thickness: 2000.0,
+            wind: [10.0, 4.0],
+            cirrus: 0.3,
+            seed: 0,
         }
     }
 }
@@ -167,6 +206,14 @@ impl Default for ScenePhysics {
     }
 }
 
+/// Copies of one asset, each placed by a transform on top of its own placement.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Copies {
+    /// A path in [`Scene::assets`].
+    pub asset: String,
+    pub transforms: Vec<Transform>,
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Scene {
     pub entities: Vec<Entity>,
@@ -178,10 +225,80 @@ pub struct Scene {
     pub lighting: Lighting,
     #[serde(default)]
     pub assets: Vec<String>,
+    /// More placements of models in `assets`, drawn instanced on the GPU and
+    /// as imposters far away.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub copies: Vec<Copies>,
     #[serde(default)]
     pub cameras: Vec<Camera>,
     #[serde(default)]
     pub physics: ScenePhysics,
+    /// The terrain generator recipe, which `verity-terra` reads; kept as JSON so
+    /// the scene format does not depend on it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub terrain: Option<serde_json::Value>,
+    /// The procedural city recipe, which `verity-pcg` reads; JSON for the
+    /// same reason.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub city: Option<serde_json::Value>,
+    /// The game's screen-space UI, drawn back to front.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ui: Vec<Widget>,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum WidgetKind {
+    #[default]
+    Panel,
+    Text,
+    Button,
+    /// Fills from the left by `value`.
+    Bar,
+}
+
+/// One element of the game UI. Lengths are pixels at the reference height
+/// that `verity-ui` scales to the screen.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Widget {
+    /// Games find widgets by name, and buttons report it when clicked.
+    pub name: String,
+    pub kind: WidgetKind,
+    /// Where on the screen the widget hangs, 0..1 from the top left.
+    pub anchor: [f32; 2],
+    /// The point of the widget, 0..1 from its top left, put at the anchor.
+    pub pivot: [f32; 2],
+    pub offset: [f32; 2],
+    pub size: [f32; 2],
+    pub text: String,
+    pub font_size: f32,
+    /// sRGB with straight alpha.
+    pub color: [u8; 4],
+    pub background: [u8; 4],
+    pub corner_radius: f32,
+    /// A bar's fill, 0..1.
+    pub value: f32,
+    pub visible: bool,
+}
+
+impl Default for Widget {
+    fn default() -> Self {
+        Self {
+            name: "Widget".into(),
+            kind: WidgetKind::Panel,
+            anchor: [0.5; 2],
+            pivot: [0.5; 2],
+            offset: [0.0; 2],
+            size: [240.0, 64.0],
+            text: String::new(),
+            font_size: 28.0,
+            color: [255; 4],
+            background: [20, 24, 37, 220],
+            corner_radius: 8.0,
+            value: 1.0,
+            visible: true,
+        }
+    }
 }
 
 impl Default for Scene {
@@ -224,8 +341,12 @@ impl Default for Scene {
             sun: Some(Sun::default()),
             lighting: Lighting::default(),
             assets: Vec::new(),
+            copies: Vec::new(),
             cameras: Vec::new(),
             physics: ScenePhysics::default(),
+            terrain: None,
+            city: None,
+            ui: Vec::new(),
         }
     }
 }
@@ -282,6 +403,7 @@ pub struct World {
     pub sun: Option<Sun>,
     pub lighting: Lighting,
     pub assets: Vec<String>,
+    pub copies: Vec<Copies>,
     pub cameras: Vec<Camera>,
     pub physics: ScenePhysics,
     stores: std::collections::HashMap<TypeId, Box<dyn AnyStore>>,
@@ -498,6 +620,7 @@ impl World {
             sun: scene.sun,
             lighting: scene.lighting,
             assets: scene.assets.clone(),
+            copies: scene.copies.clone(),
             cameras: scene.cameras.clone(),
             physics: scene.physics,
             ..Self::new()
@@ -532,8 +655,12 @@ impl World {
             sun: self.sun,
             lighting: self.lighting,
             assets: self.assets.clone(),
+            copies: self.copies.clone(),
             cameras: self.cameras.clone(),
             physics: self.physics,
+            terrain: None,
+            city: None,
+            ui: Vec::new(),
         }
     }
 }
@@ -676,8 +803,13 @@ mod tests {
             method: LightingMethod::DirectOnly,
             sky: [0.2, 0.3, 0.4],
             ground: [0.05, 0.06, 0.07],
+            clouds: Some(Clouds::default()),
         };
         scene.assets = vec!["models/ship.glb".into(), "models/tree.gltf".into()];
+        scene.copies = vec![Copies {
+            asset: "models/tree.gltf".into(),
+            transforms: vec![Transform::default(); 2],
+        }];
         scene.cameras = vec![Camera {
             name: "Nave".into(),
             ..Camera::default()
@@ -786,9 +918,11 @@ mod tests {
         scene.entities[0]
             .components
             .insert("Mana".into(), serde_json::json!({}));
-        assert!(World::from_scene(&scene, &registry)
-            .unwrap_err()
-            .contains("Mana"));
+        assert!(
+            World::from_scene(&scene, &registry)
+                .unwrap_err()
+                .contains("Mana")
+        );
         scene.entities[0].components = [("Health".into(), serde_json::json!("x"))].into();
         assert!(World::from_scene(&scene, &registry).is_err());
     }

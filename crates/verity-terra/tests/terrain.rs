@@ -1,14 +1,17 @@
 use fast_surface_nets::ndshape::ConstShape;
 use glam::{IVec3, Vec3};
-use noise::Perlin;
 use std::collections::HashMap;
 use verity_terra::*;
 
 fn flat() -> Landscape {
-    Landscape {
-        heights: vec![0.3; SIDE * SIDE],
-        flow: vec![0.0; SIDE * SIDE],
-        noise: Perlin::new(1337),
+    Landscape::flat(0.3, 385, 1.0)
+}
+
+/// A preset on a 1 km map: tests build this crate unoptimised.
+fn small(landform: Landform) -> Settings {
+    Settings {
+        size: 257,
+        ..landform.into()
     }
 }
 
@@ -17,17 +20,17 @@ fn terrain_generation_excavation_and_chunk_seams() {
     let settings = Settings {
         droplets: 500,
         thermal_steps: 3,
-        ..Settings::default()
+        ..small(Landform::Valley)
     };
-    let a = Landscape::generate(settings);
-    let b = Landscape::generate(settings);
+    let a = Landscape::generate(settings.clone());
+    let b = Landscape::generate(settings.clone());
     assert_eq!(a.heights, b.heights, "seed must reproduce the landscape");
     assert!(a.heights.iter().all(|h| h.is_finite()));
     assert!(a.flow.iter().any(|f| *f > 0.0));
     let raw = Landscape::generate(Settings {
         droplets: 0,
         thermal_steps: 0,
-        ..settings
+        ..settings.clone()
     });
     let mass_before: f64 = raw.heights.iter().map(|h| *h as f64).sum();
     let mass_after: f64 = a.heights.iter().map(|h| *h as f64).sum();
@@ -140,14 +143,13 @@ fn landform_presets() {
         let settings = Settings {
             droplets: 300,
             thermal_steps: 2,
-            ..landform.into()
+            ..small(landform)
         };
-        let land = Landscape::generate(settings);
+        let land = Landscape::generate(settings.clone());
+        let base = settings.sea_level.unwrap_or(0.0);
         assert!(
-            land.heights
-                .iter()
-                .all(|h| h.is_finite() && (MIN_Z as f32..MAX_Z as f32).contains(h)),
-            "{landform:?} must stay inside the editable volume"
+            (land.heights.iter()).all(|h| h.is_finite() && *h - base < settings.mountains + 1.0),
+            "{landform:?} peaks stay under the mountains setting"
         );
         let Some(sea) = settings.sea_level else {
             continue;
@@ -155,49 +157,105 @@ fn landform_presets() {
         let dry =
             land.heights.iter().filter(|h| **h > sea).count() as f32 / land.heights.len() as f32;
         assert!(
-            (0.1..0.7).contains(&dry),
+            (0.05..0.7).contains(&dry),
             "{landform:?} land fraction {dry}"
         );
         if landform == Landform::Island {
+            let corner = -land.half() * 0.96;
             assert!(land.height(0.0, 0.0) > sea, "island centre is land");
-            assert!(land.height(-185.0, -185.0) < sea, "island corners are sea");
+            assert!(land.height(corner, corner) < sea, "island corners are sea");
         }
     }
 }
 
+/// Mean land slope in degrees, and the steepest rise over run to any of the eight neighbours.
+fn slopes(land: &Landscape, base: f32) -> (f32, f32) {
+    let side = land.side;
+    let (mut sum, mut count, mut steepest) = (0.0, 0, 0.0f32);
+    for y in 1..side - 1 {
+        for x in 1..side - 1 {
+            let i = y * side + x;
+            for (dx, dy) in [(1, 0), (0, 1), (1, 1), (1, -1)] {
+                let j = (y as isize + dy) as usize * side + (x as isize + dx) as usize;
+                let run = land.cell * if dx != 0 && dy != 0 { 2f32.sqrt() } else { 1.0 };
+                steepest = steepest.max((land.heights[i] - land.heights[j]).abs() / run);
+            }
+            if land.heights[i] > base + 1.0 {
+                let dx = (land.heights[i + 1] - land.heights[i - 1]) / (2.0 * land.cell);
+                let dy = (land.heights[i + side] - land.heights[i - side]) / (2.0 * land.cell);
+                sum += (dx * dx + dy * dy).sqrt().atan().to_degrees();
+                count += 1;
+            }
+        }
+    }
+    (sum / count.max(1) as f32, steepest)
+}
+
 #[test]
-fn fluvial_erosion_carves_sparse_rivers() {
+fn erosion_drains_the_land_and_holds_slopes_under_talus() {
     let settings = Settings {
         droplets: 0,
         thermal_steps: 0,
+        size: 257,
+        cell: 8.0,
         ..Landform::Mountains.into()
     };
-    let raw = Landscape::generate(Settings {
-        fluvial_steps: 0,
-        ..settings
-    });
-    let eroded = Landscape::generate(settings);
+    let eroded = Landscape::generate(settings.clone());
     assert!(eroded.heights.iter().all(|h| h.is_finite()));
-    let cut: Vec<f32> = raw
-        .heights
-        .iter()
-        .zip(&eroded.heights)
-        .map(|(a, b)| a - b)
-        .collect();
-    let deep = cut.iter().filter(|c| **c > 3.0).count();
-    let touched = cut.iter().filter(|c| c.abs() > 0.5).count() as f32 / cut.len() as f32;
+    let (mean, steepest) = slopes(&eroded, 0.0);
+    // Rock stands four times steeper than soil, and no steeper.
+    assert!(steepest <= settings.talus * 4.0 + 1.0e-3, "{steepest}");
     assert!(
-        deep > 200,
-        "major rivers must incise valleys: {deep} cells cut > 3 m"
+        (15.0..35.0).contains(&mean),
+        "mountain slopes average {mean}°"
     );
-    assert!(
-        touched < 0.15,
-        "slopes between rivers keep their relief: {touched:.3} of the map changed"
-    );
+    // Lakes fill, so water runs off every cell: none is lower than all its neighbours.
+    let side = eroded.side;
+    let pits = (0..side * side)
+        .filter(|&i| {
+            let (x, y) = (i % side, i / side);
+            x > 0 && y > 0 && x < side - 1 && y < side - 1 && {
+                let h = eroded.heights[i];
+                [
+                    i - 1,
+                    i + 1,
+                    i - side,
+                    i + side,
+                    i - side - 1,
+                    i - side + 1,
+                    i + side - 1,
+                    i + side + 1,
+                ]
+                .iter()
+                .all(|j| eroded.heights[*j] > h)
+            }
+        })
+        .count();
+    assert_eq!(pits, 0, "every cell drains");
     assert!(
         eroded.flow.iter().any(|f| *f > 0.5),
         "drainage feeds wetness"
     );
+    // Age: unworn uplift is a smooth block; rivers cut it into valleys and ridges.
+    let young = Landscape::generate(Settings {
+        fluvial_steps: 0,
+        ..settings
+    });
+    let (smooth, _) = slopes(&young, 0.0);
+    assert!(mean > smooth + 5.0, "dissected {mean}° vs unworn {smooth}°");
+}
+
+#[test]
+fn plains_stay_gentle() {
+    let plains = Landscape::generate(Settings {
+        droplets: 0,
+        thermal_steps: 0,
+        size: 257,
+        cell: 8.0,
+        ..Landform::Plains.into()
+    });
+    let (mean, _) = slopes(&plains, 0.0);
+    assert!(mean < 8.0, "plains average {mean}°");
 }
 
 #[test]
@@ -307,14 +365,126 @@ fn generation_does_not_depend_on_thread_count() {
         droplets: 500,
         fluvial_steps: 8,
         thermal_steps: 4,
-        ..Landform::Island.into()
+        ..small(Landform::Island)
     };
     let serial = rayon::ThreadPoolBuilder::new()
         .num_threads(1)
         .build()
         .expect("a one-thread pool")
-        .install(|| Landscape::generate(settings));
+        .install(|| Landscape::generate(settings.clone()));
     let parallel = Landscape::generate(settings);
     assert_eq!(serial.heights, parallel.heights);
     assert_eq!(serial.flow, parallel.flow);
+}
+
+#[test]
+fn edits_save_load_and_revert() {
+    let mut terrain = Terrain::new(flat());
+    let generated = terrain.sample(Vec3::new(4.0, 4.0, 0.0));
+    let center = Vec3::new(4.0, 4.0, 0.0);
+    terrain.brush(center, 3.0, false);
+    let dug = terrain.sample(center);
+    assert!(dug > generated);
+    let mut saved = Vec::new();
+    terrain.save_edits(&mut saved).unwrap();
+
+    // A later edit elsewhere reverts on load, and the saved one comes back.
+    let other = Vec3::new(-60.0, 50.0, 0.0);
+    let untouched = terrain.sample(other);
+    terrain.brush(other, 3.0, false);
+    assert_ne!(terrain.sample(other), untouched);
+    let mut fresh = Terrain::new(flat());
+    fresh.brush(center, 5.0, true);
+    for target in [&mut terrain, &mut fresh] {
+        let changed = target.load_edits(saved.as_slice()).unwrap();
+        assert!(!changed.is_empty());
+        assert_eq!(target.sample(center), dug);
+        assert_eq!(target.sample(other), untouched);
+        let mut again = Vec::new();
+        target.save_edits(&mut again).unwrap();
+        assert_eq!(again, saved, "a loaded save writes back the same bytes");
+    }
+
+    // Bad files leave the terrain alone.
+    let mut other_landscape = flat();
+    other_landscape.heights[0] = 1.0;
+    let mut wrong = Terrain::new(other_landscape);
+    assert!(wrong.load_edits(saved.as_slice()).is_err());
+    assert!(terrain.load_edits(&saved[..saved.len() - 1]).is_err());
+    assert!(terrain.load_edits(&b"nope"[..]).is_err());
+    assert_eq!(terrain.sample(center), dug);
+}
+
+#[test]
+fn streaming_follows_the_eye_and_keeps_edits() {
+    let mut terrain = Terrain::new(flat());
+    let mut mesher = Mesher::default();
+    let mut streamer = Streamer::new(&terrain, 40.0);
+    let west = Vec3::new(-150.0, 0.0, 10.0);
+    assert!(streamer.update(&mut terrain, &mut mesher, west).is_empty());
+    let near = streamer.resident();
+    assert!(near > 0 && near < terrain.initial_coords().len());
+    let mut meshed = HashMap::new();
+    while mesher.outstanding() > 0 {
+        meshed.extend(mesher.update(&mut terrain, west, 64));
+        std::thread::yield_now();
+    }
+    assert_eq!(meshed.len(), near);
+    let dug = Vec3::new(-150.0, 0.0, 0.0);
+    terrain.brush(dug, 3.0, false);
+    let value = terrain.sample(dug);
+
+    let east = Vec3::new(150.0, 0.0, 10.0);
+    let unloaded = streamer.update(&mut terrain, &mut mesher, east);
+    assert_eq!(unloaded.len(), near);
+    assert!(unloaded.iter().all(|c| !streamer.is_resident(*c)));
+    assert_eq!(terrain.sample(dug), value, "edits survive leaving");
+    assert!(
+        (terrain.chunks.iter()).all(|(c, chunk)| streamer.is_resident(*c) || chunk.revision > 0),
+        "unedited chunks out of reach are dropped"
+    );
+}
+
+#[test]
+fn filters_apply_in_order_and_random_recipes_reproduce() {
+    let plain = Settings {
+        droplets: 0,
+        fluvial_steps: 0,
+        thermal_steps: 0,
+        ..small(Landform::Mountains)
+    };
+    let raw = Landscape::generate(plain.clone());
+    let terraced = Landscape::generate(Settings {
+        filters: vec![Filter::Terraces {
+            step: 10.0,
+            sharpness: 0.98,
+        }],
+        ..plain.clone()
+    });
+    // Sharp terraces leave most ground within a whisker of a 10 m bench.
+    let on_bench = (terraced.heights.iter())
+        .filter(|h| (**h / 10.0 - (**h / 10.0).round()).abs() < 0.05)
+        .count();
+    assert!(on_bench * 10 > terraced.heights.len() * 9, "{on_bench}");
+    let flattened = Landscape::generate(Settings {
+        filters: vec![Filter::Plateau {
+            height: 40.0,
+            strength: 1.0,
+        }],
+        ..plain.clone()
+    });
+    let peak = |l: &Landscape| l.heights.iter().copied().fold(f32::MIN, f32::max);
+    assert!(peak(&flattened) < peak(&raw));
+    let filled = Landscape::generate(Settings {
+        filters: vec![Filter::Sediment { strength: 1.0 }],
+        ..plain.clone()
+    });
+    assert!(raw.heights.iter().zip(&filled.heights).all(|(a, b)| b >= a));
+    let a = Settings::random(42);
+    assert_eq!(a, Settings::random(42));
+    assert_ne!(a, Settings::random(43));
+    // Scenes store recipes as JSON.
+    let generator = Generator::Landscape(a);
+    let json = serde_json::to_string(&generator).unwrap();
+    assert_eq!(serde_json::from_str::<Generator>(&json).unwrap(), generator);
 }

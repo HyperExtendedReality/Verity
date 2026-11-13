@@ -1,0 +1,9 @@
+[package]
+name = "verity-ui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+verity-core = { path = "../verity-core" }
+egui = "0.36"

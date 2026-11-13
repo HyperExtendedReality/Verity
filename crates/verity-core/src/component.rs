@@ -4,7 +4,7 @@
 
 use std::{any::Any, collections::HashMap, fmt::Debug, ops::RangeInclusive};
 
-use serde::{de::DeserializeOwned, Serialize};
+use serde::{Serialize, de::DeserializeOwned};
 use serde_json::Value;
 
 use crate::{EntityHandle, World};

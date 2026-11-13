@@ -35,7 +35,7 @@ pub enum TextureFormat {
 }
 
 impl TextureFormat {
-    fn block(self) -> TranscoderBlockFormat {
+    pub(crate) fn block(self) -> TranscoderBlockFormat {
         match self {
             Self::Bc7 => TranscoderBlockFormat::BC7,
             Self::Astc4x4 => TranscoderBlockFormat::ASTC_4x4,
