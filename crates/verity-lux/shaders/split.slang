@@ -259,7 +259,7 @@ uint findProbeNode(int4 key) {
         if (index != TOMBSTONE) {
             uint descriptorCount = params.size.z * CASCADES * 2u;
             if (index >= descriptorCount) return EMPTY;
-            int4 candidate = entries[index].key;
+            int4 candidate = descriptors[index].key;
             candidate.w = int(uint(candidate.w) & (PROBE_LOD | (3u << 12u)));
             if (all(candidate == key)) return index;
         }
@@ -278,9 +278,7 @@ uint findProbeNodeSlot(int4 key) {
         uint index = heads[probeDirectoryHead(level, slot, params)].load();
         if (index == EMPTY) return EMPTY;
         if (index != TOMBSTONE && index < descriptorCount) {
-            int4 candidate = entries[index].key;
-            // A packed probe's canonical entry can be a traced interval: its
-            // angular direction is not part of the probe-directory identity.
+            int4 candidate = descriptors[index].key;
             candidate.w = int(uint(candidate.w) & (PROBE_LOD | (3u << 12u)));
             if (all(candidate == key)) return slot;
         }
@@ -311,7 +309,7 @@ uint insertProbeDescriptor(int4 key, uint descriptorIndex) {
         if (candidate != TOMBSTONE) {
             uint descriptorCount = params.size.z * CASCADES * 2u;
             if (candidate >= descriptorCount) return EMPTY;
-            if (all(entries[candidate].key == key)) return candidate;
+            if (all(descriptors[candidate].key == key)) return candidate;
         }
         slot = (slot + 1u) & (directoryCapacity - 1u);
     }
@@ -348,7 +346,7 @@ uint findIrradianceProbe(int4 key, bool previous) {
         if (index == EMPTY) return EMPTY;
         if (index != TOMBSTONE) {
             if (index >= count) return EMPTY;
-            int4 candidate = previous ? previousEntries[index].key : entries[index].key;
+            int4 candidate = previous ? previousEntries[index].key : descriptors[index].key;
             if (all(candidate.xyz == key.xyz)
                 && (uint(candidate.w) & PROBE_LOD) == (uint(key.w) & PROBE_LOD)) {
                 if (previous) {
@@ -594,25 +592,26 @@ void clear(uint3 thread : SV_DispatchThreadID) {
     // large interval allocation; trace and retain initialize reachable nodes.
 }
 
-// Descriptors are read for these fields only, until a deposit replaces the whole
-// entry. Writing all 240 bytes of two variants and four levels per grid cell made
-// seeding bandwidth bound.
-void storeDescriptor(uint index, int4 key, float4 origin, uint valid, uint next,
-                     uint traced, uint initialized) {
-    entries[index].key = key;
-    entries[index].origin = origin;
-    entries[index].valid = valid;
-    entries[index].next = next;
-    entries[index].samples = 0u;
-    entries[index].padding = uint2(traced, initialized);
+static const uint DESCRIPTOR_SEEDED = 0x100u;
+uint descriptorTraced(uint index) { return descriptors[index].flags & 0xffu; }
+void setDescriptorTraced(uint index, uint traced) {
+    descriptors[index].flags = (descriptors[index].flags & ~0xffu) | traced;
 }
 
-// A descriptor with no surface under it. Readers test `valid` and `padding`
-// before anything else, and those share a cache line: zeroing the key and
-// origin too touched a second one for half of all descriptors.
+void storeDescriptor(uint index, int4 key, uint traced) {
+    Descriptor d;
+    d.key = key;
+    d.valid = 1u;
+    d.next = EMPTY;
+    d.lastSample = 0u;
+    d.flags = traced | DESCRIPTOR_SEEDED;
+    descriptors[index] = d;
+}
+
+// A descriptor with no surface under it: readers test `valid` and the flags first.
 void clearDescriptor(uint index) {
-    entries[index].valid = 0u;
-    entries[index].padding = uint2(0u, 0u);
+    descriptors[index].valid = 0u;
+    descriptors[index].flags = 0u;
 }
 
 uint permuteCandidateDomain(uint value, uint mask, uint seed) {
@@ -787,9 +786,7 @@ bool splitSampleSurface(uint2 pixel, out float3 position, out float3 normal) {
 void seed(uint3 thread : SV_DispatchThreadID) {
     if (any(thread.xy >= params.size.xy)) return;
     uint sample = thread.x + thread.y * params.size.x;
-    // Every descriptor is written exactly once, either with its seeded entry
-    // or zero. Entries are 240 bytes, so clearing and then overwriting them
-    // doubled this bandwidth-bound pass.
+    // Every descriptor is written exactly once, either seeded or cleared.
     float3 surfacePosition, geometricNormal;
     if (!splitSampleSurface(thread.xy, surfacePosition, geometricNormal)) {
         [unroll] for (uint variant = 0u; variant < 2u; ++variant)
@@ -828,8 +825,7 @@ void seed(uint3 thread : SV_DispatchThreadID) {
             // Each screen update traces once. In an LOD overlap, temporal
             // low-discrepancy assignment balances it between the two fields.
             storeDescriptor(index, key,
-                float4((float3(key.xyz) + 0.5) * spacing(params, level, lod), 1.0),
-                1u, EMPTY, (level == 0u && eligibleRay && variant == selectedLod) ? 1u : 0u, 1u);
+                (level == 0u && eligibleRay && variant == selectedLod) ? 1u : 0u);
         }
     }
     if (selectedRay && !coldPriority && (!secondary || params.sampling.x == 0u))
@@ -849,20 +845,20 @@ void rankCandidate(uint dispatchRank) {
     [unroll] for (uint variant = 0u; variant < 2u; ++variant)
         [unroll] for (uint level = 0u; level < CASCADES; ++level) {
             uint index = probeDescriptorIndex(sample, variant, level);
-            Entry descriptor = entries[index];
+            Descriptor descriptor = descriptors[index];
             if (descriptor.valid == 0u) continue;
             uint canonical = insertProbeDescriptor(descriptor.key, index);
             if (canonical == EMPTY) {
-                entries[index].valid = 0u;
+                descriptors[index].valid = 0u;
                 continue;
             }
-            entries[index].next = canonical;
+            descriptors[index].next = canonical;
             if (level == 0u) {
                 uint slot = findProbeNodeSlot(descriptor.key);
                 if (slot != EMPTY) {
                     uint countHead = probeCountHead(0u, slot, params);
                     if (coldPriority) {
-                        if (params.frame.y == 0u && descriptor.padding.x != 0u) {
+                        if (params.frame.y == 0u && (descriptor.flags & 0xffu) != 0u) {
                             // A frame-seeded permutation samples a stable receiver
                             // representative without depending on atomic arrival order.
                             uint rank = coldCandidateRank(sample);
@@ -883,8 +879,8 @@ void rankCandidate(uint dispatchRank) {
                                 uint nomineeRank = 0xffffffffu - nomineePriority;
                                 uint nomineeSample = coldCandidateFromRank(nomineeRank);
                                 uint nomineeIndex = probeDescriptorIndex(nomineeSample, 0u, 0u);
-                                if (entries[nomineeIndex].valid == 0u
-                                    || any(entries[nomineeIndex].key != descriptor.key))
+                                if (descriptors[nomineeIndex].valid == 0u
+                                    || any(descriptors[nomineeIndex].key != descriptor.key))
                                     nomineeIndex = probeDescriptorIndex(nomineeSample, 1u, 0u);
 
                                 uint population = heads[
@@ -904,26 +900,26 @@ void rankCandidate(uint dispatchRank) {
                                         probeCountHead(3u, bin, params)].add(1u);
                                     admitted = ticket < budget - higherPopulationProbes;
                                 }
-                                entries[nomineeIndex].padding.x = admitted ? 2u : 0u;
-                                entries[nomineeIndex].lastSample = 0u;
+                                setDescriptorTraced(nomineeIndex, admitted ? 2u : 0u);
+                                descriptors[nomineeIndex].lastSample = 0u;
                                 heads[countHead].store(admitted ? 1u : 0u);
                                 if (admitted) heads[2u * params.size.w + 7u].add(1u);
                             }
-                        } else if (params.frame.y == 3u && descriptor.padding.x != 0u) {
-                            if (descriptor.padding.x == 2u) {
-                                entries[index].padding.x = 1u;
-                            } else if (descriptor.padding.x == 1u
+                        } else if (params.frame.y == 3u && (descriptor.flags & 0xffu) != 0u) {
+                            if ((descriptor.flags & 0xffu) == 2u) {
+                                setDescriptorTraced(index, 1u);
+                            } else if ((descriptor.flags & 0xffu) == 1u
                                        && transportCandidateSelected(sample)
                                        && reserveColdUpdate()) {
                                 uint localOrdinal = heads[countHead].add(1u);
-                                entries[index].lastSample = localOrdinal;
+                                descriptors[index].lastSample = localOrdinal;
                             } else {
-                                entries[index].padding.x = 0u;
+                                setDescriptorTraced(index, 0u);
                             }
                         }
-                    } else if (descriptor.padding.x != 0u) {
+                    } else if ((descriptor.flags & 0xffu) != 0u) {
                         uint localOrdinal = heads[countHead].add(1u);
-                        entries[index].lastSample = localOrdinal;
+                        descriptors[index].lastSample = localOrdinal;
                     }
                 }
             }
@@ -948,7 +944,7 @@ void parents(uint3 thread : SV_DispatchThreadID) {
     if (parentSlot >= probeDirectoryCapacity(params)) return;
     uint parentIndex = heads[probeDirectoryHead(parentLevel, parentSlot, params)].load();
     if (parentIndex == EMPTY || parentIndex == TOMBSTONE) return;
-    Entry parent = entries[parentIndex];
+    Descriptor parent = descriptors[parentIndex];
     if (((uint(parent.key.w) >> 12u) & 3u) != parentLevel) return;
 
     uint childLevel = parentLevel - 1u;
@@ -972,8 +968,7 @@ void prefix(uint3 thread : SV_DispatchThreadID) {
     uint level = params.frame.y;
     uint index = heads[probeDirectoryHead(level, thread.x, params)].load();
     if (index == EMPTY || index == TOMBSTONE) return;
-    Entry probe = entries[index];
-    int4 key = probe.key;
+    int4 key = descriptors[index].key;
     level = (uint(key.w) >> 12u) & 3u;
     if (level != params.frame.y) return;
     uint rayCount = heads[probeCountHead(level, thread.x, params)].load();
@@ -988,7 +983,7 @@ void prefix(uint3 thread : SV_DispatchThreadID) {
         uint lodBits = uint(key.w) & PROBE_LOD;
         uint parentIndex = findProbeNode(int4(parent,
             int(((level + 1u) << 12u) | lodBits)));
-        if (parentIndex != EMPTY) offset = entries[parentIndex].valid;
+        if (parentIndex != EMPTY) offset = descriptors[parentIndex].valid;
         int3 local = key.xyz - parent * 2;
         uint ordinal = uint(local.x + local.y * 2 + local.z * 4);
         [loop] for (uint sibling = 0u; sibling < ordinal; ++sibling) {
@@ -1001,7 +996,7 @@ void prefix(uint3 thread : SV_DispatchThreadID) {
                 offset += heads[probeCountHead(level, childSlot, params)].load();
         }
     }
-    entries[index].valid = offset;
+    descriptors[index].valid = offset;
 }
 
 [shader("compute")]
@@ -1014,9 +1009,9 @@ void generateDirections(uint3 thread : SV_DispatchThreadID) {
     bool selected = false;
     [unroll] for (uint variant = 0u; variant < 2u; ++variant) {
         uint index = probeDescriptorIndex(sample, variant, 0u);
-        if (entries[index].padding.x == 0u || entries[index].next == EMPTY) continue;
-        uint canonical = entries[index].next;
-        entries[index].lastSample += entries[canonical].valid;
+        if (descriptorTraced(index) == 0u || descriptors[index].next == EMPTY) continue;
+        uint canonical = descriptors[index].next;
+        descriptors[index].lastSample += descriptors[canonical].valid;
         selected = true;
     }
     if (selected) {
@@ -1200,8 +1195,8 @@ void traceTransport(uint3 thread, bool deferred, uint ticket) {
     uint sample = pixel.x + pixel.y * params.size.x;
     uint firstLow = probeDescriptorIndex(sample, 0u, 0u);
     uint firstHigh = probeDescriptorIndex(sample, 1u, 0u);
-    bool lowSelected = entries[firstLow].padding.x != 0u && entries[firstLow].next != EMPTY;
-    bool highSelected = entries[firstHigh].padding.x != 0u && entries[firstHigh].next != EMPTY;
+    bool lowSelected = descriptorTraced(firstLow) != 0u && descriptors[firstLow].next != EMPTY;
+    bool highSelected = descriptorTraced(firstHigh) != 0u && descriptors[firstHigh].next != EMPTY;
     if (!lowSelected && !highSelected) return;
     float3 surfacePosition, geometricNormal;
     if (!splitSampleSurface(pixel, surfacePosition, geometricNormal)) return;
@@ -1212,8 +1207,8 @@ void traceTransport(uint3 thread, bool deferred, uint ticket) {
     [loop] for (uint variant = 0u; variant < 2u; ++variant) {
         if (variant == 0u ? !lowSelected : !highSelected) continue;
         uint first = variant == 0u ? firstLow : firstHigh;
-        uint lod = (uint(entries[first].key.w) & PROBE_LOD) >> 18u;
-        uint sequence = entries[first].lastSample;
+        uint lod = (uint(descriptors[first].key.w) & PROBE_LOD) >> 18u;
+        uint sequence = descriptors[first].lastSample;
         float2 uv = frac(0.5 + r2(sequence + 1u) + jitter);
         float3 direction = decodeDirection(uv);
         if (dot(direction, geometricNormal) < 0.0) direction = -direction;
@@ -1390,7 +1385,7 @@ void traceRecord(uint3 thread : SV_DispatchThreadID) {
         // passes issue the same visibility queries.
         uint2 pixel = ticketPixel(ticket);
         uint first = probeDescriptorIndex(pixel.x + pixel.y * params.size.x, variant, 0u);
-        surfaceFarDistance = surfaceCacheDistance((uint(entries[first].key.w) & PROBE_LOD) >> 18u);
+        surfaceFarDistance = surfaceCacheDistance((uint(descriptors[first].key.w) & PROBE_LOD) >> 18u);
         bool recordedSupported;
         DependencyContext recordedDependency = dependencyEmpty();
         outgoingTransportRadianceTracked(rayOrigin, direction, hit, recordedSupported,
@@ -1458,7 +1453,7 @@ void traceResolve(uint3 thread : SV_DispatchThreadID) {
                               rayDependency)) continue;
         uint word = deferredSlotHead(slot, params);
         uint first = probeDescriptorIndex(sample, variant, 0u);
-        uint lod = (uint(entries[first].key.w) & PROBE_LOD) >> 18u;
+        uint lod = (uint(descriptors[first].key.w) & PROBE_LOD) >> 18u;
         visibilityMode = VISIBILITY_REPLAY;
         visibilitySlot = slot;
         visibilityQueries = 0u;
@@ -1867,10 +1862,10 @@ void seedProbes(uint3 thread : SV_DispatchThreadID) {
     if (index >= currentCapacity()) return;
     // Include every initialized visible descriptor, including candidates with
     // zero prefix offsets; retained cache entries are read while packing radiance.
-    bool initialized = entries[index].padding.y != 0u;
-    bool traced = entries[index].valid == (params.frame.x | 0x80000000u);
-    if (!initialized && !traced) return;
-    int4 entryKey = entries[index].key;
+    // A traced descriptor's slot in `entries` holds its deposit, but the
+    // descriptor itself stays seeded.
+    if ((descriptors[index].flags & DESCRIPTOR_SEEDED) == 0u) return;
+    int4 entryKey = descriptors[index].key;
     if (((uint(entryKey.w) >> 12u) & 3u) != 0u) return;
     int4 key = int4(entryKey.xyz, int(uint(entryKey.w) & PROBE_LOD));
     uint slot = probeDirectoryBucket(key, params);
@@ -1885,7 +1880,7 @@ void seedProbes(uint3 thread : SV_DispatchThreadID) {
             candidate = observed;
         }
         if (candidate != TOMBSTONE && candidate < currentCapacity()) {
-            int4 otherKey = entries[candidate].key;
+            int4 otherKey = descriptors[candidate].key;
             if (all(otherKey.xyz == key.xyz)
                 && (uint(otherKey.w) & PROBE_LOD) == uint(key.w)) return;
         }
@@ -1913,7 +1908,7 @@ void packProbes(uint3 groupId : SV_GroupID, uint lane : SV_GroupIndex) {
         bool active = ordinal < currentCapacity() / CASCADES;
         if (active) {
             uint index = ordinal * CASCADES;
-            key = entries[index].key;
+            key = descriptors[index].key;
             slot = findProbeNodeSlot(key);
             active = slot != EMPTY
                 && heads[probeDirectoryHead(0u, slot, params)].load() == index;
@@ -2118,13 +2113,20 @@ void remapProbeHeads(uint3 thread : SV_DispatchThreadID) {
     uint head = probeDirectoryHead(0u, slot, params);
     uint source = heads[head].load();
     if (source != EMPTY) {
-        uint encoded = entries[source].padding.x;
+        // Commit remapped the slot only if it holds an entry that survived
+        // reduce this frame. Any other slot (most of them: an untraced
+        // representative or a merged-away duplicate) maps to history slot 0, as
+        // it always has, so last frame's probe goes unfound. Searching for it
+        // instead (EMPTY here) gives the probes' multi-bounce its full reach, but
+        // measured worse on Sponza: 0.236 to 0.246 error at 1.07x the light.
+        uint encoded = entries[source].valid == (params.frame.x | 0x80000000u)
+            ? entries[source].padding.x : 0u;
         uint mapped = encoded == EMPTY ? EMPTY : encoded & 0x7fffffffu;
         if (mapped == EMPTY) {
             // Commit can evict the directory representative while retaining
             // sibling directions. Main heads now address previousEntries, not
             // the working entries array; preserve the packed probe's slot.
-            Entry representative = entries[source];
+            Descriptor representative = descriptors[source];
             uint mode = uint(representative.key.w) & PROBE_LOD;
             uint quota = cacheHistoryQuota(params);
             [loop] for (uint direction = 0u; direction < 32u && mapped == EMPTY; ++direction) {
@@ -2132,12 +2134,11 @@ void remapProbeHeads(uint3 thread : SV_DispatchThreadID) {
                 uint bucket = transportCacheBucket(key, params.size.w);
                 uint committed = heads[bucket].load();
                 [loop] for (uint count = 0u; count < quota && committed != EMPTY; ++count) {
-                    Entry candidate = previousEntries[committed];
-                    if (all(candidate.key == key)) {
+                    if (all(previousEntries[committed].key == key)) {
                         mapped = committed;
                         break;
                     }
-                    committed = candidate.next;
+                    committed = previousEntries[committed].next;
                 }
             }
         }

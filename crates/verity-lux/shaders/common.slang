@@ -115,6 +115,17 @@ struct Light { float4 position, color, direction, edge1, edge2; uint4 source; };
 // Full keys are compared, so hash collisions never blend unrelated probes.
 // The emissive source has no fields: Verity's materials do not emit, so it is
 // never active, and entries carry only what the passes move.
+// One per screen sample, variant and level: the cell a visible surface seeds,
+// before transport. Kept apart from the 240-byte entries so the passes that
+// rank and allocate them touch one 32-byte record each, not a cache line or two.
+struct Descriptor {
+    int4 key;
+    uint valid;      // seeded; prefix then stores the probe's first ray offset
+    uint next;       // the cell's canonical descriptor, after rank
+    uint lastSample; // the sample's ordinal within its probe, then its sequence
+    uint flags;      // bits 0-7: selected for a ray (1, or 2 while cold admission decides); bit 8: seeded
+};
+
 struct Entry {
     int4 key;
     float4 interval; // J.rgb, beta (paper Eq. 6)

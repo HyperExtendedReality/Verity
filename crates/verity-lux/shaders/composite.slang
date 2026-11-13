@@ -9,7 +9,7 @@
 [[vk::binding(7, 0)]] Texture2D<uint4> rasterReceiver;
 [[vk::binding(8, 0)]] Texture2D<float> screenSpaceOcclusion;
 [[vk::binding(9, 0)]] StructuredBuffer<uint> probeHeads;
-[[vk::binding(10, 0)]] StructuredBuffer<Entry> probeEntries;
+[[vk::binding(10, 0)]] StructuredBuffer<Descriptor> probeDescriptors;
 [[vk::binding(11, 0)]] StructuredBuffer<DirectionalProbe> directionalProbes;
 [[vk::binding(12, 0)]] Texture2D<float4> anchorPosition;
 [[vk::binding(13, 0)]] Texture2D<float4> anchorNormal;
@@ -29,13 +29,13 @@ uint findIrradianceProbe(int4 key, bool previous) {
     uint capacity = probeDirectoryCapacity(params);
     uint slot = probeDirectoryBucket(key, params);
     uint count, stride;
-    probeEntries.GetDimensions(count, stride);
+    probeDescriptors.GetDimensions(count, stride);
     [loop] for (uint attempt = 0u; attempt < capacity; ++attempt) {
         uint index = probeHeads[probeDirectoryHead(0u, slot, params)];
         if (index == EMPTY) return EMPTY;
         if (index != TOMBSTONE) {
             if (index >= count) return EMPTY;
-            int4 candidate = probeEntries[index].key;
+            int4 candidate = probeDescriptors[index].key;
             if (all(candidate.xyz == key.xyz)
                 && (uint(candidate.w) & PROBE_LOD) == (uint(key.w) & PROBE_LOD))
                 return slot;

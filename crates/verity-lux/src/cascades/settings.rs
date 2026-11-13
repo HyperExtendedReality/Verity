@@ -8,6 +8,8 @@ use bytemuck::{Pod, Zeroable};
 pub const LEVELS: usize = 4;
 /// Bytes per interval cache entry.
 pub const ENTRY_SIZE: u64 = 240;
+/// Bytes per descriptor (`Descriptor` in common.slang).
+pub const DESCRIPTOR_SIZE: u64 = 32;
 /// Bytes per directional irradiance probe record.
 pub const PROBE_SIZE: u64 = 1792;
 pub const CACHE_WORK_GROUPS: u64 = 2;
@@ -218,7 +220,7 @@ pub struct Parameters {
     /// Elements in the geometry and scene words.
     pub word_lengths: [u32; 4],
     /// `CASCADE_POINTERS` in cascades.slang, in order.
-    pub buffers: [u64; 19],
+    pub buffers: [u64; 20],
 }
 
 pub fn probe_directory_capacity(samples: u64) -> u64 {
@@ -285,6 +287,11 @@ pub fn resolve_size(viewport: [u32; 2], settings: &Settings) -> [u32; 2] {
 
 pub fn cache_work_slots(samples: u64) -> u64 {
     samples * LEVELS as u64 * CACHE_WORK_GROUPS
+}
+
+/// One descriptor per working slot that seed fills: sample, variant, level.
+pub fn descriptor_bytes(samples: u64) -> u64 {
+    cache_work_slots(samples) * DESCRIPTOR_SIZE
 }
 
 pub fn cache_entry_bytes(samples: u64, buckets: u64) -> u64 {
@@ -415,7 +422,7 @@ mod tests {
     #[test]
     fn parameters_match_the_shader_block() {
         // 4 matrices, 31 vec4s and 19 pointers, no padding.
-        assert_eq!(std::mem::size_of::<Parameters>(), 4 * 64 + 32 * 16 + 19 * 8);
+        assert_eq!(std::mem::size_of::<Parameters>(), 4 * 64 + 32 * 16 + 20 * 8);
     }
 
     #[test]

@@ -342,6 +342,36 @@ the cheaper `seed`. Courtyard rows are the range of two or three runs.
   `prefix` instead of the 240-byte entry. No change; the compiler already
   splits the load.
 
+### Descriptors of their own
+
+Each screen sample seeds eight descriptors, one per level and LOD variant:
+the cells its surface falls in, which `rank`, `parents`, `prefix` and
+`generateDirections` dedupe and give rays. They lived in the first slots of the
+240-byte entry pool, where the trace later writes its deposits, so every touch
+of one cost a cache line or two. They now have a 32-byte `Descriptor` buffer of
+their own (`gi descriptors`, 32 bytes × 8 per sample, 15 MB at the budgeted
+grid on 1280×720). A deposit's key names the same cell as its descriptor's, so
+every probe-directory lookup reads the descriptors.
+
+Same protocol as above, against the commit before:
+
+| View | GPU time | Error |
+| --- | --- | --- |
+| Sponza courtyard | 4.14 → 3.49–3.63 ms | 0.235–0.236 → 0.234–0.238 |
+| Sponza corridor | 3.13 → 2.54 ms | 0.383–0.386 → 0.386 |
+| Bistro street | 6.10 → 5.35 ms | 0.212 → 0.214 |
+
+`rank` went from 0.35 to 0.06 ms, `seed` from 0.38 to 0.18, and
+`generateDirections` and `seedProbes` halved.
+
+`remapProbeHeads` maps a probe whose representative slot commit did not keep
+(most of them, on most frames) to history slot 0, so the next frame's
+`bounceFeedback` misses it. Searching for it instead lets multi-bounce through
+the probes reach everywhere it should, but measured worse in the courtyard:
+0.245–0.247 error at 1.07× the light. More bounce lands where the image is
+already too bright, so the bias lies upstream, and the old mapping stays until
+that is found.
+
 ## Screen and voxel GI
 
 A ray follows the depth buffer and takes its light from last frame's image. Past

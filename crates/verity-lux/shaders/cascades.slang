@@ -7,7 +7,8 @@
     RtgiReservoir* rtgiPreviousReservoirsBuffer; Atomic<uint>* rtgiCacheWordsBuffer; \
     RtgiCacheCell* rtgiCacheCellsBuffer; float4* rtgiFieldBuffer; \
     uint2* blueNoiseRanksBuffer; uint4* surfaceTrianglesBuffer; \
-    uint4* surfaceIslandsBuffer; uint4* surfaceTexelsBuffer; uint4* surfaceRadianceBuffer;
+    uint4* surfaceIslandsBuffer; uint4* surfaceTexelsBuffer; uint4* surfaceRadianceBuffer; \
+    Descriptor* descriptorsBuffer;
 #include "common.slang"
 // The renderer's frame set (materials, textures, DFG table) is bound at set 1.
 #define MATERIAL_SET 1
@@ -36,6 +37,7 @@
 #define surfaceIslands params.surfaceIslandsBuffer
 #define surfaceTexels params.surfaceTexelsBuffer
 #define surfaceRadiance params.surfaceRadianceBuffer
+#define descriptors params.descriptorsBuffer
 [[vk::binding(4, 0)]] DepthTexture2D depthTexture;
 [[vk::binding(10, 0)]] [format("rgba32f")] WTexture2D<float4> irradiance;
 [[vk::binding(11, 0)]] Texture2D<float4> previousIrradiance;

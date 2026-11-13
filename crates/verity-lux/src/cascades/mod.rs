@@ -225,6 +225,7 @@ struct View {
     buckets: u32,
     heads: [Buffer; 2],
     entries: Buffer,
+    descriptors: Buffer,
     history: Buffer,
     probes: Buffer,
     merge_list: Buffer,
@@ -707,6 +708,12 @@ impl SplitRadianceCascades {
             storage,
             MemoryLocation::GpuOnly,
         )?;
+        let descriptors = buffer(
+            "gi descriptors",
+            descriptor_bytes(samples),
+            storage,
+            MemoryLocation::GpuOnly,
+        )?;
         let history = buffer(
             "gi history",
             cache_history_bytes(buckets),
@@ -847,6 +854,7 @@ impl SplitRadianceCascades {
             buckets: buckets as u32,
             heads,
             entries,
+            descriptors,
             history,
             probes,
             merge_list,
@@ -1002,7 +1010,7 @@ impl SplitRadianceCascades {
                 (7, Res::View(targets.receiver, general)),
                 (8, placeholder),
                 (9, Res::Buffer(view.heads[p].buffer)),
-                (10, Res::Buffer(view.entries.buffer)),
+                (10, Res::Buffer(view.descriptors.buffer)),
                 (11, Res::Buffer(view.probes.buffer)),
                 (12, image(&view.anchors[0])),
                 (13, image(&view.anchors[1])),
@@ -1032,7 +1040,7 @@ impl SplitRadianceCascades {
         let buffers = view
             .heads
             .into_iter()
-            .chain([view.entries, view.history, view.probes, view.merge_list])
+            .chain([view.entries, view.descriptors, view.history, view.probes, view.merge_list])
             .chain(view.rtgi)
             .chain(view.lights)
             .chain(view.uniforms.into_iter().flatten());
@@ -1229,6 +1237,7 @@ impl SplitRadianceCascades {
                 &self.surface[1],
                 &self.surface[2],
                 &self.surface[3],
+                &view.descriptors,
             ]
             .map(|buffer| buffer.address),
             ..Parameters::default()
@@ -1304,7 +1313,7 @@ impl SplitRadianceCascades {
             for buffer in view
                 .heads
                 .iter()
-                .chain([&view.entries, &view.history, &view.probes, &view.merge_list])
+                .chain([&view.entries, &view.descriptors, &view.history, &view.probes, &view.merge_list])
                 .chain(&view.rtgi)
             {
                 device.cmd_fill_buffer(cmd, buffer.buffer, 0, vk::WHOLE_SIZE, 0);
