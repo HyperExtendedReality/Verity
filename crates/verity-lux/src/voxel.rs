@@ -114,10 +114,11 @@ pub struct ScreenVoxelSettings {
 }
 
 impl ScreenVoxelSettings {
-    /// The usual settings, as residual GI.
+    /// The usual settings, as residual GI, which loses nothing to two rays a texel.
     pub fn residual() -> Self {
         Self {
             residual: true,
+            rays_per_texel: 2,
             ..Self::default()
         }
     }
@@ -375,7 +376,7 @@ impl ScreenVoxel {
         for (buffer, name, size) in [
             (&mut self.cells, "voxel cells", cells),
             (&mut self.voxels, "voxels", pool * 16),
-            (&mut self.radiance, "voxel radiance", pool * 64),
+            (&mut self.radiance, "voxel radiance", pool * 96),
             (&mut self.build, "voxel build", pool * 16),
             (&mut self.free, "free voxels", (pool + 1) * 4),
             (&mut self.large, "voxel large triangles", (MAX_LARGE + 1) * 16),

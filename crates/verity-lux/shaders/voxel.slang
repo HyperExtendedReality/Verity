@@ -33,7 +33,8 @@ static const float COVER_ONE = 4096.0;
 // terrain ground as `pack_ground` in pxtgi.rs packs it.
 [[vk::binding(5, 0)]] RWStructuredBuffer<uint4> voxels;
 // Per voxel, for the side its normal faces and then the other: the light leaving
-// that side and the mean bounce light arriving (w frames).
+// that side, the mean bounce light arriving (w frames), and the mean of that
+// light's luminance times the way it came from (`voxelArriving` tilts by it).
 [[vk::binding(6, 0)]] RWStructuredBuffer<float4> radiance;
 // Each level's low cell, then each job's cells to voxelize: low corner and
 // level, high corner (exclusive) and cell count.
@@ -132,7 +133,7 @@ uint walk(float3 o, float3 d, float reach) {
 float3 voxelSeen(uint found, float3 d) {
     uint index = found - 1u;
     uint side = dot(voxelNormal(voxels[index].z), d) > 0.0 ? 1u : 0u;
-    return radiance[index * 4u + side * 2u].rgb;
+    return radiance[index * 6u + side * 3u].rgb;
 }
 
 // Irradiance / pi from the sun and, while they are few, the point lights,
@@ -201,7 +202,7 @@ void inject(uint3 id : SV_DispatchThreadID) {
     uint side = (frame >> 2u) & 1u;
     float3 n = voxelNormal(voxel.z) * (side == 0u ? 1.0 : -1.0);
     float3 o = x + n * (1.5 * cell);
-    uint slot = index * 4u + side * 2u;
+    uint slot = index * 6u + side * 3u;
 
     uint seed = hashU(index ^ hashU(frame));
     float u = float(seed >> 8u) / 16777216.0;
@@ -211,6 +212,7 @@ void inject(uint3 id : SV_DispatchThreadID) {
     float3 seen = found != 0u ? voxelSeen(found, dir) : background(dir);
     uint lightSeed = hashU(seed ^ 0x68bc21ebu);
     float3 sampled = voxelSampled(x, n, o, lightSeed);
+    float3 came = luminance(seen) * dir;
     seen += sampled;
 
     // The last 64 visits; a few while the lights change.
@@ -224,6 +226,8 @@ void inject(uint3 id : SV_DispatchThreadID) {
     // renderer already lit that surface directly.
     float direct = lerp(radiance[slot].w, luminance(sampled), 1.0 / frames);
     radiance[slot] = float4(leaving, isnan(direct) ? 0.0 : direct);
+    float3 way = lerp(radiance[slot + 2u].xyz, came, 1.0 / frames);
+    radiance[slot + 2u] = float4(any(isnan(way)) ? float3(0.0) : way, 0.0);
 }
 
 // ---------------------------------------------------------------- voxelizing
@@ -564,7 +568,7 @@ void finalize(uint3 id : SV_DispatchThreadID) {
     }
     float3 sum = float3(build[voxel * 4u + 1u], build[voxel * 4u + 2u], build[voxel * 4u + 3u]);
     if (length(sum) > 0.1 * 127.0) voxels[voxel].z = packNormal(normalize(sum));
-    for (uint i = 0u; i < 4u; i++) radiance[voxel * 4u + i] = 0.0;
+    for (uint i = 0u; i < 6u; i++) radiance[voxel * 6u + i] = 0.0;
 }
 
 // ---------------------------------------------------------------- screen
@@ -594,13 +598,22 @@ bool voxelArriving(float3 p, float3 n, out float3 arriving) {
         float3 vn = voxelNormal(voxels[index].z);
         float facing = dot(vn, n);
         uint side = facing >= 0.0 ? 0u : 1u;
-        float4 a = radiance[index * 4u + side * 2u + 1u];
+        uint slot = index * 6u + side * 3u;
+        float4 a = radiance[slot + 1u];
         if (a.w < 1.0) continue;
         float3 w3 = lerp(1.0 - t, t, float3(o));
         float w = w3.x * w3.y * w3.z * abs(facing);
         if (w <= 0.0) continue;
-        float direct = radiance[index * 4u + side * 2u].w;
-        sum += float4(a.rgb * saturate(1.0 - direct / max(luminance(a.rgb), 1e-4)) * w, w);
+        float3 bounce = a.rgb * saturate(1.0 - radiance[slot].w / max(luminance(a.rgb), 1e-4));
+        // Tilted from the voxel's normal to the pixel's. Radiance linear in
+        // direction (a + b.w), sampled cosine-weighted about the side's normal
+        // s, gives irradiance / pi at n of the mean plus 2/3 b.(n - s), and the
+        // light's mean way across s is b/4 of it: 8/3 of that way, along n.
+        float3 s = side == 0u ? vn : -vn;
+        float3 way = radiance[slot + 2u].xyz;
+        float3 across = way - s * dot(way, s);
+        float tilt = clamp(1.0 + 8.0 / 3.0 * dot(across, n) / max(luminance(bounce), 1e-4), 0.0, 3.0);
+        sum += float4(bounce * tilt * w, w);
     }
     if (sum.w < 1e-3) return false;
     arriving = sum.rgb / sum.w;

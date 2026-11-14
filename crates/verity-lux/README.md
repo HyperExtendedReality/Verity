@@ -494,21 +494,28 @@ jitter swamped flicker, so it is left out.
 | View | Method | Trace pass | Mean bounced light | Error |
 | --- | --- | --- | --- | --- |
 | Corridor | Screen and voxel | 0.46 ms | 0.64× | 0.47 |
-| Corridor | Residual | 0.42 ms | 0.65× | 0.53 |
-| Corridor | Residual, 2 rays | 0.21 ms | 0.64× | 0.54 |
+| Corridor | Residual, 4 rays | 0.43 ms | 0.65× | 0.52 |
+| Corridor | Residual, 2 rays (default) | 0.22 ms | 0.68× | 0.51 |
 | Courtyard | Screen and voxel | 0.68 ms | 1.05× | 0.44 |
-| Courtyard | Residual | 0.49 ms | 1.01× | 0.46 |
-| Courtyard | Residual, 2 rays | 0.31 ms | 1.05× | 0.47 |
+| Courtyard | Residual, 4 rays | 0.49 ms | 0.99× | 0.45 |
+| Courtyard | Residual, 2 rays (default) | 0.32 ms | 1.02× | 0.45 |
 
 The baseline blends the eight voxels around the surface as a texture is
-filtered, each by how nearly it faces the same way. Read from the one voxel
-holding the surface it scored 0.57 and 0.48.
+filtered, each by how nearly it faces the same way. Each voxel side also keeps
+the mean way its bounce light came from, luminance-weighted, and the baseline
+tilts toward the pixel's own normal (normal maps included) by a first-order
+fit of that light. Read from the one voxel holding the surface it scored 0.57
+and 0.48; blended, 0.53 and 0.46; tilted, the rows above, the brightest bounce
+gaining most. The direction costs 32 MB more for the million-voxel pool.
 
-It is cheaper, and halving its rays costs it little, but still less accurate,
-and the screen rays are not why: with them off (`--no-screen`) the corridor
-measured 0.53, the baseline alone. A voxel's settled light is gathered from
-1.5 cells off its surface, and lags 64 frames, where the voxel method walks
-voxels from each pixel every frame. `sponza_gi --residual` runs it.
+Two rays a texel are as good as four, so `ScreenVoxelSettings::residual` uses
+two: at half the trace pass of screen and voxel GI it is within 0.01 of its
+error in the courtyard and 0.04 in the corridor. The gap that is left is detail
+between pixels: block by block the baseline correlates 0.76 with the
+reference where per-pixel voxel walks reach 0.84. A voxel's settled light is
+one estimate a cell, gathered 1.5 cells off its surface over 64 frames. Both
+methods leave the brightest bounce about 40% short. `sponza_gi --residual`
+runs it (`--rays=N` sets its rays).
 
 ## PXTGI
 
