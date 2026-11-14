@@ -48,12 +48,12 @@ def ktx_tool():
     return found
 
 
-def optimize(source_name, name):
+def optimize(source_name, name, source=SOURCE):
     """Run gltfpack into an intermediate .gltf + .bin, keeping texture paths (-tr)."""
     gltfpack = shutil.which("gltfpack") or sys.exit("gltfpack not found on PATH (npm install -g gltfpack)")
     target = OUTPUT / ".mesh" / Path(name).with_suffix(".gltf")
     target.parent.mkdir(parents=True, exist_ok=True)
-    subprocess.run([gltfpack, "-i", str(SOURCE / source_name), "-o", str(target), "-noq", "-tr"], check=True)
+    subprocess.run([gltfpack, "-i", str(source / source_name), "-o", str(target), "-noq", "-tr"], check=True)
     return target
 
 
@@ -107,8 +107,9 @@ def pack(gltf, binary):
     ])
 
 
-def convert_scene(ktx, name, source_name):
-    optimized = optimize(source_name, name)
+def convert_scene(ktx, name, source_name, source=SOURCE, textures="textures", scale=None):
+    """`source` holds the glTF and the images it names; textures go to OUTPUT/<textures>."""
+    optimized = optimize(source_name, name, source)
     gltf = json.loads(optimized.read_text(encoding="utf-8"))
     if len(gltf["buffers"]) != 1:
         sys.exit(f"{source_name}: expected one buffer")
@@ -125,11 +126,11 @@ def convert_scene(ktx, name, source_name):
         if index not in roles:
             continue
         # -tr keeps URIs as written in the source scene, so they resolve from SOURCE.
-        png = SOURCE / unquote(image["uri"])
-        target = OUTPUT / "textures" / (png.stem + ".ktx2")
+        png = source / unquote(image["uri"])
+        target = OUTPUT / textures / (png.stem + ".ktx2")
         print(f"  {'encode' if encode(ktx, png, target, roles[index]) else 'keep  '} {target.name} ({roles[index]})", flush=True)
         remap[index] = len(images)
-        images.append({"uri": f"textures/{target.name}", "mimeType": "image/ktx2"})
+        images.append({"uri": f"{textures}/{target.name}", "mimeType": "image/ktx2"})
     gltf["images"] = images
     textures = []
     texture_remap = {}
@@ -154,6 +155,9 @@ def convert_scene(ktx, name, source_name):
     for key in ("extensionsUsed", "extensionsRequired"):
         gltf[key] = sorted(set(gltf.get(key, [])) | {"KHR_texture_basisu"})
 
+    if scale:  # a uniform root scale (Blender's FBX import leaves the FBX models 1e-4 too small)
+        gltf["nodes"].append({"name": "scale", "scale": [scale] * 3, "children": gltf["scenes"][0]["nodes"]})
+        gltf["scenes"][0]["nodes"] = [len(gltf["nodes"]) - 1]
     target = OUTPUT / name
     partial = target.with_suffix(".glb.partial")
     partial.write_bytes(pack(gltf, binary))

@@ -1,13 +1,17 @@
 // Physically based sky and volumetric clouds, drawn behind the scene.
 //
-// - Shape: Schneider's Nubis model (SIGGRAPH 2015/2017): tileable Perlin-Worley
-//   base noise eroded by Worley detail, a height profile per cloud genus and a
-//   coverage remap.
+// - Shape: Schneider's Nubis model: a low-resolution "dimensional profile"
+//   (tileable Perlin-Worley, a height profile per cloud genus and a coverage
+//   remap, SIGGRAPH 2015/2017) up-rezzed by eroding it with wispy and billowy
+//   alligator noise and sharpening the result (Nubis Evolved 2022, Nubis³ 2023).
 // - Lighting: Hillaire's energy-conserving integration (SIGGRAPH 2016) with
 //   Wrenninge's multiple-scattering octaves, and the Jendersie & d'Eon (2023)
 //   HG + Draine fit to Mie scattering by water droplets as the phase function.
+//   Sunlight takes a few detailed samples near each point and reads the summed
+//   density beyond from a precomputed grid (Nubis³ voxel lighting).
 // - Cost: traced at half resolution with a per-frame interleaved-gradient
-//   jitter, then reprojected through the cloud's depth and accumulated.
+//   jitter and steps that lengthen with distance, then reprojected through the
+//   cloud's depth and accumulated.
 // - Sky: single-scattering Rayleigh + Mie atmosphere over a spherical planet.
 
 #include "lib/common.slang"
@@ -25,6 +29,10 @@ static const float DETAIL_SCALE = 1.0 / 1000.0;
 static const float WEATHER_SCALE = 1.0 / 60000.0;
 static const float SUN_RADIUS = 0.0047;
 static const float CIRRUS_ALTITUDE = 9000.0;
+/// Spreads the alligator noise, which sits near 0.15, over 0..1.
+static const float ALLIGATOR_GAIN = 2.5;
+/// Farthest the light grid sums density toward the sun.
+static const float LIGHT_REACH = 16.0e3;
 
 struct Params {
     /// Layer bottom, top (metres above ground), coverage, extinction per metre.
@@ -47,6 +55,8 @@ struct Params {
 [[vk::binding(6, 1)]] Texture2D<float4> history;
 [[vk::binding(7, 1)]] [[vk::image_format("rgba16f")]] RWTexture2D<float4> current;
 [[vk::binding(8, 1)]] [[vk::image_format("r32f")]] RWTexture2D<float> shadow_out;
+[[vk::binding(9, 1)]] [[vk::image_format("rgba16f")]] RWTexture3D<float4> light_out;
+[[vk::binding(10, 1)]] Texture3D<float4> light_grid;
 
 float remap(float v, float a, float b, float c, float d) {
     return c + (v - a) / (b - a) * (d - c);
@@ -128,6 +138,40 @@ void shapeMain(uint3 id: SV_DispatchThreadID) {
     shape_out[id] = float4(perlin_worley, w, worley_fbm(p, 8), worley_fbm(p, 16));
 }
 
+/// SideFX's alligator noise, tiling every `period` cells: the gap between the
+/// two strongest of the bumps around a point, which creases like cloud billows
+/// where inverted Worley packs spheres.
+float alligator(float3 p, int period) {
+    p *= period;
+    int3 cell = int3(floor(p));
+    float3 f = frac(p);
+    float first = 0.0, second = 0.0;
+    for (int z = -1; z <= 1; ++z)
+        for (int y = -1; y <= 1; ++y)
+            for (int x = -1; x <= 1; ++x) {
+                int3 o = int3(x, y, z);
+                float3 r = hash3(cell + o, period);
+                float bump = frac(dot(r, float3(127.1, 311.7, 74.7)))
+                           * smoothstep(0.0, 1.0, 1.0 - length(float3(o) + r - f));
+                if (bump > first) {
+                    second = first;
+                    first = bump;
+                } else {
+                    second = max(second, bump);
+                }
+            }
+    return first - second;
+}
+
+float alligator_fbm(float3 p, int period) {
+    float sum = alligator(p, period) * 0.625 + alligator(p, period * 2) * 0.25 + alligator(p, period * 4) * 0.125;
+    return saturate(sum * ALLIGATOR_GAIN);
+}
+
+/// Erosion for the up-rez, as in Nubis³. RG: low and high frequency curled
+/// alligator noise, which eats the bumps and leaves wisps between them; BA:
+/// low and high frequency inverted alligator noise, which eats the creases
+/// and leaves billows.
 [shader("compute")]
 [numthreads(4, 4, 4)]
 void detailMain(uint3 id: SV_DispatchThreadID) {
@@ -135,7 +179,10 @@ void detailMain(uint3 id: SV_DispatchThreadID) {
     uint unused;
     detail_out.GetDimensions(size, unused, unused);
     float3 p = (float3(id) + 0.5) / float(size);
-    detail_out[id] = float4(worley_fbm(p, 2), worley_fbm(p, 4), worley_fbm(p, 8), 1.0);
+    // shortcut: a Perlin warp stands in for curl noise, so wisps stretch as well as curl; swap in a curl field if they read as smeared.
+    float3 curled = p + 0.2 * float3(perlin(p, 4), perlin(p + 0.37, 4), perlin(p + 0.71, 4));
+    detail_out[id] = float4(alligator_fbm(curled, 3), alligator_fbm(curled, 6),
+                            1.0 - alligator_fbm(p, 3), 1.0 - alligator_fbm(p, 6));
 }
 
 // ---- Atmosphere ---------------------------------------------------------
@@ -240,8 +287,17 @@ float height_profile(float h, float genus) {
     return smoothstep(g.x, g.y, h) * (1.0 - smoothstep(g.z, g.w, h));
 }
 
-/// Cloud density (0..1) at world position `p`, `h` up through the layer.
-float cloud_density(float3 p, float h, bool detail) {
+/// Where the noise is read for world position `p`: blown along by the wind,
+/// which shears tops downwind as convective clouds lean.
+float3 noise_position(float3 p, float h) {
+    return p + float3(params.shape.yz, 0.0) * (1.0 + h * 0.2);
+}
+
+/// The low-resolution shape of the clouds (Nubis' dimensional profile, 0..1)
+/// at world position `p`, `h` up through the layer. `type` runs from wispy
+/// (0) to billowy (1).
+float cloud_profile(float3 p, float h, out float type) {
+    type = 0.0;
     if (h <= 0.0 || h >= 1.0)
         return 0.0;
     float3 wind = float3(params.shape.yz, 0.0);
@@ -261,21 +317,45 @@ float cloud_density(float3 p, float h, bool detail) {
     // place, flatter decks or scattered puffs in another.
     float variety = shape_noise.SampleLevel(wrap_sampler, float3(weather_uv * 0.7 + 0.37, 0.55), 0).g;
     float genus = saturate(params.shape.x + (variety - 0.55) * 1.6);
-    // Wind shears tops downwind, as convective clouds lean.
-    float3 q = p + wind + float3(params.shape.yz, 0.0) * h * 0.2;
-    float4 n = shape_noise.SampleLevel(wrap_sampler, q * SHAPE_SCALE, 0);
+    // Stratus frays into wisps and cumulus billows, above a wispy base.
+    type = lerp(0.3, 1.0, genus) * saturate(h * 6.0);
+    float4 n = shape_noise.SampleLevel(wrap_sampler, noise_position(p, h) * SHAPE_SCALE, 0);
     float fbm = n.g * 0.625 + n.b * 0.25 + n.a * 0.125;
     float shape = saturate(remap(n.r, fbm - 1.0, 1.0, 0.0, 1.0));
     shape = saturate(remap(shape, 0.6, 0.9, 0.0, 1.0));
     float cloudiness = (shape * 0.6 + weather_n * 0.4) * height_profile(h, genus);
-    float base = saturate(remap(cloudiness, threshold, 1.0, 0.0, 1.0));
-    if (base <= 0.0 || !detail)
-        return base;
-    float3 d = detail_noise.SampleLevel(wrap_sampler, q * DETAIL_SCALE + float3(0.0, 0.0, h), 0).rgb;
-    float high = d.r * 0.625 + d.g * 0.25 + d.b * 0.125;
-    // Wispy bases, billowy tops.
-    high = lerp(high, 1.0 - high, saturate(h * 6.0));
-    return saturate(remap(base, high * 0.4, 1.0, 0.0, 1.0));
+    return saturate(remap(cloudiness, threshold, 1.0, 0.0, 1.0));
+}
+
+/// Nubis³ up-rez: cloud density (0..1) from a nonzero `profile`, eroded by
+/// detail noise and sharpened.
+float cloud_detail(float3 p, float h, float profile, float type) {
+    float4 n = detail_noise.SampleLevel(wrap_sampler, noise_position(p, h) * DETAIL_SCALE, 0);
+    // Finer noise deeper in; billows only dent the surface, wisps tear it.
+    float wispy = lerp(n.r, n.g, profile) * 0.7;
+    float billowy = lerp(n.b, n.a, pow(profile, 0.25)) * 0.45;
+    float erosion = lerp(wispy, billowy, type);
+    return pow(saturate(remap(profile, erosion, 1.0, 0.0, 1.0)), 0.6);
+}
+
+/// Cloud density (0..1) at world position `p`, `h` up through the layer.
+float cloud_density(float3 p, float h) {
+    float type;
+    float profile = cloud_profile(p, h, type);
+    return profile > 0.0 ? cloud_detail(p, h, profile, type) : 0.0;
+}
+
+/// Toward the sun, held off the horizon so paths through the layer stay finite.
+float3 raised_sun() {
+    float3 to_sun = -globals.sun_direction.xyz;
+    to_sun.z = max(to_sun.z, 0.08);
+    return normalize(to_sun);
+}
+
+/// Where the light grid holds world `xy` at layer height `h`: it spans twice
+/// the shadow map around the same center.
+float3 light_coord(float2 xy, float h) {
+    return float3((xy - params.region.xy) / (params.region.z * 2.0) + 0.25, h);
 }
 
 float layer_height(float3 relative) {
@@ -372,47 +452,73 @@ void traceMain(uint3 id: SV_DispatchThreadID) {
     float2 span = layer_span(origin, direction);
     if (span.y > span.x && span.x < MAX_MARCH) {
         float extinct = params.layer.w;
+        float thickness = params.layer.y - params.layer.x;
         float3 light = sun * sun_transmittance(mid_point, to_sun);
         float phases[4];
         for (int o = 0; o < 4; ++o)
             phases[o] = lerp(1.0 / (4.0 * PI), phase0, pow(0.5, o));
         float horizon = 1.0 - abs(direction.z);
         int steps = int(lerp(64.0, 128.0, horizon));
-        float dt = (span.y - span.x) / steps;
+        // Steps lengthen in proportion to distance (plus the layer's
+        // thickness, so they stop shrinking up close): far clouds need less.
+        float growth = pow((span.y + thickness) / (span.x + thickness), 1.0 / steps);
         // Interleaved gradient noise, rotated by the golden ratio every frame.
         float jitter = frac(52.9829189 * frac(dot(float2(id.xy), float2(0.06711056, 0.00583715)))
                             + float(params.frame.x % 64u) * 0.618034);
-        float light_step = (params.layer.y - params.layer.x) / 64.0;
+        float light_step = thickness / 64.0;
         float weighted_depth = 0.0, weight = 0.0;
         for (int i = 0; i < steps && transmittance > 0.01; ++i) {
-            float t = span.x + dt * (i + jitter);
+            float start = (span.x + thickness) * pow(growth, float(i));
+            float dt = start * (growth - 1.0);
+            float t = start - thickness + dt * jitter;
             float3 relative = origin + direction * t;
             float h = layer_height(relative);
-            float3 world = float3(eye.xy, 0.0) + direction * t;
-            float density = cloud_density(world, h, false);
+            float3 world = float3(eye.xy + direction.xy * t, params.layer.x + h * thickness);
+            float type;
+            float profile = cloud_profile(world, h, type);
+            if (profile <= 0.0)
+                continue;
+            float density = cloud_detail(world, h, profile, type);
             if (density <= 0.0)
                 continue;
-            density = cloud_density(world, h, true);
-            if (density <= 0.0)
-                continue;
-            // Optical depth toward the sun over six growing steps.
+            // Optical depth toward the sun: three detailed samples keep the
+            // surface crisp, and the light grid holds the density beyond them.
             float optical = 0.0, travelled = 0.0;
-            for (int j = 0; j < 6; ++j) {
+            for (int j = 0; j < 3; ++j) {
                 float stride = light_step * float(1 << j) * 0.5;
                 travelled += stride;
-                float3 lp = relative + to_sun * (travelled - 0.5 * stride);
-                float3 lw = world + to_sun * (travelled - 0.5 * stride);
-                optical += cloud_density(lw, layer_height(lp), j < 3) * stride;
+                float reach = travelled - 0.5 * stride;
+                optical += cloud_density(world + to_sun * reach, layer_height(relative + to_sun * reach)) * stride;
             }
+            float3 coord = light_coord(world.xy + to_sun.xy * travelled, layer_height(relative + to_sun * travelled));
+            float2 border = min(coord.xy, 1.0 - coord.xy);
+            // Past the grid's edge, three coarse samples stand in for it.
+            float inside = saturate(min(border.x, border.y) * 10.0);
+            float beyond = 0.0;
+            for (int j = 3; j < 6 && inside < 1.0; ++j) {
+                float stride = light_step * float(1 << j) * 0.5;
+                travelled += stride;
+                float reach = travelled - 0.5 * stride;
+                float unused;
+                beyond += cloud_profile(world + to_sun * reach, layer_height(relative + to_sun * reach), unused) * stride;
+            }
+            float2 summed = inside > 0.0 ? light_grid.SampleLevel(clamp_sampler, coord, 0).rg : 0.0;
+            optical += lerp(beyond, summed.r, inside);
             float sigma_t = density * extinct;
             float sigma_s = sigma_t * 0.99;
             // Wrenninge octaves: extinction a = 0.25, scattering b = 0.6,
-            // eccentricity c = 0.5 (a <= b keeps it energy conserving).
+            // eccentricity c = 0.5 (a <= b keeps it energy conserving). The
+            // scattered octaves build up with depth into the cloud, which
+            // gives Nubis' inner glow and dark edges.
+            float glow = lerp(0.4, 1.0, saturate(profile * 2.0));
             float3 radiance = 0.0;
             for (int o = 0; o < 4; ++o)
-                radiance += pow(0.6, o) * light * exp(-optical * extinct * pow(0.25, o)) * phases[o];
-            // Skylight reaches the tops, ground bounce the bases.
-            radiance += sky_light * lerp(0.4, 1.0, h) + ground_light * lerp(1.0, 0.2, h);
+                radiance += (o == 0 ? 1.0 : glow * pow(0.6, o)) * light * exp(-optical * extinct * pow(0.25, o)) * phases[o];
+            // Skylight is strongest at the wispy edges and under open sky: the
+            // cloud above passes what a scattering slab of g = 0.85 would.
+            float open = lerp(lerp(0.4, 1.0, h), 1.0 / (1.0 + 0.11 * summed.g * extinct), inside);
+            // Ground bounce reaches the bases.
+            radiance += sky_light * open * sqrt(1.0 - profile) + ground_light * lerp(1.0, 0.2, h);
             radiance *= sigma_s;
             // Hillaire's analytic integral of in-scatter over the step.
             float step_transmittance = exp(-sigma_t * dt);
@@ -451,21 +557,56 @@ void shadowMain(uint3 id: SV_DispatchThreadID) {
     shadow_out.GetDimensions(size, unused);
     if (any(id.xy >= size))
         return;
-    float3 to_sun = -globals.sun_direction.xyz;
-    to_sun.z = max(to_sun.z, 0.08);
-    to_sun = normalize(to_sun);
+    float3 to_sun = raised_sun();
     float2 xy = params.region.xy + (float2(id.xy) + 0.5) / float(size) * params.region.z;
     float start = params.layer.x / to_sun.z;
     float span = (params.layer.y - params.layer.x) / to_sun.z;
     const int STEPS = 24;
-    float optical = 0.0;
+    float optical = 0.0, unused_type;
     for (int i = 0; i < STEPS; ++i) {
         float t = start + span * (i + 0.5) / STEPS;
         float3 p = float3(xy, 0.0) + to_sun * t;
-        optical += cloud_density(p, (p.z - params.layer.x) / (params.layer.y - params.layer.x), false);
+        optical += cloud_profile(p, (p.z - params.layer.x) / (params.layer.y - params.layer.x), unused_type);
     }
     optical *= span / STEPS * params.layer.w;
     shadow_out[id.xy] = 0.7 * exp(-optical) + 0.3 * exp(-optical * 0.1);
+}
+
+/// Nubis³ voxel lighting: the density summed from each voxel to the top of
+/// the layer, r toward the sun and g straight up, so the trace needs only a
+/// few light samples of its own. One slice in eight is redrawn per frame.
+[shader("compute")]
+[numthreads(8, 8, 1)]
+void lightMain(uint3 id: SV_DispatchThreadID) {
+    uint size, unused;
+    light_out.GetDimensions(size, unused, unused);
+    // Every slice when the history restarts.
+    uint3 voxel = params.frame.y != 0 ? uint3(id.xy, id.z * 8 + params.frame.x % 8) : id;
+    if (any(voxel >= size))
+        return;
+    float3 uvw = (float3(voxel) + 0.5) / float(size);
+    float thickness = params.layer.y - params.layer.x;
+    float3 p = float3(params.region.xy + (uvw.xy - 0.25) * params.region.z * 2.0,
+                      params.layer.x + uvw.z * thickness);
+    float3 to_sun = raised_sun();
+    float rise = (1.0 - uvw.z) * thickness;
+    float reach = min(rise / to_sun.z, LIGHT_REACH);
+    float2 summed = 0.0;
+    float unused_type;
+    const int STEPS = 12;
+    for (int i = 0; i < STEPS; ++i) {
+        // Quadratic spacing: fine near the voxel, coarse far from it.
+        float inner = float(i * i) / (STEPS * STEPS);
+        float outer = float((i + 1) * (i + 1)) / (STEPS * STEPS);
+        float3 s = p + to_sun * (reach * (inner + outer) * 0.5);
+        summed.r += cloud_profile(s, (s.z - params.layer.x) / thickness, unused_type) * reach * (outer - inner);
+    }
+    const int UP = 4;
+    for (int i = 0; i < UP; ++i) {
+        float h = uvw.z + (1.0 - uvw.z) * (i + 0.5) / UP;
+        summed.g += cloud_profile(float3(p.xy, params.layer.x + h * thickness), h, unused_type) * rise / UP;
+    }
+    light_out[voxel] = float4(summed, 0.0, 0.0);
 }
 
 /// Fill the sky pixels the resolve left empty.

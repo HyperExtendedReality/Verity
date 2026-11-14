@@ -112,6 +112,9 @@ pub struct MaterialData {
     pub base_color_texture: Option<u32>,
     pub metallic_roughness_texture: Option<u32>,
     pub normal_texture: Option<u32>,
+    /// Emitted radiance: glTF's emissive factor times `KHR_materials_emissive_strength`.
+    pub emission: [f32; 3],
+    pub emission_texture: Option<u32>,
     pub alpha_mode: AlphaMode,
     pub alpha_cutoff: f32,
     pub double_sided: bool,
@@ -127,6 +130,8 @@ impl Default for MaterialData {
             base_color_texture: None,
             metallic_roughness_texture: None,
             normal_texture: None,
+            emission: [0.0; 3],
+            emission_texture: None,
             alpha_mode: AlphaMode::Opaque,
             alpha_cutoff: 0.5,
             double_sided: false,
@@ -231,6 +236,10 @@ pub fn load_gltf(path: &Path, options: LoadOptions) -> Result<SceneData> {
             base_color_texture: slot(pbr.base_color_texture().map(|i| i.texture())),
             metallic_roughness_texture: slot(pbr.metallic_roughness_texture().map(|i| i.texture())),
             normal_texture: slot(material.normal_texture().map(|n| n.texture())),
+            emission: material
+                .emissive_factor()
+                .map(|c| c * material.emissive_strength().unwrap_or(1.0)),
+            emission_texture: slot(material.emissive_texture().map(|i| i.texture())),
             alpha_mode: match material.alpha_mode() {
                 gltf::material::AlphaMode::Opaque => AlphaMode::Opaque,
                 gltf::material::AlphaMode::Mask => AlphaMode::Mask,
@@ -496,6 +505,66 @@ pub fn decode_ktx2(bytes: &[u8], options: LoadOptions) -> Result<TextureData> {
     })
 }
 
+/// A 3D RGBA8 volume from `scripts/convert_clouds.py`.
+pub struct VolumeData {
+    /// Width, height and depth of the largest level; z is up.
+    pub size: [u32; 3],
+    /// Mip levels, largest first, x fastest then y then z.
+    pub levels: Vec<Vec<u8>>,
+    /// The file's "verity.cloud" JSON: what the channels hold and where the
+    /// volume sits.
+    pub metadata: String,
+}
+
+/// Read an uncompressed (optionally Zstd-supercompressed) R8G8B8A8_UNORM 3D KTX2.
+pub fn decode_volume(bytes: &[u8]) -> Result<VolumeData> {
+    let reader = ktx2::Reader::new(bytes).map_err(|e| invalid(format!("not KTX2: {e:?}")))?;
+    let header = reader.header();
+    if header.format != Some(ktx2::Format::R8G8B8A8_UNORM) || header.pixel_depth == 0 {
+        return Err(invalid(
+            "volume must be 3D R8G8B8A8_UNORM (re-run scripts/convert_clouds.py)",
+        ));
+    }
+    let zstd = match header.supercompression_scheme {
+        None => false,
+        Some(ktx2::SupercompressionScheme::Zstandard) => true,
+        Some(other) => return Err(invalid(format!("unsupported supercompression {other:?}"))),
+    };
+    let size = [header.pixel_width, header.pixel_height, header.pixel_depth];
+    let mut decoder = ruzstd::decoding::FrameDecoder::new();
+    let mut levels = Vec::with_capacity(reader.levels().len());
+    for (index, level) in reader.levels().enumerate() {
+        let data = if zstd {
+            let mut raw = Vec::with_capacity(level.uncompressed_byte_length as usize);
+            decoder
+                .decode_all_to_vec(level.data, &mut raw)
+                .map_err(|e| invalid(format!("zstd: {e}")))?;
+            raw
+        } else {
+            level.data.to_vec()
+        };
+        let texels: usize = size.iter().map(|&n| (n >> index).max(1) as usize).product();
+        if data.len() != texels * 4 {
+            return Err(invalid(format!(
+                "level {index} has {} bytes, expected {}",
+                data.len(),
+                texels * 4
+            )));
+        }
+        levels.push(data);
+    }
+    let metadata = reader
+        .key_value_data()
+        .find(|(key, _)| *key == "verity.cloud")
+        .map(|(_, value)| String::from_utf8_lossy(value).trim_end_matches(' ').to_owned())
+        .ok_or_else(|| invalid("volume has no verity.cloud metadata"))?;
+    Ok(VolumeData {
+        size,
+        levels,
+        metadata,
+    })
+}
+
 /// Expand BC3 blocks, row by row, to RGBA8.
 fn decode_bc3(blocks: &[u8], width: u32, height: u32) -> Vec<u8> {
     let (width, height) = (width as usize, height as usize);
@@ -594,6 +663,38 @@ mod tests {
             .join("../../assets/packed")
             .join(name);
         path.exists().then_some(path)
+    }
+
+    #[test]
+    fn cloud_volumes_decode() {
+        let Some(noise) = packed("clouds/nubis_noise.ktx2") else {
+            return;
+        };
+        let noise = decode_volume(&fs::read(noise).unwrap()).unwrap();
+        assert_eq!(noise.size, [128; 3]);
+        assert_eq!(noise.levels.len(), 8);
+        assert_eq!(noise.levels[7].len(), 4);
+        assert!(noise.metadata.contains("\"noise\""));
+        for name in ["parkouring", "stormbird", "wdas"] {
+            let path = packed(&format!("clouds/{name}.ktx2")).unwrap();
+            let volume = decode_volume(&fs::read(path).unwrap()).unwrap();
+            assert!(volume.metadata.contains("\"cloudscape\""), "{name}");
+            let [width, height, depth] = volume.size.map(|n| n as usize);
+            let texels = volume.levels[0].as_chunks::<4>().0;
+            // Profile in R; the distance in A drops below its zero point inside.
+            assert!(texels.iter().any(|t| t[0] > 0), "{name} has no cloud");
+            assert!(texels.iter().any(|t| t[0] == 0), "{name} is not padded");
+            // z is up: clouds have flat bases, so they are wider a tenth of
+            // the way up than nine tenths (the extreme slices are stray wisps).
+            let area = |z: usize| {
+                let slice = &texels[z * width * height..(z + 1) * width * height];
+                slice.iter().filter(|t| t[0] > 0).count()
+            };
+            let cloudy: Vec<_> = (0..depth).filter(|&z| area(z) > 0).collect();
+            let at = |fraction: f32| area(cloudy[(fraction * (cloudy.len() - 1) as f32) as usize]);
+            let (bottom, top) = (at(0.1), at(0.9));
+            assert!(bottom > top, "{name}: base {bottom} texels, top {top}");
+        }
     }
 
     #[test]

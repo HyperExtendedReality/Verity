@@ -84,6 +84,12 @@ pub struct Settings {
     /// the GI scene's own tree. Changing it recompiles the passes, and GI shows
     /// the hemisphere until they are ready, as when it starts.
     pub hardware_rays: bool,
+    /// Path trace each shaded pixel's indirect light with the cache's own hit
+    /// shading and no cache, probe or filter, averaging until the view or a
+    /// light changes: a reference to measure the rest of these settings
+    /// against. Use `resolve_scale` 1 for one per pixel. Hundreds of times the
+    /// cost of the cache, and it takes hundreds of frames to settle.
+    pub reference: bool,
 }
 
 impl Default for Settings {
@@ -110,6 +116,7 @@ impl Default for Settings {
             surface_software_reach: 0.0,
             surface_from_level: 3,
             hardware_rays: true,
+            reference: false,
         }
     }
 }
@@ -220,7 +227,7 @@ pub struct Parameters {
     /// Elements in the geometry and scene words.
     pub word_lengths: [u32; 4],
     /// `CASCADE_POINTERS` in cascades.slang, in order.
-    pub buffers: [u64; 20],
+    pub buffers: [u64; 21],
 }
 
 pub fn probe_directory_capacity(samples: u64) -> u64 {
@@ -422,7 +429,7 @@ mod tests {
     #[test]
     fn parameters_match_the_shader_block() {
         // 4 matrices, 31 vec4s and 19 pointers, no padding.
-        assert_eq!(std::mem::size_of::<Parameters>(), 4 * 64 + 32 * 16 + 20 * 8);
+        assert_eq!(std::mem::size_of::<Parameters>(), 4 * 64 + 32 * 16 + 21 * 8);
     }
 
     #[test]

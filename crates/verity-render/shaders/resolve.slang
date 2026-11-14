@@ -144,6 +144,7 @@ float3 shade(uint2 id, uint2 pixel, uint2 hit, bool primary) {
     uint level = uint(instance.normal_columns[0].w);
     // Where this surface was last frame, for soft bodies and cloth.
     float3 previous_position = 0.0;
+    float3 emission = 0.0;
     bool vertex_motion = !is_matrix && globals.instance_motion[hit.x].info.x != 0;
 
     if (kind == MATRIX_VOXEL) {
@@ -237,6 +238,8 @@ float3 shade(uint2 id, uint2 pixel, uint2 hit, bool primary) {
             * sample_material(material.textures.x, texcoord, dx, dy, 1.0);
         // glTF packs roughness in green and metalness in blue.
         float4 metal_rough = sample_material(material.textures.y, texcoord, dx, dy, 1.0);
+        if (any(material.emission > 0.0))
+            emission = material.emission * sample_material(material.emission_texture, texcoord, dx, dy, 1.0).rgb;
 
         s.position = eye + direction * b.z;
         if (vertex_motion) {
@@ -357,6 +360,7 @@ float3 shade(uint2 id, uint2 pixel, uint2 hit, bool primary) {
                 * point_shadow(i, light, s.position, face);
         }
     }
+    result += emission;
     if (globals.counts.w != 0) {
         float3 colors[5] = {
             float3(0.1, 0.8, 0.2), float3(0.1, 0.5, 1.0),

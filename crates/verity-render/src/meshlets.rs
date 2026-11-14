@@ -116,8 +116,8 @@ impl Frustum {
     }
 }
 
-#[cfg(test)]
-fn visible(bounds: &Bounds, clip_from_world: Mat4, model: Mat4) -> bool {
+/// Whether any of `bounds`, placed by `model`, may land inside `clip_from_world`.
+pub(crate) fn visible(bounds: &Bounds, clip_from_world: Mat4, model: Mat4) -> bool {
     Frustum::new(clip_from_world, model).visible(bounds)
 }
 

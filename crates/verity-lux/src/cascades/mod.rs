@@ -17,7 +17,7 @@ pub mod surface;
 
 use self::{
     accel::SceneAccel,
-    scene::{GiScene, LAYER_MASK, SurfaceWords},
+    scene::{Emitter, GiScene, LAYER_MASK, MAX_EMITTERS, SurfaceWords},
     settings::*,
 };
 use crate::{
@@ -83,6 +83,7 @@ const PASSES: &[(&str, &[u8], &[u8])] = &[
     ("traceVisibility", spirv!("cascades", "traceVisibility"), spirv!("cascades", "traceVisibility", rq)),
     ("traceResolve", spirv!("cascades", "traceResolve"), spirv!("cascades", "traceResolve", rq)),
     ("surfaceUpdate", spirv!("cascades", "surfaceUpdate"), spirv!("cascades", "surfaceUpdate", rq)),
+    ("reference", spirv!("cascades", "reference"), spirv!("cascades", "reference", rq)),
     ("compositeAnchors", spirv!("composite", "compositeAnchors"), spirv!("composite", "compositeAnchors")),
     ("compositeCompute", spirv!("composite", "compositeCompute"), spirv!("composite", "compositeCompute")),
     ("compositeCapture", spirv!("composite", "compositeCapture"), spirv!("composite", "compositeCapture")),
@@ -139,7 +140,6 @@ const COMPOSITE_BINDINGS: &[(u32, D)] = &[
     (13, D::SAMPLED_IMAGE),
     (14, D::STORAGE_IMAGE),
     (15, D::STORAGE_IMAGE),
-    (16, D::SAMPLED_IMAGE),
     (17, D::STORAGE_BUFFER),
     (18, D::STORAGE_BUFFER),
     (19, D::STORAGE_IMAGE),
@@ -210,6 +210,31 @@ fn light_changes(lights: &[GiLight], previous: &[GiLight]) -> (SunChange, bool) 
     (sun_change, !points(lights).eq(points(previous)))
 }
 
+/// Emitter records for `emissiveResponseTracked`: corner, edges and normal,
+/// `direction.w` the running CDF of their power, `edge1.w` the chance of
+/// picking each and `color.w` its area. `position.w` -2 lights both sides.
+fn emitter_lights(emitters: &[Emitter]) -> Vec<GiLight> {
+    let total: f32 = emitters.iter().map(|e| e.power).sum();
+    let mut cdf = 0.0;
+    emitters
+        .iter()
+        .enumerate()
+        .map(|(index, e)| {
+            let pmf = e.power / total;
+            cdf += pmf;
+            GiLight {
+                position: e.a.extend(if e.double_sided { -2.0 } else { -1.0 }).to_array(),
+                color: [0.0, 0.0, 0.0, e.area],
+                // The last bound is exactly 1, so every selection finds an emitter.
+                direction: e.normal.extend(if index + 1 == emitters.len() { 1.0 } else { cdf }).to_array(),
+                edge1: e.edge1.extend(pmf).to_array(),
+                edge2: e.edge2.extend(0.0).to_array(),
+                source: [e.instance, e.triangle, 0, 0],
+            }
+        })
+        .collect()
+}
+
 struct Pipelines {
     set_layout: vk::DescriptorSetLayout,
     composite_set_layout: vk::DescriptorSetLayout,
@@ -226,6 +251,8 @@ struct View {
     heads: [Buffer; 2],
     entries: Buffer,
     descriptors: Buffer,
+    /// The reference's running sum per shaded pixel; 16 bytes when it is off.
+    reference_sum: Buffer,
     history: Buffer,
     probes: Buffer,
     merge_list: Buffer,
@@ -355,6 +382,9 @@ pub struct SplitRadianceCascades {
     previous_lights: Vec<GiLight>,
     /// Last frame's sky and ground.
     previous_ambient: [Vec3; 2],
+    /// Frames `Settings::reference` has averaged, and the pose it averaged them at.
+    reference_frames: u32,
+    reference_pose: Option<[glam::Vec4; 3]>,
     started: Instant,
     /// Debugging aid: `VERITY_LUX_PASS_LIMIT=n` dispatches only the first
     /// `n` passes of each frame, to bisect GPU faults.
@@ -394,6 +424,8 @@ impl SplitRadianceCascades {
             previous_clip: None,
             previous_lights: Vec::new(),
             previous_ambient: [Vec3::ZERO; 2],
+            reference_frames: 0,
+            reference_pose: None,
             started: Instant::now(),
             pass_limit: std::env::var("VERITY_LUX_PASS_LIMIT")
                 .ok()
@@ -714,6 +746,16 @@ impl SplitRadianceCascades {
             storage,
             MemoryLocation::GpuOnly,
         )?;
+        let reference_sum = buffer(
+            "gi reference sum",
+            if self.settings.reference {
+                u64::from(shading[0]) * u64::from(shading[1]) * 16
+            } else {
+                16
+            },
+            storage,
+            MemoryLocation::GpuOnly,
+        )?;
         let history = buffer(
             "gi history",
             cache_history_bytes(buckets),
@@ -755,7 +797,8 @@ impl SplitRadianceCascades {
                 .collect::<std::result::Result<_, _>>()?;
             uniforms.push(slot.try_into().ok().unwrap());
         }
-        let light_bytes = (verity_render::MAX_LIGHTS as u64 + 2) * mem::size_of::<GiLight>() as u64;
+        let light_bytes =
+            (verity_render::MAX_LIGHTS + MAX_EMITTERS + 2) as u64 * mem::size_of::<GiLight>() as u64;
         let lights = [
             buffer(
                 "gi lights",
@@ -855,6 +898,7 @@ impl SplitRadianceCascades {
             heads,
             entries,
             descriptors,
+            reference_sum,
             history,
             probes,
             merge_list,
@@ -995,8 +1039,10 @@ impl SplitRadianceCascades {
                 }
                 write_set(device, *set, &main, entries);
             }
-            let display = &irr[composite_display_index(self.settings.spatial_filter_steps, p)];
-            let display_history = if self.settings.spatial_filter_steps == 0 {
+            // The reference writes the unfiltered image directly.
+            let steps = if self.settings.reference { 0 } else { self.settings.spatial_filter_steps };
+            let display = &irr[composite_display_index(steps, p)];
+            let display_history = if steps == 0 {
                 &meta[3 + p]
             } else {
                 &view.denoise_history
@@ -1016,7 +1062,6 @@ impl SplitRadianceCascades {
                 (13, image(&view.anchors[1])),
                 (14, image(&view.anchors[0])),
                 (15, image(&view.anchors[1])),
-                (16, placeholder),
                 (17, Res::Buffer(view.rtgi[2].buffer)),
                 (18, Res::Buffer(view.rtgi[3].buffer)),
                 (19, Res::View(targets.hdr, general)),
@@ -1040,7 +1085,7 @@ impl SplitRadianceCascades {
         let buffers = view
             .heads
             .into_iter()
-            .chain([view.entries, view.descriptors, view.history, view.probes, view.merge_list])
+            .chain([view.entries, view.descriptors, view.reference_sum, view.history, view.probes, view.merge_list])
             .chain(view.rtgi)
             .chain(view.lights)
             .chain(view.uniforms.into_iter().flatten());
@@ -1059,9 +1104,10 @@ impl SplitRadianceCascades {
         }
     }
 
-    /// GI lights for the frame: punctual and directional, then the view's
-    /// layer-mask record. Returns the lights and the conventional count.
-    fn frame_lights(frame: &FrameContext) -> (Vec<GiLight>, u32) {
+    /// GI lights for the frame: punctual and directional, then the emitters
+    /// and the view's layer-mask record. Returns the lights and the
+    /// conventional count.
+    fn frame_lights(frame: &FrameContext, emitters: &[Emitter]) -> (Vec<GiLight>, u32) {
         let mut lights: Vec<GiLight> = frame
             .lights
             .iter()
@@ -1083,6 +1129,7 @@ impl SplitRadianceCascades {
             });
         }
         let conventional = lights.len() as u32;
+        lights.extend(emitter_lights(emitters));
         lights.push(GiLight {
             source: LAYER_MASK.to_array(),
             ..GiLight::default()
@@ -1115,16 +1162,36 @@ impl SplitRadianceCascades {
             .previous_clip
             .is_none_or(|p| !p.abs_diff_eq(clip, 1e-6));
         self.previous_clip = Some(clip);
-        let (lights, conventional) = Self::frame_lights(frame);
+        let emitters = &self.scene.words().emitters;
+        let (lights, conventional) = Self::frame_lights(frame, emitters);
+        let emitter_count = emitters.len() as u32;
+        // For MIS, a hit works out its own chance of being picked: from the
+        // total power, and whether it made the cut (all did unless the list is full).
+        let emitter_power: f32 = emitters.iter().map(|e| e.power).sum();
+        let emitter_cutoff = if emitters.len() == MAX_EMITTERS {
+            emitters.iter().map(|e| e.power).fold(f32::INFINITY, f32::min) * 0.9999
+        } else {
+            0.0
+        };
+        // Emitters change only with the scene, which resets everything anyway;
+        // the comparisons below look at the conventional lights alone.
+        let conventional_lights = &lights[..conventional as usize];
         // The sky and ground are in the background group, with the sun.
         let ambient = [frame.sky, frame.ground];
         let ambient_change = ambient_change(ambient, self.previous_ambient);
         self.previous_ambient = ambient;
         let lights_changed = ambient_change != SunChange::None
-            || bytemuck::cast_slice::<_, u8>(&lights)
+            || bytemuck::cast_slice::<_, u8>(conventional_lights)
                 != bytemuck::cast_slice::<_, u8>(&self.previous_lights);
         let first = view.fresh || self.scene_changed;
         let history_valid = self.history_valid && !first;
+        // The reference restarts when what it averages changes. TAA jitter moves
+        // only the projection's x and y rows, so it compares the rest.
+        let pose = [frame.view_proj.row(2), frame.view_proj.row(3), frame.eye.extend(0.0)];
+        if first || lights_changed || self.reference_pose != Some(pose) {
+            self.reference_frames = 0;
+        }
+        self.reference_pose = Some(pose);
 
         let [width, height] = view.grid;
         let samples = width * height;
@@ -1132,7 +1199,7 @@ impl SplitRadianceCascades {
         let (phase, quota) = self.schedule.next(samples, budget);
         let active = SOURCE_BACKGROUND | if conventional > 0 { SOURCE_PUNCTUAL } else { 0 };
         // Sunlight is stored in the background group, point lights in punctual.
-        let (sun_change, points_changed) = light_changes(&lights, &self.previous_lights);
+        let (sun_change, points_changed) = light_changes(conventional_lights, &self.previous_lights);
         let sun_change = sun_change.max(ambient_change);
         let changed = if first {
             active
@@ -1170,7 +1237,8 @@ impl SplitRadianceCascades {
                 traversal_query_caps(settings.sampling.max_traversal_queries).0 as f32,
             ],
             frame: [frame.frame_number as u32, 0, self.instances, conventional],
-            light_counts: [conventional, 0, settings.emissive_samples, 0],
+            // Emitters follow the conventional lights.
+            light_counts: [conventional, emitter_count, settings.emissive_samples, emitter_power.to_bits()],
             stability: [
                 f32::from(u8::from(history_valid)),
                 f32::from(u8::from(first || lights_changed)),
@@ -1178,7 +1246,7 @@ impl SplitRadianceCascades {
                 1.0,
             ],
             // The mask record follows the lights; bit 0 uses the G-buffer's occlusion byte.
-            layers: [conventional, 1, 1, 0],
+            layers: [conventional + emitter_count, 1, 1, emitter_cutoff.to_bits()],
             environment_rotation: [0.0, 0.0, 0.0, 1.0],
             environment_scale: [1.0, 0.0, 0.0, 0.0],
             // z bit 0: the sun moved a little, so the shaders blend its history rather than drop it.
@@ -1199,7 +1267,8 @@ impl SplitRadianceCascades {
                 self.started.elapsed().as_millis() as u32,
                 u32::MAX,
                 u32::from(settings.multi_bounce),
-                0,
+                // Frames the reference has summed; zero restarts it.
+                self.reference_frames,
             ],
             surface: [
                 self.surface_texels,
@@ -1238,6 +1307,7 @@ impl SplitRadianceCascades {
                 &self.surface[2],
                 &self.surface[3],
                 &view.descriptors,
+                &view.reference_sum,
             ]
             .map(|buffer| buffer.address),
             ..Parameters::default()
@@ -1252,7 +1322,7 @@ impl SplitRadianceCascades {
             uniform.write(bytemuck::bytes_of(&p));
         }
         view.lights[slot].write(bytemuck::cast_slice(&lights));
-        self.previous_lights = lights;
+        self.previous_lights = lights[..conventional as usize].to_vec();
 
         use vk::{AccessFlags2 as A, PipelineStageFlags2 as S};
         let compute_barrier = || {
@@ -1369,90 +1439,99 @@ impl SplitRadianceCascades {
         let (pack_x, pack_y) =
             pack_probe_dispatch_groups(samples).ok_or("receiver grid too large")?;
 
-        // Receivers, probe ranking and the cascade hierarchy.
-        dispatch("clear", clear[0], clear_groups, 1);
-        dispatch("seed", compute[0], image[0], image[1]);
-        dispatch("rank", compute[0], ray_groups, 1);
-        for &phase in cold_rank_phases(settings.history_frames, history_valid) {
-            dispatch("rank", compute[phase], ray_groups, 1);
-        }
-        for &set in &compute[1..] {
-            dispatch("parents", set, directory_groups, 1);
-        }
-        for level in (0..LEVELS).rev() {
-            dispatch("prefix", compute[level], directory_groups, 1);
-        }
-        dispatch("generateDirections", compute[0], image[0], image[1]);
-        dispatch("clear", clear[1], clear_groups, 1);
-        // Surface cache texels this frame, before any hit reads them.
-        let surface_updates = settings.surface_updates.min(self.surface_texels);
-        if surface_updates > 0 {
-            dispatch("surfaceUpdate", compute[0], surface_updates.div_ceil(64), 1);
-        }
-        // Transport: closest hits, recorded visibility queries, the queries in
-        // parallel, shading and deposit; the immediate kernel takes overflow.
-        dispatch("traceDeferred", compute[0], trace_groups, 1);
-        dispatch("traceRecord", compute[0], trace_groups, 1);
-        dispatch(
-            "traceVisibility",
-            compute[0],
-            query_lanes.div_ceil(64) as u32,
-            1,
-        );
-        dispatch("traceResolve", compute[0], trace_groups, 1);
-        dispatch("trace", compute[0], trace_groups, 1);
-        // World cache and directional probes.
-        dispatch("retain", compute[0], bucket_groups, 1);
-        dispatch("reduce", compute[0], bucket_groups, 1);
-        for level in (0..LEVELS).rev() {
-            passes.set(passes.get() + 1);
-            if passes.get() > limit {
-                continue;
+        if settings.reference {
+            // Path traced, accumulated in the shader; no cache or filter. The
+            // clear empties the probe directory: the composite's fallback walks
+            // it, and a stale one made each lookup walk all of it.
+            dispatch("clear", clear[0], clear_groups, 1);
+            dispatch("reference", compute[0], shading_x, shading_y);
+            self.reference_frames += 1;
+        } else {
+            // Receivers, probe ranking and the cascade hierarchy.
+            dispatch("clear", clear[0], clear_groups, 1);
+            dispatch("seed", compute[0], image[0], image[1]);
+            dispatch("rank", compute[0], ray_groups, 1);
+            for &phase in cold_rank_phases(settings.history_frames, history_valid) {
+                dispatch("rank", compute[phase], ray_groups, 1);
             }
-            device.cmd_bind_pipeline(
-                cmd,
-                vk::PipelineBindPoint::COMPUTE,
-                pipelines.passes["merge"],
+            for &set in &compute[1..] {
+                dispatch("parents", set, directory_groups, 1);
+            }
+            for level in (0..LEVELS).rev() {
+                dispatch("prefix", compute[level], directory_groups, 1);
+            }
+            dispatch("generateDirections", compute[0], image[0], image[1]);
+            dispatch("clear", clear[1], clear_groups, 1);
+            // Surface cache texels this frame, before any hit reads them.
+            let surface_updates = settings.surface_updates.min(self.surface_texels);
+            if surface_updates > 0 {
+                dispatch("surfaceUpdate", compute[0], surface_updates.div_ceil(64), 1);
+            }
+            // Transport: closest hits, recorded visibility queries, the queries in
+            // parallel, shading and deposit; the immediate kernel takes overflow.
+            dispatch("traceDeferred", compute[0], trace_groups, 1);
+            dispatch("traceRecord", compute[0], trace_groups, 1);
+            dispatch(
+                "traceVisibility",
+                compute[0],
+                query_lanes.div_ceil(64) as u32,
+                1,
             );
-            bind(pipelines.layout, compute[level]);
-            device.cmd_dispatch_indirect(cmd, view.merge_list.buffer, level as u64 * 16);
+            dispatch("traceResolve", compute[0], trace_groups, 1);
+            dispatch("trace", compute[0], trace_groups, 1);
+            // World cache and directional probes.
+            dispatch("retain", compute[0], bucket_groups, 1);
+            dispatch("reduce", compute[0], bucket_groups, 1);
+            for level in (0..LEVELS).rev() {
+                passes.set(passes.get() + 1);
+                if passes.get() > limit {
+                    continue;
+                }
+                device.cmd_bind_pipeline(
+                    cmd,
+                    vk::PipelineBindPoint::COMPUTE,
+                    pipelines.passes["merge"],
+                );
+                bind(pipelines.layout, compute[level]);
+                device.cmd_dispatch_indirect(cmd, view.merge_list.buffer, level as u64 * 16);
+                compute_barrier();
+                stamp("merge");
+            }
+            dispatch(
+                "seedProbes",
+                compute[0],
+                work.div_ceil(64 * LEVELS as u64) as u32,
+                1,
+            );
+            dispatch("packProbes", compute[0], pack_x, pack_y);
+            // Per-pixel irradiance, temporal history, spatial filtering.
+            dispatch("worldResolve", world_resolve, shading_x, shading_y);
+            dispatch("temporal", temporal, shading_x, shading_y);
+            // Only temporal results become history; filtered display values never feed back.
+            let layers = vk::ImageSubresourceLayers::default()
+                .aspect_mask(vk::ImageAspectFlags::COLOR)
+                .layer_count(1);
+            let region = vk::ImageCopy::default()
+                .src_subresource(layers)
+                .dst_subresource(layers)
+                .extent(vk::Extent3D {
+                    width: view.shading[0],
+                    height: view.shading[1],
+                    depth: 1,
+                });
+            device.cmd_copy_image(
+                cmd,
+                view.irradiance[2].image,
+                vk::ImageLayout::GENERAL,
+                view.irradiance[slot].image,
+                vk::ImageLayout::GENERAL,
+                &[region],
+            );
             compute_barrier();
-            stamp("merge");
-        }
-        dispatch(
-            "seedProbes",
-            compute[0],
-            work.div_ceil(64 * LEVELS as u64) as u32,
-            1,
-        );
-        dispatch("packProbes", compute[0], pack_x, pack_y);
-        // Per-pixel irradiance, temporal history, spatial filtering.
-        dispatch("worldResolve", world_resolve, shading_x, shading_y);
-        dispatch("temporal", temporal, shading_x, shading_y);
-        // Only temporal results become history; filtered display values never feed back.
-        let layers = vk::ImageSubresourceLayers::default()
-            .aspect_mask(vk::ImageAspectFlags::COLOR)
-            .layer_count(1);
-        let region = vk::ImageCopy::default()
-            .src_subresource(layers)
-            .dst_subresource(layers)
-            .extent(vk::Extent3D {
-                width: view.shading[0],
-                height: view.shading[1],
-                depth: 1,
-            });
-        device.cmd_copy_image(
-            cmd,
-            view.irradiance[2].image,
-            vk::ImageLayout::GENERAL,
-            view.irradiance[slot].image,
-            vk::ImageLayout::GENERAL,
-            &[region],
-        );
-        compute_barrier();
-        stamp("copyHistory");
-        for &set in denoise.iter().take(settings.spatial_filter_steps as usize) {
-            dispatch("denoise", set, shading_x, shading_y);
+            stamp("copyHistory");
+            for &set in denoise.iter().take(settings.spatial_filter_steps as usize) {
+                dispatch("denoise", set, shading_x, shading_y);
+            }
         }
         // Add diffuse GI times albedo into the HDR target.
         let composite = view.composite_sets[slot];
@@ -1487,8 +1566,10 @@ impl SplitRadianceCascades {
         // Publish the world cache once composition is done reading it: without
         // this, next frame's history heads point at stale working entries and
         // every interval restarts from a single noisy sample.
-        dispatch("commitCache", compute[0], bucket_groups, 1);
-        dispatch("remapProbeHeads", compute[0], directory_groups, 1);
+        if !settings.reference {
+            dispatch("commitCache", compute[0], bucket_groups, 1);
+            dispatch("remapProbeHeads", compute[0], directory_groups, 1);
+        }
 
         self.history_valid = true;
         self.scene_changed = false;
@@ -1714,6 +1795,28 @@ impl RenderExtension for SplitRadianceCascades {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn emitter_records_pick_in_proportion_to_power() {
+        let emitter = |power: f32| Emitter {
+            a: Vec3::ZERO,
+            edge1: Vec3::X,
+            edge2: Vec3::Y,
+            normal: Vec3::Z,
+            area: 0.5,
+            power,
+            double_sided: false,
+            instance: 0,
+            triangle: 0,
+        };
+        let lights = emitter_lights(&[emitter(1.0), emitter(3.0), emitter(0.1)]);
+        let pmf: Vec<f32> = lights.iter().map(|l| l.edge1[3]).collect();
+        assert!((pmf[1] - 3.0 * pmf[0]).abs() < 1e-6);
+        assert!((pmf.iter().sum::<f32>() - 1.0).abs() < 1e-6);
+        let cdf: Vec<f32> = lights.iter().map(|l| l.direction[3]).collect();
+        assert!(cdf.is_sorted() && cdf[2] == 1.0);
+        assert_eq!((lights[0].position[3], lights[0].color[3]), (-1.0, 0.5));
+    }
 
     fn sun(direction: [f32; 3], color: [f32; 3]) -> GiLight {
         GiLight {

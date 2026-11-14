@@ -25,6 +25,7 @@ const CASCADE_ENTRIES: &[&str] = &[
     "traceVisibility",
     "traceResolve",
     "surfaceUpdate",
+    "reference",
 ];
 
 /// PXTGI's compute passes, all in `pxtgi.slang`.

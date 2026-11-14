@@ -22,6 +22,7 @@ mod gpu_culling;
 mod meshlets;
 mod profiler;
 mod scene;
+mod shadows;
 mod upload;
 mod virtual_texture;
 
@@ -332,10 +333,9 @@ pub struct Renderer {
     model_indices_key: Option<(u64, bool)>,
     /// Changes whenever model draws or primitives do.
     model_generation: u64,
-    /// What the shadow maps were last drawn from, and whether this frame
-    /// must draw them again.
-    shadow_key: Vec<u8>,
-    shadows_stale: bool,
+    /// Each shadow layer's casters, what it was last drawn from, and whether
+    /// this frame draws it again.
+    shadows: shadows::ShadowLayers,
     /// Meshes drawn as set by `set_deforming_meshes`, and the space reserved
     /// for their vertices at `deforming_base` of the shared vertex buffer.
     deforming: Vec<DeformingMesh>,
@@ -545,8 +545,7 @@ impl Renderer {
                 model_indices_len: 0,
                 model_indices_key: None,
                 model_generation: 0,
-                shadow_key: Vec::new(),
-                shadows_stale: true,
+                shadows: shadows::ShadowLayers::default(),
                 deforming: Vec::new(),
                 deforming_vertices: Vec::new(),
                 deforming_base: 0,
@@ -862,6 +861,8 @@ impl Renderer {
         )?;
         self.shadow_map = Some(shadow_map);
         self.shadow_layers = shadow_layers;
+        // New maps hold nothing: every layer draws again.
+        self.shadows = shadows::ShadowLayers::default();
         let (point_shadow_map, point_shadow_layers) = gpu::create_depth_layers(
             device,
             self.allocator.as_mut().unwrap(),
@@ -1831,6 +1832,7 @@ impl Renderer {
                 self.cloud_shadow.as_ref().unwrap(),
                 self.frame_clouds.filter(|_| self.frame_sun.is_some()),
                 self.camera.eye,
+                viewport,
             )?;
             self.record_scene(command, set, viewport)?;
             profile.stages[11..16].copy_from_slice(&self.scene_stages);
@@ -2185,24 +2187,12 @@ impl Renderer {
                 }
             }
         }
-        // The shadow maps outlive frames: redraw them only when what they
-        // show can have changed. Moving geometry always redraws them.
-        let mut key = Vec::with_capacity(self.shadow_key.len());
-        key.extend_from_slice(bytemuck::bytes_of(&globals.sun_direction));
-        key.extend_from_slice(bytemuck::bytes_of(&globals.shadow_view_proj));
-        key.extend_from_slice(bytemuck::bytes_of(&globals.point_shadow_view_proj));
-        key.extend_from_slice(bytemuck::cast_slice(&self.light_data));
-        key.extend_from_slice(bytemuck::cast_slice(&self.instance_data));
-        for &(instance, count) in &self.shadow_calls {
-            key.extend_from_slice(bytemuck::bytes_of(&[instance, count]));
-        }
-        key.extend_from_slice(&self.model_generation.to_ne_bytes());
+        // Moving geometry has no stable key: every layer it may reach redraws.
         let moving = self.matrix_enabled
             || !self.deforming.is_empty()
             || !self.retained.copies.is_empty()
             || self.embedded.as_ref().is_some_and(|e| e.reshaping());
-        self.shadows_stale = moving || key != self.shadow_key;
-        self.shadow_key = key;
+        self.plan_shadows(&mut globals, viewport, moving);
         let unjittered = glam::Mat4::from_cols_array_2d(&globals.view_proj);
         let jitter = if !self.anti_aliasing.temporal() {
             glam::Mat4::IDENTITY
@@ -2580,49 +2570,59 @@ impl Renderer {
         split(0);
 
         // Both images are shared across frames. The queue dependency protects the
-        // prior resolve's sampled reads before discarding and rewriting the maps.
-        // Unchanged maps stay read-only from the frame that drew them.
-        for (map, layers, size, point) in [
+        // prior resolve's sampled reads before discarding and rewriting a layer.
+        // Layers that did not change stay read-only from the frame that drew them.
+        for (map, layers, size, first) in [
             (
                 self.shadow_map.as_ref().unwrap(),
                 &self.shadow_layers,
                 scene::SHADOW_SIZE,
-                false,
+                0,
             ),
             (
                 self.point_shadow_map.as_ref().unwrap(),
                 &self.point_shadow_layers,
                 scene::POINT_SHADOW_SIZE,
-                true,
+                scene::CASCADES,
             ),
-        ]
-        .into_iter()
-        .filter(|_| self.shadows_stale)
-        {
-            let all_layers =
-                gpu::subresource(vk::ImageAspectFlags::DEPTH).layer_count(layers.len() as u32);
-            let shadow_barrier = |src_stage, src_access, dst_stage, dst_access, old, new| {
-                gpu::image_barrier(
-                    map.image,
-                    vk::ImageAspectFlags::DEPTH,
-                    src_stage,
-                    src_access,
-                    dst_stage,
-                    dst_access,
-                    old,
-                    new,
-                )
-                .subresource_range(all_layers)
+        ] {
+            let redraw: Vec<usize> = (0..layers.len())
+                .filter(|&index| self.shadows.redraw(first + index))
+                .collect();
+            if redraw.is_empty() {
+                continue;
+            }
+            let layer_barriers = |src_stage, src_access, dst_stage, dst_access, old, new| {
+                redraw
+                    .iter()
+                    .map(|&index| {
+                        gpu::image_barrier(
+                            map.image,
+                            vk::ImageAspectFlags::DEPTH,
+                            src_stage,
+                            src_access,
+                            dst_stage,
+                            dst_access,
+                            old,
+                            new,
+                        )
+                        .subresource_range(
+                            gpu::subresource(vk::ImageAspectFlags::DEPTH)
+                                .base_array_layer(index as u32)
+                                .layer_count(1),
+                        )
+                    })
+                    .collect::<Vec<_>>()
             };
             barrier(
-                &[shadow_barrier(
+                &layer_barriers(
                     S::COMPUTE_SHADER,
                     A::SHADER_SAMPLED_READ,
                     S::EARLY_FRAGMENT_TESTS | S::LATE_FRAGMENT_TESTS,
                     A::DEPTH_STENCIL_ATTACHMENT_WRITE,
                     L::UNDEFINED,
                     L::DEPTH_ATTACHMENT_OPTIMAL,
-                )],
+                ),
                 &[],
             );
             let shadow_area = vk::Rect2D {
@@ -2632,9 +2632,10 @@ impl Renderer {
                     height: size,
                 },
             };
-            for (index, &layer) in layers.iter().enumerate() {
+            for &index in &redraw {
+                let layer = first + index;
                 let attachment = vk::RenderingAttachmentInfo::default()
-                    .image_view(layer)
+                    .image_view(layers[index])
                     .image_layout(L::DEPTH_ATTACHMENT_OPTIMAL)
                     .load_op(vk::AttachmentLoadOp::CLEAR)
                     .store_op(vk::AttachmentStoreOp::STORE)
@@ -2651,27 +2652,15 @@ impl Renderer {
                         .layer_count(1)
                         .depth_attachment(&attachment),
                 );
-                let enabled = if point {
-                    self.frame_lights
-                        .get(index / scene::POINT_SHADOW_FACES)
-                        .is_some_and(|light| {
-                            light.radius.is_finite()
-                                && light.radius > 0.0
-                                && light.position.iter().all(|value| value.is_finite())
-                        })
-                } else {
-                    self.frame_sun.is_some()
-                };
-                if enabled {
+                if self.shadows.enabled(layer) {
                     set_viewport(device, cmd, shadow_area);
                     device.cmd_bind_pipeline(
                         cmd,
                         vk::PipelineBindPoint::GRAPHICS,
                         self.shadow_pipeline,
                     );
-                    for &(instance, index_count) in &self.shadow_calls {
-                        let matrix = index + if point { scene::CASCADES } else { 0 };
-                        let push = [instance, matrix as u32];
+                    for &(instance, index_count) in self.shadows.calls(layer) {
+                        let push = [instance, layer as u32];
                         device.cmd_push_constants(
                             cmd,
                             self.pipeline_layout,
@@ -2681,21 +2670,20 @@ impl Renderer {
                         );
                         device.cmd_draw(cmd, index_count, 1, 0, 0);
                     }
-                    let layer = index + if point { scene::CASCADES } else { 0 };
                     self.matrix
                         .record_shadows(device, cmd, self.pipeline_layout, layer as u32);
                 }
                 device.cmd_end_rendering(cmd);
             }
             barrier(
-                &[shadow_barrier(
+                &layer_barriers(
                     S::EARLY_FRAGMENT_TESTS | S::LATE_FRAGMENT_TESTS,
                     A::DEPTH_STENCIL_ATTACHMENT_WRITE,
                     S::COMPUTE_SHADER,
                     A::SHADER_SAMPLED_READ,
                     L::DEPTH_ATTACHMENT_OPTIMAL,
                     L::DEPTH_READ_ONLY_OPTIMAL,
-                )],
+                ),
                 &[],
             );
         }

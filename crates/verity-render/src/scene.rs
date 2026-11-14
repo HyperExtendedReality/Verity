@@ -102,6 +102,8 @@ pub struct Cascades {
     pub view_proj: [Mat4; CASCADES],
     pub splits: [f32; CASCADES],
     pub texels: [f32; CASCADES],
+    /// World-space corners of the camera frustum slice each cascade covers.
+    pub corners: [[Vec3; 8]; CASCADES],
 }
 
 /// Fit sun cascades to the camera frustum: practical splits, one bounding
@@ -126,17 +128,16 @@ pub fn cascades(camera: &Camera, aspect: f32, sun_direction: Vec3, distance: f32
     };
     let mut view_proj = [Mat4::IDENTITY; CASCADES];
     let mut texels = [0.0; CASCADES];
+    let mut slices = [[Vec3::ZERO; 8]; CASCADES];
     for i in 0..CASCADES {
         let near = if i == 0 { NEAR } else { splits[i - 1] };
-        let mut corners = Vec::with_capacity(8);
-        for z in [near, splits[i]] {
-            for (x, y) in [(-1.0, -1.0), (1.0, -1.0), (-1.0, 1.0), (1.0, 1.0)] {
-                corners.push(world_from_view.transform_point3(Vec3::new(
-                    x * tan_x * z,
-                    y * tan_y * z,
-                    -z,
-                )));
-            }
+        let corners = &mut slices[i];
+        for (corner, (z, (x, y))) in corners.iter_mut().zip(
+            [near, splits[i]]
+                .into_iter()
+                .flat_map(|z| [(-1.0, -1.0), (1.0, -1.0), (-1.0, 1.0), (1.0, 1.0)].map(|xy| (z, xy))),
+        ) {
+            *corner = world_from_view.transform_point3(Vec3::new(x * tan_x * z, y * tan_y * z, -z));
         }
         let center = corners.iter().copied().sum::<Vec3>() / corners.len() as f32;
         // Quantized so floating-point noise never changes the cascade's size.
@@ -176,6 +177,7 @@ pub fn cascades(camera: &Camera, aspect: f32, sun_direction: Vec3, distance: f32
         view_proj,
         splits,
         texels,
+        corners: slices,
     }
 }
 
@@ -207,6 +209,10 @@ pub struct GpuMaterial {
     pub params: [f32; 4],
     /// x: base color, y: metallic-roughness, z: normal texture ([`NO_TEXTURE`] if none); w: flags.
     pub textures: [u32; 4],
+    /// Emitted radiance, scene-linear (glTF emissive factor times strength).
+    pub emission: [f32; 3],
+    /// Texture scaling `emission` ([`NO_TEXTURE`] if none).
+    pub emission_texture: u32,
 }
 
 impl GpuMaterial {
@@ -217,6 +223,8 @@ impl GpuMaterial {
             base_color: [r, g, b, 1.0],
             params: [material.metallic, material.roughness, 1.0, 0.5],
             textures: [NO_TEXTURE, NO_TEXTURE, NO_TEXTURE, 0],
+            emission: [0.0; 3],
+            emission_texture: NO_TEXTURE,
         }
     }
 
@@ -228,6 +236,8 @@ impl GpuMaterial {
             base_color: [1.0; 4],
             params: [0.0, 1.0, detail, sea_level],
             textures: [NO_TEXTURE, NO_TEXTURE, NO_TEXTURE, TERRAIN_SURFACE],
+            emission: [0.0; 3],
+            emission_texture: NO_TEXTURE,
         }
     }
 }

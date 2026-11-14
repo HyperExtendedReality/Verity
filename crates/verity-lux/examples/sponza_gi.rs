@@ -9,7 +9,9 @@
 //! then does the same along a moving camera. `--size=WxH`, `--warm=N`,
 //! `--eye=X,Y,Z`, `--target=X,Y,Z`, `--updates=N` and `--uncapped` adjust it, `--no-gi-light`
 //! saves direct light alone, and `--pxtgi` (diffuse only without `--reflections`),
-//! `--voxel` and `--reference` run those instead. `--reference` needs a high `--warm`.
+//! and `--voxel` run those instead. `--reference` path traces Split's own hit
+//! shading per pixel with no cache (`Settings::reference`), and
+//! `--pxtgi-reference` PXTGI's simpler Lambertian one; both need a high `--warm`.
 //! H switches between hardware and software tracing while viewing.
 //! `--turn=N` looks the other way for N frames before saving the still view.
 //! `--cold` saves the first frames GI draws instead, to see how it starts.
@@ -255,7 +257,12 @@ impl ApplicationHandler for Viewer {
                 if let Some(length) = arg("interval") {
                     settings.interval_length = length.parse().expect("--interval=M");
                 }
-                let lux = Lux::new(if flag("--reference") {
+                if flag("--reference") {
+                    settings.reference = true;
+                    settings.sampling.resolve_scale =
+                        arg("resolve").map_or(1, |s| s.parse().expect("--resolve=N"));
+                }
+                let lux = Lux::new(if flag("--pxtgi-reference") {
                     Method::Pxtgi(PxtgiSettings {
                         debug: PxtgiDebug::Reference,
                         reflections: PxtgiReflections::Off,

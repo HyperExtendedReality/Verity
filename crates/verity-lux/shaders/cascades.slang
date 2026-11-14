@@ -8,7 +8,7 @@
     RtgiCacheCell* rtgiCacheCellsBuffer; float4* rtgiFieldBuffer; \
     uint2* blueNoiseRanksBuffer; uint4* surfaceTrianglesBuffer; \
     uint4* surfaceIslandsBuffer; uint4* surfaceTexelsBuffer; uint4* surfaceRadianceBuffer; \
-    Descriptor* descriptorsBuffer;
+    Descriptor* descriptorsBuffer; float4* referenceSumBuffer;
 #include "common.slang"
 // The renderer's frame set (materials, textures, DFG table) is bound at set 1.
 #define MATERIAL_SET 1
@@ -38,6 +38,7 @@
 #define surfaceTexels params.surfaceTexelsBuffer
 #define surfaceRadiance params.surfaceRadianceBuffer
 #define descriptors params.descriptorsBuffer
+#define referenceSum params.referenceSumBuffer
 [[vk::binding(4, 0)]] DepthTexture2D depthTexture;
 [[vk::binding(10, 0)]] [format("rgba32f")] WTexture2D<float4> irradiance;
 [[vk::binding(11, 0)]] Texture2D<float4> previousIrradiance;
@@ -151,6 +152,93 @@ float3 emissiveResponseTracked(float3 position, float3 normal, float3 geometricN
     return sum / float(count);
 }
 
+// Listed emitters (the light buffer's, `emitter_lights`) reach Split's pixels
+// and hits only through sampling: probe rays leave their emission out, so it is
+// never counted twice. The reference meets them both ways, sampled at every
+// vertex and hit by its paths, combined by Veach's balance heuristic.
+
+// The emitter `hit`'s power as `emitter_lights` weighs it, with its world
+// edges' cross product; 0 for a triangle not in the light buffer.
+float listedEmitterPower(Hit hit, out float3 crossEdges) {
+    crossEdges = 0.0;
+    if (params.lightCounts.y == 0u || !(asfloat(params.lightCounts.w) > 0.0)) return 0.0;
+    float luminance = dot(hitMaterial(hit).emission, float3(0.2126, 0.7152, 0.0722));
+    if (!(luminance > 0.0)) return 0.0;
+    uint base = instanceBase(hit.instance);
+    Triangle triangle = localTriangle(hit.triangle);
+    float3 a = transformPoint(base + 3, triangle.a.xyz);
+    crossEdges = cross(transformPoint(base + 3, triangle.b.xyz) - a,
+                       transformPoint(base + 3, triangle.c.xyz) - a);
+    float power = luminance * 0.5 * length(crossEdges);
+    return power > 0.0 && power >= asfloat(params.layers.w) ? power : 0.0;
+}
+
+bool emitterListed(Hit hit) {
+    float3 crossEdges;
+    return listedEmitterPower(hit, crossEdges) > 0.0;
+}
+
+// The solid-angle pdf of `emitterLight` picking the emitter `hit` along
+// `direction`; 0 for one it cannot pick.
+float emitterPdf(Hit hit, float3 direction) {
+    float3 crossEdges;
+    float power = listedEmitterPower(hit, crossEdges);
+    float area = 0.5 * length(crossEdges);
+    float cosine = abs(dot(crossEdges, direction)) / max(2.0 * area, 1e-20);
+    if (!(power > 0.0) || !(cosine > 0.0)) return 0.0;
+    return power / asfloat(params.lightCounts.w) * hit.distance * hit.distance / (area * cosine);
+}
+
+// One emitter sampled at a surface. `receiver`: a shaded pixel, which the
+// composite lights with its albedo, so it weighs by cos/pi (and the reference
+// samples its paths by it). `weighted`: MIS-weight against the surface's own
+// direction sampling, for a caller that also counts emitters its rays hit.
+float3 emitterLight(float3 position, float3 normal, float3 geometric, float3 view,
+                    bool receiver, bool weighted, SurfaceBsdf material, float2 ab,
+                    inout uint state) {
+    if (params.lightCounts.y == 0u) return 0.0;
+    float selection = rtgiRandom(state);
+    float2 uv = float2(rtgiRandom(state), rtgiRandom(state));
+    uint low = 0, high = params.lightCounts.y - 1;
+    [loop] while (low < high) {
+        uint middle = (low + high) / 2;
+        if (lights[params.lightCounts.x + middle].direction.w < selection) low = middle + 1;
+        else high = middle;
+    }
+    Light light = lights[params.lightCounts.x + low];
+    if (!instanceVisible(light.source.x)) return 0.0;
+    if (light.position.w != -2 && dot(light.direction.xyz, position - light.position.xyz) <= 0) return 0.0;
+    float root = sqrt(uv.x);
+    float3 target = light.position.xyz + light.edge1.xyz * (root * (1 - uv.y))
+                    + light.edge2.xyz * (root * uv.y);
+    float3 toLight = target - position;
+    float lightDistance = length(toLight);
+    if (!(lightDistance > params.tuning.z * 0.25)) return 0.0;
+    float3 direction = toLight / lightDistance;
+    float cosine = dot(normal, direction);
+    float emitterCosine = sourceCosine(light, direction);
+    if (cosine <= 0.0 || emitterCosine <= 0.0 || dot(geometric, direction) <= 0.0) return 0.0;
+    float3 emission = emitterRadiance(light, float3(1 - root, root * (1 - uv.y), root * uv.y));
+    if (!any(emission > 0.0)) return 0.0;
+    float lightPdf = light.edge1.w * lightDistance * lightDistance / (light.color.w * emitterCosine);
+    float3 origin = rayOffset(position, geometric, params.tuning.z);
+    float3 delta = target - origin;
+    float distance = length(delta);
+    bool supported; DependencyContext dependency;
+    if (traceOccludedTracked(origin, delta / distance, distance - min(params.tuning.z * 0.25, distance * 0.001),
+            supported, dependency, 0u) || !supported) return 0.0;
+    float3 response; float bsdfPdf;
+    if (receiver) {
+        response = cosine / PI;
+        bsdfPdf = cosine / PI;
+    } else {
+        response = bsdfEvaluate(material, normal, view, direction, ab) * cosine;
+        bsdfPdf = 0.5 * cosine / PI + 0.5 * bsdfVisibleGgxPdf(material, normal, view, direction);
+    }
+    // Weighted: (f cos / lightPdf) * lightPdf / (lightPdf + bsdfPdf).
+    return emission * response / (lightPdf + (weighted ? bsdfPdf : 0.0));
+}
+
 // Up to this many point lights are all shaded, each with its own shadow ray;
 // past it one is picked by resampled importance sampling (Talbot et al. 2005)
 // from uniform candidates, in proportion to its unshadowed light.
@@ -256,8 +344,10 @@ TransportRadiance clampOutgoingTransportRadiance(TransportRadiance radiance) {
     if (!all(isfinite(radiance.background)) || !all(isfinite(radiance.emissive))
         || !all(isfinite(radiance.punctual)) || !all(isfinite(total)))
         return (TransportRadiance)0;
-    radiance.background = clampOutgoingRadiance(radiance.background, params);
-    radiance.emissive = clampOutgoingRadiance(radiance.emissive, params);
+    // Entries keep no emissive group, so emitted light travels with the
+    // background: both change only with the scene, which resets history.
+    radiance.background = clampOutgoingRadiance(radiance.background + radiance.emissive, params);
+    radiance.emissive = 0.0;
     radiance.punctual = clampOutgoingRadiance(radiance.punctual, params);
     return radiance;
 }
@@ -288,7 +378,8 @@ TransportRadiance outgoingTransportRadianceTracked(float3 origin, float3 directi
     }
     float3 baseColor = materialBaseColor(hit).rgb;
     // Secondary rays already account for direct emitters through hit-point NEE.
-    if (params.environmentScale.z <= 0.5 && !surfaceShading)
+    // Listed emitters reach the receiver through its own sample (worldResolve).
+    if (params.environmentScale.z <= 0.5 && !surfaceShading && !emitterListed(hit))
         radiance.emissive = hitEmission(hit, baseColor);
     if ((sceneWord(instanceBase(hit.instance) + 6u).w & 16u) != 0u)
         return clampOutgoingTransportRadiance(radiance);
@@ -333,8 +424,10 @@ TransportRadiance outgoingTransportRadianceTracked(float3 origin, float3 directi
     bool skyFromCache = surfaceShading || fromSurface
         ? surfaceBounceSeesSky() : indirectBackgroundCoverage > 0.0;
     bool emissiveSupported, environmentSupported = true, conventionalSupported;
+    // One emitter a hit: the surface cache and probes average many hits, and
+    // eight cost a fifth of Split's time for under 2% of the image.
     float3 emissiveNee = emissiveResponseTracked(position, normal, geometricNormal, view,
-        roughness, directSamples, directSequence ^ 0xE11E0001u, emissiveSupported,
+        roughness, 1u, directSequence ^ 0xE11E0001u, emissiveSupported,
         dependency, admissionLimit, true, material, ab);
     float3 environment = 0.0;
     // The ambient hemisphere is smooth: one ray, and the cache averages them.
@@ -801,97 +894,6 @@ void denoise(uint3 thread : SV_DispatchThreadID) {
     receiverHistory.Store(pixel, receiverWithScreenHistorySupportMask(
         receiver, outputDepth > 0.0 ? 1u : 0u));
 }
-
-#ifdef PENUMBRA_HARDWARE_RAY_QUERY
-// One shadow ray per pixel for each directional light Bevy would shadow-map,
-// aimed at a point on the sun's disk. The point follows a fixed per-pixel
-// pattern, so neighbouring pixels sample the whole disk and sunShadowDepth's
-// filter integrates them into an antialiased penumbra; the pattern is
-// screen-stable, so a still frame does not shimmer. An 8x8 group covers two
-// mask tiles; each lane records its per-light occlusion, then one lane per
-// tile packs and stores the tile.
-groupshared uint sunShadowOccluded[64];
-// Bevy's default `DirectionalLight::sun_disk_angular_size`, in radians.
-static const float SUN_DISK_ANGULAR_SIZE = 0.00930842;
-
-float3 sunDiskDirection(float3 direction, uint2 pixel) {
-    float3 tangent = normalize(abs(direction.y) < 0.999
-        ? cross(float3(0.0, 1.0, 0.0), direction)
-        : cross(float3(1.0, 0.0, 0.0), direction));
-    float3 bitangent = cross(direction, tangent);
-    // Interleaved gradient noise (Jimenez 2014) decorrelates neighbours.
-    float2 u = float2(
-        frac(52.9829189 * frac(dot(float2(pixel), float2(0.06711056, 0.00583715)))),
-        frac(52.9829189 * frac(dot(float2(pixel) + float2(47.0, 17.0),
-            float2(0.06711056, 0.00583715)))));
-    float radius = tan(0.5 * SUN_DISK_ANGULAR_SIZE) * sqrt(u.x);
-    float phi = 2.0 * PI * u.y;
-    return normalize(direction + (tangent * cos(phi) + bitangent * sin(phi)) * radius);
-}
-
-[shader("compute")]
-[numthreads(8, 8, 1)]
-void sunShadowsHardware(uint3 thread : SV_DispatchThreadID, uint3 local : SV_GroupThreadID,
-                        uint3 group : SV_GroupID) {
-    uint tile = local.x / 4u;
-    uint occluded = 0u; // bit k: light k blocked
-    occlusionIgnoresCulling = true;
-    if (all(thread.xy < params.viewport.zw) && params.frame.z != 0u) {
-        uint2 pixel = params.viewport.xy + thread.xy;
-        float depth = depthTexture.Load(int3(pixel, 0));
-        uint4 deferred = gbuffer.Load(int3(pixel, 0));
-        // Bevy shadows lit receivers only: not unlit, shadow-receiver flag set.
-        if (depth > 0.0 && (deferred.w & (1u << 24u)) == 0u && (deferred.w & (1u << 26u)) != 0u) {
-            float3 shadingNormal = deferredShadingNormal(deferred);
-            float3 position = worldPosition(float2(pixel) + 0.5, depth, params);
-            float3 normal = receiverGeometricNormal(rasterReceiver.Load(int3(pixel, 0)).z,
-                                                    shadingNormal);
-            // The visible side of the surface is the one facing the camera.
-            if (dot(normal, params.cameraPosition.xyz - position) < 0.0) normal = -normal;
-            // Reconstructed depth loses precision with distance.
-            float bias = params.tuning.z
-                * (1.0 + 0.05 * length(params.cameraPosition.xyz - position));
-            float3 origin = rayOffset(position, normal, bias);
-            uint4 geometryHeader = geometryWord(0);
-            uint selected = 0u;
-            for (uint index = 0u; index < params.lightCounts.x
-                    && selected < SUN_SHADOW_LIGHTS; ++index) {
-                Light light = lights[index];
-                if (!sunShadowLight(light)) continue;
-                float3 direction = normalize(light.position.xyz);
-                float3 ray = sunDiskDirection(direction, pixel);
-                // A normal map can light a pixel whose triangle faces away from
-                // the sun. Its ray would re-enter the receiver's own triangle,
-                // speckling sunlit stone with self-shadow; Bevy's shading
-                // treats that surface as lit, so step the ray past the plane.
-                float grazing = dot(normal, ray);
-                float3 rayOrigin = grazing < 0.1
-                    ? origin + ray * min(0.1, 4.0 * bias / max(abs(grazing), 0.04))
-                    : origin;
-                // Bevy's light is zero where the shading normal faces away;
-                // record it as occluded so the filter keeps the terminator dark.
-                if (dot(shadingNormal, direction) <= 0.0
-                    || hardwareOccluded(rayOrigin, ray, 1.0e7, geometryHeader))
-                    occluded |= 1u << selected;
-                ++selected;
-            }
-        }
-    }
-    sunShadowOccluded[local.x + 8u * local.y] = occluded;
-    GroupMemoryBarrierWithGroupSync();
-    if (local.y == 0u && (local.x & 3u) == 0u) {
-        uint bits = 0u;
-        for (uint y = 0u; y < 8u; ++y) {
-            [unroll] for (uint x = 0u; x < 4u; ++x) {
-                if ((sunShadowOccluded[tile * 4u + x + 8u * y] & 1u) != 0u)
-                    bits |= 1u << sunShadowBit(uint2(x, y));
-            }
-        }
-        irradiance.Store(int2(group.x * 2u + tile, group.y),
-            float4(bits & 0xffffu, bits >> 16u, 0.0, 0.0));
-    }
-}
-#endif
 
 // Ray-traced GI (GiMethod::RayTraced), after idTech 8 (Sousa 2025, "Fast as
 // Hell") and AMD GI-1.2 (Boisse et al. 2022; Tjernell 2025):
@@ -2043,3 +2045,135 @@ void rtgiResolve(uint3 thread : SV_DispatchThreadID) {
     rtgiField[gather + 5u] = float4(receiver.normal, 0.0);
 }
 #endif
+
+// The reference (`Settings::reference`): every shaded pixel path traces its
+// indirect light with the cache's own hit shading and no cache, probe or
+// filter. Hits use the full material (EON diffuse and multi-scatter GGX,
+// textures, normal maps, alpha) sampled half by its GGX lobe and half by
+// cosine; the sun and point lights light each hit through shadow rays, emitters
+// through both a shadow ray and hits under MIS, and the sky arrives when a
+// path escapes. It writes the image the composite reads, as
+// a running fp32 mean the host restarts whenever the view or light changes, so
+// Split's receivers and the reference's share everything up to their irradiance.
+// One path a pixel a frame keeps a full-resolution frame near 30 ms on an RTX
+// 4070 Laptop; four took 116 ms, close enough to the driver's 2 s watchdog at
+// its peaks to freeze the display.
+static const uint REFERENCE_PATHS = 1u;
+// Software traversal is about 16 times slower: a frame then traces one pixel in
+// 16, in rotation, so the reference cannot stall the GPU into a driver reset.
+#ifdef GI_RAY_QUERY
+static const uint REFERENCE_INTERLEAVE = 1u;
+#else
+static const uint REFERENCE_INTERLEAVE = 16u;
+#endif
+static const uint REFERENCE_BOUNCES = 32u;
+
+float3 referencePath(float3 position, float3 normal, float3 geometric, inout uint state) {
+    SurfaceBsdf noMaterial = (SurfaceBsdf)0;
+    float3 light = emitterLight(position, normal, geometric, normal, true, true,
+        noMaterial, 0.0, state);
+    float3 direction = rtgiCosineDirection(normal, float2(rtgiRandom(state), rtgiRandom(state)));
+    if (dot(direction, geometric) <= 0.0) return light;
+    float3 origin = rayOffset(position, geometric, params.tuning.z);
+    float3 throughput = 1.0;
+    // The pdf the last direction was sampled with, for weighting emitter hits.
+    float directionPdf = max(dot(normal, direction), 0.0) / PI;
+    [loop] for (uint bounce = 0u; bounce < REFERENCE_BOUNCES; ++bounce) {
+        DependencyContext dependency; float start, distance, padding;
+        Hit hit = traceRayTracked(origin, direction, 1e20, dependency, start, distance, padding);
+        if ((hit.errors & HIT_QUERY_UNSUPPORTED) != 0u) break;
+        if (hit.triangle == EMPTY) {
+            light += throughput * environmentRadiance(direction);
+            break;
+        }
+        float3 baseColor = materialBaseColor(hit).rgb;
+        if ((sceneWord(instanceBase(hit.instance) + 6u).w & 16u) != 0u) {
+            light += throughput * baseColor;
+            break;
+        }
+        float3 emission = hitEmission(hit, baseColor);
+        if (any(emission > 0.0)) {
+            float pickPdf = emitterPdf(hit, direction);
+            light += throughput * emission * (directionPdf / (directionPdf + pickPdf));
+        }
+        HitAttributes attributes = hitAttributes(hit);
+        float3 hitGeometric = attributes.geometricNormal;
+        if (dot(hitGeometric, direction) > 0.0) hitGeometric = -hitGeometric;
+        float3 hitNormal = hitShadingNormal(hit, attributes, direction);
+        float3 view = -direction;
+        if (dot(hitNormal, view) <= 0.0 || dot(hitNormal, hitGeometric) <= 0.0) break;
+        SurfaceBsdf material = hitSurfaceBsdf(hit, baseColor);
+        float roughness = isfinite(material.perceptualRoughness) ? material.perceptualRoughness : 1.0;
+        float2 ab = bsdfDfg(roughness, saturate(dot(hitNormal, view)));
+        float3 at = origin + direction * hit.distance;
+        float3 directional, punctual;
+        bool supported;
+        DependencyContext lightDependency = dependencyEmpty();
+        state = rtgiHash(state);
+        conventionalLightResponseTracked(at, hitNormal, hitGeometric, view, roughness, state,
+            directional, punctual, supported, lightDependency, 0u, true, material, ab);
+        light += throughput * (directional + punctual);
+        light += throughput * emitterLight(at, hitNormal, hitGeometric, view, false, true,
+            material, ab, state);
+
+        float2 xi = float2(rtgiRandom(state), rtgiRandom(state));
+        float3 next;
+        if (rtgiRandom(state) < 0.5) {
+            float ggxPdf;
+            next = bsdfSampleVisibleGgx(xi, material, hitNormal, view, ggxPdf);
+            if (!(ggxPdf > 0.0)) break;
+        } else next = rtgiCosineDirection(hitNormal, xi);
+        float cosine = dot(hitNormal, next);
+        if (cosine <= 0.0 || dot(hitGeometric, next) <= 0.0) break;
+        float pdf = 0.5 * cosine / PI + 0.5 * bsdfVisibleGgxPdf(material, hitNormal, view, next);
+        if (!(pdf > 0.0)) break;
+        directionPdf = pdf;
+        throughput *= bsdfEvaluate(material, hitNormal, view, next, ab) * (cosine / pdf);
+        if (!all(isfinite(throughput))) break;
+        // Russian roulette keeps long paths unbiased without paying for all of them.
+        if (bounce >= 3u) {
+            float keep = clamp(max(throughput.x, max(throughput.y, throughput.z)), 0.05, 0.95);
+            if (rtgiRandom(state) >= keep) break;
+            throughput /= keep;
+        }
+        origin = rayOffset(at, hitGeometric, params.tuning.z);
+        direction = next;
+    }
+    return light;
+}
+
+[shader("compute")]
+[numthreads(8, 8, 1)]
+void reference(uint3 thread : SV_DispatchThreadID) {
+    uint2 extent = giResolveExtent(params);
+    if (any(thread.xy >= extent)) return;
+    uint scale = giResolveScale(params);
+    uint2 full = params.viewport.xy + min(thread.xy * scale + scale / 2u, params.viewport.zw - 1u);
+    uint at = thread.y * extent.x + thread.x;
+    uint4 deferred = gbuffer.Load(int3(full, 0));
+    uint4 raster = rasterReceiver.Load(int3(full, 0));
+    float depth = depthTexture.Load(int3(full, 0));
+    float3 normal = deferredShadingNormal(deferred);
+    if (!(depth > 0.0) || !isfinite(depth) || (raster.z & 0x80000000u) == 0u
+        || (deferred.w & (1u << 24u)) != 0u || !(dot(normal, normal) > 0.01)) {
+        irradiance.Store(int2(thread.xy), 0.0);
+        receiverHistory.Store(int2(thread.xy), 0.0);
+        return;
+    }
+    normal = normalize(normal);
+    float3 geometric = receiverGeometricNormal(raster.z, normal);
+    float3 position = worldPosition(float2(full) + 0.5, depth, params);
+    float4 total = params.cacheTime.w == 0u ? 0.0 : referenceSum[at];
+    if ((thread.x + thread.y * 5u + params.cacheTime.w) % REFERENCE_INTERLEAVE == 0u) {
+        uint state = transportHash(at ^ transportHash(params.frame.x * 0x9e3779b9u + 0x2545f491u));
+        transportAdmissionBypass = true;
+        float3 sum = 0.0;
+        [loop] for (uint path = 0u; path < REFERENCE_PATHS; ++path)
+            sum += referencePath(position, normal, geometric, state);
+        total += float4(sum / float(REFERENCE_PATHS), 1.0);
+    }
+    referenceSum[at] = total;
+    irradiance.Store(int2(thread.xy), float4(total.w > 0.0 ? total.xyz / total.w : 0.0, depth));
+    receiverHistory.Store(int2(thread.xy),
+        receiverWithScreenHistorySupportMask(splitRasterMetadata(full), 1u));
+}

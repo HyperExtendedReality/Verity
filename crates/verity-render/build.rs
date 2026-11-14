@@ -22,6 +22,7 @@ const ENTRY_POINTS: &[(&str, &str, SlangStage)] = &[
     ("clouds", "traceMain", SlangStage::Compute),
     ("clouds", "applyMain", SlangStage::Compute),
     ("clouds", "shadowMain", SlangStage::Compute),
+    ("clouds", "lightMain", SlangStage::Compute),
     ("taa", "resolveMain", SlangStage::Compute),
     ("taa", "applyMain", SlangStage::Compute),
     ("breaker", "vertexMain", SlangStage::Vertex),

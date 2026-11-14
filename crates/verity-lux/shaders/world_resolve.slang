@@ -230,6 +230,10 @@ TransportRadiance bounceFeedback(float3 position, float3 normal,
     return result;
 }
 
+float3 emitterLight(float3 position, float3 normal, float3 geometric, float3 view,
+                    bool receiver, bool weighted, SurfaceBsdf material, float2 ab,
+                    inout uint state);
+
 [shader("compute")]
 [numthreads(8, 8, 1)]
 void worldResolve(uint3 thread : SV_DispatchThreadID) {
@@ -254,6 +258,15 @@ void worldResolve(uint3 thread : SV_DispatchThreadID) {
             normal = normalize(normal);
             float3 position = worldPosition(float2(full) + 0.5, depth, params);
             diffuse = resolveSplitDiffuse(position, normal, coverage, background, backgroundCoverage, anyCoverage);
+            // Direct light from listed emitters, which the probes leave out:
+            // one shadow ray a pixel a frame, smoothed by temporal and denoise.
+            if (params.lightCounts.y != 0u) {
+                uint at = thread.y * giResolveExtent(params).x + thread.x;
+                uint state = transportHash(at ^ transportHash(params.frame.x * 0x9e3779b9u + 0x51ed270bu));
+                transportAdmissionBypass = true;
+                diffuse += emitterLight(position, normal, receiverGeometricNormal(receiver.z, normal),
+                    normal, true, false, (SurfaceBsdf)0, 0.0, state);
+            }
             supported = coverage > 0.0 && all(isfinite(diffuse));
         }
     }

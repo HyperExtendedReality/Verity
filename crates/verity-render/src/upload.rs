@@ -255,6 +255,8 @@ impl Renderer {
                                 AlphaMode::Blend => scene::ALPHA_BLEND,
                             },
                         ],
+                        emission: m.emission,
+                        emission_texture: texture(m.emission_texture),
                     },
                     double_sided: m.double_sided,
                     // shortcut: blended materials need a forward transparency

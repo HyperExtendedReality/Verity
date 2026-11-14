@@ -15,7 +15,6 @@
 [[vk::binding(13, 0)]] Texture2D<float4> anchorNormal;
 [[vk::binding(14, 0)]] [format("rgba32f")] WTexture2D<float4> anchorPositionOutput;
 [[vk::binding(15, 0)]] [format("rgba32f")] WTexture2D<float4> anchorNormalOutput;
-[[vk::binding(16, 0)]] Texture2D<float4> sunShadowMask;
 // Ray-traced GI's field: temporal SH and irradiance volumes.
 [[vk::binding(17, 0)]] StructuredBuffer<float4> rtgiField;
 #include "rtgi_field.slang"
@@ -317,58 +316,6 @@ float4 rtgiFragment(VertexOutput input) : SV_Target {
     uint4 deferred = gbuffer.Load(int3(pixel, 0));
     if (!(depth > 0.0) || (deferred.w & (1u << 24u)) != 0u) return 0.0;
     return composeGi(pixel, deferred, reconstructRtgi(pixel, depth, deferred));
-}
-
-// Bevy's directional shadow lookup reads this layer at the shaded pixel for a
-// light whose shadow is ray traced (see sun_shadow_patch.rs) and uses the
-// stored depth as the light's visibility. Each pixel's visibility is a 5x5
-// tent filter of sunShadowsHardware's disk-jittered rays, restricted to
-// neighbours on the pixel's surface plane, so shadow edges are antialiased
-// without bleeding light across depth discontinuities.
-bool sunShadowOccludedAt(int2 local) {
-    float4 mask = sunShadowMask.Load(int3(sunShadowTexel(uint2(local)), 0));
-    return (sunShadowBits(mask, 0u) & (1u << sunShadowBit(uint2(local)))) != 0u;
-}
-
-float sunShadowVisibility(uint2 pixel) {
-    int2 local = int2(pixel - params.viewport.xy);
-    float visibility = sunShadowOccludedAt(local) ? 0.0 : 1.0;
-    float depth = depthTexture.Load(int3(pixel, 0));
-    if (!(depth > 0.0)) return visibility;
-    float3 position = worldPosition(float2(pixel) + 0.5, depth, params);
-    float3 normal = receiverGeometricNormal(rasterReceiver.Load(int3(pixel, 0)).z,
-        deferredShadingNormal(gbuffer.Load(int3(pixel, 0))));
-    // Depth reconstruction error grows with distance; allow a pixel's slope.
-    float tolerance = 0.002 * length(position - params.cameraPosition.xyz) + 0.01;
-    int2 extent = int2(params.viewport.zw);
-    float sum = 0.0, total = 0.0;
-    [unroll] for (int y = -2; y <= 2; ++y) {
-        [unroll] for (int x = -2; x <= 2; ++x) {
-            int2 tap = local + int2(x, y);
-            if (any(tap < 0) || any(tap >= extent)) continue;
-            uint2 tapPixel = params.viewport.xy + uint2(tap);
-            float tapDepth = depthTexture.Load(int3(tapPixel, 0));
-            if (!(tapDepth > 0.0)) continue;
-            float3 tapPosition = worldPosition(float2(tapPixel) + 0.5, tapDepth, params);
-            if (abs(dot(tapPosition - position, normal)) > tolerance) continue;
-            float weight = float((3 - abs(x)) * (3 - abs(y)));
-            sum += sunShadowOccludedAt(tap) ? 0.0 : weight;
-            total += weight;
-        }
-    }
-    return total > 0.0 ? sum / total : visibility;
-}
-
-// Slang's WGSL backend maps SV_Depth to frag_depth only on a struct field.
-struct SunShadowDepthOutput {
-    float visibility : SV_Depth;
-};
-
-[shader("fragment")]
-SunShadowDepthOutput sunShadowDepth(VertexOutput input) {
-    SunShadowDepthOutput output;
-    output.visibility = sunShadowVisibility(uint2(input.position.xy));
-    return output;
 }
 
 // Verity: the HDR target is a storage image, so the composite adds GI in

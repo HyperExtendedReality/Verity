@@ -990,6 +990,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "flip-rs"
+version = "0.1.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9c9b6b63e1846015bbe3da269ecb374a427800ef66613d3e2241d7f51b211ce2"
+dependencies = [
+ "rayon",
+]
+
+[[package]]
 name = "float-cmp"
 version = "0.10.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3171,8 +3180,10 @@ version = "0.1.0"
 dependencies = [
  "ash",
  "bytemuck",
+ "flip-rs",
  "glam",
  "gpu-allocator",
+ "png",
  "rayon",
  "verity-core",
  "verity-physics",

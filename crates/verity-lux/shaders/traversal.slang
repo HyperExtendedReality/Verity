@@ -282,12 +282,13 @@ HitAttributes hitAttributes(Hit hit) {
 float3 hitShadingNormal(Hit hit, HitAttributes attributes, float3 incoming) {
     return materialNormal(hit, attributes, incoming);
 }
-// Verity's materials do not emit (`GpuMaterial` has no emission) and its HDR
-// target has no exposure: an unlit instance shows its base colour, and nothing
-// else glows. This read emission and Bevy's exposure weight from scene words at
-// the material index, which in Verity are unrelated data.
+// Emitted radiance at a hit, scene-linear: Verity's HDR target has no exposure.
+// An unlit instance shows its base colour.
 float3 hitEmission(Hit hit, float3 baseColor) {
-    return (sceneWord(instanceBase(hit.instance) + 6).w & 16) != 0 ? baseColor : 0.0;
+    if ((sceneWord(instanceBase(hit.instance) + 6).w & 16) != 0) return baseColor;
+    float3 emission = hitMaterial(hit).emission;
+    if (!any(emission > 0.0)) return 0.0;
+    return emission * materialSample(hit, 4).rgb;
 }
 Triangle worldTriangle(Hit hit) {
     uint base = instanceBase(hit.instance);
@@ -754,15 +755,10 @@ Hit traceRay(float3 origin, float3 direction, float limit, bool anyHit = false,
                            coneWidth, coneSpread, admissionLimit);
 }
 
-// Shadow rays leave the receiver toward the light, so they meet the side of a
-// one-sided occluder facing away from the light, which a shadow map, rendered
-// from the light, never culls. Set by sunShadowsHardware.
-static bool occlusionIgnoresCulling = false;
-
 bool occludedTriangle(float3 origin, float3 direction, TriangleRay ray, uint triangleIndex,
                       uint instance, uint flags, float limit, uint4 geometryHeader) {
     Triangle triangle = localTriangle(triangleIndex, geometryHeader);
-    if ((flags & 3u) != 0 && !occlusionIgnoresCulling) {
+    if ((flags & 3u) != 0) {
         float facing = dot(cross(triangle.b.xyz-triangle.a.xyz,triangle.c.xyz-triangle.a.xyz),direction)
                        * ((flags & 4) != 0 ? -1 : 1);
         if (((flags & 1) != 0 && facing >= 0) || ((flags & 2) != 0 && facing <= 0)) return false;

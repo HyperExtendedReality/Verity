@@ -19,6 +19,9 @@ struct Material {
     float4 params;
     /// x: base color, y: metallic-roughness, z: normal texture; w: flags.
     uint4 textures;
+    /// Emitted radiance, scene-linear.
+    float3 emission;
+    uint emission_texture;
 };
 
 [[vk::binding(10, MATERIAL_SET)]] StructuredBuffer<Material> materials;

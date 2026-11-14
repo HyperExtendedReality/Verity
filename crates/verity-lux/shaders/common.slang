@@ -38,9 +38,9 @@ struct Parameters {
     float4 history;      // temporal blend, deferred trace unavailable, valid, retention frames
     float4 intervalHistory; // transmittance decay, Split flag, diffuse debug .25, early query cap
     uint4 frame;         // frame index, merge cascade, instance count, light count
-    uint4 lightCounts;   // conventional count, emissive count, hit-lighting sample budget, reserved
+    uint4 lightCounts;   // conventional count, emissive count, hit-lighting sample budget, emitters' total power (float bits)
     float4 stability;    // screen history valid, scene changed, motion vectors, exact Disney diffuse
-    uint4 layers;        // light-buffer mask tail, word count, occlusion flags, reserved
+    uint4 layers;        // light-buffer mask tail, word count, occlusion flags, least emitter power listed (float bits; 0 = all)
     uint4 environmentInfo; // alias-record offset, width, height, enabled
     float4 environmentRotation; // world-to-environment quaternion
     float4 environmentScale; // HDR intensity, secondary enabled, secondary pass, reserved
@@ -113,8 +113,9 @@ struct Light { float4 position, color, direction, edge1, edge2; uint4 source; };
 
 // One bounded node per ray/cascade, rather than a worst-case directional atlas.
 // Full keys are compared, so hash collisions never blend unrelated probes.
-// The emissive source has no fields: Verity's materials do not emit, so it is
-// never active, and entries carry only what the passes move.
+// The emissive source has no fields: emitted light is folded into the
+// background group (`clampOutgoingTransportRadiance`), so it is never active,
+// and entries carry only what the passes move.
 // One per screen sample, variant and level: the cell a visible surface seeds,
 // before transport. Kept apart from the 240-byte entries so the passes that
 // rank and allocate them touch one 32-byte record each, not a cache line or two.
@@ -613,21 +614,3 @@ uint2 fullPixel(uint2 pixel, Parameters p) {
                                p.viewport.zw - 1);
 }
 
-// Ray-traced sun shadows cover at most this many directional lights that Bevy
-// would shadow-map, in light-buffer order. Mirrors SUN_SHADOW_LIGHTS in render.rs.
-static const uint SUN_SHADOW_LIGHTS = 1u;
-bool sunShadowLight(Light light) {
-    return light.position.w == 0.0 && light.source.x != 0u;
-}
-// The sun shadow mask holds one Rgba32Float texel per 4x8-pixel tile. Light k's
-// 32 occlusion bits are two exactly representable 16-bit halves, .xy or .zw.
-uint2 sunShadowTexel(uint2 local) {
-    return uint2(local.x / 4u, local.y / 8u);
-}
-uint sunShadowBit(uint2 local) {
-    return (local.x & 3u) + 4u * (local.y & 7u);
-}
-uint sunShadowBits(float4 texel, uint light) {
-    float2 halves = light == 0u ? texel.xy : texel.zw;
-    return uint(halves.x) | (uint(halves.y) << 16u);
-}

@@ -66,6 +66,8 @@ struct Instance {
     count: u32,
     flags: u32,
     material: u32,
+    /// The material's emitted radiance, before its texture.
+    emission: Vec3,
     /// Index into [`GiScene::charts`], or `u32::MAX` when the surface cache
     /// leaves the instance out.
     chart: u32,
@@ -219,6 +221,28 @@ pub struct GiWords {
     pub triangles: u32,
     pub instances: u32,
     pub surface: SurfaceWords,
+    /// Emissive triangles in world space, for next-event estimation.
+    pub emitters: Vec<Emitter>,
+}
+
+/// Emissive triangles the GI samples at most; past it the brightest are kept.
+pub const MAX_EMITTERS: usize = 4096;
+
+/// One emissive triangle, as the light sampling in `cascades.slang` reads it.
+#[derive(Clone, Copy, Debug)]
+pub struct Emitter {
+    pub a: Vec3,
+    pub edge1: Vec3,
+    pub edge2: Vec3,
+    /// Unit normal of the emitting side.
+    pub normal: Vec3,
+    pub area: f32,
+    /// Area times the luminance of the material's emission: what sampling is proportional to.
+    pub power: f32,
+    pub double_sided: bool,
+    /// Instance as traversal numbers them, and global triangle.
+    pub instance: u32,
+    pub triangle: u32,
 }
 
 /// The surface cache's words, laid out by [`GiScene::pack`].
@@ -353,6 +377,7 @@ impl GiScene {
                 count,
                 flags: cull | mirrored,
                 material: material_base + primitive.material,
+                emission: Vec3::from_array(material.emission),
                 chart,
                 surface: UVec2::ZERO,
             })
@@ -490,6 +515,8 @@ impl GiScene {
             triangles: 0,
             instances: count as u32,
             surface,
+            // `write_top` lists them.
+            emitters: Vec::new(),
         };
         for blas in self.retained.values() {
             let slot = blas.slot.expect("laid out above");
@@ -610,12 +637,15 @@ impl GiScene {
                 count: blas.triangles.len() as u32,
                 flags: FLAG_CULL_BACK,
                 material: self.retained_material,
+                // Retained meshes (terrain) do not emit.
+                emission: Vec3::ZERO,
                 chart: u32::MAX,
                 surface: UVec2::ZERO,
             })
         }));
         let tlas = build_tree(&mut instances, |(_, i)| (i.min, i.max));
         self.packed.instances = instances.len() as u32;
+        self.packed.emitters = self.emitters(&instances);
         let words = &mut self.packed.scene_words;
         words[0].z = instances.len() as u32;
         let [mask, base, _, _] = words[0].to_array();
@@ -658,6 +688,52 @@ impl GiScene {
             }
         }
         [0..1 + 2 * tlas.len(), base..end, slots..slots + count]
+    }
+
+    /// The emissive triangles of `instances`, numbered as traversal numbers them.
+    fn emitters(&self, instances: &[(u32, Instance)]) -> Vec<Emitter> {
+        let position = |vertex: u32| {
+            let word = self.vertex_words[(vertex * VERTEX_WORDS) as usize];
+            Vec3::new(f32::from_bits(word.x), f32::from_bits(word.y), f32::from_bits(word.z))
+        };
+        let mut emitters = Vec::new();
+        for (index, (_, instance)) in instances.iter().enumerate() {
+            let luminance = instance.emission.dot(Vec3::new(0.2126, 0.7152, 0.0722));
+            if luminance <= 0.0 || luminance.is_nan() {
+                continue;
+            }
+            // A mirroring transform turns the front face's winding around.
+            let side = if instance.flags & FLAG_MIRRORED != 0 { -1.0 } else { 1.0 };
+            for triangle in instance.first..instance.first + instance.count {
+                let [a, b, c] = self.triangles[triangle as usize]
+                    .indices
+                    .to_array()
+                    .map(|v| instance.world_from_local.transform_point3(position(v)));
+                let cross = (b - a).cross(c - a) * side;
+                let area = 0.5 * cross.length();
+                if area <= 0.0 || !area.is_finite() {
+                    continue;
+                }
+                emitters.push(Emitter {
+                    a,
+                    edge1: b - a,
+                    edge2: c - a,
+                    normal: cross.normalize(),
+                    area,
+                    power: area * luminance,
+                    double_sided: instance.flags & FLAG_DOUBLE_SIDED != 0,
+                    instance: index as u32,
+                    triangle,
+                });
+            }
+        }
+        // shortcut: dropped emitters still light what sees them, but not through
+        // next-event estimation; sample a light tree if scenes need more.
+        if emitters.len() > MAX_EMITTERS {
+            emitters.sort_by(|x, y| y.power.total_cmp(&x.power));
+            emitters.truncate(MAX_EMITTERS);
+        }
+        emitters
     }
 }
 
@@ -1283,6 +1359,31 @@ mod tests {
         let mut seen: Vec<u32> = (0..count as usize).map(|i| slots[i / 4][i % 4]).collect();
         seen.sort_unstable();
         assert_eq!(seen, (0..count).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn emitters_come_from_emissive_instances_facing_their_front() {
+        let mut scene = soup();
+        scene.materials[1].emission = [2.0, 1.0, 0.5];
+        let gi = GiScene::build(&scene, 10);
+        let [_, base, count, stride] = gi.scene_words[0].to_array();
+        let words = |i: u32| (base + i * stride) as usize;
+        let emissive = (0..count).filter(|&i| gi.scene_words[words(i) + 7].w == 11).count();
+        assert!(emissive > 0);
+        assert_eq!(gi.emitters.len(), emissive * 300);
+        for e in &gi.emitters {
+            let at = words(e.instance);
+            assert_eq!(gi.scene_words[at + 7].w, 11);
+            // Triangles are numbered from the instance's first.
+            let first = gi.scene_words[at + 8].y;
+            assert!((first..first + 300).contains(&e.triangle));
+            let cross = e.edge1.cross(e.edge2);
+            assert!((e.area - 0.5 * cross.length()).abs() <= 1e-4 * e.area.max(1.0));
+            // Mirrored instances emit from the other side of their world winding.
+            let mirrored = gi.scene_words[at + 6].w & FLAG_MIRRORED != 0;
+            assert_eq!(e.normal.dot(cross) < 0.0, mirrored);
+            assert!(e.power > 0.0);
+        }
     }
 
     #[test]

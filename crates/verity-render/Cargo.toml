@@ -16,7 +16,7 @@ verity-core = { path = "../verity-core" }
 verity-matrix = { path = "../verity-matrix" }
 gpu-allocator = { version = "0.28", default-features = false, features = ["std", "vulkan"] }
 bytemuck = { version = "1.25.2", features = ["derive"] }
-gltf = { version = "1.4.1", default-features = false, features = ["KHR_lights_punctual", "allow_empty_texture", "extensions", "utils", "names"] }
+gltf = { version = "1.4.1", default-features = false, features = ["KHR_lights_punctual", "KHR_materials_emissive_strength","allow_empty_texture", "extensions", "utils", "names"] }
 ktx2 = "0.5"
 ruzstd = "0.8"
 basis-universal = "0.3"

@@ -22,3 +22,6 @@ verity-slang = { version = "0.1.0", path = "../verity-slang" }
 [dev-dependencies]
 verity-terra = { path = "../verity-terra" }
 winit = "0.30"
+# HDR-FLIP error maps for `examples/flip.rs`.
+flip-rs = "0.1.2"
+png = "0.18"

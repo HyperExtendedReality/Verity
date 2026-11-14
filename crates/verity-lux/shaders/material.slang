@@ -1,6 +1,6 @@
 // Hit materials through Verity's bindless materials (`materials.slang`,
 // bound at MATERIAL_SET). Instance word 7.w is the material index. Lux slots:
-// 0 base color, 2 metallic-roughness, 3 normal; others have no texture.
+// 0 base color, 2 metallic-roughness, 3 normal, 4 emission; others have no texture.
 
 #include "terrain.slang"
 
@@ -9,7 +9,9 @@ Material hitMaterial(Hit hit) { return materials[sceneWord(instanceBase(hit.inst
 uint materialBase(Hit hit) { return sceneWord(instanceBase(hit.instance) + 7).w; }
 
 uint materialTexture(Hit hit, uint slot) {
-    uint4 textures = hitMaterial(hit).textures;
+    Material material = hitMaterial(hit);
+    uint4 textures = material.textures;
+    if (slot == 4) return material.emission_texture;
     return slot == 0 ? textures.x : (slot == 2 ? textures.y : (slot == 3 ? textures.z : EMPTY));
 }
 

@@ -2,7 +2,8 @@
 //! `shaders/clouds.slang` for the techniques. Clouds are traced at half
 //! resolution into a ping-pong history, then fill the pixels the resolve left
 //! empty. A shadow map of sunlight through the layer is drawn before the
-//! resolve, which darkens the sun with it.
+//! resolve, which darkens the sun with it. A grid of density summed toward the
+//! sun, refreshed a slice in eight per frame, lights the clouds themselves.
 
 use crate::{gpu, Result};
 use ash::vk;
@@ -13,7 +14,8 @@ use std::time::Instant;
 use verity_core::Clouds;
 
 const SHAPE_SIZE: u32 = 128;
-const DETAIL_SIZE: u32 = 32;
+const DETAIL_SIZE: u32 = 64;
+const LIGHT_SIZE: u32 = 128;
 const NOISE_FORMAT: vk::Format = vk::Format::R8G8B8A8_UNORM;
 const HISTORY_FORMAT: vk::Format = vk::Format::R16G16B16A16_SFLOAT;
 const SHADOW_SIZE: u32 = 512;
@@ -69,12 +71,14 @@ pub(crate) struct CloudPass {
     detail_pipeline: vk::Pipeline,
     trace: vk::Pipeline,
     shadow_pipeline: vk::Pipeline,
+    light_pipeline: vk::Pipeline,
     /// The shadow map has left `UNDEFINED`; it holds all ones while `shadow_clear`.
     shadow_laid_out: bool,
     shadow_clear: bool,
     apply: vk::Pipeline,
     shape: Option<gpu::Image>,
     detail: Option<gpu::Image>,
+    light: Option<gpu::Image>,
     /// `sets[k]` reads `history[k]` and writes the other.
     sets: [vk::DescriptorSet; 2],
     history: Vec<gpu::Image>,
@@ -107,6 +111,8 @@ impl CloudPass {
             D::SAMPLED_IMAGE,
             D::STORAGE_IMAGE,
             D::STORAGE_IMAGE,
+            D::STORAGE_IMAGE,
+            D::SAMPLED_IMAGE,
         ];
         let bindings: Vec<_> = (kinds.iter().enumerate())
             .map(|(i, &kind)| {
@@ -168,6 +174,7 @@ impl CloudPass {
             (&mut self.trace, c"traceMain", &spirv!("clouds.traceMain")[..]),
             (&mut self.apply, c"applyMain", &spirv!("clouds.applyMain")[..]),
             (&mut self.shadow_pipeline, c"shadowMain", &spirv!("clouds.shadowMain")[..]),
+            (&mut self.light_pipeline, c"lightMain", &spirv!("clouds.lightMain")[..]),
         ] {
             *pipeline =
                 gpu::compute_pipeline(device, vk::PipelineCache::null(), self.layout, spirv, entry)?;
@@ -189,9 +196,18 @@ impl CloudPass {
             DETAIL_SIZE,
             usage,
         )?);
+        self.light = Some(gpu::create_volume(
+            device,
+            allocator,
+            "cloud light grid",
+            HISTORY_FORMAT,
+            LIGHT_SIZE,
+            usage,
+        )?);
         let samplers = self.samplers;
         let shape = self.shape.as_ref().unwrap().view;
         let detail = self.detail.as_ref().unwrap().view;
+        let light = self.light.as_ref().unwrap().view;
         for set in self.sets {
             let image = |view, layout| [vk::DescriptorImageInfo::default().image_view(view).image_layout(layout)];
             let general = vk::ImageLayout::GENERAL;
@@ -203,6 +219,8 @@ impl CloudPass {
                 (4, D::SAMPLER, [vk::DescriptorImageInfo::default().sampler(samplers[0])]),
                 (5, D::SAMPLER, [vk::DescriptorImageInfo::default().sampler(samplers[1])]),
                 (8, D::STORAGE_IMAGE, image(shadow, general)),
+                (9, D::STORAGE_IMAGE, image(light, general)),
+                (10, D::SAMPLED_IMAGE, image(light, general)),
             ];
             let writes: Vec<_> = (infos.iter())
                 .map(|(binding, ty, info)| {
@@ -344,6 +362,7 @@ impl CloudPass {
         shadow: &gpu::Image,
         clouds: Option<Clouds>,
         eye: Vec3,
+        viewport: [u32; 4],
     ) -> Result<()> {
         use vk::AccessFlags2 as A;
         use vk::ImageLayout as L;
@@ -397,6 +416,11 @@ impl CloudPass {
                 return Err(error);
             }
         }
+        // Rewriting the history descriptors invalidates any command buffer
+        // they are bound in, so resize before this frame binds them.
+        if viewport[2] != 0 && viewport[3] != 0 {
+            self.resize(device, allocator, viewport[2], viewport[3])?;
+        }
         // Waits for last frame's resolve to finish reading the shadow map.
         let mut barriers = vec![gpu::image_barrier(
             shadow.image,
@@ -409,7 +433,7 @@ impl CloudPass {
             L::GENERAL,
         )];
         if !self.baked {
-            barriers.extend([&self.shape, &self.detail].map(|image| {
+            barriers.extend([&self.shape, &self.detail, &self.light].map(|image| {
                 gpu::image_barrier(
                     image.as_ref().unwrap().image,
                     color,
@@ -473,6 +497,7 @@ impl CloudPass {
         if viewport[2] == 0 || viewport[3] == 0 {
             return Ok(());
         }
+        // A no-op after `record_shadow`; without a sun nothing is bound yet.
         self.resize(device, allocator, viewport[2], viewport[3])?;
 
         let now = Instant::now();
@@ -516,6 +541,11 @@ impl CloudPass {
             A::SHADER_STORAGE_WRITE,
             A::SHADER_SAMPLED_READ | A::SHADER_STORAGE_READ | A::SHADER_STORAGE_WRITE,
         );
+        device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, self.light_pipeline);
+        // The shader redraws every slice when the history restarts.
+        let slices = if self.history_valid { LIGHT_SIZE / 8 } else { LIGHT_SIZE };
+        device.cmd_dispatch(cmd, LIGHT_SIZE / 8, LIGHT_SIZE / 8, slices);
+        memory(A::SHADER_STORAGE_WRITE, A::SHADER_SAMPLED_READ);
         device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, self.trace);
         device.cmd_dispatch(cmd, self.size[0].div_ceil(8), self.size[1].div_ceil(8), 1);
         memory(A::SHADER_STORAGE_WRITE, A::SHADER_SAMPLED_READ);
@@ -536,7 +566,11 @@ impl CloudPass {
     }
 
     pub unsafe fn destroy(&mut self, device: &ash::Device, allocator: &mut Allocator) {
-        for image in self.history.drain(..).chain(self.shape.take()).chain(self.detail.take()) {
+        for image in (self.history.drain(..))
+            .chain(self.shape.take())
+            .chain(self.detail.take())
+            .chain(self.light.take())
+        {
             gpu::destroy_image(device, allocator, image);
         }
         for pipeline in [
@@ -545,6 +579,7 @@ impl CloudPass {
             self.trace,
             self.apply,
             self.shadow_pipeline,
+            self.light_pipeline,
         ] {
             device.destroy_pipeline(pipeline, None);
         }

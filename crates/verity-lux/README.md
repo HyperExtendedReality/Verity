@@ -86,6 +86,19 @@ is the only sky light a surface gets. A cache texel takes it through its bounce
 rays and a hit reads it from its texel or the probes; a hit neither covers
 traces one sky ray.
 
+Emissive materials (glTF `emissiveFactor`, `KHR_materials_emissive_strength`
+and `emissiveTexture`) glow in the renderer and light the scene through GI.
+The brightest `MAX_EMITTERS` (4096) emissive triangles go in a light list,
+picked in proportion to area times emission. Each shaded pixel samples one a
+frame with a shadow ray (`worldResolve`), and so does each ray hit; probe rays
+leave their emission out so it is not counted twice. Emitters past the cap
+reach the scene only through rays that hit them. Emitted light shares the background group's history, so
+an emitter that changes needs the scene reloaded. PXTGI and the voxel method
+see emitters only on screen. The reference (`Settings::reference`) samples one
+emitter at every path vertex, the shaded pixel included, and weighs it against
+paths that hit emitters with the balance heuristic (multiple importance
+sampling, Veach 1997, chapter 9).
+
 Against the path-traced reference (RTX 4070 Laptop, 1280×720, 600 frames).
 Error compares the mean of the last four frames with the reference's; single
 frames swing by up to 0.14. These rows predate sky light and the bench's fix
@@ -125,6 +138,15 @@ path-traced image of the same view:
 `PxtgiDebug::Reference` traces diffuse light with no cache or filter, and hits
 take mean colours as PXTGI's do. `--pxtgi` leaves reflections off to compare
 diffuse with diffuse; add `--reflections` for what PXTGI normally costs.
+
+`examples/flip.rs` shows where a run differs from the reference, as a viewer
+would see it: HDR-FLIP ([Andersson et al.](https://research.nvidia.com/publication/2021-05_hdr-flip-visualizing-errors-rendered-high-dynamic-range-images),
+through `flip-rs`) of each saved frame against the reference's, with a Magma
+heatmap beside each as `.flip.png`:
+
+```bash
+cargo run --release -p verity-lux --example flip -- ref/still15.pfm run/still*.pfm
+```
 
 Sponza at 1280×720 on an RTX 4070 Laptop GPU, 300 frames after starting, against
 that reference. Error is the mean absolute difference over 8×8 pixel blocks, as a
