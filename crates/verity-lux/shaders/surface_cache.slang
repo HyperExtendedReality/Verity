@@ -132,19 +132,8 @@ float surfaceHashLod(float3 position) {
 // one when `claim` is set (linear probing). EMPTY when the cache is off or
 // the probe sequence is full.
 // shortcut: dropped cells are not tombstoned, so a key placed past one becomes a miss and is claimed again; add tombstones if duplicates crowd the table.
-uint surfaceHashFind(float3 position, float3 normal, bool claim, out bool claimed) {
+uint surfaceHashProbe(uint hash, uint key, uint capacity, bool claim, out bool claimed) {
     claimed = false;
-    uint capacity = params.surfaceHash.x;
-    if (capacity == 0u || !all(isfinite(position)) || !all(isfinite(normal))) return EMPTY;
-    float lod = surfaceHashLod(position);
-    int3 cell = int3(floor(position / (SURFACE_HASH_CELL * lod)));
-    float3 magnitude = abs(normal);
-    uint axis = magnitude.x >= magnitude.y && magnitude.x >= magnitude.z ? 0u
-        : (magnitude.y >= magnitude.z ? 1u : 2u);
-    uint face = axis * 2u + (normal[axis] < 0.0 ? 1u : 0u);
-    uint hash = transportHash(uint(lod) + transportHash(uint(cell.z) + transportHash(uint(cell.y)
-        + transportHash(uint(cell.x) + transportHash(face)))));
-    uint key = transportHash(hash ^ 0x9e3779b9u) | 1u;
     uint slot = hash % capacity;
     for (uint probe = 0u; probe < SURFACE_HASH_PROBES; ++probe) {
         uint stored = surfaceHashKeys[slot * 2u].load();
@@ -161,20 +150,44 @@ uint surfaceHashFind(float3 position, float3 normal, bool claim, out bool claime
     return EMPTY;
 }
 
+// `shared` is set when this lane took another lane's lookup (wave_batch.slang),
+// which has already touched the cell.
+uint surfaceHashFind(float3 position, float3 normal, bool claim, out bool claimed, out bool shared) {
+    claimed = false;
+    shared = false;
+    uint capacity = params.surfaceHash.x;
+    if (capacity == 0u || !all(isfinite(position)) || !all(isfinite(normal))) return EMPTY;
+    float lod = surfaceHashLod(position);
+    int3 cell = int3(floor(position / (SURFACE_HASH_CELL * lod)));
+    float3 magnitude = abs(normal);
+    uint axis = magnitude.x >= magnitude.y && magnitude.x >= magnitude.z ? 0u
+        : (magnitude.y >= magnitude.z ? 1u : 2u);
+    uint face = axis * 2u + (normal[axis] < 0.0 ? 1u : 0u);
+    uint hash = transportHash(uint(lod) + transportHash(uint(cell.z) + transportHash(uint(cell.y)
+        + transportHash(uint(cell.x) + transportHash(face)))));
+    uint key = transportHash(hash ^ 0x9e3779b9u) | 1u;
+    uint tag = claim ? 1u : 0u;
+    bool follows = waveBatchFollows(key, tag);
+    uint slot = follows ? EMPTY : surfaceHashProbe(hash, key, capacity, claim, claimed);
+    uint first = waveBatchTake(slot, key, tag, follows, shared);
+    if (shared) return first;
+    return follows ? surfaceHashProbe(hash, key, capacity, claim, claimed) : slot;
+}
+
 // The cell under a hit seen along `direction`, claimed if it has none yet; the
 // claiming lane records the hit so surfaceUpdate can shade the cell.
 uint surfaceHashAt(Hit hit, float3 position, float3 direction, bool claim) {
     float3 front = hitGeometricNormal(hit);
     bool back = dot(front, direction) > 0.0;
-    bool claimed;
-    uint slot = surfaceHashFind(position, back ? -front : front, claim, claimed);
+    bool claimed, shared;
+    uint slot = surfaceHashFind(position, back ? -front : front, claim, claimed, shared);
     if (slot == EMPTY) return EMPTY;
     if (claimed) {
         uint2 barycentric = uint2(round(saturate(hit.barycentric.yz) * 65535.0));
         surfaceHashRecords[slot] = uint4(hit.triangle, hit.instance,
             barycentric.x | (barycentric.y << 16u), back ? 2u : 1u);
     }
-    surfaceHashKeys[slot * 2u + 1u].max(params.frame.x + 1u);
+    if (!shared) surfaceHashKeys[slot * 2u + 1u].max(params.frame.x + 1u);
     return params.surface.x + slot;
 }
 

@@ -11,6 +11,7 @@
     Descriptor* descriptorsBuffer; float4* referenceSumBuffer; \
     Atomic<uint>* surfaceHashKeysBuffer; uint4* surfaceHashRecordsBuffer;
 #include "common.slang"
+#include "wave_batch.slang"
 // The renderer's frame set (materials, textures, DFG table) is bound at set 1.
 #define MATERIAL_SET 1
 #include "materials.slang"
@@ -1079,10 +1080,8 @@ uint rtgiCacheHome(float3 position, float3 normal, out uint key) {
 // Finds a cell, or claims an empty one when `insert` is set, by linear
 // probing (Gautron 2020). EMPTY when the probe sequence is full.
 static const uint RTGI_CACHE_PROBES = 8u;
-uint rtgiCacheFind(float3 position, float3 normal, bool insert, out bool inserted) {
+uint rtgiCacheProbe(uint slot, uint key, bool insert, out bool inserted) {
     inserted = false;
-    uint key;
-    uint slot = rtgiCacheHome(position, normal, key);
     uint probe = 0u;
     [loop] for (uint attempt = 0u; probe < RTGI_CACHE_PROBES && attempt < 4u * RTGI_CACHE_PROBES;
                 ++attempt) {
@@ -1106,6 +1105,20 @@ uint rtgiCacheFind(float3 position, float3 normal, bool insert, out bool inserte
         ++probe;
     }
     return EMPTY;
+}
+
+// Lanes looking up the first active lane's cell take its lookup (wave_batch.slang).
+uint rtgiCacheFind(float3 position, float3 normal, bool insert, out bool inserted) {
+    inserted = false;
+    uint key;
+    uint home = rtgiCacheHome(position, normal, key);
+    uint tag = insert ? 1u : 0u;
+    bool follows = waveBatchFollows(key, tag);
+    uint slot = follows ? EMPTY : rtgiCacheProbe(home, key, insert, inserted);
+    bool taken;
+    uint first = waveBatchTake(slot, key, tag, follows, taken);
+    if (taken) return first;
+    return follows ? rtgiCacheProbe(home, key, insert, inserted) : slot;
 }
 
 void rtgiCacheStoreHit(uint slot, float3 origin, float3 direction, Hit hit) {
@@ -2211,6 +2224,10 @@ void reference(uint3 thread : SV_DispatchThreadID) {
     float3 normal = deferredShadingNormal(deferred);
     if (!(depth > 0.0) || !isfinite(depth) || (raster.z & 0x80000000u) == 0u
         || (deferred.w & (1u << 24u)) != 0u || !(dot(normal, normal) > 0.01)) {
+        // A pixel that becomes eligible later starts its mean from zero rather
+        // than from whatever the slot held: one stale word decoded as a huge
+        // float saturated that pixel for the rest of the run.
+        referenceSum[at] = 0.0;
         irradiance.Store(int2(thread.xy), 0.0);
         receiverHistory.Store(int2(thread.xy), 0.0);
         return;
