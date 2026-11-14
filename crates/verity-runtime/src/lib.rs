@@ -27,6 +27,47 @@ pub fn registry() -> ComponentRegistry {
     registry
 }
 
+/// Game logic: a function run every fixed tick with the tick's length in
+/// seconds. Keep its state in components, so scenes save it and the
+/// inspector shows it; sweep them with [`World::query_mut`].
+pub type System = fn(&mut Runtime, f32);
+
+/// A game's own components and systems, added to the engine's.
+#[derive(Clone, Default)]
+pub struct Game {
+    components: Vec<fn(&mut ComponentRegistry)>,
+    systems: Vec<System>,
+}
+
+impl Game {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Makes `T` available to scenes and the inspector.
+    pub fn component<T: verity_core::Component>(mut self) -> Self {
+        self.components.push(|registry| {
+            registry.register::<T>();
+        });
+        self
+    }
+
+    /// Runs `system` every tick, before physics, after the systems added before it.
+    pub fn system(mut self, system: System) -> Self {
+        self.systems.push(system);
+        self
+    }
+
+    /// The engine's components with this game's.
+    pub fn registry(&self) -> ComponentRegistry {
+        let mut registry = registry();
+        for register in &self.components {
+            register(&mut registry);
+        }
+        registry
+    }
+}
+
 /// A city's network and the traffic and people running on it.
 pub struct CityRun {
     pub city: verity_pcg::City,
@@ -68,6 +109,9 @@ pub struct Runtime {
     pub focus: Vec<glam::Vec3>,
     /// Time spent on crowds and the city in the last [`Self::advance`].
     pub last_agents: Duration,
+    /// Time spent in game systems in the last [`Self::advance`].
+    pub last_systems: Duration,
+    systems: Vec<System>,
     fixed_timestep: Duration,
     accumulated: Duration,
 }
@@ -88,6 +132,8 @@ impl Runtime {
             city: None,
             focus: Vec::new(),
             last_agents: Duration::ZERO,
+            last_systems: Duration::ZERO,
+            systems: Vec::new(),
             fixed_timestep: Duration::from_nanos(16_666_667),
             accumulated: Duration::ZERO,
         }
@@ -96,8 +142,15 @@ impl Runtime {
     /// Creates a runtime from a scene, simulating its Rigid Body components.
     /// Fails on unknown components or invalid values.
     pub fn from_scene(scene: &Scene) -> Result<Self, String> {
+        Self::for_game(scene, &Game::default())
+    }
+
+    /// Creates a runtime from a scene that may use `game`'s components, and
+    /// runs `game`'s systems.
+    pub fn for_game(scene: &Scene, game: &Game) -> Result<Self, String> {
         let mut runtime = Self {
-            world: World::from_scene(scene, &registry())?,
+            world: World::from_scene(scene, &game.registry())?,
+            systems: game.systems.clone(),
             ..Self::new()
         };
         let physics = scene.physics;
@@ -316,12 +369,19 @@ impl Runtime {
         self.joint_events.clear();
         self.last_profile = StepProfile::default();
         self.last_agents = Duration::ZERO;
+        self.last_systems = Duration::ZERO;
         self.agents.crowd.focus.clone_from(&self.focus);
         if let Some(city) = &mut self.city {
             city.sim.set_focus(&self.focus);
         }
         while self.accumulated >= self.fixed_timestep {
             let dt = self.fixed_timestep.as_secs_f32();
+            let start = Instant::now();
+            // By index: a system may borrow the whole runtime, its own list included.
+            for i in 0..self.systems.len() {
+                (self.systems[i])(self, dt);
+            }
+            self.last_systems += start.elapsed();
             self.physics.step(&mut self.world, &self.physics_settings, dt);
             self.world.propagate();
             self.joint_events
@@ -396,6 +456,42 @@ mod tests {
         );
         assert_eq!(runtime.advance(Duration::from_millis(21)), 3);
         assert!(runtime.world.get(entity).unwrap().transform.translation[2] < 5.0);
+    }
+
+    #[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
+    struct Rise {
+        speed: f32,
+    }
+
+    impl verity_core::Component for Rise {
+        const NAME: &'static str = "Rise";
+        fn fields(&mut self) -> Vec<(&'static str, verity_core::FieldMut<'_>)> {
+            vec![("Speed", verity_core::FieldMut::Float(&mut self.speed, 0.0..=10.0))]
+        }
+    }
+
+    fn rise(runtime: &mut Runtime, dt: f32) {
+        (runtime.world).each_mut(|_, rise: &mut Rise, transform| {
+            transform.translation[2] += rise.speed * dt;
+        });
+    }
+
+    #[test]
+    fn game_components_load_and_game_systems_run_each_tick() {
+        let game = Game::new().component::<Rise>().system(rise);
+        let mut scene = Scene::default();
+        scene.entities[0]
+            .components
+            .insert("Rise".into(), serde_json::json!({ "speed": 2.0 }));
+        assert!(Runtime::from_scene(&scene).is_err(), "the engine alone does not know Rise");
+        let mut runtime = Runtime::for_game(&scene, &game).unwrap();
+        runtime.set_fixed_timestep(Duration::from_millis(250)).unwrap();
+        let start = scene.entities[0].transform.translation[2];
+        assert_eq!(runtime.advance(Duration::from_secs(1)), 4);
+        let entity = runtime.world.handles()[0];
+        let z = runtime.world.get(entity).unwrap().transform.translation[2];
+        assert!((z - start - 2.0).abs() < 1e-5);
+        assert!(game.registry().get("Rise").is_some());
     }
 
     #[test]

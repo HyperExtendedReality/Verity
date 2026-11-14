@@ -804,6 +804,20 @@ impl World {
             .flat_map(|s| s.owners.iter().copied().zip(&mut s.values))
     }
 
+    /// Calls `f` with every entity that has a `T`, its `T` and its transform,
+    /// in the store's dense order.
+    pub fn each_mut<T: Component>(&mut self, mut f: impl FnMut(EntityHandle, &mut T, &mut Transform)) {
+        let Some(store) = (self.stores.get_mut(&TypeId::of::<T>()))
+            .and_then(|s| s.as_any_mut().downcast_mut::<Store<T>>())
+        else {
+            return;
+        };
+        for (&entity, value) in store.owners.iter().zip(&mut store.values) {
+            let dense = self.slots[entity.index as usize].dense_index;
+            f(entity, value, &mut self.transforms[dense.expect("stores hold live entities")]);
+        }
+    }
+
     /// Builds a runtime world, resolving each entity's components through
     /// `registry`. Fails on unknown or malformed components.
     pub fn from_scene(scene: &Scene, registry: &ComponentRegistry) -> Result<Self, String> {
