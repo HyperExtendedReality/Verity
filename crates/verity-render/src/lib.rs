@@ -72,6 +72,9 @@ const HDR_FORMAT: vk::Format = vk::Format::R16G16B16A16_SFLOAT;
 // Neutral gray, matching the editor chrome.
 const CLEAR_COLOR: [f32; 4] = [0.086, 0.086, 0.086, 1.0];
 
+/// Exposure state before any metering: no sums, exposure 1, not yet seeded.
+const EXPOSURE_INITIAL: [u32; 4] = [0, 0, 0x3f80_0000, 0];
+
 macro_rules! spirv {
     ($name:literal) => {
         include_bytes!(concat!(env!("OUT_DIR"), "/", $name, ".spv"))
@@ -154,6 +157,22 @@ impl RenderInput<'_> {
 }
 
 /// Back-face culling for one-sided materials; none for two-sided ones.
+/// Smallest bounding-sphere radius over distance for a depth prepass
+/// occluder: about a tenth of the height of a 60 degree view.
+const OCCLUDER_SIZE: f32 = 0.05;
+
+/// Whether an opaque draw with model-space bounds `min`..`max` is large on
+/// screen from `eye`. Small or distant draws cost the prepass about what they
+/// cost the visibility pass and hide little: a 2x quad-overdraw multiplier.
+fn is_occluder(model: glam::Mat4, min: glam::Vec3, max: glam::Vec3, eye: glam::Vec3) -> bool {
+    let scale = (model.x_axis.truncate().length())
+        .max(model.y_axis.truncate().length())
+        .max(model.z_axis.truncate().length());
+    let radius = 0.5 * (max - min).length() * scale;
+    let distance = model.transform_point3(0.5 * (min + max)).distance(eye);
+    distance <= radius || radius >= OCCLUDER_SIZE * distance
+}
+
 pub(crate) fn cull_sides(two_sided: bool) -> vk::CullModeFlags {
     if two_sided {
         vk::CullModeFlags::NONE
@@ -288,6 +307,8 @@ pub struct Renderer {
     pipeline_layout: vk::PipelineLayout,
     descriptor_pool: vk::DescriptorPool,
     cluster_pipeline: vk::Pipeline,
+    /// Turns the resolve's metering into the exposure; see `shaders/exposure.slang`.
+    adapt_pipeline: vk::Pipeline,
     visibility_pipeline: vk::Pipeline,
     depth_prepass: vk::Pipeline,
     resolve_pipeline: vk::Pipeline,
@@ -301,6 +322,10 @@ pub struct Renderer {
     frames: Vec<Frame>,
     frame: usize,
     clusters: Buffer,
+    /// Auto exposure state, shared across frames: see `shaders/lib/exposure.slang`.
+    exposure: Buffer,
+    /// When the last frame was presented, for exposure adaptation.
+    last_present: Option<Instant>,
     vertices: Buffer,
     brdf_lut: Buffer,
     vertex_count: u32,
@@ -404,6 +429,8 @@ pub struct Renderer {
     shadow_calls: Vec<(u32, u32)>,
     culler: Option<gpu_culling::Culler>,
     culling_ranges: Vec<Option<(usize, usize)>>,
+    /// Per draw: whether it occludes enough to join the depth prepass.
+    occluders: Vec<bool>,
     /// Each draw's meshlet runs that pass the frustum, for the camera and
     /// models in `meshlet_runs_key`; a draw keeps its runs while it stays put.
     meshlet_runs: Vec<MeshletRuns>,
@@ -506,6 +533,7 @@ impl Renderer {
                 pipeline_layout: vk::PipelineLayout::null(),
                 descriptor_pool: vk::DescriptorPool::null(),
                 cluster_pipeline: vk::Pipeline::null(),
+                adapt_pipeline: vk::Pipeline::null(),
                 visibility_pipeline: vk::Pipeline::null(),
                 depth_prepass: vk::Pipeline::null(),
                 resolve_pipeline: vk::Pipeline::null(),
@@ -522,6 +550,8 @@ impl Renderer {
                 gpu_timer_attempted: false,
                 scene_stages: [Duration::ZERO; 5],
                 clusters: Buffer::default(),
+                exposure: Buffer::default(),
+                last_present: None,
                 vertices: Buffer::default(),
                 brdf_lut: Buffer::default(),
                 vertex_count: 0,
@@ -597,6 +627,7 @@ impl Renderer {
                 shadow_calls: Vec::new(),
                 culler: None,
                 culling_ranges: Vec::new(),
+                occluders: Vec::new(),
                 meshlet_runs: Vec::new(),
                 meshlet_runs_key: None,
                 hiz_active: false,
@@ -679,6 +710,8 @@ impl Renderer {
             D::SAMPLED_IMAGE,
             // Every visibility sample, for the MSAA resolve; unwritten without MSAA.
             D::SAMPLED_IMAGE,
+            // Auto exposure: see `shaders/lib/exposure.slang`.
+            D::STORAGE_BUFFER,
         ];
         // Instances, lights, vertices, indices and Matrix's buffers: now
         // pointers in `Globals`. Their slots stay empty so no other binding renumbers.
@@ -776,6 +809,13 @@ impl Renderer {
             layout,
             spirv!("resolve.resolveMain"),
             c"resolveMain",
+        )?;
+        self.adapt_pipeline = gpu::compute_pipeline(
+            device,
+            vk::PipelineCache::null(),
+            layout,
+            spirv!("exposure.adaptMain"),
+            c"adaptMain",
         )?;
         // Cull mode is dynamic: `cull_sides` sets it per draw.
         self.visibility_pipeline = gpu::graphics_pipeline(
@@ -931,6 +971,15 @@ impl Renderer {
             storage,
             MemoryLocation::GpuOnly,
         )?;
+        self.exposure = gpu::create_buffer(
+            device,
+            allocator,
+            "exposure",
+            mem::size_of_val(&EXPOSURE_INITIAL) as u64,
+            storage,
+            MemoryLocation::CpuToGpu,
+        )?;
+        self.exposure.write(bytemuck::cast_slice(&EXPOSURE_INITIAL));
 
         for (command, set) in commands.into_iter().zip(sets) {
             let mut frame = Frame {
@@ -1266,6 +1315,7 @@ impl Renderer {
         ];
         infos.push((30, [frame.layer_table.info()]));
         infos.push((31, [frame.layer_feedback.info()]));
+        infos.push((35, [self.exposure.info()]));
         let writes: Vec<_> = infos
             .iter()
             .map(|(binding, info)| {
@@ -2198,7 +2248,7 @@ impl Renderer {
             glam::Mat4::IDENTITY
         } else {
             // Sub-pixel offset in NDC.
-            let [x, y] = taa::jitter(self.frame_number);
+            let [x, y] = taa::jitter(self.frame_number, self.anti_aliasing);
             let size = [viewport[2].max(1) as f32, viewport[3].max(1) as f32];
             glam::Mat4::from_translation(glam::Vec3::new(2.0 * x / size[0], 2.0 * y / size[1], 0.0))
         };
@@ -2213,6 +2263,7 @@ impl Renderer {
         self.frame_view_proj = (view_proj, previous);
         self.previous_view_proj = Some(unjittered);
         self.culling_ranges.clear();
+        self.occluders.clear();
         let mut jobs = Vec::new();
         let use_culling = self.matrix_enabled && self.culler.is_some();
         for (instance, &(count, _, primitive)) in
@@ -2221,10 +2272,13 @@ impl Renderer {
             let record = &self.instance_data[instance];
             let model = glam::Mat4::from_cols_array_2d(&record.model);
             let start = jobs.len();
+            let masked = self.material_data[record.draw[2] as usize].textures[3] & scene::ALPHA_MASK != 0;
+            let mut bounds: Option<(glam::Vec3, glam::Vec3)> = None;
             if primitive == NO_PRIMITIVE {
                 // Unculled: its bounds change every frame.
             } else if primitive >= EMBEDDED_PRIMITIVE {
                 let (min, max) = self.embedded_bounds[primitive - EMBEDDED_PRIMITIVE];
+                bounds = Some((min, max));
                 jobs.push(gpu_culling::Job::new(
                     view_proj,
                     model,
@@ -2235,6 +2289,11 @@ impl Renderer {
                 ));
             } else if let Some(meshlets) = &self.primitive_meshlets[primitive] {
                 for meshlet in meshlets {
+                    let (min, max) = (
+                        glam::Vec3::from_array(meshlet.bounds.min),
+                        glam::Vec3::from_array(meshlet.bounds.max),
+                    );
+                    bounds = Some(bounds.map_or((min, max), |(lo, hi)| (lo.min(min), hi.max(max))));
                     jobs.push(gpu_culling::Job::new(
                         view_proj,
                         model,
@@ -2247,6 +2306,9 @@ impl Renderer {
             }
             self.culling_ranges
                 .push((jobs.len() > start).then_some((start, jobs.len())));
+            self.occluders.push(bounds.is_some_and(|(min, max)| {
+                !masked && is_occluder(model, min, max, self.camera.eye)
+            }));
         }
         self.culling_active = self.matrix_enabled
             && self.culler.as_mut().is_some_and(|culler| {
@@ -2726,7 +2788,11 @@ impl Renderer {
             set_viewport(device, cmd, area);
             device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, self.depth_prepass);
             let mut bound = None;
-            for (instance, &(count, two_sided, _)) in self.draw_calls.iter().enumerate() {
+            // Only large opaque occluders: Hi-Z culling needs the big shapes,
+            // and the visibility pass draws everything anyway.
+            let occluders = (self.draw_calls.iter().enumerate())
+                .filter(|&(instance, _)| self.occluders.get(instance) == Some(&true));
+            for (instance, &(count, two_sided, _)) in occluders {
                 if bound != Some(two_sided) {
                     device.cmd_set_cull_mode(cmd, cull_sides(two_sided));
                     bound = Some(two_sided);
@@ -3005,11 +3071,13 @@ impl Renderer {
                     L::DEPTH_READ_ONLY_OPTIMAL,
                 ),
             ],
+            // Storage writes too: the exposure sums are atomics after last
+            // frame's reset.
             &[memory(
                 S::COMPUTE_SHADER,
                 A::SHADER_STORAGE_WRITE,
                 S::COMPUTE_SHADER,
-                A::SHADER_STORAGE_READ,
+                A::SHADER_STORAGE_READ | A::SHADER_STORAGE_WRITE,
             )],
         );
         if let Some((ids, _)) = msaa {
@@ -3136,6 +3204,37 @@ impl Renderer {
             extent,
         };
 
+        // Adapt the exposure to this frame's metering before the composite applies it.
+        let now = Instant::now();
+        let seconds = self
+            .last_present
+            .map_or(0.0, |last| now.duration_since(last).as_secs_f32());
+        self.last_present = Some(now);
+        let read_write = A::SHADER_STORAGE_READ | A::SHADER_STORAGE_WRITE;
+        gpu::memory_barrier(
+            device,
+            cmd,
+            (S::COMPUTE_SHADER | S::FRAGMENT_SHADER, read_write),
+            (S::COMPUTE_SHADER, read_write),
+        );
+        device.cmd_bind_descriptor_sets(
+            cmd,
+            vk::PipelineBindPoint::COMPUTE,
+            self.pipeline_layout,
+            0,
+            &[set],
+            &[],
+        );
+        device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, self.adapt_pipeline);
+        device.cmd_push_constants(
+            cmd,
+            self.pipeline_layout,
+            vk::ShaderStageFlags::COMPUTE,
+            8,
+            &seconds.to_ne_bytes(),
+        );
+        device.cmd_dispatch(cmd, 1, 1, 1);
+
         // Composite and UI into the swapchain image.
         let target = self.swap.images[image];
         barrier(
@@ -3161,7 +3260,12 @@ impl Renderer {
                     L::COLOR_ATTACHMENT_OPTIMAL,
                 ),
             ],
-            &[],
+            // The exposure the adapt pass just wrote.
+            &[vk::MemoryBarrier2::default()
+                .src_stage_mask(S::COMPUTE_SHADER)
+                .src_access_mask(A::SHADER_STORAGE_WRITE)
+                .dst_stage_mask(S::FRAGMENT_SHADER)
+                .dst_access_mask(A::SHADER_STORAGE_READ)],
         );
         let present_attachment = [vk::RenderingAttachmentInfo::default()
             .image_view(self.swap.views[image])
@@ -3470,6 +3574,7 @@ impl Drop for Renderer {
                 }
                 for buffer in [
                     mem::take(&mut self.clusters),
+                    mem::take(&mut self.exposure),
                     mem::take(&mut self.vertices),
                     mem::take(&mut self.brdf_lut),
                 ] {
@@ -3489,6 +3594,7 @@ impl Drop for Renderer {
             self.allocator.take();
             for pipeline in [
                 self.cluster_pipeline,
+                self.adapt_pipeline,
                 self.visibility_pipeline,
                 self.depth_prepass,
                 self.resolve_pipeline,
@@ -3549,6 +3655,29 @@ fn instance_motion(
         current.insert(slot, (model, base_vertex));
     }
     current
+}
+
+#[cfg(test)]
+mod cascade_tests {
+    use super::*;
+
+    #[test]
+    fn near_large_draws_occlude_and_far_small_ones_do_not() {
+        let unit = (glam::Vec3::splat(-1.0), glam::Vec3::splat(1.0));
+        let at = |z: f32, scale: f32| {
+            glam::Mat4::from_scale_rotation_translation(
+                glam::Vec3::splat(scale),
+                glam::Quat::IDENTITY,
+                glam::Vec3::new(0.0, 0.0, z),
+            )
+        };
+        let eye = glam::Vec3::ZERO;
+        assert!(is_occluder(at(-10.0, 1.0), unit.0, unit.1, eye));
+        assert!(!is_occluder(at(-100.0, 1.0), unit.0, unit.1, eye));
+        assert!(is_occluder(at(-100.0, 10.0), unit.0, unit.1, eye));
+        // The camera inside the bounds.
+        assert!(is_occluder(at(0.0, 0.01), unit.0, unit.1, eye));
+    }
 }
 
 #[cfg(test)]
