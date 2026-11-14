@@ -311,7 +311,8 @@ float3 shade(uint2 id, uint2 pixel, uint2 hit, bool primary) {
     }
     float nv = max(dot(s.normal, s.view), 0.0001);
     float2 dfg = env_brdf(nv, s.roughness);
-    Brdf brdf = make_brdf(s.base_color, s.metallic, s.roughness, nv, dfg);
+    Specular specular = material_specular(material);
+    Brdf brdf = make_brdf(s.base_color, s.metallic, s.roughness, specular, nv, dfg);
     // Diffuse transmission (KHR_materials_diffuse_transmission): that share of
     // the diffuse light passes through instead of reflecting, and leaves the
     // far side as a Lambertian lobe in the transmission color. `transmitted`
@@ -323,7 +324,7 @@ float3 shade(uint2 id, uint2 pixel, uint2 hit, bool primary) {
     if (primary && globals.counts.z != 0) {
         // GI reflects off the surface's diffuse albedo, which transmission lowers.
         // shortcut: GI arriving at the far side does not pass through to the viewer; add a back-facing GI lookup when foliage looks too dark under GI.
-        gi_gbuffer[pixel] = pack_gbuffer(s.base_color * (1.0 - transmits), s.roughness, s.metallic, s.normal);
+        gi_gbuffer[pixel] = pack_gbuffer(s.base_color * (1.0 - transmits), s.roughness, s.metallic, specular, s.normal);
         gi_receiver[pixel] = pack_receiver(instance.draw.w, face);
     }
     // Camera and object motion, for GI and TAA. Matrix instances are placed at
@@ -349,12 +350,12 @@ float3 shade(uint2 id, uint2 pixel, uint2 hit, bool primary) {
     // irradiance if interiors come out too dark.
     float3 diffuse_light = hemisphere;
     if (globals.counts.z == 0) {
-        result = (brdf.diffuse_color + specular_albedo(brdf.f0, dfg)) * hemisphere;
+        result = (brdf.diffuse_color + brdf.albedo) * hemisphere;
         // The hemisphere behind the surface, through it.
         result += transmitted * PI * lerp(globals.ground.rgb, globals.sky.rgb, -s.normal.z * 0.5 + 0.5);
     } else if ((globals.counts.z & 2) != 0) {
         float3 mirrored = reflect(-s.view, s.normal);
-        result = specular_albedo(brdf.f0, dfg) * lerp(globals.ground.rgb, globals.sky.rgb, mirrored.z * 0.5 + 0.5);
+        result = brdf.albedo * lerp(globals.ground.rgb, globals.sky.rgb, mirrored.z * 0.5 + 0.5);
     }
     if (globals.sun_direction.w > 0.0) {
         float3 l = -globals.sun_direction.xyz;

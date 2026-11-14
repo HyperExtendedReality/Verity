@@ -217,7 +217,13 @@ pub struct GpuMaterial {
     /// color light takes passing through, w the share of diffuse light that
     /// passes instead of reflecting. Zero for opaque surfaces.
     pub transmission: [f32; 4],
+    /// OpenPBR specular: rgb `specular_color` (dielectric Fresnel tint and
+    /// metals' F82 tint), w `specular_ior`.
+    pub specular: [f32; 4],
 }
+
+/// White specular color, IOR 1.5: F0 = 0.04, the common dielectric.
+pub const DEFAULT_SPECULAR: [f32; 4] = [1.0, 1.0, 1.0, 1.5];
 
 impl GpuMaterial {
     /// A plain verity material: factors only, no textures.
@@ -230,6 +236,7 @@ impl GpuMaterial {
             emission: [0.0; 3],
             emission_texture: NO_TEXTURE,
             transmission: [1.0, 1.0, 1.0, 0.0],
+            specular: DEFAULT_SPECULAR,
         }
     }
 
@@ -244,6 +251,7 @@ impl GpuMaterial {
             emission: [0.0; 3],
             emission_texture: NO_TEXTURE,
             transmission: [1.0, 1.0, 1.0, 0.0],
+            specular: DEFAULT_SPECULAR,
         }
     }
 }
@@ -484,38 +492,44 @@ pub fn cube() -> (Vec<Vertex>, Vec<u32>) {
 /// N·V (x) and perceptual roughness (y); the shader interpolates it for the
 /// Fdez-Agüera multiple-scattering compensation.
 pub fn brdf_lut() -> Vec<[f32; 2]> {
-    const SAMPLES: u32 = 256;
     let mut table = vec![[0.0; 2]; 256];
     for y in 0..16 {
         let roughness = (y as f32 / 15.0).max(0.045);
-        let alpha2 = roughness.powi(4);
         for x in 0..16 {
             let nv = (x as f32 / 15.0).max(0.0001);
-            let v = Vec3::new((1.0 - nv * nv).sqrt(), 0.0, nv);
-            let (mut a, mut b) = (0.0, 0.0);
-            for i in 0..SAMPLES {
-                let u = (i as f32 + 0.5) / SAMPLES as f32;
-                let w = i.reverse_bits() as f32 * (1.0 / 4294967296.0);
-                let phi = std::f32::consts::TAU * u;
-                let cos_theta = ((1.0 - w) / (1.0 + (alpha2 - 1.0) * w)).sqrt();
-                let sin_theta = (1.0 - cos_theta * cos_theta).max(0.0).sqrt();
-                let h = Vec3::new(phi.cos() * sin_theta, phi.sin() * sin_theta, cos_theta);
-                let vh = v.dot(h).max(0.0);
-                let nl = (2.0 * vh * h - v).z.max(0.0);
-                if nl > 0.0 && vh > 0.0 {
-                    let gv = nl * (nv * nv * (1.0 - alpha2) + alpha2).sqrt();
-                    let gl = nv * (nl * nl * (1.0 - alpha2) + alpha2).sqrt();
-                    let visibility = 0.5 / (gv + gl).max(1e-8);
-                    let weight = 4.0 * nl * visibility * vh / cos_theta.max(1e-8);
-                    let fc = (1.0 - vh).powi(5);
-                    a += (1.0 - fc) * weight;
-                    b += fc * weight;
-                }
-            }
-            table[y * 16 + x] = [a / SAMPLES as f32, b / SAMPLES as f32];
+            let fc = |vh: f32| (1.0 - vh).powi(5);
+            table[y * 16 + x] = [
+                ggx_albedo(roughness, nv, 256, |vh| 1.0 - fc(vh)),
+                ggx_albedo(roughness, nv, 256, fc),
+            ];
         }
     }
     table
+}
+
+/// Single-scattering albedo of the GGX lobe (height-correlated Smith) at N·V
+/// `nv` and perceptual `roughness`, with `fresnel` a function of V·H.
+fn ggx_albedo(roughness: f32, nv: f32, samples: u32, fresnel: impl Fn(f32) -> f32) -> f32 {
+    let alpha2 = roughness.powi(4);
+    let v = Vec3::new((1.0 - nv * nv).sqrt(), 0.0, nv);
+    let mut sum = 0.0;
+    for i in 0..samples {
+        let u = (i as f32 + 0.5) / samples as f32;
+        let w = i.reverse_bits() as f32 * (1.0 / 4294967296.0);
+        let phi = std::f32::consts::TAU * u;
+        let cos_theta = ((1.0 - w) / (1.0 + (alpha2 - 1.0) * w)).sqrt();
+        let sin_theta = (1.0 - cos_theta * cos_theta).max(0.0).sqrt();
+        let h = Vec3::new(phi.cos() * sin_theta, phi.sin() * sin_theta, cos_theta);
+        let vh = v.dot(h).max(0.0);
+        let nl = (2.0 * vh * h - v).z.max(0.0);
+        if nl > 0.0 && vh > 0.0 {
+            let gv = nl * (nv * nv * (1.0 - alpha2) + alpha2).sqrt();
+            let gl = nv * (nl * nl * (1.0 - alpha2) + alpha2).sqrt();
+            let visibility = 0.5 / (gv + gl).max(1e-8);
+            sum += fresnel(vh) * 4.0 * nl * visibility * vh / cos_theta.max(1e-8);
+        }
+    }
+    sum / samples as f32
 }
 
 #[cfg(test)]
@@ -620,6 +634,123 @@ mod tests {
         for [a, b] in brdf_lut() {
             assert!(a >= 0.0 && b >= 0.0 && a + b <= 1.01, "{a} + {b}");
         }
+    }
+
+    // Mirrors of brdf.slang's Fresnel, to check its formulas and the albedo
+    // shortcuts it takes from the Schlick DFG table.
+    fn fresnel_dielectric(c: f32, ior: f32) -> f32 {
+        let g2 = ior * ior - 1.0 + c * c;
+        if g2 < 0.0 {
+            return 1.0;
+        }
+        let g = g2.sqrt();
+        let a = (g - c) / (g + c);
+        let b = (c * (g + c) - 1.0) / (c * (g - c) + 1.0);
+        0.5 * a * a * (1.0 + b * b)
+    }
+    const F82_COSINE: f32 = 1.0 / 7.0;
+    fn schlick(f0: f32, c: f32) -> f32 {
+        f0 + (1.0 - f0) * (1.0 - c).powi(5)
+    }
+    fn f82_coefficient(f0: f32, tint: f32) -> f32 {
+        schlick(f0, F82_COSINE) * (1.0 - tint) / (F82_COSINE * (1.0 - F82_COSINE).powi(6))
+    }
+    fn fresnel_f82(f0: f32, coefficient: f32, c: f32) -> f32 {
+        (schlick(f0, c) - coefficient * c * (1.0 - c).powi(6)).clamp(0.0, 1.0)
+    }
+
+    #[test]
+    fn fresnel_matches_openpbr_definitions() {
+        assert!((fresnel_dielectric(1.0, 1.5) - 0.04).abs() < 1e-6);
+        assert!((fresnel_dielectric(0.0, 1.5) - 1.0).abs() < 1e-6);
+        assert!(fresnel_dielectric(1.0, 1.0).abs() < 1e-9);
+        for f0 in [0.2, 0.6, 0.95] {
+            for tint in [0.0, 0.5, 1.0] {
+                let b = f82_coefficient(f0, tint);
+                let at = fresnel_f82(f0, b, F82_COSINE);
+                assert!((at - tint * schlick(f0, F82_COSINE)).abs() < 1e-5, "{f0} {tint}");
+            }
+            // A white tint is plain Schlick.
+            let b = f82_coefficient(f0, 1.0);
+            assert!((0..=10).all(|i| {
+                let c = i as f32 / 10.0;
+                (fresnel_f82(f0, b, c) - schlick(f0, c)).abs() < 1e-6
+            }));
+        }
+    }
+
+    /// brdf.slang's F82_SHARE table: over the DFG table's grid, the F82 term's
+    /// lobe integral, cos (1 - cos)^6, over Schlick's (1 - cos)^5.
+    fn f82_share_table() -> Vec<f32> {
+        let mut table = Vec::with_capacity(256);
+        for y in 0..16 {
+            let roughness = (y as f32 / 15.0).max(0.045);
+            for x in 0..16 {
+                let nv = (x as f32 / 15.0).max(0.0001);
+                let schlick = ggx_albedo(roughness, nv, 2048, |c| (1.0 - c).powi(5));
+                let f82 = ggx_albedo(roughness, nv, 2048, |c| c * (1.0 - c).powi(6));
+                table.push(if schlick > 1e-7 { f82 / schlick } else { 0.0 });
+            }
+        }
+        table
+    }
+
+    #[test]
+    fn f82_share_table_matches_shader() {
+        let source = include_str!("../shaders/lib/brdf.slang");
+        let start = source.find("F82_SHARE[256] = {").expect("table") + "F82_SHARE[256] = {".len();
+        let end = start + source[start..].find("};").unwrap();
+        let shader: Vec<f32> =
+            source[start..end].split(',').filter_map(|v| v.trim().parse().ok()).collect();
+        let table = f82_share_table();
+        if shader.len() != 256 || shader.iter().zip(&table).any(|(a, b)| (a - b).abs() > 2e-3) {
+            let rows: Vec<String> = table
+                .chunks(16)
+                .map(|r| r.iter().map(|v| format!("{v:.4}")).collect::<Vec<_>>().join(", "))
+                .collect();
+            panic!("regenerate brdf.slang's F82_SHARE:\n    {},", rows.join(",\n    "));
+        }
+    }
+
+    #[test]
+    fn f82_albedo_fit() {
+        // brdf.slang's single-scattering albedos from the Schlick table against
+        // integrating the real Fresnel: F82 as F0·x + y(1 − share·b) with the
+        // share read bilinearly as the shader does, dielectric as Schlick at the
+        // IOR's F0. The dielectric gap peaks at grazing angles on smooth, low-IOR
+        // surfaces, where Schlick itself is that far off.
+        let table = f82_share_table();
+        let share = |nv: f32, roughness: f32| {
+            let (u, v) = (nv.clamp(0.0, 1.0) * 15.0, roughness.clamp(0.0, 1.0) * 15.0);
+            let (ax, ay) = (u.floor() as usize, v.floor() as usize);
+            let (bx, by) = ((ax + 1).min(15), (ay + 1).min(15));
+            let (fx, fy) = (u.fract(), v.fract());
+            let row = |y: usize| table[y * 16 + ax] * (1.0 - fx) + table[y * 16 + bx] * fx;
+            row(ay) * (1.0 - fy) + row(by) * fy
+        };
+        let (mut worst_f82, mut worst_dielectric) = (0.0f32, 0.0f32);
+        for roughness in [0.1f32, 0.3, 0.6, 1.0] {
+            for nv in [0.1f32, 0.2, 0.35, 0.5, 0.7, 0.9] {
+                let x = ggx_albedo(roughness, nv, 4096, |c| 1.0 - (1.0 - c).powi(5));
+                let y = ggx_albedo(roughness, nv, 4096, |c| (1.0 - c).powi(5));
+                let share = share(nv, roughness);
+                for (f0, tint) in [(0.95, 0.6), (0.6, 0.3), (0.9, 1.0)] {
+                    let b = f82_coefficient(f0, tint);
+                    let exact = ggx_albedo(roughness, nv, 4096, |c| fresnel_f82(f0, b, c));
+                    let fit = f0 * x + y * (1.0 - b * share);
+                    worst_f82 = worst_f82.max((exact - fit).abs() / exact);
+                }
+                for ior in [1.33, 1.5, 2.0] {
+                    let r = (ior - 1.0) / (ior + 1.0);
+                    let exact = ggx_albedo(roughness, nv, 4096, |c| fresnel_dielectric(c, ior));
+                    worst_dielectric = worst_dielectric.max((exact - (r * r * x + y)).abs());
+                }
+            }
+        }
+        println!("F82 relative {worst_f82:.4}, dielectric absolute {worst_dielectric:.4}");
+        assert!(worst_f82 < 0.01, "F82 albedo fit off by {worst_f82}");
+        // 0.059 at N·V 0.1, roughness 0.1, IOR 1.33; elsewhere under 0.03.
+        assert!(worst_dielectric < 0.065, "dielectric albedo off by {worst_dielectric}");
     }
 
     #[test]

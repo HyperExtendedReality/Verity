@@ -143,11 +143,13 @@ float gbufferMetallic(uint4 g) { return float((g.z >> 8u) & 255u) / 255.0; }
 float3 gbufferAlbedo(uint4 g) { return gbufferBase(g) * (1.0 - gbufferMetallic(g)); }
 float gbufferRoughness(uint4 g) { return float(g.x >> 24u) / 255.0; }
 
-// Specular reflectance at normal incidence.
-float3 gbufferF0(uint4 g) {
-    float reflectance = float(g.z & 255u) / 255.0;
-    float metallic = gbufferMetallic(g);
-    return 0.16 * reflectance * reflectance * (1.0 - metallic) + gbufferBase(g) * metallic;
+// Specular color and the IOR its reflectance stands for (F0 = 0.16 r²).
+Specular gbufferSpecular(uint4 g) {
+    Specular s;
+    s.color = pow(float3(g.y & 255u, (g.y >> 8u) & 255u, (g.y >> 16u) & 255u) / 255.0, 2.2);
+    float r = sqrt(0.16) * float(g.z & 255u) / 255.0;
+    s.ior = (1.0 + r) / max(1.0 - r, 1e-4);
+    return s;
 }
 
 // What a ray leaving the scene along d sees: the renderer's hemisphere.

@@ -747,9 +747,8 @@ void composite(uint3 id : SV_DispatchThreadID) {
     float3 specular = open * background(reflect(-view, n));
     float nv = max(dot(n, view), 1e-4);
     float2 dfg = env_brdf(nv, rough);
-    Brdf brdf = make_brdf(gbufferBase(g), gbufferMetallic(g), rough, nv, dfg);
-    float4 result = float4(lit.rgb + diffuse * brdf.diffuse_color
-        + specular * specular_albedo(brdf.f0, dfg), lit.a);
+    Brdf brdf = make_brdf(gbufferBase(g), gbufferMetallic(g), rough, gbufferSpecular(g), nv, dfg);
+    float4 result = float4(lit.rgb + diffuse * brdf.diffuse_color + specular * brdf.albedo, lit.a);
     hdr[at] = result;
     colorOut.Store(at, float4(diffuseLit(lit.rgb, brdf, rough, n, view) + diffuse * brdf.diffuse_color, lit.a));
 }

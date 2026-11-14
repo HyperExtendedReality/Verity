@@ -77,11 +77,11 @@ SurfaceBsdf hitSurfaceBsdf(Hit hit, float3 baseColor) {
     SurfaceBsdf material;
     material.metallic = materialMetallic(hit);
     // Transmission takes its share of the diffuse reflection. Dielectric
-    // specular comes from `reflectance`, so only the diffuse lobe dims.
+    // specular comes from the IOR, so only the diffuse lobe dims.
     material.baseColor = baseColor * (1.0 - hitTransmits(hit, material.metallic));
     material.perceptualRoughness = materialPerceptualRoughness(hit);
-    // Reflectance 0.5 is F0 = 0.04, the renderer's dielectric F0.
-    material.reflectance = 0.5;
+    material.specularColor = hitMaterial(hit).specular.rgb;
+    material.ior = hitMaterial(hit).specular.w;
     return material;
 }
 #include "environment.slang"

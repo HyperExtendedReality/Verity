@@ -953,8 +953,8 @@ void composite(uint3 id : SV_DispatchThreadID) {
     // The energy split the resolve gives its own ambient term.
     float nv = max(dot(n, view), 1e-4);
     float2 dfg = env_brdf(nv, rough);
-    Brdf brdf = make_brdf(gbufferBase(g), gbufferMetallic(g), rough, nv, dfg);
-    float3 total = lit.rgb + diffuse * brdf.diffuse_color + specular * specular_albedo(brdf.f0, dfg);
+    Brdf brdf = make_brdf(gbufferBase(g), gbufferMetallic(g), rough, gbufferSpecular(g), nv, dfg);
+    float3 total = lit.rgb + diffuse * brdf.diffuse_color + specular * brdf.albedo;
     float4 result = float4(total, lit.a);
     // A debug view replaces what is shown, not what next frame's rays see.
     float4 shown = debugView(fp, p, gi, reflection);

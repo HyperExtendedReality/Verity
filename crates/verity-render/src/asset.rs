@@ -121,6 +121,8 @@ pub struct MaterialData {
     /// Diffuse transmission color (rgb) and factor (w), as in
     /// `GpuMaterial::transmission`.
     pub transmission: [f32; 4],
+    /// Specular color (rgb) and IOR (w), as in `GpuMaterial::specular`.
+    pub specular: [f32; 4],
 }
 
 impl Default for MaterialData {
@@ -139,8 +141,37 @@ impl Default for MaterialData {
             alpha_cutoff: 0.5,
             double_sided: false,
             transmission: [1.0, 1.0, 1.0, 0.0],
+            specular: crate::scene::DEFAULT_SPECULAR,
         }
     }
+}
+
+/// OpenPBR specular color (rgb) and IOR (w) from KHR_materials_specular and
+/// KHR_materials_ior. glTF's specularFactor scales the color.
+// shortcut: specularTexture and specularColorTexture are ignored; sample them in the shaders when assets use them.
+fn specular(
+    specular: Option<&gltf::json::Value>,
+    ior: Option<&gltf::json::Value>,
+) -> [f32; 4] {
+    let number = |value: &gltf::json::Value| value.as_f64().map(|v| v as f32);
+    let [r, g, b, default_ior] = crate::scene::DEFAULT_SPECULAR;
+    // Below 1 (glTF allows exactly 0) has no opaque-surface meaning here.
+    let ior = ior
+        .and_then(|e| e.get("ior"))
+        .and_then(number)
+        .filter(|n| *n >= 1.0)
+        .unwrap_or(default_ior);
+    let factor = specular
+        .and_then(|e| e.get("specularFactor"))
+        .and_then(number)
+        .unwrap_or(1.0)
+        .clamp(0.0, 1.0);
+    let color = specular
+        .and_then(|e| e.get("specularColorFactor"))
+        .and_then(|c| c.as_array())
+        .filter(|c| c.len() == 3)
+        .map_or([r, g, b], |c| std::array::from_fn(|i| number(&c[i]).unwrap_or(1.0).max(0.0)));
+    [color[0] * factor, color[1] * factor, color[2] * factor, ior]
 }
 
 /// KHR_materials_diffuse_transmission's color (rgb) and factor (w); no
@@ -270,6 +301,10 @@ pub fn load_gltf(path: &Path, options: LoadOptions) -> Result<SceneData> {
             double_sided: material.double_sided(),
             transmission: diffuse_transmission(
                 material.extension_value("KHR_materials_diffuse_transmission"),
+            ),
+            specular: specular(
+                material.extension_value("KHR_materials_specular"),
+                material.extension_value("KHR_materials_ior"),
             ),
         });
     }
@@ -678,6 +713,17 @@ mod tests {
         // Out-of-range factors clamp; a malformed color falls back to white.
         let odd = value(r#"{"diffuseTransmissionFactor": 3, "diffuseTransmissionColorFactor": [1]}"#);
         assert_eq!(diffuse_transmission(Some(&odd)), [1.0, 1.0, 1.0, 1.0]);
+    }
+
+    #[test]
+    fn specular_reads_color_factor_and_ior_with_defaults() {
+        let value = |text: &str| serde_json::from_str::<gltf::json::Value>(text).unwrap();
+        assert_eq!(specular(None, None), crate::scene::DEFAULT_SPECULAR);
+        let tinted = value(r#"{"specularFactor": 0.5, "specularColorFactor": [1.0, 0.5, 0.0]}"#);
+        let glass = value(r#"{"ior": 1.33}"#);
+        assert_eq!(specular(Some(&tinted), Some(&glass)), [0.5, 0.25, 0.0, 1.33]);
+        // An IOR below 1 falls back to the default.
+        assert_eq!(specular(None, Some(&value(r#"{"ior": 0}"#)))[3], 1.5);
     }
 
     #[test]

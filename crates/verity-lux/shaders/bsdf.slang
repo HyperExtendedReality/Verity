@@ -13,7 +13,9 @@ struct SurfaceBsdf {
     float3 baseColor;
     float metallic;
     float perceptualRoughness;
-    float reflectance;
+    /// OpenPBR's `specular_color` and `specular_ior`, as the renderer shades them.
+    float3 specularColor;
+    float ior;
 };
 
 float bsdfPow5(float value) {
@@ -46,19 +48,15 @@ float bsdfAlpha(SurfaceBsdf material) {
     return roughness * roughness;
 }
 
-float bsdfReflectance(SurfaceBsdf material) {
-    return isfinite(material.reflectance) ? saturate(material.reflectance) : 0.5;
+Specular bsdfSpecular(SurfaceBsdf material) {
+    Specular s;
+    s.color = all(isfinite(material.specularColor)) ? saturate(material.specularColor) : 1.0;
+    s.ior = isfinite(material.ior) ? material.ior : 1.5;
+    return s;
 }
 
 float3 bsdfDiffuseColor(SurfaceBsdf material) {
     return bsdfBaseColor(material) * (1.0 - bsdfMetallic(material));
-}
-
-// Bevy maps dielectric reflectance to F0 = 0.16 * reflectance^2, then uses
-// base color as F0 for metals.
-float3 bsdfF0(SurfaceBsdf material) {
-    float3 dielectricF0 = 0.16 * bsdfReflectance(material) * bsdfReflectance(material);
-    return lerp(dielectricF0.xxx, bsdfBaseColor(material), bsdfMetallic(material));
 }
 
 // Bevy's isotropic GGX distribution. `alpha` is perceptual roughness squared.
@@ -75,10 +73,11 @@ float bsdfD_GGX(float alpha, float NdotH) {
     return isfinite(value) ? max(value, 0.0) : 0.0;
 }
 
-// Specular albedo, single plus multiple scattering, from the DFG terms.
+// The dielectric specular albedo the diffuse lobe loses, as `make_brdf` takes
+// it; `bsdfDiffuseColor` already leaves out the metal share.
 float3 bsdfSpecularEnergy(SurfaceBsdf material, float2 ab) {
     ab = all(isfinite(ab)) ? max(ab, float2(0.00005, 0.00005)) : float2(0.00005, 0.00005);
-    float3 energy = specular_albedo(bsdfF0(material), ab);
+    float3 energy = dielectric_albedo(bsdfSpecular(material), ab);
     return all(isfinite(energy)) ? saturate(energy) : 0.0;
 }
 
@@ -90,7 +89,7 @@ float3 bsdfEvaluate(SurfaceBsdf material, float3 normal, float3 view, float3 lig
     if (dot(n, n) <= 0.0 || dot(v, v) <= 0.0 || dot(l, l) <= 0.0 || !(NdotV > 0.0)) return 0.0;
     ab = all(isfinite(ab)) ? ab : float2(0.0, 0.0);
     Brdf brdf = make_brdf(bsdfBaseColor(material), bsdfMetallic(material),
-                          bsdfPerceptualRoughness(material), NdotV, ab);
+                          bsdfPerceptualRoughness(material), bsdfSpecular(material), NdotV, ab);
     float3 value = brdf_value(brdf, n, v, l);
     return all(isfinite(value)) ? max(value, 0.0) : 0.0;
 }

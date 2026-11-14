@@ -2,6 +2,8 @@
 // with their own set 0, such as GI, define MATERIAL_SET to the index where
 // they bind the renderer's frame set. Layout mirrors `GpuMaterial` in scene.rs.
 
+#include "brdf.slang"
+
 #ifndef MATERIAL_SET
 #define MATERIAL_SET 0
 #endif
@@ -25,7 +27,16 @@ struct Material {
     /// Diffuse transmission: rgb its color, w the share of diffuse light that
     /// passes through instead of reflecting (KHR_materials_diffuse_transmission).
     float4 transmission;
+    /// OpenPBR specular: rgb `specular_color`, w `specular_ior`.
+    float4 specular;
 };
+
+Specular material_specular(Material m) {
+    Specular s;
+    s.color = m.specular.rgb;
+    s.ior = m.specular.w;
+    return s;
+}
 
 [[vk::binding(10, MATERIAL_SET)]] StructuredBuffer<Material> materials;
 [[vk::binding(11, MATERIAL_SET)]] SamplerState material_sampler;
