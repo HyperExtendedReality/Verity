@@ -1,6 +1,7 @@
 //! Verity runtime world and fixed-step physics simulation.
 
 pub mod agents;
+pub mod audio;
 
 use std::{
     collections::HashMap,
@@ -22,6 +23,7 @@ pub fn registry() -> ComponentRegistry {
     registry.register::<JointComponent>();
     registry.register::<SoftBodyComponent>();
     registry.register::<CrowdComponent>();
+    registry.register::<audio::AudioSourceComponent>();
     registry
 }
 

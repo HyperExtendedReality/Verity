@@ -18,6 +18,8 @@ pub enum FieldMut<'a> {
     Choice(&'a mut dyn Choice),
     /// Another entity, by name; empty for none.
     Entity(&'a mut String),
+    /// A file, with the extensions it may have; empty for none.
+    File(&'a mut String, &'static [&'static str]),
 }
 
 /// A field-less enum offered as a list of options.

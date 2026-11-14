@@ -14,6 +14,7 @@ verity-terra = { path = "../verity-terra" }
 verity-ui = { path = "../verity-ui" }
 verity-nav = { path = "../verity-nav" }
 verity-pcg = { path = "../verity-pcg" }
+verity-audio = { path = "../verity-audio" }
 winit = "0.30"
 rfd = "0.15"
 arboard = "3"

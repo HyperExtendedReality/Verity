@@ -639,6 +639,24 @@ fn fields(
                 });
                 edited
             }
+            FieldMut::File(value, extensions) => {
+                let mut edited = false;
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new(*label).size(11.5).color(MUTED));
+                    if ui.button("…").on_hover_text("Choose a file").clicked()
+                        && let Some(path) = rfd::FileDialog::new()
+                            .add_filter(extensions.join(", "), extensions)
+                            .pick_file()
+                    {
+                        **value = path.to_string_lossy().into_owned();
+                        edited = true;
+                    }
+                    edited |= ui
+                        .add(egui::TextEdit::singleline(*value).desired_width(f32::INFINITY))
+                        .changed();
+                });
+                edited
+            }
             FieldMut::Choice(choice) => {
                 let options = choice.options();
                 let mut index = choice.index();

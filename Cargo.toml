@@ -14,6 +14,7 @@ members = [
     "crates/verity-nav",
     "crates/verity-agents",
     "crates/verity-pcg",
+    "crates/verity-audio",
 ]
 resolver = "2"
 

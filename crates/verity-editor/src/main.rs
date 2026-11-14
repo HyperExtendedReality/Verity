@@ -115,6 +115,8 @@ struct Play {
     dirty: bool,
     paused: bool,
     last: Instant,
+    /// Audio Sources playing; `None` when there is no output device.
+    audio: Option<verity_runtime::audio::SceneAudio>,
 }
 
 /// Keep `mirror` holding `scene`'s entities, in its order, keeping their
@@ -749,6 +751,10 @@ impl Editor {
                         runtime.city = Some(verity_runtime::CityRun::new(run.city, &height));
                     }
                 }
+                // Silence is no reason to stop the scene playing.
+                let audio = (verity_runtime::audio::SceneAudio::start(&runtime.world))
+                    .map_err(|e| Self::error(format!("No sound: {e}")))
+                    .ok();
                 self.play = Some(Play {
                     handles,
                     runtime,
@@ -756,6 +762,7 @@ impl Editor {
                     dirty: self.dirty,
                     paused: false,
                     last: Instant::now(),
+                    audio,
                 });
                 self.redraw();
             }
@@ -1146,6 +1153,17 @@ impl Editor {
         if self.loading.is_none() {
             if let Some(play) = &mut self.play {
                 play.runtime.focus = vec![self.tools.camera.eye];
+                if let Some(audio) = &play.audio {
+                    let camera = &self.tools.camera;
+                    let forward = camera.target - camera.eye;
+                    let right = forward.cross(glam::Vec3::Z).try_normalize();
+                    let listener = verity_audio::Listener {
+                        position: camera.eye,
+                        // Looking straight up or down keeps the default ear.
+                        right: right.unwrap_or(glam::Vec3::X),
+                    };
+                    audio.sync(&play.runtime.world, listener);
+                }
             }
             let start = Instant::now();
             self.tick(false);
