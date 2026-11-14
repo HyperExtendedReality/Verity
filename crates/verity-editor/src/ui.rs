@@ -329,6 +329,18 @@ enum Icon {
 }
 
 fn hierarchy_row(ui: &mut egui::Ui, name: &str, selected: bool, kind: Icon) -> egui::Response {
+    nested_row(ui, name, selected, kind, 0)
+}
+
+/// A hierarchy row indented `depth` levels under its parent.
+fn nested_row(
+    ui: &mut egui::Ui,
+    name: &str,
+    selected: bool,
+    kind: Icon,
+    depth: usize,
+) -> egui::Response {
+    let indent = 14.0 * depth.min(12) as f32;
     let (rect, response) =
         ui.allocate_exact_size(egui::vec2(ui.available_width(), 26.0), Sense::click());
     // Rows scrolled out of the hierarchy keep their space but skip text layout and painting.
@@ -352,7 +364,7 @@ fn hierarchy_row(ui: &mut egui::Ui, name: &str, selected: bool, kind: Icon) -> e
     } else if response.hovered() {
         painter.rect_filled(rect, 6, HOVER);
     }
-    let icon = rect.left_center() + egui::vec2(14.0, 0.0);
+    let icon = rect.left_center() + egui::vec2(14.0 + indent, 0.0);
     match kind {
         Icon::Light => {
             painter.circle_stroke(icon, 4.0, Stroke::new(1.2, PINK));
@@ -383,7 +395,7 @@ fn hierarchy_row(ui: &mut egui::Ui, name: &str, selected: bool, kind: Icon) -> e
         },
     );
     let text_rect = Rect::from_min_max(
-        rect.left_top() + egui::vec2(28.0, 0.0),
+        rect.left_top() + egui::vec2(28.0 + indent, 0.0),
         rect.right_bottom() - egui::vec2(6.0, 0.0),
     );
     painter.with_clip_rect(text_rect).galley(
@@ -1426,7 +1438,7 @@ pub fn show(
         tools.gizmo.cancel_drag();
         *selected = match *selected {
             Selection::Entity(index) => {
-                scene.entities.remove(index);
+                scene.remove_entity(index);
                 if scene.entities.is_empty() {
                     Selection::None
                 } else {
@@ -1550,7 +1562,8 @@ impl Panels<'_> {
             ui.add_space(first as f32 * step);
             // Keep row ids stable while scrolling, so an open context menu stays open.
             ui.skip_ahead_auto_ids(first);
-            for index in first..last {
+            let tree = scene.tree();
+            for &(index, depth) in &tree[first..last] {
                 let entity = &scene.entities[index];
                 let name = if entity.name.is_empty() {
                     "Unnamed entity"
@@ -1561,8 +1574,10 @@ impl Panels<'_> {
                     continue;
                 }
                 let item = Selection::Entity(index);
+                // Filtered rows lose their parents, so indenting them would mislead.
+                let depth = if filter.is_empty() { depth } else { 0 };
                 menu(
-                    hierarchy_row(ui, name, *selected == item, Icon::Entity),
+                    nested_row(ui, name, *selected == item, Icon::Entity, depth),
                     item,
                 );
             }
@@ -1693,11 +1708,34 @@ impl Panels<'_> {
                     .filter(|&(i, e)| i != index && e.components.contains_key("Rigid Body"))
                     .map(|(_, e)| e.name.clone())
                     .collect();
+                let below = scene.descendants(index);
+                let parents: Vec<_> = (scene.entities.iter().enumerate())
+                    .filter(|&(i, _)| i != index && !below.contains(&i))
+                    .map(|(i, e)| (i, e.name.clone()))
+                    .collect();
                 let entity = &mut scene.entities[index];
+                let before = entity.transform.clone();
+                let mut parent = entity.parent;
                 section(ui, "ENTITY");
                 changed |= ui
                     .add(egui::TextEdit::singleline(&mut entity.name).desired_width(f32::INFINITY))
                     .changed();
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("Parent").size(11.5).color(MUTED));
+                    let name = |p: Option<usize>| {
+                        let found = parents.iter().find(|(i, _)| Some(*i) == p);
+                        found.map_or("None", |(_, name)| name.as_str()).to_owned()
+                    };
+                    egui::ComboBox::from_id_salt("entity_parent")
+                        .width(ui.available_width())
+                        .selected_text(name(parent))
+                        .show_ui(ui, |ui| {
+                            ui.selectable_value(&mut parent, None, "None");
+                            for (i, name) in &parents {
+                                ui.selectable_value(&mut parent, Some(*i), name);
+                            }
+                        });
+                });
                 if !entity.components.contains_key("Rigid Body")
                     && let Some(info) = tools.registry.get("Rigid Body")
                     && ui.button("＋ Add rigid body").clicked()
@@ -1738,6 +1776,13 @@ impl Panels<'_> {
                 delete |= ui
                     .button(RichText::new("Delete entity").color(PINK))
                     .clicked();
+                if scene.entities[index].transform != before {
+                    scene.carry_children(index, &before);
+                }
+                if parent != scene.entities[index].parent {
+                    // The picker only offers parents that cannot form a cycle.
+                    changed |= scene.set_parent(index, parent).is_ok();
+                }
             }
             Selection::Light(index) => {
                 let light = &mut scene.lights[index];
@@ -2008,12 +2053,16 @@ impl Panels<'_> {
             && tools.play == PlayState::Editing
             && tools.loading.is_none()
         {
-            changed |= tools.gizmo.show(
+            let before = scene.entities[index].transform.clone();
+            if tools.gizmo.show(
                 ui,
                 viewport,
                 &mut scene.entities[index].transform,
                 &tools.camera,
-            );
+            ) {
+                scene.carry_children(index, &before);
+                changed = true;
+            }
         }
         self.viewport = viewport;
         self.changed |= changed;

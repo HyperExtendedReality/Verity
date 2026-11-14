@@ -131,6 +131,8 @@ impl Runtime {
                 .physics
                 .insert(&runtime.world, entity, body)
                 .expect("entities come from this world");
+            // A child with its own body simulates freely rather than fighting its parent.
+            (runtime.world.set_parent(entity, None)).expect("entities come from this world");
         }
         runtime.add_joints()?;
         runtime.add_soft_bodies()?;
@@ -319,6 +321,7 @@ impl Runtime {
         while self.accumulated >= self.fixed_timestep {
             let dt = self.fixed_timestep.as_secs_f32();
             self.physics.step(&mut self.world, &self.physics_settings, dt);
+            self.world.propagate();
             self.joint_events
                 .extend_from_slice(self.physics.joint_events());
             self.last_profile.accumulate(&self.physics.last_profile());
@@ -391,6 +394,30 @@ mod tests {
         );
         assert_eq!(runtime.advance(Duration::from_millis(21)), 3);
         assert!(runtime.world.get(entity).unwrap().transform.translation[2] < 5.0);
+    }
+
+    #[test]
+    fn children_follow_a_falling_parent_unless_they_have_a_body() {
+        let mut scene = Scene::default();
+        scene.entities[0].transform.translation = [0.0, 0.0, 5.0];
+        scene.entities[0].components.insert(
+            "Rigid Body".into(),
+            serde_json::to_value(RigidBodyComponent::default()).unwrap(),
+        );
+        scene.set_parent(1, Some(0)).unwrap();
+        let mut runtime = Runtime::from_scene(&scene).unwrap();
+        let [parent, child] = [0, 1].map(|i| runtime.world.handles()[i]);
+        let z = |r: &Runtime, e| r.world.get(e).unwrap().transform.translation[2];
+        let gap = z(&runtime, parent) - z(&runtime, child);
+        runtime.advance(Duration::from_millis(100));
+        assert!(z(&runtime, child) < scene.entities[1].transform.translation[2]);
+        assert!((z(&runtime, parent) - z(&runtime, child) - gap).abs() < 1e-4);
+
+        // The parent's body would otherwise be overwritten by its own parent.
+        scene.set_parent(1, None).unwrap();
+        scene.set_parent(0, Some(1)).unwrap();
+        let runtime = Runtime::from_scene(&scene).unwrap();
+        assert_eq!(runtime.world.parent(runtime.world.handles()[0]), None);
     }
 
     #[test]

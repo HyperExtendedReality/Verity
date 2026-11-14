@@ -3146,6 +3146,7 @@ dependencies = [
 name = "verity-core"
 version = "0.1.0"
 dependencies = [
+ "glam",
  "serde",
  "serde_json",
 ]

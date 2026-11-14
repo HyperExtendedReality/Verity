@@ -45,6 +45,7 @@ pub fn sea(level: f32) -> Entity {
             roughness: 0.06,
         },
         components: Default::default(),
+        parent: None,
     }
 }
 

@@ -988,7 +988,7 @@ impl Editor {
             Key::Named(NamedKey::Delete) => {
                 let removed = match self.selected {
                     Selection::Entity(i) if i < self.scene.entities.len() => {
-                        self.scene.entities.remove(i);
+                        self.scene.remove_entity(i);
                         true
                     }
                     Selection::Light(i) if i < self.scene.lights.len() => {
@@ -1077,6 +1077,11 @@ impl Editor {
                     };
                     if let Some(position) = position {
                         position[axis] += amount;
+                        if let Selection::Entity(i) = self.selected {
+                            for child in self.scene.descendants(i) {
+                                self.scene.entities[child].transform.translation[axis] += amount;
+                            }
+                        }
                         self.changed();
                     }
                 }

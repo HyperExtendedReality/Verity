@@ -30,6 +30,26 @@ impl Default for Transform {
     }
 }
 
+impl Transform {
+    pub fn matrix(&self) -> glam::Mat4 {
+        glam::Mat4::from_scale_rotation_translation(
+            self.scale.into(),
+            glam::Quat::from_array(self.rotation),
+            self.translation.into(),
+        )
+    }
+
+    /// The nearest scale, rotation and translation to `matrix`; shear is lost.
+    pub fn from_matrix(matrix: glam::Mat4) -> Self {
+        let (scale, rotation, translation) = matrix.to_scale_rotation_translation();
+        Self {
+            translation: translation.into(),
+            rotation: rotation.to_array(),
+            scale: scale.into(),
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Material {
     pub base_color: [f32; 3],
@@ -55,6 +75,10 @@ pub struct Entity {
     /// Authoring data of registered components, by [`Component::NAME`].
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub components: BTreeMap<String, serde_json::Value>,
+    /// Index in [`Scene::entities`] of the entity this one moves with.
+    /// Transforms stay in world space; a parent carries its children along.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent: Option<usize>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -353,6 +377,101 @@ impl Default for Scene {
     }
 }
 
+impl Scene {
+    /// Whether `ancestor` is `index` or above it.
+    fn descends(&self, mut index: usize, ancestor: usize) -> bool {
+        // Bounded, so a cycle in a hand-edited file cannot hang the walk.
+        for _ in 0..=self.entities.len() {
+            if index == ancestor {
+                return true;
+            }
+            match self.entities.get(index).and_then(|e| e.parent) {
+                Some(parent) => index = parent,
+                None => return false,
+            }
+        }
+        false
+    }
+
+    /// Make `parent` carry `child`, or detach it with `None`. World
+    /// transforms do not change.
+    pub fn set_parent(&mut self, child: usize, parent: Option<usize>) -> Result<(), &'static str> {
+        let count = self.entities.len();
+        if child >= count || parent.is_some_and(|p| p >= count) {
+            return Err("no such entity");
+        }
+        if parent.is_some_and(|p| self.descends(p, child)) {
+            return Err("an entity cannot be its own ancestor");
+        }
+        self.entities[child].parent = parent;
+        Ok(())
+    }
+
+    /// Every entity below `index`, not including it.
+    pub fn descendants(&self, index: usize) -> Vec<usize> {
+        (0..self.entities.len())
+            .filter(|&i| i != index && self.descends(i, index))
+            .collect()
+    }
+
+    /// After `index`'s transform changed from `before`, move its descendants
+    /// with it.
+    pub fn carry_children(&mut self, index: usize, before: &Transform) {
+        let before = before.matrix();
+        if !before.is_finite() || before.determinant() == 0.0 {
+            return;
+        }
+        let delta = self.entities[index].transform.matrix() * before.inverse();
+        if !delta.is_finite() || delta == glam::Mat4::IDENTITY {
+            return;
+        }
+        for child in self.descendants(index) {
+            let transform = &mut self.entities[child].transform;
+            *transform = Transform::from_matrix(delta * transform.matrix());
+        }
+    }
+
+    /// Removes an entity. Its children move up to its parent, and later
+    /// entities' indices shift down by one.
+    pub fn remove_entity(&mut self, index: usize) -> Entity {
+        let removed = self.entities.remove(index);
+        let shift = |p: usize| if p > index { p - 1 } else { p };
+        for entity in &mut self.entities {
+            entity.parent = match entity.parent {
+                Some(p) if p == index => removed.parent.map(shift),
+                parent => parent.map(shift),
+            };
+        }
+        removed
+    }
+
+    /// Entities depth first with their depths, each parent before its
+    /// children. Entities caught in a parent cycle come last, at depth 0.
+    pub fn tree(&self) -> Vec<(usize, usize)> {
+        let count = self.entities.len();
+        let mut children = vec![Vec::new(); count];
+        let mut roots = Vec::new();
+        for (index, entity) in self.entities.iter().enumerate() {
+            match entity.parent {
+                Some(parent) if parent < count && parent != index => children[parent].push(index),
+                _ => roots.push(index),
+            }
+        }
+        let mut order = Vec::with_capacity(count);
+        let mut seen = vec![false; count];
+        let mut stack: Vec<_> = roots.into_iter().rev().map(|i| (i, 0)).collect();
+        while let Some((index, depth)) = stack.pop() {
+            if std::mem::replace(&mut seen[index], true) {
+                continue;
+            }
+            order.push((index, depth));
+            stack.extend(children[index].iter().rev().map(|&c| (c, depth + 1)));
+        }
+        order.extend((0..count).filter(|&i| !seen[i]).map(|i| (i, 0)));
+        order
+    }
+}
+
 /// A generational identifier issued by a particular [`World`].
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct EntityHandle {
@@ -401,6 +520,9 @@ pub struct World {
     names: Vec<String>,
     transforms: Vec<Transform>,
     materials: Vec<Material>,
+    parents: Vec<Option<EntityHandle>>,
+    /// Each child's transform relative to its parent, kept from [`World::set_parent`].
+    locals: Vec<glam::Mat4>,
     pub lights: Vec<PointLight>,
     pub sun: Option<Sun>,
     pub lighting: Lighting,
@@ -424,7 +546,8 @@ impl World {
 
     /// Inserts an entity and returns its stable runtime handle. Authoring
     /// components need a registry: add them with [`World::insert_component`]
-    /// or build the world with [`World::from_scene`].
+    /// or build the world with [`World::from_scene`]. `entity.parent` is
+    /// ignored; use [`World::set_parent`].
     pub fn spawn(&mut self, entity: Entity) -> EntityHandle {
         debug_assert!(
             entity.components.is_empty(),
@@ -452,7 +575,65 @@ impl World {
         self.names.push(entity.name);
         self.transforms.push(entity.transform);
         self.materials.push(entity.material);
+        self.parents.push(None);
+        self.locals.push(glam::Mat4::IDENTITY);
         handle
+    }
+
+    pub fn parent(&self, child: EntityHandle) -> Option<EntityHandle> {
+        self.parents[self.dense_index(child)?]
+    }
+
+    /// Make `parent` carry `child` from where they stand now, or detach it
+    /// with `None`.
+    pub fn set_parent(
+        &mut self,
+        child: EntityHandle,
+        parent: Option<EntityHandle>,
+    ) -> Result<(), &'static str> {
+        let index = self.dense_index(child).ok_or("no such entity")?;
+        let local = match parent {
+            None => glam::Mat4::IDENTITY,
+            Some(parent) => {
+                let mut above = Some(parent);
+                while let Some(ancestor) = above {
+                    if ancestor == child {
+                        return Err("an entity cannot be its own ancestor");
+                    }
+                    above = self.parent(ancestor);
+                }
+                let at = self.dense_index(parent).ok_or("no such entity")?;
+                self.transforms[at].matrix().inverse() * self.transforms[index].matrix()
+            }
+        };
+        if !local.is_finite() {
+            return Err("the parent's transform cannot be inverted");
+        }
+        self.parents[index] = parent;
+        self.locals[index] = local;
+        Ok(())
+    }
+
+    /// Move every child to where its parent now carries it, parents first.
+    /// A child's own transform changes are overwritten.
+    pub fn propagate(&mut self) {
+        let depth = |mut index: usize| {
+            let mut depth = 0;
+            while let Some(parent) = self.parents[index] {
+                index = self.dense_index(parent).expect("despawn detaches children");
+                depth += 1;
+            }
+            depth
+        };
+        let mut children: Vec<usize> =
+            (0..self.len()).filter(|&i| self.parents[i].is_some()).collect();
+        children.sort_by_cached_key(|&i| depth(i));
+        for index in children {
+            let parent = self.parents[index].and_then(|p| self.dense_index(p));
+            let parent = parent.expect("despawn detaches children");
+            let world = self.transforms[parent].matrix() * self.locals[index];
+            self.transforms[index] = Transform::from_matrix(world);
+        }
     }
 
     fn dense_index(&self, handle: EntityHandle) -> Option<usize> {
@@ -499,7 +680,16 @@ impl World {
             transform: self.transforms.swap_remove(index),
             material: self.materials.swap_remove(index),
             components: BTreeMap::new(),
+            parent: None,
         };
+        self.parents.swap_remove(index);
+        self.locals.swap_remove(index);
+        // Children stay where they stand.
+        for parent in &mut self.parents {
+            if *parent == Some(handle) {
+                *parent = None;
+            }
+        }
         if let Some(moved) = self.handles.get(index) {
             self.slots[moved.index as usize].dense_index = Some(index);
         }
@@ -627,15 +817,25 @@ impl World {
             physics: scene.physics,
             ..Self::new()
         };
+        let mut handles = Vec::with_capacity(scene.entities.len());
         for entity in &scene.entities {
             let handle = world.spawn(Entity {
                 components: BTreeMap::new(),
                 ..entity.clone()
             });
+            handles.push(handle);
             for (name, value) in &entity.components {
                 registry
                     .insert(&mut world, handle, name, value)
                     .map_err(|e| format!("{}: {e}", entity.name))?;
+            }
+        }
+        for (entity, &handle) in scene.entities.iter().zip(&handles) {
+            if let Some(parent) = entity.parent {
+                let parent = handles.get(parent).copied();
+                (parent.ok_or("no such entity"))
+                    .and_then(|parent| world.set_parent(handle, Some(parent)))
+                    .map_err(|e| format!("{}: parent: {e}", entity.name))?;
             }
         }
         Ok(world)
@@ -651,6 +851,7 @@ impl World {
                     transform: entity.transform.clone(),
                     material: entity.material.clone(),
                     components: registry.extract(self, entity.handle).collect(),
+                    parent: self.parent(entity.handle).and_then(|p| self.dense_index(p)),
                 })
                 .collect(),
             lights: self.lights.clone(),
@@ -943,5 +1144,77 @@ mod tests {
         let new = world.spawn(entity("new"));
         assert_ne!(new.index(), last.index());
         assert!(!world.contains(last));
+    }
+
+    fn at(x: f32) -> Transform {
+        Transform {
+            translation: [x, 0.0, 0.0],
+            ..Transform::default()
+        }
+    }
+
+    fn close(a: [f32; 3], b: [f32; 3]) -> bool {
+        a.iter().zip(b).all(|(a, b)| (a - b).abs() < 1e-5)
+    }
+
+    /// a ← b ← c, plus a lone d.
+    fn family() -> Scene {
+        let mut scene = Scene {
+            entities: ["a", "b", "c", "d"].map(entity).to_vec(),
+            ..Scene::default()
+        };
+        for (i, e) in scene.entities.iter_mut().enumerate() {
+            e.transform = at(i as f32);
+        }
+        scene.set_parent(2, Some(1)).unwrap();
+        scene.set_parent(1, Some(0)).unwrap();
+        scene
+    }
+
+    #[test]
+    fn scene_hierarchy_refuses_cycles_and_orders_parents_first() {
+        let mut scene = family();
+        assert!(scene.set_parent(0, Some(2)).is_err());
+        assert!(scene.set_parent(1, Some(1)).is_err());
+        assert_eq!(scene.tree(), [(0, 0), (1, 1), (2, 2), (3, 0)]);
+        assert_eq!(scene.descendants(0), [1, 2]);
+        // A cycle from a hand-edited file still lists every entity.
+        scene.entities[0].parent = Some(2);
+        assert_eq!(scene.tree().len(), 4);
+    }
+
+    #[test]
+    fn moving_a_parent_carries_descendants() {
+        let mut scene = family();
+        let before = scene.entities[0].transform.clone();
+        scene.entities[0].transform.rotation = glam::Quat::from_rotation_z(90f32.to_radians()).to_array();
+        scene.carry_children(0, &before);
+        assert!(close(scene.entities[2].transform.translation, [0.0, 2.0, 0.0]));
+        assert!(close(scene.entities[3].transform.translation, [3.0, 0.0, 0.0]));
+    }
+
+    #[test]
+    fn removing_a_parent_hands_children_to_the_grandparent() {
+        let mut scene = family();
+        scene.remove_entity(1);
+        assert_eq!(scene.entities[1].name, "c");
+        assert_eq!(scene.entities[1].parent, Some(0));
+        scene.remove_entity(0);
+        assert_eq!(scene.entities[0].parent, None);
+    }
+
+    #[test]
+    fn world_children_follow_parents_and_round_trip() {
+        let registry = ComponentRegistry::default();
+        let mut world = World::from_scene(&family(), &registry).unwrap();
+        let handles = world.handles().to_vec();
+        world.get_mut(handles[0]).unwrap().transform.translation[2] = 5.0;
+        world.propagate();
+        assert!(close(world.get(handles[2]).unwrap().transform.translation, [2.0, 0.0, 5.0]));
+        assert_eq!(world.to_scene(&registry).entities[2].parent, Some(1));
+        assert!(world.set_parent(handles[0], Some(handles[2])).is_err());
+        world.despawn(handles[1]);
+        assert_eq!(world.parent(handles[2]), None);
+        world.propagate();
     }
 }

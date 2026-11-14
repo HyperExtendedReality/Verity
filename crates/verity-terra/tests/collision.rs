@@ -35,6 +35,7 @@ fn spawn(world: &mut World, position: Vec3) -> EntityHandle {
             ..Transform::default()
         },
         material: Material::default(),
+        parent: None,
         components: Default::default(),
     })
 }

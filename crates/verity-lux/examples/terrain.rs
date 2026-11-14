@@ -208,6 +208,7 @@ impl Viewer {
             },
             material: BOX_MATERIAL,
             components: Default::default(),
+            parent: None,
         });
         let collider = Collider::Cuboid {
             half_extents: Vec3::splat(BOX_SIZE * 0.5),
@@ -748,6 +749,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                 roughness: 0.06,
             },
             components: Default::default(),
+            parent: None,
         });
     }
     // The ground is a body like any other, drawn by its chunks rather than a cube.
@@ -759,6 +761,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         },
         material: Material::default(),
         components: Default::default(),
+        parent: None,
     });
     let body = PhysicsBody::new(RigidBody::Static, Collider::Ground);
     physics.insert(&world, ground, body)?;
