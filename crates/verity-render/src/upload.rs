@@ -257,6 +257,7 @@ impl Renderer {
                         ],
                         emission: m.emission,
                         emission_texture: texture(m.emission_texture),
+                        transmission: m.transmission,
                     },
                     double_sided: m.double_sided,
                     // shortcut: blended materials need a forward transparency

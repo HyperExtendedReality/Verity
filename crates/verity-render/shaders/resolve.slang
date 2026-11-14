@@ -307,9 +307,18 @@ float3 shade(uint2 id, uint2 pixel, uint2 hit, bool primary) {
     float nv = max(dot(s.normal, s.view), 0.0001);
     float2 dfg = env_brdf(nv, s.roughness);
     Brdf brdf = make_brdf(s.base_color, s.metallic, s.roughness, nv, dfg);
+    // Diffuse transmission (KHR_materials_diffuse_transmission): that share of
+    // the diffuse light passes through instead of reflecting, and leaves the
+    // far side as a Lambertian lobe in the transmission color. `transmitted`
+    // is radiance per unit irradiance arriving from behind.
+    float transmits = saturate(material.transmission.w) * (1.0 - saturate(s.metallic));
+    brdf.diffuse_color *= 1.0 - transmits;
+    float3 transmitted = max(material.transmission.rgb, 0.0) * transmits / PI;
 
     if (primary && globals.counts.z != 0) {
-        gi_gbuffer[pixel] = pack_gbuffer(s.base_color, s.roughness, s.metallic, s.normal);
+        // GI reflects off the surface's diffuse albedo, which transmission lowers.
+        // shortcut: GI arriving at the far side does not pass through to the viewer; add a back-facing GI lookup when foliage looks too dark under GI.
+        gi_gbuffer[pixel] = pack_gbuffer(s.base_color * (1.0 - transmits), s.roughness, s.metallic, s.normal);
         gi_receiver[pixel] = pack_receiver(instance.draw.w, face);
     }
     // Camera and object motion, for GI and TAA. Matrix instances are placed at
@@ -332,6 +341,8 @@ float3 shade(uint2 id, uint2 pixel, uint2 hit, bool primary) {
     if (globals.counts.z == 0) {
         float3 hemisphere = lerp(globals.ground.rgb, globals.sky.rgb, s.normal.z * 0.5 + 0.5);
         result = (brdf.diffuse_color + specular_albedo(brdf.f0, dfg)) * hemisphere;
+        // The hemisphere behind the surface, through it.
+        result += transmitted * PI * lerp(globals.ground.rgb, globals.sky.rgb, -s.normal.z * 0.5 + 0.5);
     } else if ((globals.counts.z & 2) != 0) {
         float3 mirrored = reflect(-s.view, s.normal);
         result = specular_albedo(brdf.f0, dfg) * lerp(globals.ground.rgb, globals.sky.rgb, mirrored.z * 0.5 + 0.5);
@@ -339,6 +350,10 @@ float3 shade(uint2 id, uint2 pixel, uint2 hit, bool primary) {
     if (globals.sun_direction.w > 0.0) {
         float3 l = -globals.sun_direction.xyz;
         result += evaluate_brdf(brdf, s, l) * globals.sun_color.rgb * sun_shadow(s.position, face, depth) * cloud_shadow(s.position);
+        // Sun behind a leaf, shadowed on the side it lights.
+        float behind = -dot(s.normal, l);
+        if (transmits > 0.0 && behind > 0.0)
+            result += transmitted * behind * globals.sun_color.rgb * sun_shadow(s.position, -face, depth) * cloud_shadow(s.position);
     }
     uint2 tile = min(uint2(float2(id.xy) / viewport.zw * float2(CLUSTER_X, CLUSTER_Y)), uint2(CLUSTER_X - 1, CLUSTER_Y - 1));
     uint first = cluster_index(uint3(tile, depth_slice(depth))) * LIGHT_WORDS;
@@ -358,6 +373,10 @@ float3 shade(uint2 id, uint2 pixel, uint2 hit, bool primary) {
             float falloff = window / max(distance * distance, 0.01);
             result += evaluate_brdf(brdf, s, l) * light.color_intensity.rgb * light.color_intensity.a * falloff
                 * point_shadow(i, light, s.position, face);
+            float behind = -dot(s.normal, l);
+            if (transmits > 0.0 && behind > 0.0)
+                result += transmitted * behind * light.color_intensity.rgb * light.color_intensity.a * falloff
+                    * point_shadow(i, light, s.position, -face);
         }
     }
     result += emission;

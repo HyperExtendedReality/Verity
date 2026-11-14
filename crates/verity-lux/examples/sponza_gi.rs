@@ -18,7 +18,8 @@
 //! `--lights=N` hangs N point lights in two rows along the nave. `--software`
 //! traces without hardware ray queries, and `--world=M` sets PXTGI's ray reach.
 //! `--scene=A.glb,B.glb` loads those from `assets/packed` instead of Sponza.
-//! `--no-surface-cache` turns the surface cache off; `--surface-level=N` and
+//! `--no-surface-cache` turns the surface cache off, `--no-surface-hash` only
+//! its hashed cells for uncharted surfaces; `--surface-level=N` and
 //! `--surface-texel=M` set the first cascade read from it and its texel size;
 //! `--surface-updates=N` and `--surface-rays=N` its texels shaded a frame and
 //! bounce rays each; `--surface-reach=M` caps software bounce rays.
@@ -233,6 +234,9 @@ impl ApplicationHandler for Viewer {
                 }
                 settings.hardware_rays = !flag("--software");
                 settings.surface_cache = !flag("--no-surface-cache");
+                if flag("--no-surface-hash") {
+                    settings.surface_hash_cells = 0;
+                }
                 if let Some(level) = arg("surface-level") {
                     settings.surface_from_level = level.parse().expect("--surface-level=N");
                 }

@@ -77,7 +77,21 @@ bounces build up across the scene, on screen or not. A ray hit reads its
 texel's bounce light, where it used to read world probes, which leak through
 walls. From `surface_from_level` (3) on, a hit takes all of its light from the
 texel and skips shading. Blended and double-sided surfaces such as foliage are
-not charted and still read the probes. So are retained meshes such as terrain.
+not charted, and neither are retained meshes such as terrain. A hit on one
+claims a hashed cell instead (`surface_hash_cells`, 65,536 by default): a cell
+covers 0.3 m out to 10 m from the camera, twice that to 30 m, and so on, and
+each side of a surface gets its own, so a leaf's two sides never share light.
+`surfaceUpdate` shades `surface_hash_updates` (8,192) cells a frame like atlas
+texels, and drops a cell no hit has read for 240 frames. Bounce rays that hit
+these surfaces now bring their light instead of being left out. On the Bistro
+street view at 1920×1080 (RTX 4070 Laptop, runs alternating off and on) the
+cells add 0.22–0.28 ms to `surfaceUpdate` and 0.15–0.31 ms to the GI total.
+
+Materials with `KHR_materials_diffuse_transmission` pass that share of their
+diffuse light through: lights behind a leaf shine through it in the
+transmission color, both in the renderer's direct light and at GI hits, and at
+hits the bounce light in the far side's cell passes through too. The
+extension's textures are not read yet.
 
 A ray that leaves the scene brings the scene's ambient hemisphere
 (`Lighting::sky` and `ground`, or `Renderer::set_ambient`), as PXTGI's and the

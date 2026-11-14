@@ -8,7 +8,8 @@
     RtgiCacheCell* rtgiCacheCellsBuffer; float4* rtgiFieldBuffer; \
     uint2* blueNoiseRanksBuffer; uint4* surfaceTrianglesBuffer; \
     uint4* surfaceIslandsBuffer; uint4* surfaceTexelsBuffer; uint4* surfaceRadianceBuffer; \
-    Descriptor* descriptorsBuffer; float4* referenceSumBuffer;
+    Descriptor* descriptorsBuffer; float4* referenceSumBuffer; \
+    Atomic<uint>* surfaceHashKeysBuffer; uint4* surfaceHashRecordsBuffer;
 #include "common.slang"
 // The renderer's frame set (materials, textures, DFG table) is bound at set 1.
 #define MATERIAL_SET 1
@@ -37,6 +38,8 @@
 #define surfaceIslands params.surfaceIslandsBuffer
 #define surfaceTexels params.surfaceTexelsBuffer
 #define surfaceRadiance params.surfaceRadianceBuffer
+#define surfaceHashKeys params.surfaceHashKeysBuffer
+#define surfaceHashRecords params.surfaceHashRecordsBuffer
 #define descriptors params.descriptorsBuffer
 #define referenceSum params.referenceSumBuffer
 [[vk::binding(4, 0)]] DepthTexture2D depthTexture;
@@ -60,10 +63,21 @@ float2 bsdfDfg(float roughness, float nDotV) {
 }
 #include "bsdf.slang"
 #include "traversal.slang"
+// The share of diffuse light passing through a hit's surface instead of
+// reflecting (KHR_materials_diffuse_transmission); metal transmits none.
+// Opaque materials skip the metallic texture sample.
+float hitTransmits(Hit hit, float metallic) {
+    return saturate(hitMaterial(hit).transmission.w) * (1.0 - saturate(metallic));
+}
+float hitTransmits(Hit hit) {
+    return hitMaterial(hit).transmission.w > 0.0 ? hitTransmits(hit, materialMetallic(hit)) : 0.0;
+}
 SurfaceBsdf hitSurfaceBsdf(Hit hit, float3 baseColor) {
     SurfaceBsdf material;
-    material.baseColor = baseColor;
     material.metallic = materialMetallic(hit);
+    // Transmission takes its share of the diffuse reflection. Dielectric
+    // specular comes from `reflectance`, so only the diffuse lobe dims.
+    material.baseColor = baseColor * (1.0 - hitTransmits(hit, material.metallic));
     material.perceptualRoughness = materialPerceptualRoughness(hit);
     // Reflectance 0.5 is F0 = 0.04, the renderer's dielectric F0.
     material.reflectance = 0.5;
@@ -404,9 +418,11 @@ TransportRadiance outgoingTransportRadianceTracked(float3 origin, float3 directi
     float indirectBackgroundCoverage = 0.0;
     TransportRadiance indirect = (TransportRadiance)0;
     // A cached surface brings its bounce light without leaking through walls,
-    // and far hits take all their light from it.
+    // and far hits take all their light from it. An uncharted surface claims a
+    // hashed cell here; a new cell reads as uncached in both the recording and
+    // the replay of this frame, so they still make the same choice.
     SurfaceTexel cached;
-    bool fromSurface = !rtgiDirectOnly && surfaceRead(hit, cached);
+    bool fromSurface = !rtgiDirectOnly && surfaceRead(hit, position, direction, true, cached);
     if (fromSurface) {
         indirect = cached.bounce;
         dependencyUnion(dependency, cached.dependency);
@@ -415,6 +431,17 @@ TransportRadiance outgoingTransportRadianceTracked(float3 origin, float3 directi
             radiance.background = cached.direct.background + indirect.background * diffuse;
             radiance.emissive += cached.direct.emissive + indirect.emissive * diffuse;
             radiance.punctual = cached.direct.punctual + indirect.punctual * diffuse;
+            // The cell's direct light already holds what shines through; the
+            // far side's bounce light passes through as below.
+            float transmits = hitTransmits(hit);
+            SurfaceTexel far;
+            if (transmits > 0.0 && surfaceReadFarSide(hit, position, direction, far)) {
+                float3 throughColor = max(hitMaterial(hit).transmission.rgb, 0.0) * transmits;
+                dependencyUnion(dependency, far.dependency);
+                radiance.background += far.bounce.background * throughColor;
+                radiance.emissive += far.bounce.emissive * throughColor;
+                radiance.punctual += far.bounce.punctual * throughColor;
+            }
             return clampOutgoingTransportRadiance(radiance);
         }
     } else if (!rtgiDirectOnly)
@@ -440,7 +467,24 @@ TransportRadiance outgoingTransportRadianceTracked(float3 origin, float3 directi
     conventionalLightResponseTracked(position, normal, geometricNormal, view, roughness,
         directSequence ^ 0xC0A10003u, directional, punctual, conventionalSupported, dependency, admissionLimit,
         true, material, ab);
-    querySupported = emissiveSupported && environmentSupported && conventionalSupported;
+    // Diffuse transmission: lights behind the surface shine through it as a
+    // diffuse lobe on this side, in the transmission color. Seen from the far
+    // side with the view mirrored through the surface, the diffuse-only
+    // response is that lobe.
+    float transmits = hitTransmits(hit);
+    float3 throughColor = max(hitMaterial(hit).transmission.rgb, 0.0) * transmits;
+    bool transmittedSupported = true;
+    if (transmits > 0.0) {
+        float3 mirrored = view - 2.0 * dot(view, normal) * normal;
+        float3 backDirectional, backPunctual;
+        conventionalLightResponseTracked(position, -normal, -geometricNormal, mirrored, 1.0,
+            directSequence ^ 0x7A45F004u, backDirectional, backPunctual, transmittedSupported,
+            dependency, admissionLimit, false, material, ab);
+        directional += throughColor * backDirectional;
+        punctual += throughColor * backPunctual;
+    }
+    querySupported = emissiveSupported && environmentSupported && conventionalSupported
+        && transmittedSupported;
     if (!querySupported) return (TransportRadiance)0;
 
     radiance.background = environment + directional;
@@ -451,6 +495,17 @@ TransportRadiance outgoingTransportRadianceTracked(float3 origin, float3 directi
     radiance.background += indirect.background * diffuse;
     radiance.emissive += indirect.emissive * diffuse;
     radiance.punctual += indirect.punctual * diffuse;
+    // Bounce light reaching the far side passes through too; that side's
+    // hashed cell holds it.
+    if (transmits > 0.0 && !rtgiDirectOnly) {
+        SurfaceTexel far;
+        if (surfaceReadFarSide(hit, position, direction, far)) {
+            dependencyUnion(dependency, far.dependency);
+            radiance.background += far.bounce.background * throughColor;
+            radiance.emissive += far.bounce.emissive * throughColor;
+            radiance.punctual += far.bounce.punctual * throughColor;
+        }
+    }
     return clampOutgoingTransportRadiance(radiance);
 }
 

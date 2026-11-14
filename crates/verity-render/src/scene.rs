@@ -213,6 +213,10 @@ pub struct GpuMaterial {
     pub emission: [f32; 3],
     /// Texture scaling `emission` ([`NO_TEXTURE`] if none).
     pub emission_texture: u32,
+    /// Diffuse transmission (KHR_materials_diffuse_transmission): rgb the
+    /// color light takes passing through, w the share of diffuse light that
+    /// passes instead of reflecting. Zero for opaque surfaces.
+    pub transmission: [f32; 4],
 }
 
 impl GpuMaterial {
@@ -225,6 +229,7 @@ impl GpuMaterial {
             textures: [NO_TEXTURE, NO_TEXTURE, NO_TEXTURE, 0],
             emission: [0.0; 3],
             emission_texture: NO_TEXTURE,
+            transmission: [1.0, 1.0, 1.0, 0.0],
         }
     }
 
@@ -238,6 +243,7 @@ impl GpuMaterial {
             textures: [NO_TEXTURE, NO_TEXTURE, NO_TEXTURE, TERRAIN_SURFACE],
             emission: [0.0; 3],
             emission_texture: NO_TEXTURE,
+            transmission: [1.0, 1.0, 1.0, 0.0],
         }
     }
 }

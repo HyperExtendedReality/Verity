@@ -62,7 +62,8 @@ pub struct Settings {
     /// Cache outgoing light on the scene's surfaces, in islands of nearly flat
     /// triangles packed into an atlas, and let ray hits read it: multi-bounce
     /// light then stays on the surface it belongs to instead of leaking through
-    /// walls from world probes. Blended and double-sided surfaces stay out.
+    /// walls from world probes. Blended and double-sided surfaces stay out of
+    /// the atlas; [`Self::surface_hash_cells`] holds their light instead.
     pub surface_cache: bool,
     /// The cache's texel size in metres. It grows when the atlas would pass
     /// two million texels.
@@ -80,6 +81,13 @@ pub struct Settings {
     /// the cache instead of shading direct light; [`LEVELS`] keeps every hit
     /// shaded and uses the cache for further bounces only.
     pub surface_from_level: u32,
+    /// Hashed cells for the surfaces the atlas leaves out (double-sided ones
+    /// such as foliage, and retained meshes such as terrain), each side of a
+    /// surface its own cell. Ray hits claim them; zero turns them off. Taken
+    /// when a scene loads. Needs [`Self::surface_cache`].
+    pub surface_hash_cells: u32,
+    /// Hashed cells shaded per frame, as [`Self::surface_updates`] for texels.
+    pub surface_hash_updates: u32,
     /// Trace with hardware ray queries where the GPU has them; off, rays walk
     /// the GI scene's own tree. Changing it recompiles the passes, and GI shows
     /// the hemisphere until they are ready, as when it starts.
@@ -115,6 +123,8 @@ impl Default for Settings {
             surface_bounce_rays: 2,
             surface_software_reach: 0.0,
             surface_from_level: 3,
+            surface_hash_cells: 1 << 16,
+            surface_hash_updates: 8_192,
             hardware_rays: true,
             reference: false,
         }
@@ -220,6 +230,9 @@ pub struct Parameters {
     /// cascade whose hits read the cache instead of shading, bounce rays per
     /// texel (bits 0-7) and software reach in centimetres (bits 8-31).
     pub surface: [u32; 4],
+    /// Hashed surface cells: capacity (0 = off), cells updated per frame and
+    /// frames a cell may go unread before it is dropped.
+    pub surface_hash: [u32; 4],
     /// Elements in the cache entries, previous entries, head words and
     /// merge-list words: the shaders reach them through pointers, which have
     /// no length of their own.
@@ -227,7 +240,7 @@ pub struct Parameters {
     /// Elements in the geometry and scene words.
     pub word_lengths: [u32; 4],
     /// `CASCADE_POINTERS` in cascades.slang, in order.
-    pub buffers: [u64; 21],
+    pub buffers: [u64; 23],
 }
 
 pub fn probe_directory_capacity(samples: u64) -> u64 {
@@ -428,8 +441,8 @@ mod tests {
 
     #[test]
     fn parameters_match_the_shader_block() {
-        // 4 matrices, 31 vec4s and 19 pointers, no padding.
-        assert_eq!(std::mem::size_of::<Parameters>(), 4 * 64 + 32 * 16 + 21 * 8);
+        // 4 matrices, 33 vec4s and 23 pointers, no padding.
+        assert_eq!(std::mem::size_of::<Parameters>(), 4 * 64 + 33 * 16 + 23 * 8);
     }
 
     #[test]

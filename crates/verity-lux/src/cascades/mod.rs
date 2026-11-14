@@ -39,6 +39,8 @@ use verity_render::{
 };
 
 const SLOTS: usize = 2;
+/// Frames a hashed surface cell may go unread before `surfaceUpdate` drops it.
+const SURFACE_HASH_LIFETIME: u32 = 240;
 
 /// How many `stride`-byte elements a whole-buffer binding held: what
 /// `GetDimensions` reported before shaders read buffers through pointers.
@@ -359,10 +361,13 @@ pub struct SplitRadianceCascades {
     geometry: Buffer,
     words: Buffer,
     /// Surface cache: triangle charts, island rects, texel records, and the
-    /// texels' radiance (three words each), bindings 51 to 54.
-    surface: [Buffer; 4],
+    /// texels' radiance (three words each, then the hashed cells'), and the
+    /// hashed cells' keys and records (see surface_cache.slang).
+    surface: [Buffer; 6],
     /// Texels in the surface atlas; zero when the cache is off.
     surface_texels: u32,
+    /// Hashed surface cells; zero when they are off.
+    surface_hash_cells: u32,
     blue_noise: Buffer,
     /// The scene for hardware ray queries, on GPUs with them.
     accel: Option<SceneAccel>,
@@ -406,6 +411,7 @@ impl SplitRadianceCascades {
             words: Buffer::default(),
             surface: Default::default(),
             surface_texels: 0,
+            surface_hash_cells: 0,
             blue_noise: Buffer::default(),
             accel: None,
             instances: 0,
@@ -685,10 +691,20 @@ impl SplitRadianceCascades {
     }
 
     /// Upload the surface cache's words with every texel's radiance cleared,
-    /// since a new atlas moves texels. Each buffer holds at least one word.
+    /// since a new atlas moves texels, and every hashed cell empty, since its
+    /// records name instances in TLAS order. Each buffer holds at least one word.
     unsafe fn upload_surface(&mut self, gpu: &mut Gpu, surface: &SurfaceWords) -> Result<()> {
         self.surface_texels = surface.texels.len() as u32;
-        let radiance = vec![glam::UVec4::ZERO; 3 * surface.texels.len().max(1)];
+        self.surface_hash_cells = if self.settings.surface_cache {
+            self.settings.surface_hash_cells
+        } else {
+            0
+        };
+        let cells = self.surface_hash_cells as usize;
+        let radiance = vec![glam::UVec4::ZERO; 3 * (surface.texels.len() + cells).max(1)];
+        // Two u32 words a cell: key and last read frame.
+        let keys = vec![glam::UVec4::ZERO; cells.div_ceil(2).max(1)];
+        let records = vec![glam::UVec4::ZERO; cells.max(1)];
         let one = [glam::UVec4::ZERO];
         let words = |w: &[glam::UVec4]| -> Vec<u8> {
             bytemuck::cast_slice(if w.is_empty() { &one } else { w }).to_vec()
@@ -698,6 +714,8 @@ impl SplitRadianceCascades {
             ("gi surface islands", words(&surface.islands)),
             ("gi surface texels", words(&surface.texels)),
             ("gi surface radiance", words(&radiance)),
+            ("gi surface hash keys", words(&keys)),
+            ("gi surface hash records", words(&records)),
         ];
         let mut buffers = mem::take(&mut self.surface);
         let mut result = Ok(());
@@ -1277,6 +1295,12 @@ impl SplitRadianceCascades {
                 settings.surface_bounce_rays.min(8)
                     | ((settings.surface_software_reach.max(0.0) * 100.0) as u32).min(0xff_ffff) << 8,
             ],
+            surface_hash: [
+                self.surface_hash_cells,
+                settings.surface_hash_updates.min(self.surface_hash_cells),
+                SURFACE_HASH_LIFETIME,
+                0,
+            ],
             // As `GetDimensions` saw them: the whole buffer, in elements.
             lengths: [
                 elements(&view.entries, ENTRY_SIZE),
@@ -1308,6 +1332,8 @@ impl SplitRadianceCascades {
                 &self.surface[3],
                 &view.descriptors,
                 &view.reference_sum,
+                &self.surface[4],
+                &self.surface[5],
             ]
             .map(|buffer| buffer.address),
             ..Parameters::default()
@@ -1462,8 +1488,10 @@ impl SplitRadianceCascades {
             }
             dispatch("generateDirections", compute[0], image[0], image[1]);
             dispatch("clear", clear[1], clear_groups, 1);
-            // Surface cache texels this frame, before any hit reads them.
-            let surface_updates = settings.surface_updates.min(self.surface_texels);
+            // Surface cache texels, then hashed cells, this frame, before any
+            // hit reads them.
+            let surface_updates = settings.surface_updates.min(self.surface_texels)
+                + settings.surface_hash_updates.min(self.surface_hash_cells);
             if surface_updates > 0 {
                 dispatch("surfaceUpdate", compute[0], surface_updates.div_ceil(64), 1);
             }

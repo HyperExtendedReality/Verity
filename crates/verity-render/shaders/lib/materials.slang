@@ -22,6 +22,9 @@ struct Material {
     /// Emitted radiance, scene-linear.
     float3 emission;
     uint emission_texture;
+    /// Diffuse transmission: rgb its color, w the share of diffuse light that
+    /// passes through instead of reflecting (KHR_materials_diffuse_transmission).
+    float4 transmission;
 };
 
 [[vk::binding(10, MATERIAL_SET)]] StructuredBuffer<Material> materials;
