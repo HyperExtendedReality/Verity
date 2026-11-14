@@ -59,6 +59,7 @@ struct Parameters {
     float4 lightDirtyMax;
     uint4 rayTraced;      // multi-bounce, spatial samples, reservoir history, previous frame ray traced (history valid)
     uint4 surface;        // surface cache texels (0 = off), texels updated per frame, first cascade read from the cache, bounce rays per texel (bits 0-7) and software bounce reach in cm (8-31, 0 = none)
+    uint4 surfaceHash;    // hashed surface cells (0 = off), cells updated per frame, frames unread before a cell is dropped, reserved
     // Elements behind the pointers below, which have no GetDimensions.
     uint4 lengths;        // cache entries, previous entries, head words, merge-list words
     uint4 wordLengths;    // geometry words, scene words; zw unused

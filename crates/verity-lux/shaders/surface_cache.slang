@@ -107,10 +107,94 @@ uint surfaceTexelAt(Hit hit) {
     return texel < params.surface.x ? texel : EMPTY;
 }
 
-// The cached light under a hit, once its texel has been shaded.
-bool surfaceRead(Hit hit, out SurfaceTexel texel) {
+// Hashed cells: surfaces the atlas does not chart (double-sided ones such as
+// foliage, and retained meshes such as terrain) keep their light in a hash
+// grid instead. A cell's texel follows the atlas's in surfaceRadiance, at
+// params.surface.x + slot, and is shaded by surfaceUpdate like any texel.
+// The key is the position at a cell size that doubles with distance, and the
+// dominant axis and sign of the normal facing the ray, so the two sides of a
+// leaf never share light. surfaceHashKeys holds two words a slot: the key
+// (0 = empty) and the frame it was last read. surfaceHashRecords holds the hit
+// that claimed it: triangle, instance (in TLAS order), barycentrics b, c
+// (unorm16), and 1 for the triangle's front face or 2 for its back.
+static const float SURFACE_HASH_CELL = 0.3;            // metres up to SURFACE_HASH_LOD_DISTANCE
+static const float SURFACE_HASH_LOD_DISTANCE = 10.0;
+static const uint SURFACE_HASH_PROBES = 8u;
+
+float surfaceHashLod(float3 position) {
+    float distance = length(position - params.cameraPosition.xyz);
+    return exp2(floor(log2(1.0 + distance / SURFACE_HASH_LOD_DISTANCE)));
+}
+
+// The slot holding the cell at `position` facing `normal`, claiming an empty
+// one when `claim` is set (linear probing). EMPTY when the cache is off or
+// the probe sequence is full.
+// shortcut: dropped cells are not tombstoned, so a key placed past one becomes a miss and is claimed again; add tombstones if duplicates crowd the table.
+uint surfaceHashFind(float3 position, float3 normal, bool claim, out bool claimed) {
+    claimed = false;
+    uint capacity = params.surfaceHash.x;
+    if (capacity == 0u || !all(isfinite(position)) || !all(isfinite(normal))) return EMPTY;
+    float lod = surfaceHashLod(position);
+    int3 cell = int3(floor(position / (SURFACE_HASH_CELL * lod)));
+    float3 magnitude = abs(normal);
+    uint axis = magnitude.x >= magnitude.y && magnitude.x >= magnitude.z ? 0u
+        : (magnitude.y >= magnitude.z ? 1u : 2u);
+    uint face = axis * 2u + (normal[axis] < 0.0 ? 1u : 0u);
+    uint hash = transportHash(uint(lod) + transportHash(uint(cell.z) + transportHash(uint(cell.y)
+        + transportHash(uint(cell.x) + transportHash(face)))));
+    uint key = transportHash(hash ^ 0x9e3779b9u) | 1u;
+    uint slot = hash % capacity;
+    for (uint probe = 0u; probe < SURFACE_HASH_PROBES; ++probe) {
+        uint stored = surfaceHashKeys[slot * 2u].load();
+        if (stored == 0u && claim) {
+            stored = surfaceHashKeys[slot * 2u].compareExchange(0u, key);
+            if (stored == 0u) {
+                claimed = true;
+                return slot;
+            }
+        }
+        if (stored == key) return slot;
+        slot = (slot + 1u) % capacity;
+    }
+    return EMPTY;
+}
+
+// The cell under a hit seen along `direction`, claimed if it has none yet; the
+// claiming lane records the hit so surfaceUpdate can shade the cell.
+uint surfaceHashAt(Hit hit, float3 position, float3 direction, bool claim) {
+    float3 front = hitGeometricNormal(hit);
+    bool back = dot(front, direction) > 0.0;
+    bool claimed;
+    uint slot = surfaceHashFind(position, back ? -front : front, claim, claimed);
+    if (slot == EMPTY) return EMPTY;
+    if (claimed) {
+        uint2 barycentric = uint2(round(saturate(hit.barycentric.yz) * 65535.0));
+        surfaceHashRecords[slot] = uint4(hit.triangle, hit.instance,
+            barycentric.x | (barycentric.y << 16u), back ? 2u : 1u);
+    }
+    surfaceHashKeys[slot * 2u + 1u].max(params.frame.x + 1u);
+    return params.surface.x + slot;
+}
+
+// The cached light under a hit at `position` seen along `direction`, once its
+// atlas texel or hashed cell has been shaded. `claim` starts a cell for an
+// uncharted surface, which reads as uncached until surfaceUpdate shades it.
+bool surfaceRead(Hit hit, float3 position, float3 direction, bool claim, out SurfaceTexel texel) {
     texel = (SurfaceTexel)0;
+    if (hit.triangle == EMPTY || hit.instance == EMPTY) return false;
     uint at = surfaceTexelAt(hit);
+    if (at == EMPTY) at = surfaceHashAt(hit, position, direction, claim);
+    if (at == EMPTY) return false;
+    texel = loadSurfaceTexel(at);
+    return texel.mass > 0.0;
+}
+
+// The hashed cell on the far side of a thin surface hit along `direction`,
+// for light passing through it. False for atlas texels, which chart one side.
+bool surfaceReadFarSide(Hit hit, float3 position, float3 direction, out SurfaceTexel texel) {
+    texel = (SurfaceTexel)0;
+    if (hit.triangle == EMPTY || hit.instance == EMPTY || surfaceTexelAt(hit) != EMPTY) return false;
+    uint at = surfaceHashAt(hit, position, -direction, true);
     if (at == EMPTY) return false;
     texel = loadSurfaceTexel(at);
     return texel.mass > 0.0;
@@ -159,22 +243,67 @@ bool surfaceBounceSeesSky() {
 #endif
 }
 
-// One rolling share of the atlas a frame. Each texel shades its direct light
-// as a diffuse surface seen head on, traces cosine rays whose hits read other
-// texels (so bounces build up across frames), and blends both into its history.
+// The hashed cell `slot`'s surface point, as surfaceRecordPoint gives an atlas
+// texel's, facing the side that claimed it. False for an empty slot, and for
+// one unread for params.surfaceHash.z frames, which this drops.
+bool surfaceHashPoint(uint slot, out Hit hit, out float3 position, out float3 normal) {
+    hit = (Hit)0;
+    position = 0.0;
+    normal = 0.0;
+    if (surfaceHashKeys[slot * 2u].load() == 0u) return false;
+    uint stamp = params.frame.x + 1u;
+    if (stamp - surfaceHashKeys[slot * 2u + 1u].load() > params.surfaceHash.z) {
+        // Cleared before the key is released, so a lane that claims the slot
+        // next never shades this cell's history as its own.
+        storeSurfaceTexel(params.surface.x + slot, (SurfaceTexel)0);
+        surfaceHashKeys[slot * 2u].store(0u);
+        return false;
+    }
+    uint4 record = surfaceHashRecords[slot];
+    if (record.w == 0u) return false;
+    hit.triangle = record.x;
+    hit.instance = record.y;
+    hit.errors = 0u;
+    hit.footprint = 0.0;
+    hit.distance = 1.0;
+    float2 yz = float2(record.z & 0xffffu, record.z >> 16u) / 65535.0;
+    hit.barycentric = float3(saturate(1.0 - yz.x - yz.y), yz);
+    uint base = instanceBase(hit.instance);
+    Triangle triangle = localTriangle(hit.triangle);
+    position = transformPoint(base + 3u, triangle.a.xyz * hit.barycentric.x
+        + triangle.b.xyz * hit.barycentric.y + triangle.c.xyz * hit.barycentric.z);
+    normal = triangleGeometricNormal(base, sceneWord(base + 6u).w, triangle)
+        * (record.w == 2u ? -1.0 : 1.0);
+    return true;
+}
+
+// One rolling share of the atlas and of the hashed cells a frame: threads
+// below params.surface.y take atlas texels, the next params.surfaceHash.y
+// take cells. Each shades its direct light as a diffuse surface seen head on,
+// traces cosine rays whose hits read other texels (so bounces build up across
+// frames), and blends both into its history.
 [shader("compute")]
 [numthreads(64, 1, 1)]
 void surfaceUpdate(uint3 thread : SV_DispatchThreadID) {
     uint texels = params.surface.x;
     uint budget = params.surface.y;
-    if (texels == 0u || thread.x >= budget) return;
-    // Consecutive texels share islands, so their rays stay coherent.
-    uint at = (params.frame.x * budget + thread.x) % texels;
-    uint4 record = surfaceTexels[at];
-    if (record.w == 0u) return;
+    uint at;
     Hit hit;
     float3 position, normal;
-    surfaceRecordPoint(record, hit, position, normal);
+    if (thread.x < budget) {
+        // Consecutive texels share islands, so their rays stay coherent.
+        at = (params.frame.x * budget + thread.x) % texels;
+        uint4 record = surfaceTexels[at];
+        if (record.w == 0u) return;
+        surfaceRecordPoint(record, hit, position, normal);
+    } else {
+        uint lane = thread.x - budget;
+        uint cells = params.surfaceHash.x;
+        if (lane >= params.surfaceHash.y || cells == 0u) return;
+        uint slot = (params.frame.x * params.surfaceHash.y + lane) % cells;
+        if (!surfaceHashPoint(slot, hit, position, normal)) return;
+        at = texels + slot;
+    }
     if (!all(isfinite(position)) || !all(isfinite(normal))) return;
 
     // Direct light, as the RTGI cache shades its cells: a ray one metre long
@@ -190,9 +319,10 @@ void surfaceUpdate(uint3 thread : SV_DispatchThreadID) {
     if (!supported) return;
     float3 reflectance = rtgiDiffuseReflectance;
 
-    // Bounce light; escaped rays bring the sky.
-    // Hits on uncached surfaces leave the mean, rather than count as black:
-    // shading them instead cost 0.3 ms on Sponza and Bistro for no net gain.
+    // Bounce light; escaped rays bring the sky. A hit on an uncharted surface
+    // claims a hashed cell, so foliage and terrain bounce light too.
+    // Hits on surfaces not shaded yet leave the mean, rather than count as
+    // black: shading them instead cost 0.3 ms on Sponza and Bistro for no net gain.
     TransportRadiance incoming = (TransportRadiance)0;
     float counted = 0.0;
     float3 origin = rayOffset(position, normal, params.tuning.z);
@@ -217,7 +347,9 @@ void surfaceUpdate(uint3 thread : SV_DispatchThreadID) {
         if ((bounce.errors & HIT_QUERY_UNSUPPORTED) != 0u) continue;
         if (bounce.triangle == EMPTY && reach < 1e20) continue;
         SurfaceTexel other;
-        if (bounce.triangle != EMPTY && !surfaceRead(bounce, other)) continue;
+        if (bounce.triangle != EMPTY
+            && !surfaceRead(bounce, origin + direction * bounce.distance, direction, true, other))
+            continue;
         dependencyUnion(dependency, rayDependency);
         counted += 1.0;
         if (bounce.triangle == EMPTY) {

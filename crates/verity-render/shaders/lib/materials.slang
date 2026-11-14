@@ -19,6 +19,9 @@ struct Material {
     float4 params;
     /// x: base color, y: metallic-roughness, z: normal texture; w: flags.
     uint4 textures;
+    /// Diffuse transmission: rgb its color, w the share of diffuse light that
+    /// passes through instead of reflecting (KHR_materials_diffuse_transmission).
+    float4 transmission;
 };
 
 [[vk::binding(10, MATERIAL_SET)]] StructuredBuffer<Material> materials;

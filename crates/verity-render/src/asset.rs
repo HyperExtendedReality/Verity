@@ -115,6 +115,9 @@ pub struct MaterialData {
     pub alpha_mode: AlphaMode,
     pub alpha_cutoff: f32,
     pub double_sided: bool,
+    /// Diffuse transmission color (rgb) and factor (w), as in
+    /// `GpuMaterial::transmission`.
+    pub transmission: [f32; 4],
 }
 
 impl Default for MaterialData {
@@ -130,8 +133,26 @@ impl Default for MaterialData {
             alpha_mode: AlphaMode::Opaque,
             alpha_cutoff: 0.5,
             double_sided: false,
+            transmission: [1.0, 1.0, 1.0, 0.0],
         }
     }
+}
+
+/// KHR_materials_diffuse_transmission's color (rgb) and factor (w); no
+/// extension means none passes.
+// shortcut: diffuseTransmissionTexture and diffuseTransmissionColorTexture are ignored; sample them in the shaders when assets use them.
+fn diffuse_transmission(extension: Option<&gltf::json::Value>) -> [f32; 4] {
+    let Some(extension) = extension else {
+        return [1.0, 1.0, 1.0, 0.0];
+    };
+    let number = |value: &gltf::json::Value| value.as_f64().map(|v| v as f32);
+    let factor = extension.get("diffuseTransmissionFactor").and_then(number).unwrap_or(0.0);
+    let color = extension
+        .get("diffuseTransmissionColorFactor")
+        .and_then(|c| c.as_array())
+        .filter(|c| c.len() == 3)
+        .map_or([1.0; 3], |c| std::array::from_fn(|i| number(&c[i]).unwrap_or(1.0)));
+    [color[0], color[1], color[2], factor.clamp(0.0, 1.0)]
 }
 
 /// A triangle list within [`SceneData::indices`]; indices are relative to `base_vertex`.
@@ -238,6 +259,9 @@ pub fn load_gltf(path: &Path, options: LoadOptions) -> Result<SceneData> {
             },
             alpha_cutoff: material.alpha_cutoff().unwrap_or(0.5),
             double_sided: material.double_sided(),
+            transmission: diffuse_transmission(
+                material.extension_value("KHR_materials_diffuse_transmission"),
+            ),
         });
     }
     // Primitives without a material use the glTF default, appended last.
@@ -572,6 +596,20 @@ fn percent_decode(uri: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn diffuse_transmission_reads_factor_and_color_with_defaults() {
+        let value = |text: &str| serde_json::from_str::<gltf::json::Value>(text).unwrap();
+        assert_eq!(diffuse_transmission(None), [1.0, 1.0, 1.0, 0.0]);
+        assert_eq!(diffuse_transmission(Some(&value("{}"))), [1.0, 1.0, 1.0, 0.0]);
+        let leaf = value(
+            r#"{"diffuseTransmissionFactor": 0.4, "diffuseTransmissionColorFactor": [0.5, 0.75, 0.25]}"#,
+        );
+        assert_eq!(diffuse_transmission(Some(&leaf)), [0.5, 0.75, 0.25, 0.4]);
+        // Out-of-range factors clamp; a malformed color falls back to white.
+        let odd = value(r#"{"diffuseTransmissionFactor": 3, "diffuseTransmissionColorFactor": [1]}"#);
+        assert_eq!(diffuse_transmission(Some(&odd)), [1.0, 1.0, 1.0, 1.0]);
+    }
 
     #[test]
     fn scene_sun_normalizes_direction_and_handles_zero() {

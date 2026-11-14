@@ -207,6 +207,10 @@ pub struct GpuMaterial {
     pub params: [f32; 4],
     /// x: base color, y: metallic-roughness, z: normal texture ([`NO_TEXTURE`] if none); w: flags.
     pub textures: [u32; 4],
+    /// Diffuse transmission (KHR_materials_diffuse_transmission): rgb the
+    /// color light takes passing through, w the share of diffuse light that
+    /// passes instead of reflecting. Zero for opaque surfaces.
+    pub transmission: [f32; 4],
 }
 
 impl GpuMaterial {
@@ -217,6 +221,7 @@ impl GpuMaterial {
             base_color: [r, g, b, 1.0],
             params: [material.metallic, material.roughness, 1.0, 0.5],
             textures: [NO_TEXTURE, NO_TEXTURE, NO_TEXTURE, 0],
+            transmission: [1.0, 1.0, 1.0, 0.0],
         }
     }
 
@@ -228,6 +233,7 @@ impl GpuMaterial {
             base_color: [1.0; 4],
             params: [0.0, 1.0, detail, sea_level],
             textures: [NO_TEXTURE, NO_TEXTURE, NO_TEXTURE, TERRAIN_SURFACE],
+            transmission: [1.0, 1.0, 1.0, 0.0],
         }
     }
 }

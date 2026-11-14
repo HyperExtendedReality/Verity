@@ -143,7 +143,11 @@ fn scene(leaves: u32) -> SceneData {
         draws: Vec::new(),
         materials: vec![
             material(false, 0.9),
-            material(true, 0.6),
+            // Leaves let a third of their diffuse light through, yellow-green.
+            MaterialData {
+                transmission: [0.6, 0.8, 0.25, 0.35],
+                ..material(true, 0.6)
+            },
             material(false, 1.0),
         ],
         textures: Vec::new(),
