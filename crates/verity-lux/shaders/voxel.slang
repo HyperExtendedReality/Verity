@@ -136,13 +136,56 @@ float3 voxelSeen(uint found, float3 d) {
     return radiance[index * 6u + side * 3u].rgb;
 }
 
+// The start of the renderer's `Globals` (lib/common.slang), through its sun
+// shadow cascades, and its shadow map: set 2 is the renderer's frame set.
+static const uint SHADOW_CASCADES = 4u;
+struct RenderGlobals {
+    float4x4 viewProj;
+    float4x4 view;
+    float4x4 inverseViewProj;
+    float4 eye;
+    float4 viewport;
+    float4 projection;
+    uint4 counts;
+    float4 sunDirection;
+    float4 sunColor;
+    float4x4 previousViewProj;
+    float4x4 shadowViewProj[SHADOW_CASCADES];
+    float4 shadowSplits;
+    float4 shadowTexels;
+    float4 sky; // w: sun shadows on
+};
+[[vk::binding(0, MATERIAL_SET)]] ConstantBuffer<RenderGlobals> renderGlobals;
+[[vk::binding(16, MATERIAL_SET)]] Texture2DArray<float> sunShadowMap;
+[[vk::binding(17, MATERIAL_SET)]] SamplerComparisonState sunShadowSampler;
+
+// How much sun reaches a voxel's face: the renderer's shadow map where one of
+// its cascades holds the face, else a walk from o through the voxels. A walk
+// through coarse cells fattens the sun's shadow edges: in Sponza's courtyard
+// it blocked 8.8% of what the shadow map lit, mostly at roof edges 16 m off,
+// where the shadow map blocks 0.5%.
+float sunVisible(float3 x, float3 n, float3 o, float cell) {
+    if (renderGlobals.sky.w != 0.0) {
+        // The face, not the centre, which can sit under the surface it holds.
+        float3 face = x + n * (0.5 * cell);
+        [loop] for (uint c = 0u; c < SHADOW_CASCADES; c++) {
+            float3 biased = face + n * renderGlobals.shadowTexels[c] * 1.5;
+            float4 clip = mul(renderGlobals.shadowViewProj[c], float4(biased, 1.0));
+            float3 ndc = clip.xyz / clip.w;
+            if (all(abs(ndc.xy) < 0.98) && ndc.z > 0.0 && ndc.z < 1.0)
+                return sunShadowMap.SampleCmpLevelZero(sunShadowSampler, float3(ndc.xy * 0.5 + 0.5, float(c)), ndc.z);
+        }
+    }
+    return walk(o, f.sunDirection.xyz, 1e6) == 0u ? 1.0 : 0.0;
+}
+
 // Irradiance / pi from the sun and, while they are few, the point lights,
 // shadowed by the voxels. Many point lights come from `voxelSampled`.
-float3 voxelDirect(float3 x, float3 n, float3 o) {
+float3 voxelDirect(float3 x, float3 n, float3 o, float cell) {
     float3 light = 0.0;
     float lit = dot(n, f.sunDirection.xyz);
-    if (lit > 0.0 && f.sunDirection.w > 0.5 && walk(o, f.sunDirection.xyz, 1e6) == 0u)
-        light += f.sunColor.rgb * lit;
+    if (lit > 0.0 && f.sunDirection.w > 0.5)
+        light += f.sunColor.rgb * lit * sunVisible(x, n, o, cell);
     if (sampledLights()) return light;
     [loop] for (uint i = 0u; i < f.counts.z; i++) {
         float3 l;
@@ -220,7 +263,7 @@ void inject(uint3 id : SV_DispatchThreadID) {
     float frames = min(arriving.w + 1.0, f.extra.y > 0.0 ? f.extra.y : 64.0);
     arriving = float4(lerp(arriving.rgb, seen, 1.0 / frames), frames);
     radiance[slot + 1u] = bad(arriving) ? float4(0.0) : arriving;
-    float3 leaving = voxelAlbedo(voxel, x, n) * (voxelDirect(x, n, o) + arriving.rgb);
+    float3 leaving = voxelAlbedo(voxel, x, n) * (voxelDirect(x, n, o, cell) + arriving.rgb);
     // w: the sampled point lights' share of `arriving`, as a mean luminance.
     // Residual GI takes `arriving` as a surface's bounce light, and the
     // renderer already lit that surface directly.

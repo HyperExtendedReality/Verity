@@ -1409,7 +1409,14 @@ impl SplitRadianceCascades {
             for buffer in view
                 .heads
                 .iter()
-                .chain([&view.entries, &view.descriptors, &view.history, &view.probes, &view.merge_list])
+                .chain([
+                    &view.entries,
+                    &view.descriptors,
+                    &view.reference_sum,
+                    &view.history,
+                    &view.probes,
+                    &view.merge_list,
+                ])
                 .chain(&view.rtgi)
             {
                 device.cmd_fill_buffer(cmd, buffer.buffer, 0, vk::WHOLE_SIZE, 0);

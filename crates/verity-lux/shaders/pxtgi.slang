@@ -21,6 +21,7 @@
     Primitive* prims; Node* nodes; Atomic<uint>* cacheKeys; Cell* cells; \
     float4* geo; float4* softGeo; float4* referenceSum;
 #include "screen_gi.slang"
+#include "wave_batch.slang"
 
 // Debug views, as `PxtgiDebug` numbers them.
 static const int DEBUG_ROUND_TRIP = 1;
@@ -398,11 +399,8 @@ uint cellHash(int3 cell, uint side, uint level) {
 
 // The slot of x's cell at a level, claiming an empty one when asked; -1 when
 // the table is full there.
-int cacheSlot(float3 x, float3 n, uint level, bool claim, out bool claimed) {
+int cacheProbe(uint h, uint key, bool claim, out bool claimed) {
     claimed = false;
-    int3 cell = int3(floor(x / (0.25 * float(1u << level))));
-    uint h = cellHash(cell, facing(n), level);
-    uint key = hashU(h ^ 0x9e3779b9u) | 1u;
     [loop] for (uint i = 0u; i < 8u; i++) {
         uint slot = (h + i) & f.cache.y;
         uint was = f.cacheKeys[slot].load();
@@ -420,6 +418,25 @@ int cacheSlot(float3 x, float3 n, uint level, bool claim, out bool claimed) {
     return -1;
 }
 
+// The slot of the cell hashing to `h`; lanes looking up the first active
+// lane's cell take its lookup (wave_batch.slang).
+int cacheLookup(uint h, bool claim, out bool claimed) {
+    claimed = false;
+    uint key = hashU(h ^ 0x9e3779b9u) | 1u;
+    uint tag = claim ? 1u : 0u;
+    bool follows = waveBatchFollows(key, tag);
+    int slot = follows ? -1 : cacheProbe(h, key, claim, claimed);
+    bool taken;
+    uint first = waveBatchTake(asuint(slot), key, tag, follows, taken);
+    if (taken) return asint(first);
+    return follows ? cacheProbe(h, key, claim, claimed) : slot;
+}
+
+int cacheSlot(float3 x, float3 n, uint level, bool claim, out bool claimed) {
+    int3 cell = int3(floor(x / (0.25 * float(1u << level))));
+    return cacheLookup(cellHash(cell, facing(n), level), claim, claimed);
+}
+
 // The bounce light arriving at x (or with leaving, the light leaving it),
 // blended from the eight refined cells around it as a texture is filtered: a
 // cell's own value would show as a square patch in a reflection.
@@ -431,21 +448,13 @@ float4 smoothCacheAt(float3 x, float3 n, bool leaving, uint level) {
     float4 sum = 0.0;
     [loop] for (int i = 0; i < 8; i++) {
         int3 o = int3(i & 1, (i >> 1) & 1, i >> 2);
-        uint h = cellHash(base + o, side, level);
-        uint key = hashU(h ^ 0x9e3779b9u) | 1u;
-        [loop] for (uint j = 0u; j < 8u; j++) {
-            uint slot = (h + j) & f.cache.y;
-            uint was = f.cacheKeys[slot].load();
-            if (was == key) {
-                if (f.cells[slot].normal.w > 0.5) {
-                    float3 w3 = lerp(1.0 - t, t, float3(o));
-                    float w = w3.x * w3.y * w3.z;
-                    float3 light = leaving ? f.cells[slot].outgoing.rgb : f.cells[slot].incoming.rgb;
-                    sum += float4(light * w, w);
-                }
-                break;
-            }
-            if (was == 0u) break;
+        bool unused;
+        int slot = cacheLookup(cellHash(base + o, side, level), false, unused);
+        if (slot >= 0 && f.cells[slot].normal.w > 0.5) {
+            float3 w3 = lerp(1.0 - t, t, float3(o));
+            float w = w3.x * w3.y * w3.z;
+            float3 light = leaving ? f.cells[slot].outgoing.rgb : f.cells[slot].incoming.rgb;
+            sum += float4(light * w, w);
         }
     }
     return sum;
@@ -968,7 +977,11 @@ void reference(uint3 id : SV_DispatchThreadID) {
     int2 fp = framePixel(px, traceSize());
     float depth = loadDepth(fp);
     uint4 g = loadGbuffer(fp);
+    uint at = uint(px.y) * uint(f.sizes.z) + uint(px.x);
     if (!receives(depth, g)) {
+        // A pixel that receives later starts its mean from zero, not from
+        // whatever the slot held (stale words read as huge floats stick).
+        f.referenceSum[at] = 0.0;
         out0.Store(px, 0.0);
         return;
     }
@@ -1002,8 +1015,9 @@ void reference(uint3 id : SV_DispatchThreadID) {
     float4 now = float4(light / float(REFERENCE_PATHS), 1.0);
     if (bad(now)) now = float4(0.0, 0.0, 0.0, 1.0);
     float frames = f.reflection.z;
-    uint at = uint(px.y) * uint(f.sizes.z) + uint(px.x);
     float4 sum = (frames < 0.5 ? 0.0 : f.referenceSum[at]) + now;
     f.referenceSum[at] = sum;
-    out0.Store(px, sum / (frames + 1.0));
+    // w counts this pixel's own samples, which is fewer than `frames` for one
+    // that started receiving after the restart.
+    out0.Store(px, sum / max(sum.w, 1.0));
 }
