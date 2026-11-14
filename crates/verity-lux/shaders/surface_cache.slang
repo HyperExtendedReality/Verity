@@ -12,6 +12,8 @@
 // bounds as half floats and flags. Light is R11G11B10 floats.
 static const uint SURFACE_ATLAS_WIDTH = 2048u; // surface::ATLAS_WIDTH
 static const float SURFACE_MIN_BLEND = 0.1;
+// A settled texel reshades its direct light on one visit in this many.
+static const uint SURFACE_DIRECT_EVERY = 4u;
 
 struct SurfaceTexel {
     TransportRadiance direct;   // outgoing direct light, diffuse, without self-emission
@@ -306,18 +308,38 @@ void surfaceUpdate(uint3 thread : SV_DispatchThreadID) {
     }
     if (!all(isfinite(position)) || !all(isfinite(normal))) return;
 
+    SurfaceTexel texel = loadSurfaceTexel(at);
+    // Drop history its rays or lights no longer support, as the world cache does.
+    bool reset = params.sourceHistory.y != 0u
+        || dependencyIntersectsDirty(texel.dependency)
+        || dependencyIntersectsEmissiveDirty(texel.dependency)
+        || (params.lightDirtyMin.w > 0.5
+            && surfaceBoxIntersects(texel.dependency, params.lightDirtyMin, params.lightDirtyMax));
+    float mass = reset || !isfinite(texel.mass) ? 0.0 : texel.mass;
+
     // Direct light, as the RTGI cache shades its cells: a ray one metre long
     // arriving along the normal, so the view is head on.
     transportAdmissionBypass = true;
     rtgiDirectOnly = true;
     surfaceShading = true;
     rtgiDiffuseReflectance = 0.0;
-    bool supported;
     DependencyContext dependency = dependencyEmpty();
-    TransportRadiance direct = outgoingTransportRadianceTracked(position + normal, -normal, hit,
-        supported, dependency);
-    if (!supported) return;
-    float3 reflectance = rtgiDiffuseReflectance;
+    TransportRadiance direct = texel.direct;
+    float3 reflectance = texel.reflectance;
+    // Lights and geometry that change reset the history above, so a settled
+    // texel reshades its direct light on one visit in SURFACE_DIRECT_EVERY,
+    // keeping its bounce rays every visit. Picked per thread group, so a warp
+    // shades or skips together.
+    bool reuseDirect = mass >= float(SURFACE_DIRECT_EVERY)
+        && transportHash((thread.x / 64u) ^ transportHash(params.frame.x ^ 0xd1ec7u))
+            % SURFACE_DIRECT_EVERY != 0u;
+    if (!reuseDirect) {
+        bool supported;
+        direct = outgoingTransportRadianceTracked(position + normal, -normal, hit,
+            supported, dependency);
+        if (!supported) return;
+        reflectance = rtgiDiffuseReflectance;
+    }
 
     // Bounce light; escaped rays bring the sky. A hit on an uncharted surface
     // claims a hashed cell, so foliage and terrain bounce light too.
@@ -367,14 +389,6 @@ void surfaceUpdate(uint3 thread : SV_DispatchThreadID) {
         incoming.punctual /= counted;
     }
 
-    SurfaceTexel texel = loadSurfaceTexel(at);
-    // Drop history its rays or lights no longer support, as the world cache does.
-    bool reset = params.sourceHistory.y != 0u
-        || dependencyIntersectsDirty(texel.dependency)
-        || dependencyIntersectsEmissiveDirty(texel.dependency)
-        || (params.lightDirtyMin.w > 0.5
-            && surfaceBoxIntersects(texel.dependency, params.lightDirtyMin, params.lightDirtyMax));
-    float mass = reset || !isfinite(texel.mass) ? 0.0 : texel.mass;
     float blend = max(1.0 / (mass + 1.0), SURFACE_MIN_BLEND);
     if (mass > 0.0) dependencyUnion(dependency, texel.dependency);
     texel.direct = lerpTransport(texel.direct, direct, blend);
