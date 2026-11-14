@@ -493,29 +493,55 @@ jitter swamped flicker, so it is left out.
 
 | View | Method | Trace pass | Mean bounced light | Error |
 | --- | --- | --- | --- | --- |
-| Corridor | Screen and voxel | 0.46 ms | 0.64× | 0.47 |
-| Corridor | Residual, 4 rays | 0.43 ms | 0.65× | 0.52 |
-| Corridor | Residual, 2 rays (default) | 0.22 ms | 0.68× | 0.51 |
-| Courtyard | Screen and voxel | 0.68 ms | 1.05× | 0.44 |
-| Courtyard | Residual, 4 rays | 0.49 ms | 0.99× | 0.45 |
-| Courtyard | Residual, 2 rays (default) | 0.32 ms | 1.02× | 0.45 |
+| Corridor | Screen and voxel | 0.51 ms | 0.76× | 0.42 |
+| Corridor | Residual, 2 rays (default) | 0.22 ms | 0.76× | 0.48 |
+| Courtyard | Screen and voxel | 0.70 ms | 1.09× | 0.45 |
+| Courtyard | Residual, 2 rays (default) | 0.33 ms | 1.07× | 0.47 |
+
+Each method's whole frame takes 0.7–1.1 ms. These rows take the sun from the
+shadow map (below); before that the four read 0.47, 0.51, 0.44 and 0.45.
 
 The baseline blends the eight voxels around the surface as a texture is
 filtered, each by how nearly it faces the same way. Each voxel side also keeps
 the mean way its bounce light came from, luminance-weighted, and the baseline
 tilts toward the pixel's own normal (normal maps included) by a first-order
 fit of that light. Read from the one voxel holding the surface it scored 0.57
-and 0.48; blended, 0.53 and 0.46; tilted, the rows above, the brightest bounce
+and 0.48; blended, 0.53 and 0.46; tilted, 0.52 and 0.45, the brightest bounce
 gaining most. The direction costs 32 MB more for the million-voxel pool.
 
-Two rays a texel are as good as four, so `ScreenVoxelSettings::residual` uses
-two: at half the trace pass of screen and voxel GI it is within 0.01 of its
-error in the courtyard and 0.04 in the corridor. The gap that is left is detail
+Two rays a texel were as good as four (0.51 against 0.52 in the corridor, 0.45
+both in the courtyard), so `ScreenVoxelSettings::residual` uses two, at under
+half the trace pass of screen and voxel GI. The gap to it that is left is detail
 between pixels: block by block the baseline correlates 0.76 with the
 reference where per-pixel voxel walks reach 0.84. A voxel's settled light is
-one estimate a cell, gathered 1.5 cells off its surface over 64 frames. Both
-methods leave the brightest bounce about 40% short. `sponza_gi --residual`
+one estimate a cell, gathered 1.5 cells off its surface over 64 frames.
+`sponza_gi --residual`
 runs it (`--rays=N` sets its rays).
+
+### Sunlight from the shadow map
+
+Both voxel methods left the corridor's brightest bounce about 40% short: one
+patch in shade, lit only by bounce. Holding the first bounce alone on both
+sides (the reference at one bounce, voxels leaving only their direct light),
+the voxels gave 0.69× of it, and later bounces added as much to each (×1.20
+against ×1.25), so the loss was in the first bounce. With sun shadows off on
+both sides too they gave 0.95×: the voxels' shadow rays blocked sunlight the
+scene does not.
+
+Testing each pixel facing the sun as a voxel would showed where: of what the
+renderer's shadow map lit, the walk blocked 53% in the corridor (few such
+pixels) and 8.8% in the courtyard, most of it at roof edges 16 m along the
+sun, whose cells there are 0.25–0.5 m. A level spans 128 cells, so cells at a
+distance are the same size whatever `--cell` is, which is why finer voxels,
+more levels, longer rays, more frames, other ray starts and passing the first
+cell of each coarser level all left it alone.
+
+So a voxel now takes its sun from the renderer's shadow map wherever one of
+its cascades holds the voxel's face, sampled at the face rather than the
+centre, and walks the voxels only beyond them. Against the shadow map the same
+test blocks 2.0% and 0.5%. The corridor's brightest fifth went from 43% short
+to 32%, and its error from 0.47 to 0.42; the courtyard, already a little
+bright, went from 0.44 to 0.45.
 
 ## PXTGI
 
