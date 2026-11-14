@@ -116,6 +116,8 @@ pub enum LightingMethod {
     Pxtgi,
     /// GI traced along the depth buffer, then through a voxel copy of the scene.
     ScreenVoxel,
+    /// Residual GI: the voxel copy's light, corrected by rays along the depth buffer.
+    Residual,
 }
 
 /// Scene-wide ambient lighting, expressed as linear RGB radiance.

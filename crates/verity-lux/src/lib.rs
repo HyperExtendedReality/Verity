@@ -4,7 +4,8 @@
 //!
 //! - [`cascades`], Split Radiance Cascades, which traces a GI scene of its own.
 //! - [`pxtgi`], which traces the physics scene.
-//! - [`voxel`], which traces the screen, then a voxel copy of the scene.
+//! - [`voxel`], which traces the screen, then a voxel copy of the scene, and
+//!   as residual GI takes the voxels' light and corrects it by the screen's.
 //!
 //! The editor offers whatever [`METHODS`] lists. To add a method, implement
 //! [`GiMethod`] for it, add a [`Method`] variant and a row in [`METHODS`], and
@@ -122,6 +123,13 @@ pub const METHODS: &[MethodInfo] = &[
         name: "Screen and voxel GI",
         about: "Rays along the depth buffer, then through a voxel copy of the scene.",
         method: || Method::ScreenVoxel(ScreenVoxelSettings::default()),
+    },
+    MethodInfo {
+        lighting: LightingMethod::Residual,
+        name: "Residual GI",
+        about: "The voxel copy's settled light, corrected where rays along the depth buffer see it differ.",
+        // shortcut: shares ScreenVoxel's passes, flagged by settings; a variant of its own when it needs its own.
+        method: || Method::ScreenVoxel(ScreenVoxelSettings::residual()),
     },
 ];
 

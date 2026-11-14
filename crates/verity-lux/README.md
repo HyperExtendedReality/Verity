@@ -9,6 +9,7 @@ hemisphere ambient belong to `verity-render`; they do not require Lux.
 | Split Radiance Cascades | `cascades` | A GI scene of its own |
 | PXTGI | `pxtgi` | The physics scene |
 | Screen and voxel GI | `voxel` | The depth buffer, then a voxel copy of the scene |
+| Residual GI | `voxel` | The voxels' settled light, corrected along the depth buffer |
 
 Install `Lux` with `Renderer::set_extension` before loading the geometry that
 should take part:
@@ -475,6 +476,40 @@ This is a first version, and these are its limits:
 - History does not react when a light changes, so light that has bounced more
   than once catches up over a few seconds.
 
+## Residual GI
+
+Residual GI (`ScreenVoxelSettings::residual`, `LightingMethod::Residual`) runs
+the voxel method's passes with a different estimate per texel: a control
+variate. The light its voxel has settled on arriving at the surface is the
+answer, smooth and without a ray, and each screen ray adds only how far its
+light differs from what the voxels show along it. A ray the screen can't
+follow adds nothing and walks no voxels. Voxels also keep how much of their
+arriving light is sampled point lights' direct light, which the renderer has
+already given the surface, and the estimate leaves that out.
+
+Sponza, RTX 4070 Laptop, 1280×720, 300 frames, against `--pxtgi-reference`
+(1200 frames). Error is as above, over the mean of the last four frames; TAA
+jitter swamped flicker, so it is left out.
+
+| View | Method | Trace pass | Mean bounced light | Error |
+| --- | --- | --- | --- | --- |
+| Corridor | Screen and voxel | 0.46 ms | 0.64× | 0.47 |
+| Corridor | Residual | 0.42 ms | 0.65× | 0.53 |
+| Corridor | Residual, 2 rays | 0.21 ms | 0.64× | 0.54 |
+| Courtyard | Screen and voxel | 0.68 ms | 1.05× | 0.44 |
+| Courtyard | Residual | 0.49 ms | 1.01× | 0.46 |
+| Courtyard | Residual, 2 rays | 0.31 ms | 1.05× | 0.47 |
+
+The baseline blends the eight voxels around the surface as a texture is
+filtered, each by how nearly it faces the same way. Read from the one voxel
+holding the surface it scored 0.57 and 0.48.
+
+It is cheaper, and halving its rays costs it little, but still less accurate,
+and the screen rays are not why: with them off (`--no-screen`) the corridor
+measured 0.53, the baseline alone. A voxel's settled light is gathered from
+1.5 cells off its surface, and lags 64 frames, where the voxel method walks
+voxels from each pixel every frame. `sponza_gi --residual` runs it.
+
 ## PXTGI
 
 PXTGI traces the physics scene rather than a GI scene of its own, and runs none
@@ -490,6 +525,12 @@ answers CPU rays with `RayScene::ray`. Diffuse rays trace the scene, where a
 hashed radiance cache carries further bounces; `max_distance` lets them follow
 the screen first for geometry drawn but missing from it. Reflection rays follow
 the screen first, taking their light from the previous frame's lit image.
+
+Cache cells double in size with each doubling of distance past 8 m, and each
+cell claims its parent one size up, which stays alive while the cell is used.
+A cell with fewer than four rays blends toward its parent, so a surface just
+come into view, or one the camera walked up to, starts with soft bounce light
+rather than none (the fallback of Hierarchical Voxel Irradiance Caching).
 
 Physics supplies more than geometry:
 
@@ -534,6 +575,7 @@ measurement below, taken on an RTX 4070 Laptop GPU:
 | Light left one frame after it goes out (`--extinction`) | 0.0% (the Bevy build: 68.4% after 100 ms) |
 | Light dimmed to half (`--extinction=half`) | 50.8% after three frames |
 | Residual 10 frames after a wall panel moves | 13%, against 29% without moved regions |
+| Bounce light after the camera steps 3.5 m in (`--approach`) | 5.5% below where it settles at worst, against 10.4% without parent cells; 0.79 to 0.80 ms |
 
 History runs to 48 frames while the camera is still, for steadier light. That is
 what took the room's error from 8.8% to 9.6%: at 32 frames Sponza flickers half as

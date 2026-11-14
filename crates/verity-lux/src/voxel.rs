@@ -108,6 +108,19 @@ pub struct ScreenVoxelSettings {
     pub levels: u32,
     /// The finest level's cell. A level spans 128 cells.
     pub cell_size: f32,
+    /// Residual GI: the voxels' light arriving at each surface is the answer,
+    /// and screen rays add only how far what they see differs from the voxels.
+    pub residual: bool,
+}
+
+impl ScreenVoxelSettings {
+    /// The usual settings, as residual GI.
+    pub fn residual() -> Self {
+        Self {
+            residual: true,
+            ..Self::default()
+        }
+    }
 }
 
 impl Default for ScreenVoxelSettings {
@@ -119,6 +132,7 @@ impl Default for ScreenVoxelSettings {
             intensity: 1.0,
             levels: 5,
             cell_size: 0.125,
+            residual: false,
         }
     }
 }
@@ -871,7 +885,7 @@ impl ScreenVoxel {
             settings.rays_per_texel.clamp(1, 4),
         ];
         data.extra = [
-            0.0,
+            f32::from(u8::from(settings.residual)),
             self.light_age.map_or(0.0, changed_history),
             f32::from(u8::from(unbroken)),
             0.0,

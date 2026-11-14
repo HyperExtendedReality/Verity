@@ -8,6 +8,7 @@ fn every_gi_lighting_method_has_a_method() {
         LightingMethod::SplitRadianceCascades,
         LightingMethod::Pxtgi,
         LightingMethod::ScreenVoxel,
+        LightingMethod::Residual,
     ] {
         let info = method_info(lighting).expect("a method");
         assert_eq!(info.lighting, lighting);
@@ -43,4 +44,6 @@ fn lux_runs_the_chosen_method() {
     assert!(cascades.method_mut::<Pxtgi>().is_none());
     let chosen = (METHODS[1].method)();
     assert!(matches!(chosen, Method::Pxtgi(_)));
+    let residual = method_info(LightingMethod::Residual).expect("a method");
+    assert!(matches!((residual.method)(), Method::ScreenVoxel(s) if s.residual));
 }

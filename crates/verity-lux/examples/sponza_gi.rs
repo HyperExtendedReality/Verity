@@ -9,7 +9,7 @@
 //! then does the same along a moving camera. `--size=WxH`, `--warm=N`,
 //! `--eye=X,Y,Z`, `--target=X,Y,Z`, `--updates=N` and `--uncapped` adjust it, `--no-gi-light`
 //! saves direct light alone, and `--pxtgi` (diffuse only without `--reflections`),
-//! and `--voxel` run those instead. `--reference` path traces Split's own hit
+//! `--voxel` and `--residual` run those instead. `--reference` path traces Split's own hit
 //! shading per pixel with no cache (`Settings::reference`), and
 //! `--pxtgi-reference` PXTGI's simpler Lambertian one; both need a high `--warm`.
 //! H switches between hardware and software tracing while viewing.
@@ -293,10 +293,11 @@ impl ApplicationHandler for Viewer {
                         },
                         ..PxtgiSettings::default()
                     })
-                } else if flag("--voxel") {
+                } else if flag("--voxel") || flag("--residual") {
                     Method::ScreenVoxel(ScreenVoxelSettings {
                         max_distance: if flag("--no-screen") { 0.0 } else { 8.0 },
                         rays_per_texel: arg("rays").map_or(4, |r| r.parse().expect("--rays=N")),
+                        residual: flag("--residual"),
                         ..ScreenVoxelSettings::default()
                     })
                 } else {

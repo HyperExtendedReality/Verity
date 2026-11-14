@@ -210,7 +210,8 @@ void inject(uint3 id : SV_DispatchThreadID) {
     uint found = walk(o, dir, f.sky.w);
     float3 seen = found != 0u ? voxelSeen(found, dir) : background(dir);
     uint lightSeed = hashU(seed ^ 0x68bc21ebu);
-    seen += voxelSampled(x, n, o, lightSeed);
+    float3 sampled = voxelSampled(x, n, o, lightSeed);
+    seen += sampled;
 
     // The last 64 visits; a few while the lights change.
     float4 arriving = radiance[slot + 1u];
@@ -218,7 +219,11 @@ void inject(uint3 id : SV_DispatchThreadID) {
     arriving = float4(lerp(arriving.rgb, seen, 1.0 / frames), frames);
     radiance[slot + 1u] = bad(arriving) ? float4(0.0) : arriving;
     float3 leaving = voxelAlbedo(voxel, x, n) * (voxelDirect(x, n, o) + arriving.rgb);
-    radiance[slot] = float4(leaving, 1.0);
+    // w: the sampled point lights' share of `arriving`, as a mean luminance.
+    // Residual GI takes `arriving` as a surface's bounce light, and the
+    // renderer already lit that surface directly.
+    float direct = lerp(radiance[slot].w, luminance(sampled), 1.0 / frames);
+    radiance[slot] = float4(leaving, isnan(direct) ? 0.0 : direct);
 }
 
 // ---------------------------------------------------------------- voxelizing
@@ -564,8 +569,53 @@ void finalize(uint3 id : SV_DispatchThreadID) {
 
 // ---------------------------------------------------------------- screen
 
+// The bounce light arriving at surface point p facing n, as the voxels around
+// it have settled on it over the last 64 frames, blended between their
+// centres as a texture is filtered; false where none has. Each gives the side
+// facing n, and voxels facing across it (the other wall of a corner) count
+// for less.
+bool voxelArriving(float3 p, float3 n, out float3 arriving) {
+    arriving = 0.0;
+    int level = levelAt(p);
+    float cell = levelCell(level);
+    int3 low = levelLow(level);
+    // A little into the surface, whose voxels may sit just behind it.
+    float3 c = (p - n * (0.25 * cell)) / cell - 0.5;
+    int3 base = int3(floor(c));
+    float3 t = c - float3(base);
+    float4 sum = 0.0;
+    [loop] for (int i = 0; i < 8; i++) {
+        int3 o = int3(i & 1, (i >> 1) & 1, i >> 2);
+        int3 at = base + o;
+        if (any(at < low) || any(at >= low + gridSize())) continue;
+        uint found = cells[cellIndex(level, at)];
+        if (found == 0u) continue;
+        uint index = found - 1u;
+        float3 vn = voxelNormal(voxels[index].z);
+        float facing = dot(vn, n);
+        uint side = facing >= 0.0 ? 0u : 1u;
+        float4 a = radiance[index * 4u + side * 2u + 1u];
+        if (a.w < 1.0) continue;
+        float3 w3 = lerp(1.0 - t, t, float3(o));
+        float w = w3.x * w3.y * w3.z * abs(facing);
+        if (w <= 0.0) continue;
+        float direct = radiance[index * 4u + side * 2u].w;
+        sum += float4(a.rgb * saturate(1.0 - direct / max(luminance(a.rgb), 1e-4)) * w, w);
+    }
+    if (sum.w < 1e-3) return false;
+    arriving = sum.rgb / sum.w;
+    return true;
+}
+
 // Rays from a quarter-size texel: writes the light they found / rays and the
 // fraction that hit something.
+//
+// Residual GI (extra.x) estimates the same light with a control variate: the
+// voxels' settled light at the surface, which is smooth and costs no ray, plus
+// how far each ray's light differs from what the voxels show along it. A ray
+// the screen can't follow would see what the voxels do, so it adds nothing and
+// walks nothing; one it can carries the contact shadow and detail the voxels
+// are too coarse for. Where no voxel has settled, the texel traces as before.
 [shader("compute")]
 [numthreads(8, 8, 1)]
 void trace(uint3 id : SV_DispatchThreadID) {
@@ -586,6 +636,8 @@ void trace(uint3 id : SV_DispatchThreadID) {
     float hits = 0.0;
     float3 origin = p + n * (0.02 + 0.002 * linearDepth(depth));
     float3 voxelOrigin = p + n * (1.5 * levelCell(levelAt(p)));
+    float3 proxy;
+    bool residual = f.extra.x > 0.5 && voxelArriving(p, n, proxy);
     [loop] for (int r = 0; r < rays; r++) {
         float index = f.misc.x * float(rays) + float(r);
         float u = frac(noise.x + index * 0.7548776662);
@@ -593,7 +645,12 @@ void trace(uint3 id : SV_DispatchThreadID) {
         float3 dir = cosineDir(n, u, phi);
         float jitter = frac(noise.z + index * 0.6180339887);
         float4 seen = march(origin, dir, f.misc.y, STEPS, jitter);
-        if (seen.w > 0.5) {
+        if (residual) {
+            if (seen.w > 0.5) {
+                uint found = walk(voxelOrigin, dir, f.sky.w);
+                light += clampFirefly(seen.rgb) - (found != 0u ? voxelSeen(found, dir) : background(dir));
+            }
+        } else if (seen.w > 0.5) {
             light += clampFirefly(seen.rgb);
             hits += 1.0;
         } else {
@@ -604,7 +661,9 @@ void trace(uint3 id : SV_DispatchThreadID) {
             }
         }
     }
-    float4 result = float4(light, hits) / float(rays);
+    // A residual texel's light covers the sky too: nothing is left open.
+    float4 result = residual ? float4(max(proxy + light / float(rays), 0.0), 1.0)
+                             : float4(light, hits) / float(rays);
     out0.Store(px, bad(result) ? float4(0.0) : result);
 }
 

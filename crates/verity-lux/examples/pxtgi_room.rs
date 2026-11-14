@@ -7,7 +7,8 @@
 //! `--frames=N` quits after N frames, `--dump=file.pfm` saves the last one,
 //! `--debug=hits|bounce|reflections|world|position|roundtrip` picks a view,
 //! `--no-gi` runs the plain renderer, `--software` traces without ray queries, `--lights=N` spreads the light over N, `--extinction` puts the light out at
-//! frame 240 and prints how fast its bounce light goes, and `--reference`
+//! frame 240 and prints how fast its bounce light goes, `--approach` steps the
+//! camera in at frame 300 and prints its light as it settles, and `--reference`
 //! path traces the bounce light on the CPU to compare with `--debug=bounce`.
 use glam::{Quat, Vec3};
 use std::{f32::consts::PI, sync::Arc, time::Instant};
@@ -28,6 +29,9 @@ use winit::{
 const STEP: f32 = 1.0 / 60.0;
 /// When `--extinction` puts the light out.
 const LIGHT_OUT: u64 = 240;
+/// When `--approach` steps the camera 3.5 m in, so the back of the room comes
+/// within 8 m and its cache cells halve.
+const APPROACH: u64 = 300;
 
 fn flag(name: &str) -> Option<String> {
     let prefix = format!("--{name}");
@@ -400,18 +404,28 @@ impl Viewer {
         }
         let renderer = self.renderer.as_mut().unwrap();
         renderer.set_deforming_meshes(meshes(room));
-        renderer.set_camera(EYE, LOOK, FOV_DEGREES.to_radians());
+        let approach = flag("approach").is_some();
+        let eye = if approach && self.frames >= APPROACH {
+            EYE + Vec3::new(0.0, 3.5, 0.0)
+        } else {
+            EYE
+        };
+        renderer.set_camera(eye, LOOK, FOV_DEGREES.to_radians());
         let pxtgi = renderer.extension_mut::<Pxtgi>();
         if let Some(pxtgi) = pxtgi {
             pxtgi.sync(&room.physics, &room.world);
             // Every other frame is as often as a capture can come back.
             let near_out = self.frames + 2 >= LIGHT_OUT && self.frames < LIGHT_OUT + 40;
+            let near_step = self.frames >= APPROACH && self.frames < APPROACH + 40;
             let last = self.limit.is_some_and(|limit| self.frames + 4 == limit);
-            if (extinction && near_out) || last {
+            if (extinction && near_out) || (approach && near_step) || last {
                 pxtgi.request_capture();
             }
             if let Some(capture) = pxtgi.take_capture() {
                 let mean = mean_luminance(&capture);
+                if approach && near_step {
+                    println!("{:3} frames after the step: {mean:.4}", self.frames - APPROACH);
+                }
                 if extinction {
                     if self.frames < LIGHT_OUT + 2 {
                         self.lit = Some(mean);

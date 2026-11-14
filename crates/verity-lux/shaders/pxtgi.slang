@@ -396,11 +396,10 @@ uint cellHash(int3 cell, uint side, uint level) {
     return hashU(uint(cell.x) + hashU(uint(cell.y) + hashU(uint(cell.z) + hashU(side * 8u + level))));
 }
 
-// The slot of x's cell, claiming an empty one when asked; -1 when the table
-// is full there.
-int cacheSlot(float3 x, float3 n, bool claim, out bool claimed) {
+// The slot of x's cell at a level, claiming an empty one when asked; -1 when
+// the table is full there.
+int cacheSlot(float3 x, float3 n, uint level, bool claim, out bool claimed) {
     claimed = false;
-    uint level = cacheLevel(x);
     int3 cell = int3(floor(x / (0.25 * float(1u << level))));
     uint h = cellHash(cell, facing(n), level);
     uint key = hashU(h ^ 0x9e3779b9u) | 1u;
@@ -424,8 +423,7 @@ int cacheSlot(float3 x, float3 n, bool claim, out bool claimed) {
 // The bounce light arriving at x (or with leaving, the light leaving it),
 // blended from the eight refined cells around it as a texture is filtered: a
 // cell's own value would show as a square patch in a reflection.
-float3 smoothCache(float3 x, float3 n, bool leaving) {
-    uint level = cacheLevel(x);
+float4 smoothCacheAt(float3 x, float3 n, bool leaving, uint level) {
     float3 c = x / (0.25 * float(1u << level)) - 0.5;
     int3 base = int3(floor(c));
     float3 t = c - float3(base);
@@ -450,7 +448,23 @@ float3 smoothCache(float3 x, float3 n, bool leaving) {
             if (was == 0u) break;
         }
     }
+    return sum;
+}
+
+float3 smoothCache(float3 x, float3 n, bool leaving) {
+    uint level = cacheLevel(x);
+    float4 sum = smoothCacheAt(x, n, leaving, level);
+    // None refined here yet (just come into view, or the camera came closer and
+    // cells shrank): the coarser cells around it, softer rather than dark.
+    if (sum.w <= 1e-4) sum = smoothCacheAt(x, n, leaving, level + 1u);
     return sum.w > 1e-4 ? sum.rgb / sum.w : float3(0.0);
+}
+
+void claimCell(int slot, float3 x, float3 n, float3 albedo) {
+    f.cells[slot].pos = float4(x, asfloat(f.cache.x));
+    f.cells[slot].normal = float4(n, 0.0);
+    f.cells[slot].albedo = float4(albedo, 0.0);
+    f.cells[slot].incoming = 0.0;
 }
 
 // ---------------------------------------------------------------- lighting
@@ -499,8 +513,8 @@ static const uint SEEN_GLOSSY = 1u;
 static const uint SEEN_MIRROR = 2u;
 
 // The light leaving a surface toward the ray: for a reflection, last frame's
-// image where that point was on it; otherwise its cache cell once refined, or
-// else the direct light on its albedo. Diffuse rays skip the image: its
+// image where that point was on it; otherwise its cache cell once refined (or
+// while young, its coarser parent), or else the direct light on its albedo. Diffuse rays skip the image: its
 // shading (shadow maps, Hammon diffuse as it then was, normal-map spread) ran
 // brighter than the scene's own Lambertian light, and against a path-traced
 // reference of the courtyard taking it cost 0.13 error where the cache gave
@@ -520,29 +534,50 @@ float3 worldLight(float3 x, float3 n, int hit, bool fromPixels, uint seenAs) {
     }
     float3 albedo = hitAlbedo(hit, x, n);
     if (f.cache.z != 0u) {
+        uint level = cacheLevel(x);
         bool claimed;
-        int slot = cacheSlot(x, n, fromPixels, claimed);
-        if (slot >= 0) {
-            if (claimed) {
-                f.cells[slot].pos = float4(x, asfloat(f.cache.x));
-                f.cells[slot].normal = float4(n, 0.0);
-                f.cells[slot].albedo = float4(albedo, 0.0);
-                f.cells[slot].incoming = 0.0;
-            } else {
-                if (fromPixels) f.cells[slot].pos.w = asfloat(f.cache.x);
-                if (f.cells[slot].normal.w > 0.5) {
-                    // A pixel's ray lights the hit itself and takes only the cell's
-                    // bounce light: the cell's outgoing light is the direct light where
-                    // it was claimed, which leaks sun across shadow edges a cell
-                    // straddles (0.155 to 0.146 error). The cache's own rays gained
-                    // nothing from it. Trace runs after the cache took its fade; the
-                    // cache's own rays don't.
-                    if (seenAs == SEEN_DIFFUSE && fromPixels) return albedo * (directLight(x, n) + f.cells[slot].incoming.rgb);
-                    if (seenAs == SEEN_DIFFUSE) return f.cells[slot].outgoing.rgb * f.fade.rgb;
-                    if (seenAs == SEEN_GLOSSY) return smoothCache(x, n, true);
-                    return albedo * (directLight(x, n) + smoothCache(x, n, false));
-                }
+        int slot = cacheSlot(x, n, level, fromPixels, claimed);
+        float own = 0.0;
+        if (slot >= 0 && claimed) {
+            claimCell(slot, x, n, albedo);
+            // Its parent too, one level coarser, for this cell and its
+            // neighbours to fall back on while they are young.
+            bool parentClaimed;
+            int parent = cacheSlot(x, n, level + 1u, true, parentClaimed);
+            if (parentClaimed) claimCell(parent, x, n, albedo);
+        } else if (slot >= 0) {
+            if (fromPixels) f.cells[slot].pos.w = asfloat(f.cache.x);
+            own = f.cells[slot].normal.w;
+        }
+        float3 incoming = own > 0.5 ? f.cells[slot].incoming.rgb : 0.0;
+        float known = own;
+        int parent = -1;
+        if (own < 4.0) {
+            // A cell with fewer than four rays leans on its parent, the more the
+            // younger it is: a surface come into view starts soft, not dark or
+            // noisy, and sharpens as its own cell fills (Hierarchical Voxel
+            // Irradiance Caching's fallback to converged parents).
+            bool unused;
+            int p = cacheSlot(x, n, level + 1u, false, unused);
+            float coarse = p >= 0 ? f.cells[p].normal.w : 0.0;
+            if (coarse > own) {
+                parent = p;
+                incoming = lerp(f.cells[p].incoming.rgb, incoming, own / 4.0);
+                known = coarse;
             }
+        }
+        if (known > 0.5) {
+            // A pixel's ray lights the hit itself and takes only the cell's
+            // bounce light: the cell's outgoing light is the direct light where
+            // it was claimed, which leaks sun across shadow edges a cell
+            // straddles (0.155 to 0.146 error). The cache's own rays gained
+            // nothing from it, and read only `outgoing`, which no cell writes
+            // while they run. Trace runs after the cache took its fade; the
+            // cache's own rays don't.
+            if (seenAs == SEEN_DIFFUSE && fromPixels) return albedo * (directLight(x, n) + incoming);
+            if (seenAs == SEEN_DIFFUSE) return f.cells[own > 0.5 ? slot : parent].outgoing.rgb * f.fade.rgb;
+            if (seenAs == SEEN_GLOSSY) return smoothCache(x, n, true);
+            return albedo * (directLight(x, n) + smoothCache(x, n, false));
         }
     }
     uint seed = positionSeed(x);
@@ -590,6 +625,10 @@ void cache_gather(uint3 id : SV_DispatchThreadID) {
     }
     if (!cacheDue(slot, cell)) return;
     float3 n = normalize(cell.normal.xyz);
+    // A cell in use keeps its parent alive, though no pixel reads the parent.
+    bool unused;
+    int parent = cacheSlot(cell.pos.xyz, n, cacheLevel(cell.pos.xyz) + 1u, false, unused);
+    if (parent >= 0 && asuint(f.cells[parent].pos.w) < asuint(cell.pos.w)) f.cells[parent].pos.w = cell.pos.w;
     float u = frac(float(hashU(slot) & 0xffffu) / 65536.0 + float(f.cache.x) * 0.7548776662);
     float phi = 6.2831853 * frac(float(hashU(slot ^ 0x5bd1e995u) & 0xffffu) / 65536.0 + float(f.cache.x) * 0.5698402910);
     float3 dir = cosineDir(n, u, phi);
