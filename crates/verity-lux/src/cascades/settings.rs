@@ -146,9 +146,12 @@ impl Settings {
     }
 
     /// The benchmarked budget for a frame, with about 800 MB of world cache in
-    /// place of the uncapped default. On Sponza a coarser grid and half-size
+    /// place of the uncapped default. On Sponza a coarser grid and a third-size
     /// resolve lost nothing, and what they save buys a cache that keeps probes:
     /// against a path-traced reference, a smaller one is what costs accuracy.
+    /// A third-size resolve against half-size saved 0.25 ms in the corridor and
+    /// courtyard at the same error and HDR-FLIP; a quarter-size one cost the
+    /// corridor 0.29 error against 0.27 and doubled its flicker.
     /// Half-metre probes, with intervals scaled to match, keep the update budget
     /// from spreading thin: in Sponza's courtyard they took the error from 0.30
     /// to 0.26 and the frame from 9.9 ms to 4.9 ms (quarter-metre ones suit the
@@ -159,7 +162,7 @@ impl Settings {
             interval_length: 0.8,
             sampling: Sampling {
                 grid_divisor: 4,
-                resolve_scale: 2,
+                resolve_scale: 3,
                 max_cache_entries: 1_048_576,
                 max_updates_per_frame: 2048,
                 max_traversal_queries: 65_536,
