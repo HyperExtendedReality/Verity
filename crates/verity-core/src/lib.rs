@@ -142,6 +142,20 @@ pub enum LightingMethod {
     ScreenVoxel,
     /// Residual GI: the voxel copy's light, corrected by rays along the depth buffer.
     Residual,
+    /// Experimental Split presets and traced final-gather controls.
+    SplitColdPriority,
+    SplitLowDiscrepancyEmitters,
+    SplitCosineGather,
+    CascadeGuided,
+    /// Experimental voxel presets with empty-brick skipping.
+    ScreenVoxelBricks,
+    ResidualBricks,
+    PxtgiTemporalDiffuse,
+    SplitSurfaceBounceGuide,
+    ScreenVoxelSourceHistory,
+    ResidualSourceHistory,
+    /// Ultra PBR: material-space diffuse and glossy global illumination.
+    UltraPbrMsgi,
 }
 
 /// Scene-wide ambient lighting, expressed as linear RGB radiance.
@@ -646,8 +660,9 @@ impl World {
             }
             depth
         };
-        let mut children: Vec<usize> =
-            (0..self.len()).filter(|&i| self.parents[i].is_some()).collect();
+        let mut children: Vec<usize> = (0..self.len())
+            .filter(|&i| self.parents[i].is_some())
+            .collect();
         children.sort_by_cached_key(|&i| depth(i));
         for index in children {
             let parent = self.parents[index].and_then(|p| self.dense_index(p));
@@ -827,7 +842,10 @@ impl World {
 
     /// Calls `f` with every entity that has a `T`, its `T` and its transform,
     /// in the store's dense order.
-    pub fn each_mut<T: Component>(&mut self, mut f: impl FnMut(EntityHandle, &mut T, &mut Transform)) {
+    pub fn each_mut<T: Component>(
+        &mut self,
+        mut f: impl FnMut(EntityHandle, &mut T, &mut Transform),
+    ) {
         let Some(store) = (self.stores.get_mut(&TypeId::of::<T>()))
             .and_then(|s| s.as_any_mut().downcast_mut::<Store<T>>())
         else {
@@ -835,7 +853,11 @@ impl World {
         };
         for (&entity, value) in store.owners.iter().zip(&mut store.values) {
             let dense = self.slots[entity.index as usize].dense_index;
-            f(entity, value, &mut self.transforms[dense.expect("stores hold live entities")]);
+            f(
+                entity,
+                value,
+                &mut self.transforms[dense.expect("stores hold live entities")],
+            );
         }
     }
 
@@ -1035,6 +1057,29 @@ mod tests {
     }
 
     #[test]
+    fn scenes_round_trip_experimental_lighting_choices() {
+        for method in [
+            LightingMethod::SplitColdPriority,
+            LightingMethod::SplitLowDiscrepancyEmitters,
+            LightingMethod::SplitCosineGather,
+            LightingMethod::CascadeGuided,
+            LightingMethod::ScreenVoxelBricks,
+            LightingMethod::ResidualBricks,
+            LightingMethod::PxtgiTemporalDiffuse,
+            LightingMethod::SplitSurfaceBounceGuide,
+            LightingMethod::ScreenVoxelSourceHistory,
+            LightingMethod::ResidualSourceHistory,
+            LightingMethod::UltraPbrMsgi,
+        ] {
+            let mut scene = Scene::default();
+            scene.lighting.method = method;
+            let json = serde_json::to_string(&scene).unwrap();
+            let restored: Scene = serde_json::from_str(&json).unwrap();
+            assert_eq!(restored.lighting.method, method);
+        }
+    }
+
+    #[test]
     fn lighting_and_assets_survive_json_and_world_conversions() {
         let mut scene = Scene::default();
         scene.lighting = Lighting {
@@ -1156,11 +1201,9 @@ mod tests {
         scene.entities[0]
             .components
             .insert("Mana".into(), serde_json::json!({}));
-        assert!(
-            World::from_scene(&scene, &registry)
-                .unwrap_err()
-                .contains("Mana")
-        );
+        assert!(World::from_scene(&scene, &registry)
+            .unwrap_err()
+            .contains("Mana"));
         scene.entities[0].components = [("Health".into(), serde_json::json!("x"))].into();
         assert!(World::from_scene(&scene, &registry).is_err());
     }
@@ -1222,10 +1265,17 @@ mod tests {
     fn moving_a_parent_carries_descendants() {
         let mut scene = family();
         let before = scene.entities[0].transform.clone();
-        scene.entities[0].transform.rotation = glam::Quat::from_rotation_z(90f32.to_radians()).to_array();
+        scene.entities[0].transform.rotation =
+            glam::Quat::from_rotation_z(90f32.to_radians()).to_array();
         scene.carry_children(0, &before);
-        assert!(close(scene.entities[2].transform.translation, [0.0, 2.0, 0.0]));
-        assert!(close(scene.entities[3].transform.translation, [3.0, 0.0, 0.0]));
+        assert!(close(
+            scene.entities[2].transform.translation,
+            [0.0, 2.0, 0.0]
+        ));
+        assert!(close(
+            scene.entities[3].transform.translation,
+            [3.0, 0.0, 0.0]
+        ));
     }
 
     #[test]
@@ -1245,7 +1295,10 @@ mod tests {
         let handles = world.handles().to_vec();
         world.get_mut(handles[0]).unwrap().transform.translation[2] = 5.0;
         world.propagate();
-        assert!(close(world.get(handles[2]).unwrap().transform.translation, [2.0, 0.0, 5.0]));
+        assert!(close(
+            world.get(handles[2]).unwrap().transform.translation,
+            [2.0, 0.0, 5.0]
+        ));
         assert_eq!(world.to_scene(&registry).entities[2].parent, Some(1));
         assert!(world.set_parent(handles[0], Some(handles[2])).is_err());
         world.despawn(handles[1]);
