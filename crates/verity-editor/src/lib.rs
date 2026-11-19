@@ -1265,6 +1265,11 @@ impl Editor {
             renderer.set_uncapped(self.tools.uncapped);
             renderer.set_anti_aliasing(self.tools.anti_aliasing);
             renderer.set_sharpening(self.tools.sharpening);
+            renderer.set_ambient_occlusion(if self.tools.ambient_occlusion {
+                self.tools.ao_radius
+            } else {
+                0.0
+            });
             let mut deforming = soft_meshes(self.play.as_ref());
             deforming.extend(city::agents(
                 self.play.as_ref().map(|p| &p.runtime),

@@ -286,10 +286,15 @@ impl Runtime {
                     glam::Vec3::from_array(t.translation),
                     glam::Quat::from_array(t.rotation).normalize(),
                 );
-                let collider = physics.get(other).map(|b| b.collider);
+                let collider = physics.get(other).map(|b| b.collider.clone());
                 let within = |p: glam::Vec3| {
                     let q = turn.conjugate() * (p - center);
                     match collider {
+                        // Pulled 5 cm toward the center, as the others are grown.
+                        Some(verity_physics::Collider::Hull(ref hull)) => {
+                            hull.contains(q - q.normalize_or_zero() * 0.05)
+                        }
+                        Some(verity_physics::Collider::Mesh(_)) => false,
                         Some(verity_physics::Collider::Cuboid { half_extents }) => {
                             q.abs().cmple(half_extents + 0.05).all()
                         }

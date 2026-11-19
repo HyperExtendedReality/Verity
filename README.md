@@ -310,9 +310,12 @@ Floating-point reordering can change pile trajectories. Every change, including 
 | Split Radiance Cascades | `cascades` | A GI scene of its own |
 | PXTGI | `pxtgi` | The physics scene |
 | Screen and voxel GI | `voxel` | The depth buffer, then a voxel copy of the scene |
+| Residual GI | `voxel` | A settled voxel baseline plus screen-space corrections |
+| Ultra PBR / MSGI (experimental) | `cascades` | Material-weighted rays with Split's surface cache |
+| Sliced Holographic Radiance Cascades (experimental) | `voxel` / `holographic` | One voxel clipmap level or a standalone volume |
 
 - **Split Radiance Cascades** trace a budget of receivers into a world cache, merge cascades from far to near, and pack directional probes that every pixel reads. Light bounces through last frame's probes.
-- **PXTGI** traces the physics world itself (rigid colliders, soft-body surfaces, static meshes), screen rays first and then a hashed radiance cache. Sleeping bodies cost nothing on the GPU, and moving bodies refresh only the region they disturbed. When a light dims, everything remembered scales with it, so no stale light lingers.
+- **PXTGI** traces the physics world (rigid colliders, soft-body surfaces, static meshes), with a hashed radiance cache for multiple bounces. Reflections try screen rays first. Sleeping bodies cost nothing on the GPU, and moving bodies refresh only the region they disturbed.
 - **Screen and voxel GI** march the depth buffer, then a 256³ voxel grid that gains a bounce every few frames.
 
 ```rust
@@ -336,7 +339,7 @@ The full method notes, limits and measurements are in the [Lux README](crates/ve
 
 <br>
 
-`verity-matrix` cooks every static material primitive into a continuous LOD. In the editor, open **View → Enable Matrix** to draw through it. **View → Matrix LOD debug view** colors surfaces by tier: green, blue and yellow for cluster levels, orange for voxels, purple for imposters. Both are editor-session settings, not scene data. `Renderer::set_matrix_enabled` is the same switch in code.
+`verity-matrix` cooks every static material primitive into a continuous LOD. In the editor, open **View → Matrix Geometry → Enable Matrix** to draw through it. **Matrix LOD debug view** in the same menu colors surfaces by tier: green, blue and yellow for cluster levels, orange for voxels, purple for imposters. Both are editor-session settings, not scene data. `Renderer::set_matrix_enabled` is the same switch in code.
 
 There are three tiers, chosen on the GPU each frame by `matrix_select.slang`. The CPU records a fixed number of indirect draws however large the scene is.
 
@@ -444,14 +447,14 @@ This runs a Vulkan beach scene. The separate breaker pass can coexist with a ren
 
 <br>
 
-The editor uses a dark interface and requests a dark native window theme. The Scene outliner, Inspector and project Assets browser are resizable around the viewport.
+The Hierarchy, Inspector, Content Browser, Console and Profiler are dockable around the viewport. Reopen or focus a panel from **Window**, or choose **Window → Reset Layout** to restore the default workspace.
 
-- **Transform:** select an entity in the hierarchy, choose Translate, Rotate or Scale above the viewport, then drag a colored axis or rotation ring. Translation and rotation use world axes; scale uses the object's local axes. The inspector also accepts numeric transforms.
+- **Toolbar:** use **Add** to create a cube, point light, camera from the current view, or UI widget. Use **Select**, **Move**, **Rotate** and **Scale** (Q/W/E/R) to switch tools. Move and rotate use world axes; scale uses local axes. **Frame** (F) centers the selection, and **Camera** holds fly speed and navigation controls.
 - **Hierarchy:** right-click a row to frame, duplicate or delete it. Ctrl+C, Ctrl+V and Ctrl+D copy, paste and duplicate entities.
 - **Lighting:** select Environment & Physics to choose direct-only or direct plus hemisphere ambient lighting and edit the sky and ground colors. The sun is directional; point lights can be added and edited separately. Pick a GI method under **Scene Lighting**.
 - **Physics:** open `assets/scenes/physics-playground.verity` and press Play to test a pyramid and a falling pile. Select Environment & Physics to change gravity and solver settings, or an object to add or edit its Rigid Body component. Collider dimensions do not follow visual scale. Capsules and restitution are not supported.
 - **Assets:** the Asset Browser is rooted at `assets/`. Double-click folders to navigate, a `.verity` or `.json` scene to open it, or a `.glb` to import it. Imported paths are saved relative to the project and reloaded with the scene. Models must use the renderer's supported GLB/KTX2 format. Imported models are whole-scene geometry rather than editable entities; remove them from the Imported Models list. Imported point lights stay active, while directional lighting follows the editor's Sun setting.
-- **View → Uncap FPS** stops waiting for vsync and draws continuously, which may tear.
+- **View:** use **Overlays** to toggle the world axes or game UI preview; set renderer options under **Anti-aliasing** and **Matrix Geometry**. **Uncap FPS** stops waiting for vsync and draws continuously, which may tear.
 
 </details>
 
