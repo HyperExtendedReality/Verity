@@ -28,7 +28,10 @@ pub const SHADOW_SIZE: u32 = 2048;
 pub const MAX_POINT_SHADOWS: usize = 4;
 pub const POINT_SHADOW_SIZE: u32 = 512;
 pub const POINT_SHADOW_FACES: usize = 6;
-pub const SHADOW_DISTANCE: f32 = 60.0;
+pub const SHADOW_DISTANCE: f32 = 150.0;
+/// The cascades before the last split this much, so near shadows keep their
+/// texels however far the last cascade reaches.
+const DETAIL_DISTANCE: f32 = 60.0;
 /// How far behind each cascade (toward the sun) occluders still cast.
 const SHADOW_CASTER_REACH: f32 = 100.0;
 /// Blend between logarithmic (1) and uniform (0) cascade splits.
@@ -113,7 +116,12 @@ pub fn cascades(camera: &Camera, aspect: f32, sun_direction: Vec3, distance: f32
     let world_from_view = Mat4::look_at_rh(camera.eye, camera.target, UP).inverse();
     let tan_y = (camera.vertical_fov * 0.5).tan();
     let tan_x = tan_y * aspect;
+    let detail = distance.min(DETAIL_DISTANCE);
     let splits: [f32; CASCADES] = std::array::from_fn(|i| {
+        if i == CASCADES - 1 {
+            return distance;
+        }
+        let distance = detail;
         let t = (i + 1) as f32 / CASCADES as f32;
         let logarithmic = NEAR * (distance / NEAR).powf(t);
         let uniform = NEAR + (distance - NEAR) * t;
@@ -328,7 +336,7 @@ impl DeformingMesh {
 }
 
 /// The camera's view and reverse-Z, infinite-far projection for a viewport.
-fn view_projection(camera: &Camera, viewport: [u32; 4]) -> (Mat4, Mat4) {
+pub(crate) fn view_projection(camera: &Camera, viewport: [u32; 4]) -> (Mat4, Mat4) {
     let view = Mat4::look_at_rh(camera.eye, camera.target, UP);
     let aspect = viewport[2].max(1) as f32 / viewport[3].max(1) as f32;
     let mut projection = Mat4::perspective_infinite_reverse_rh(camera.vertical_fov, aspect, NEAR);

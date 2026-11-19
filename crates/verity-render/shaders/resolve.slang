@@ -67,6 +67,9 @@ float cloud_shadow(float3 position) {
     return cloud_shadow_map.SampleLevel(material_sampler, uv, 0);
 }
 
+/// Ambient light reaching each pixel, 0 to 1; see ao.rs. 1 while AO is off.
+[[vk::binding(36, MATERIAL_SET)]] Texture2D<float> ambient_occlusion;
+
 float sun_shadow(float3 position, float3 normal, float depth) {
     float range = globals.shadow_splits[CASCADES - 1];
     if (globals.sky.w == 0.0 || depth >= range)
@@ -324,7 +327,9 @@ float3 shade(uint2 id, uint2 pixel, uint2 hit, bool primary) {
     if (primary && globals.counts.z != 0) {
         // GI reflects off the surface's diffuse albedo, which transmission lowers.
         // shortcut: GI arriving at the far side does not pass through to the viewer; add a back-facing GI lookup when foliage looks too dark under GI.
-        gi_gbuffer[pixel] = pack_gbuffer(s.base_color * (1.0 - transmits), s.roughness, s.metallic, specular, s.normal);
+        // The Matrix debug view gives GI no albedo, so its tiers' colors stay flat.
+        float3 gi_albedo = globals.counts.w != 0 ? 0.0 : s.base_color * (1.0 - transmits);
+        gi_gbuffer[pixel] = pack_gbuffer(gi_albedo, s.roughness, s.metallic, specular, s.normal);
         gi_receiver[pixel] = pack_receiver(instance.draw.w, face);
     }
     // Camera and object motion, for GI and TAA. Matrix instances are placed at
@@ -349,13 +354,15 @@ float3 shade(uint2 id, uint2 pixel, uint2 hit, bool primary) {
     // light, so dark GI-lit interiors meter like the sky; meter GI's own
     // irradiance if interiors come out too dark.
     float3 diffuse_light = hemisphere;
+    // shortcut: AO also stands in for specular occlusion of the ambient.
+    float occlusion = ambient_occlusion.Load(int3(pixel, 0));
     if (globals.counts.z == 0) {
-        result = (brdf.diffuse_color + brdf.albedo) * hemisphere;
+        result = (brdf.diffuse_color + brdf.albedo) * hemisphere * occlusion;
         // The hemisphere behind the surface, through it.
         result += transmitted * PI * lerp(globals.ground.rgb, globals.sky.rgb, -s.normal.z * 0.5 + 0.5);
     } else if ((globals.counts.z & 2) != 0) {
         float3 mirrored = reflect(-s.view, s.normal);
-        result = brdf.albedo * lerp(globals.ground.rgb, globals.sky.rgb, mirrored.z * 0.5 + 0.5);
+        result = brdf.albedo * lerp(globals.ground.rgb, globals.sky.rgb, mirrored.z * 0.5 + 0.5) * occlusion;
     }
     if (globals.sun_direction.w > 0.0) {
         float3 l = -globals.sun_direction.xyz;
@@ -403,7 +410,12 @@ float3 shade(uint2 id, uint2 pixel, uint2 hit, bool primary) {
             float3(1.0, 0.8, 0.1), float3(1.0, 0.3, 0.1),
             float3(0.8, 0.1, 0.9)
         };
-        result = colors[min(level, 4)];
+        // Lit from the eye so shapes read, and metered on that light alone:
+        // metering the scene's own light blew the flat colors out to white.
+        float light = 0.4 + 0.6 * nv;
+        result = colors[min(level, 4)] * light;
+        if (primary)
+            metered_light = light;
     }
     return result;
 }

@@ -21,6 +21,7 @@ mod retained;
 mod gpu_culling;
 mod meshlets;
 mod profiler;
+mod ray_features;
 mod scene;
 mod shadows;
 mod upload;
@@ -28,7 +29,7 @@ mod virtual_texture;
 
 pub use asset::{Sun, TextureFormat};
 pub use matrix::MatrixStats;
-pub use extension::{FrameContext, Gpu, RenderExtension, RetainedChange, Targets};
+pub use extension::{FrameContext, Gpu, RayFeatures, RenderExtension, RetainedChange, Targets};
 pub use embedded::{Dent, EmbeddedInstanceId, EmbeddedModel, EmbeddedModelId, MAX_DENTS};
 pub use retained::RetainedMesh;
 pub use scene::{entity_matrix, Camera, DeformingMesh, GpuMaterial, Vertex, UP};
@@ -82,6 +83,7 @@ macro_rules! spirv {
 }
 
 pub mod breaker;
+mod ao;
 mod clouds;
 mod matrix;
 mod taa;
@@ -259,6 +261,8 @@ struct Swapchain {
     gbuffer: Option<Image>,
     receiver: Option<Image>,
     motion: Option<Image>,
+    /// Ambient occlusion over the viewport, for the resolve; see `ao.rs`.
+    ao: Option<Image>,
 }
 
 /// A loaded material and how its draws are issued.
@@ -279,6 +283,7 @@ struct DeviceChoice {
     anisotropy: Option<f32>,
     /// Acceleration structures, ray queries and buffer device addresses are on.
     ray_query: bool,
+    ray_features: RayFeatures,
 }
 
 /// Owns all Vulkan resources and the window for the lifetime of its surface.
@@ -299,6 +304,7 @@ pub struct Renderer {
     queue: vk::Queue,
     queue_family: u32,
     ray_query: bool,
+    ray_features: RayFeatures,
     swap_loader: ash::khr::swapchain::Device,
     allocator: Option<Allocator>,
     depth_format: vk::Format,
@@ -396,6 +402,9 @@ pub struct Renderer {
     breakers: breaker::BreakerPass,
     clouds: clouds::CloudPass,
     taa: taa::TaaPass,
+    ao: ao::AoPass,
+    /// World radius ambient occlusion searches; 0 turns it off.
+    ao_radius: f32,
     anti_aliasing: AntiAliasing,
     sharpening: f32,
     /// Sunlight let through the clouds, sampled by the resolve.
@@ -512,6 +521,7 @@ impl Renderer {
                 texture_format,
                 anisotropy,
                 ray_query,
+                ray_features,
             } = choice;
             let size = window.inner_size();
             let mut renderer = Self {
@@ -527,6 +537,7 @@ impl Renderer {
                 device,
                 queue_family,
                 ray_query,
+                ray_features,
                 allocator: None,
                 swap: Swapchain::default(),
                 set_layout: vk::DescriptorSetLayout::null(),
@@ -605,6 +616,8 @@ impl Renderer {
                 breakers: breaker::BreakerPass::default(),
                 clouds: clouds::CloudPass::default(),
                 taa: taa::TaaPass::default(),
+                ao: ao::AoPass::default(),
+                ao_radius: 1.0,
                 anti_aliasing: AntiAliasing::default(),
                 sharpening: 0.5,
                 cloud_shadow: None,
@@ -712,6 +725,8 @@ impl Renderer {
             D::SAMPLED_IMAGE,
             // Auto exposure: see `shaders/lib/exposure.slang`.
             D::STORAGE_BUFFER,
+            // Ambient occlusion, for the resolve: see `ao.rs`.
+            D::SAMPLED_IMAGE,
         ];
         // Instances, lights, vertices, indices and Matrix's buffers: now
         // pointers in `Globals`. Their slots stay empty so no other binding renumbers.
@@ -1246,6 +1261,7 @@ impl Renderer {
             queue: self.queue,
             queue_family: self.queue_family,
             ray_query: self.ray_query,
+            ray_features: self.ray_features,
             allocator: self.allocator.as_mut().expect("allocator lives until drop"),
             frame_set_layout: self.set_layout,
             frames_in_flight: FRAMES,
@@ -1292,6 +1308,12 @@ impl Renderer {
         // The multisampled targets come and go with the swapchain's.
         self.recreate |= mode.msaa() != self.anti_aliasing.msaa();
         self.anti_aliasing = mode;
+    }
+
+    /// How far ambient occlusion looks for occluders, in world units; 0
+    /// turns it off. 1 by default.
+    pub fn set_ambient_occlusion(&mut self, radius: f32) {
+        self.ao_radius = radius.max(0.0);
     }
 
     /// How much temporal anti-aliasing sharpens, from 0 (off) to 1; 0.5 by default.
@@ -1348,13 +1370,14 @@ impl Renderer {
 
     /// Point every frame's set at the current render targets.
     unsafe fn write_image_descriptors(&self) {
-        let (Some(visibility), Some(hdr), Some(gbuffer), Some(receiver), Some(motion), Some(depth)) = (
+        let (Some(visibility), Some(hdr), Some(gbuffer), Some(receiver), Some(motion), Some(depth), Some(ao)) = (
             &self.swap.visibility,
             &self.swap.hdr,
             &self.swap.gbuffer,
             &self.swap.receiver,
             &self.swap.motion,
             &self.swap.depth,
+            &self.swap.ao,
         ) else {
             return;
         };
@@ -1393,6 +1416,12 @@ impl Renderer {
                 vk::DescriptorType::SAMPLED_IMAGE,
                 depth.view,
                 vk::ImageLayout::DEPTH_READ_ONLY_OPTIMAL,
+            ),
+            (
+                36,
+                vk::DescriptorType::SAMPLED_IMAGE,
+                ao.view,
+                vk::ImageLayout::GENERAL,
             ),
         ];
         let infos = images.map(|(_, _, view, layout)| {
@@ -1442,6 +1471,7 @@ impl Renderer {
             self.swap.gbuffer.take(),
             self.swap.receiver.take(),
             self.swap.motion.take(),
+            self.swap.ao.take(),
         ]
         .into_iter()
         .flatten()
@@ -1663,6 +1693,17 @@ impl Renderer {
                 vk::ImageAspectFlags::COLOR,
             )?);
         }
+        // Cleared to 1 while ambient occlusion is off.
+        self.swap.ao = Some(gpu::create_image(
+            device,
+            allocator,
+            "ambient occlusion",
+            vk::Format::R32_SFLOAT,
+            extent,
+            1,
+            U::STORAGE | U::SAMPLED | U::TRANSFER_DST,
+            vk::ImageAspectFlags::COLOR,
+        )?);
         self.write_image_descriptors();
 
         if self.composite_format != chosen {
@@ -3096,6 +3137,35 @@ impl Renderer {
             );
         }
         if visible {
+            let ao = self.swap.ao.as_ref().unwrap();
+            let projection = scene::view_projection(&self.camera, viewport).1;
+            // A new noise pattern each frame only when TAA averages them.
+            let seed = if self.anti_aliasing.temporal() {
+                (self.frame_number as u32).wrapping_mul(0x9E37_79B9)
+            } else {
+                0
+            };
+            self.ao.record(
+                device,
+                self.allocator.as_mut().unwrap(),
+                self.set_layout,
+                cmd,
+                set,
+                viewport,
+                (ao.image, ao.view),
+                [projection.x_axis.x, projection.y_axis.y],
+                scene::NEAR,
+                self.ao_radius,
+                seed,
+            )?;
+            device.cmd_bind_descriptor_sets(
+                cmd,
+                vk::PipelineBindPoint::COMPUTE,
+                self.pipeline_layout,
+                0,
+                &[set],
+                &[],
+            );
             let resolve = if msaa.is_some() {
                 self.resolve_msaa_pipeline
             } else {
@@ -3464,8 +3534,15 @@ unsafe fn pick_device(
                 && ray_extensions.iter().all(|name| has(name))
                 && accel.acceleration_structure != 0
                 && query.ray_query != 0;
+            let ray_features = if ray_query {
+                // SAFETY: The current physical device was enumerated from this instance.
+                ray_features::probe(instance, physical, has)
+            } else {
+                RayFeatures::default()
+            };
             if ray_query {
                 names.extend(ray_extensions.map(CStr::as_ptr));
+                ray_features.add_extension_names(&mut names);
             }
             let anisotropy =
                 (core.sampler_anisotropy != 0).then_some(properties.limits.max_sampler_anisotropy);
@@ -3486,6 +3563,7 @@ unsafe fn pick_device(
             let mut accel = vk::PhysicalDeviceAccelerationStructureFeaturesKHR::default()
                 .acceleration_structure(true);
             let mut query = vk::PhysicalDeviceRayQueryFeaturesKHR::default().ray_query(true);
+            let mut optional_ray_features = ray_features::EnableChain::new();
             let mut info = vk::DeviceCreateInfo::default()
                 .queue_create_infos(&queues)
                 .enabled_extension_names(&names)
@@ -3495,6 +3573,7 @@ unsafe fn pick_device(
                 .push_next(&mut v13);
             if ray_query {
                 info = info.push_next(&mut accel).push_next(&mut query);
+                info = optional_ray_features.push_next(info, ray_features);
             }
             let device = instance.create_device(physical, &info, None)?;
             return Ok(DeviceChoice {
@@ -3504,6 +3583,7 @@ unsafe fn pick_device(
                 texture_format,
                 anisotropy,
                 ray_query,
+                ray_features,
             });
         }
     }
@@ -3539,6 +3619,7 @@ impl Drop for Renderer {
                 self.breakers.destroy(&self.device, allocator);
                 self.clouds.destroy(&self.device, allocator);
                 self.taa.destroy(&self.device, allocator);
+                self.ao.destroy(&self.device, allocator);
             }
             if self.allocator.is_some() {
                 self.clear_swapchain();

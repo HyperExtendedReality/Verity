@@ -10,8 +10,9 @@ use gpu_allocator::vulkan::Allocator;
 const HISTORY_FORMAT: vk::Format = vk::Format::R16G16B16A16_SFLOAT;
 /// SMAA's edges and blend weights.
 const SMAA_FORMAT: vk::Format = vk::Format::R8G8B8A8_UNORM;
-/// Halton(2, 3) points per cycle: enough to converge before the cycle repeats.
-const JITTER_PHASES: u64 = 8;
+/// Halton(2, 3) points per cycle. Eight left low resolutions, where a pixel
+/// spans more of each edge, visibly stepped; sixteen fill the pixel evenly.
+const JITTER_PHASES: u64 = 16;
 
 /// How the scene is anti-aliased: a player-facing graphics setting.
 ///
@@ -83,6 +84,9 @@ pub(crate) fn jitter(frame_number: u64, mode: AntiAliasing) -> [f32; 2] {
     if mode == AntiAliasing::Smaa {
         // SMAA T2x's two diagonal positions, a half pixel apart.
         return if frame_number.is_multiple_of(2) { [0.25, -0.25] } else { [-0.25, 0.25] };
+    }
+    if !mode.temporal() {
+        return [0.0, 0.0];
     }
     let index = (frame_number % JITTER_PHASES + 1) as u32;
     [halton(index, 2) - 0.5, halton(index, 3) - 0.5]

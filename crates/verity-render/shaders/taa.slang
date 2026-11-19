@@ -1,7 +1,7 @@
 // Temporal anti-aliasing. The projection moves by a sub-pixel Halton(2, 3)
 // offset each frame (`taa.rs`) and the samples accumulate in a history
 // reprojected through the depth buffer, so a still image converges to an
-// 8x supersampled one. Two tiers share the pass:
+// 16x supersampled one. Two tiers share the pass:
 //
 //  Desktop: 3x3 neighbourhood variance clipping in YCoCg (Salvi 2016) inside
 //    the min/max box, clipping toward its centre (Karis 2014), motion from the
@@ -12,9 +12,9 @@
 //    and Snapdragon GSR 2, at about half the texture traffic.
 //
 // Both tiers blend in a luma-compressed space so HDR highlights do not
-// flicker, and against ghosting raise this frame's weight with velocity, with
-// how far the clip moved the history, and to all of it where the history's
-// depth shows a disocclusion, and by the reactive mask in HDR alpha above 1
+// flicker, and against ghosting raise this frame's weight with velocity, to
+// all of it where no history texel in 3x3 saw this pixel's depth (a
+// disocclusion), and by the reactive mask in HDR alpha above 1
 // for passes without motion. The history's alpha holds that depth. The copy
 // back to HDR applies contrast-adaptive sharpening (AMD CAS) to undo the
 // resampling blur. Motion comes from the resolve, per object; the sky, with
@@ -60,6 +60,7 @@ static const int2 OFFSETS[9] = {
 
 /// Reversible tonemap: blending here weights each sample by 1 / (1 + luma).
 float3 compress(float3 c) {
+    c = max(c, 0.0);
     return c / (1.0 + max(c.r, max(c.g, c.b)));
 }
 
@@ -73,6 +74,27 @@ float3 to_ycocg(float3 c) {
 
 float3 from_ycocg(float3 c) {
     return float3(c.x + c.y - c.z, c.x + c.z, c.x - c.y - c.z);
+}
+
+/// Whether no history texel around `history_uv` saw this pixel's surface
+/// (reverse-Z `own` depth) at the depth the camera expects there. Any of 3x3
+/// counts, and the histories hold each pixel's own depth, so a sub-pixel pole
+/// this frame's jitter missed does not read as a disocclusion and drop the
+/// history that held it: that dropping is what made thin, distant geometry shimmer.
+bool disoccluded(float own, int2 local, float2 history_uv, bool smaa) {
+    float4 viewport = globals.viewport;
+    float2 uv = (float2(local) + 0.5) / viewport.zw;
+    float4 world = mul(globals.inverse_view_proj, float4(uv * 2.0 - 1.0, own, 1.0));
+    float expected = mul(globals.previous_view_proj, world).w / world.w;
+    int2 last = int2(viewport.zw) - 1;
+    int2 texel = int2(floor(history_uv * viewport.zw));
+    for (uint i = 0u; i < 9u; ++i) {
+        int2 p = clamp(texel + OFFSETS[i], int2(0, 0), last);
+        float seen = smaa ? accumulated[p].a : history.Load(int3(p, 0)).a;
+        if (abs(seen - expected) <= DISOCCLUSION * expected)
+            return false;
+    }
+    return true;
 }
 
 /// Pull `value` along the line to the box centre until it is inside the box.
@@ -161,9 +183,10 @@ void resolveMain(uint3 id: SV_DispatchThreadID) {
     float2 history_uv = (float2(local) + 0.5) / viewport.zw - motion;
 
     // Reverse-Z with an infinite far plane: view depth is near / depth.
-    float linear_depth = depth > 0.0 ? min(globals.projection.z / depth, FAR_DEPTH) : FAR_DEPTH;
+    float own = scene_depth.Load(int3(origin + local, 0));
+    float linear_depth = own > 0.0 ? min(globals.projection.z / own, FAR_DEPTH) : FAR_DEPTH;
     float3 result = color;
-    bool valid = params.frame.y != 0u && previous.w > 0.0
+    bool valid = params.frame.y != 0u && (depth > 0.0 || previous.w > 0.0)
         && all(history_uv >= 0.0) && all(history_uv <= 1.0);
     if (valid) {
         float3 sampled = desktop
@@ -179,23 +202,19 @@ void resolveMain(uint3 id: SV_DispatchThreadID) {
             kept = clamp(old, lo, hi);
         }
         float speed = length(motion * viewport.zw);
+        // The clip alone answers history that showed something else; raising
+        // this frame's weight by how far it moved also threw away sub-pixel
+        // features each frame the jitter missed them, so they shimmered.
         float weight = lerp(still_weight, MOVING_WEIGHT, saturate(speed / FAST_PIXELS));
-        // A large luma correction means the history showed something else.
-        weight = max(weight, saturate(abs(old.x - kept.x) * 2.0));
         // Reactive mask: passes without motion vectors write alpha 1 + r to
         // keep at most 1 - r of the history.
         weight = max(weight, saturate(current.a - 1.0));
-        if (depth > 0.0) {
-            // The surface's depth last frame against what the history saw there,
-            // from the camera alone: an object rushing at it only rejects early.
-            float expected = previous.w / world.w;
-            int2 texel = clamp(int2(history_uv * viewport.zw), int2(0, 0), last);
-            float seen = history.Load(int3(texel, 0)).a;
-            if (abs(seen - expected) > DISOCCLUSION * expected)
-                weight = 1.0;
-        }
+        // From the camera alone: an object rushing at a surface only rejects early.
+        if (own > 0.0 && disoccluded(own, local, history_uv, false))
+            weight = 1.0;
         result = lerp(from_ycocg(kept), color, weight);
     }
+    result = clamp(result, 0.0, 1.0 - 1.0e-4);
     accumulated[id.xy] = float4(expand(result), linear_depth);
 }
 
@@ -226,7 +245,8 @@ void applyMain(uint3 id: SV_DispatchThreadID) {
     // Sharpen less where the neighbourhood already spans the full range.
     float3 amount = sqrt(saturate(min(lo, 1.0 - hi) / max(hi, 1.0e-4)));
     float3 w = amount * (-SHARPEST * saturate(asfloat(params.frame.z)));
-    float3 sharpened = saturate((centre + cross * w) / (1.0 + 4.0 * w));
+    //float3 sharpened = saturate((centre + cross * w) / (1.0 + 4.0 * w));
+    float3 sharpened = clamp((centre + cross * w) / (1.0 + 4.0 * w), lo, hi);
     uint2 pixel = id.xy + uint2(viewport.xy);
     hdr_output[pixel] = float4(expand(sharpened), hdr_output[pixel].a);
 }
@@ -465,13 +485,11 @@ void smaa_temporal(int2 local) {
         float weight = 0.5 * (1.0 - saturate(speed / SMAA_FAST_PIXELS));
         // Reactive mask, as in the TAA resolve.
         weight = min(weight, 1.0 - saturate(alpha - 1.0));
-        if (depth > 0.0) {
-            float expected = previous.w / world.w;
-            int2 texel = clamp(int2(history_uv * viewport.zw), int2(0, 0), last);
-            if (abs(accumulated[texel].a - expected) > DISOCCLUSION * expected)
-                weight = 0.0;
-        }
+        float own = scene_depth.Load(int3(origin + local, 0));
+        if (own > 0.0 && disoccluded(own, local, history_uv, true))
+            weight = 0.0;
         result = lerp(current, kept, weight);
     }
+    result = clamp(result, 0.0, 1.0 - 1.0e-4);
     hdr_output[pixel] = float4(expand(result), alpha);
 }

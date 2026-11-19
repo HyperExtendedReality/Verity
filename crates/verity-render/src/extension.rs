@@ -11,6 +11,22 @@ use verity_core::PointLight;
 
 pub type Result<T, E = Box<dyn Error>> = std::result::Result<T, E>;
 
+/// Optional Vulkan ray features enabled on the logical device.
+///
+/// These gates report availability, not whether an extension has opted in.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct RayFeatures {
+    /// `VK_EXT_opacity_micromap` with the `micromap` feature.
+    pub opacity_micromap: bool,
+    /// `VK_NV_cluster_acceleration_structure` with its feature enabled.
+    pub cluster_acceleration: bool,
+    /// `VK_NV_partitioned_acceleration_structure` with its feature enabled.
+    pub partitioned_acceleration: bool,
+    /// `VK_AMDX_dense_geometry_format` and its buffer usage flag dependency.
+    pub dense_geometry: bool,
+}
+
 /// The renderer's device and memory, lent to an extension.
 pub struct Gpu<'a> {
     pub instance: &'a ash::Instance,
@@ -22,6 +38,8 @@ pub struct Gpu<'a> {
     /// `VK_KHR_acceleration_structure`, `VK_KHR_ray_query` and buffer device
     /// addresses are enabled, so an extension may trace with ray queries.
     pub ray_query: bool,
+    /// Enabled optional ray features; all false when `ray_query` is disabled.
+    pub ray_features: RayFeatures,
     pub allocator: &'a mut Allocator,
     /// Layout of the renderer's per-frame descriptor set: globals, instances,
     /// lights, geometry, materials, textures and the G-buffer (see
