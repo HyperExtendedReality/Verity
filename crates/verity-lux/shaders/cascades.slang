@@ -12,6 +12,7 @@
     Atomic<uint>* surfaceHashKeysBuffer; uint4* surfaceHashRecordsBuffer;
 #include "common.slang"
 #include "wave_batch.slang"
+#include "nile.slang"
 // The renderer's frame set (materials, textures, DFG table) is bound at set 1.
 #define MATERIAL_SET 1
 #include "materials.slang"
@@ -204,16 +205,32 @@ float emitterPdf(Hit hit, float3 direction) {
     return power / asfloat(params.lightCounts.w) * hit.distance * hit.distance / (area * cosine);
 }
 
-// One emitter sampled at a surface. `receiver`: a shaded pixel, which the
-// composite lights with its albedo, so it weighs by cos/pi (and the reference
-// samples its paths by it). `weighted`: MIS-weight against the surface's own
-// direction sampling, for a caller that also counts emitters its rays hit.
-float3 emitterLight(float3 position, float3 normal, float3 geometric, float3 view,
-                    bool receiver, bool weighted, SurfaceBsdf material, float2 ab,
-                    inout uint state) {
-    if (params.lightCounts.y == 0u) return 0.0;
+// At a receiver, the composite applies albedo, so the response is cos/pi.
+// Path vertices instead evaluate the full BSDF. `weighted` enables MIS against
+// the BSDF draw. `resample` estimates the same light integral from several
+// candidates and one visibility ray; it does not change the base light PDF
+// used by MIS. The reference keeps one candidate per path vertex.
+static const uint EMITTER_CANDIDATES = 8u;
+
+float3 emitterRandomSample(inout uint state) {
     float selection = rtgiRandom(state);
-    float2 uv = float2(rtgiRandom(state), rtgiRandom(state));
+    return float3(selection, float2(rtgiRandom(state), rtgiRandom(state)));
+}
+
+// R3 rank-1 sequence, with a Cranley-Patterson shift in uint fixed point.
+// The steps are round(2^32 / g^k), where g^4 = g + 1 and k is 1, 2, 3.
+float3 emitterR3(uint index, uint3 shift) {
+    uint3 point = shift + index * uint3(3518319155u, 2882110345u, 2360945575u);
+    return float3(point >> 8u) * (1.0 / 16777216.0);
+}
+
+// One emitter point drawn by power; false for one that cannot light here.
+bool emitterCandidate(float3 position, float3 normal, float3 geometric, float3 sample,
+                      out float3 target, out float3 direction, out float cosine,
+                      out float3 emission, out float lightPdf) {
+    target = 0.0; direction = 0.0; cosine = 0.0; emission = 0.0; lightPdf = 0.0;
+    float selection = sample.x;
+    float2 uv = sample.yz;
     uint low = 0, high = params.lightCounts.y - 1;
     [loop] while (low < high) {
         uint middle = (low + high) / 2;
@@ -221,21 +238,28 @@ float3 emitterLight(float3 position, float3 normal, float3 geometric, float3 vie
         else high = middle;
     }
     Light light = lights[params.lightCounts.x + low];
-    if (!instanceVisible(light.source.x)) return 0.0;
-    if (light.position.w != -2 && dot(light.direction.xyz, position - light.position.xyz) <= 0) return 0.0;
+    if (!instanceVisible(light.source.x)) return false;
+    if (light.position.w != -2 && dot(light.direction.xyz, position - light.position.xyz) <= 0) return false;
     float root = sqrt(uv.x);
-    float3 target = light.position.xyz + light.edge1.xyz * (root * (1 - uv.y))
-                    + light.edge2.xyz * (root * uv.y);
+    target = light.position.xyz + light.edge1.xyz * (root * (1 - uv.y))
+             + light.edge2.xyz * (root * uv.y);
     float3 toLight = target - position;
     float lightDistance = length(toLight);
-    if (!(lightDistance > params.tuning.z * 0.25)) return 0.0;
-    float3 direction = toLight / lightDistance;
-    float cosine = dot(normal, direction);
+    if (!(lightDistance > params.tuning.z * 0.25)) return false;
+    direction = toLight / lightDistance;
+    cosine = dot(normal, direction);
     float emitterCosine = sourceCosine(light, direction);
-    if (cosine <= 0.0 || emitterCosine <= 0.0 || dot(geometric, direction) <= 0.0) return 0.0;
-    float3 emission = emitterRadiance(light, float3(1 - root, root * (1 - uv.y), root * uv.y));
-    if (!any(emission > 0.0)) return 0.0;
-    float lightPdf = light.edge1.w * lightDistance * lightDistance / (light.color.w * emitterCosine);
+    if (cosine <= 0.0 || emitterCosine <= 0.0 || dot(geometric, direction) <= 0.0) return false;
+    emission = emitterRadiance(light, float3(1 - root, root * (1 - uv.y), root * uv.y));
+    if (!any(emission > 0.0)) return false;
+    lightPdf = light.edge1.w * lightDistance * lightDistance / (light.color.w * emitterCosine);
+    return lightPdf > 0.0 && isfinite(lightPdf);
+}
+
+float3 evaluateEmitterCandidate(float3 position, float3 normal, float3 geometric, float3 view,
+                                bool receiver, bool weighted, bool resample, SurfaceBsdf material,
+                                float2 ab, float ggxProbability, float3 target, float3 direction,
+                                float3 emission, float cosine, float lightPdf, float scale) {
     float3 origin = rayOffset(position, geometric, params.tuning.z);
     float3 delta = target - origin;
     float distance = length(delta);
@@ -248,10 +272,81 @@ float3 emitterLight(float3 position, float3 normal, float3 geometric, float3 vie
         bsdfPdf = cosine / PI;
     } else {
         response = bsdfEvaluate(material, normal, view, direction, ab) * cosine;
-        bsdfPdf = 0.5 * cosine / PI + 0.5 * bsdfVisibleGgxPdf(material, normal, view, direction);
+        bsdfPdf = lerp(cosine / PI, bsdfVisibleGgxPdf(material, normal, view, direction), ggxProbability);
     }
-    // Weighted: (f cos / lightPdf) * lightPdf / (lightPdf + bsdfPdf).
-    return emission * response / (lightPdf + (weighted ? bsdfPdf : 0.0));
+    if (weighted) {
+        // Multiply the original light estimator by its balance weight. RIS
+        // changes `scale`, not the proposal PDF shared with the BSDF draw.
+        if (!resample) return emission * response / (lightPdf + bsdfPdf);
+        scale *= lightPdf / (lightPdf + bsdfPdf);
+    }
+    if (!resample) scale = 1.0 / lightPdf;
+    return emission * response * scale;
+}
+
+float3 emitterLight(float3 position, float3 normal, float3 geometric, float3 view,
+                    bool receiver, bool weighted, bool resample,
+                    SurfaceBsdf material, float2 ab, float ggxProbability, inout uint state) {
+    if (params.lightCounts.y == 0u) return 0.0;
+    float3 target, direction, emission;
+    float cosine, lightPdf;
+    // RIS: estimate f / p̂(y) * mean(w), with p̂ the unshadowed luminance and
+    // w = p̂ / pdf. The single-candidate case uses 1 / pdf instead.
+    float scale = 0.0;
+    if (!resample) {
+        if (!emitterCandidate(position, normal, geometric, emitterRandomSample(state),
+                target, direction, cosine, emission, lightPdf)) return 0.0;
+    } else {
+        bool lowDiscrepancy = (params.ownerSequence.y & 8u) != 0u;
+        // worldResolve's initial state is keyed by receiver pixel and frame.
+        // Keep the shift fixed for the batch, even when a candidate is rejected.
+        uint3 shift = 0u;
+        if (lowDiscrepancy) {
+            shift = uint3(transportHash(state ^ 0x68bc21ebu), transportHash(state ^ 0x02e5be93u),
+                          transportHash(state ^ 0x967a889bu));
+        }
+        float total = 0.0, chosen = 0.0;
+        [loop] for (uint i = 0u; i < EMITTER_CANDIDATES; ++i) {
+            float3 sample;
+            if (lowDiscrepancy) sample = emitterR3(i, shift);
+            else sample = emitterRandomSample(state);
+            float3 t, d, e; float c, p;
+            if (!emitterCandidate(position, normal, geometric, sample, t, d, c, e, p)) continue;
+            float wanted = dot(e, float3(0.2126, 0.7152, 0.0722)) * c;
+            float w = wanted / p;
+            if (!(w > 0.0) || !isfinite(w)) continue;
+            total += w;
+            // Keep the replacement coin out of the candidate's 3D sample.
+            float replacement;
+            if (lowDiscrepancy) {
+                uint bits = transportHash(state ^ (0xa511e9b3u + i));
+                replacement = float(bits >> 8u) * (1.0 / 16777216.0);
+            } else replacement = rtgiRandom(state);
+            if (replacement * total < w) {
+                target = t; direction = d; cosine = c; emission = e; lightPdf = p; chosen = wanted;
+            }
+        }
+        if (!(chosen > 0.0)) return 0.0;
+        scale = total / float(EMITTER_CANDIDATES) / chosen;
+    }
+    return evaluateEmitterCandidate(position, normal, geometric, view, receiver, weighted, resample,
+        material, ab, ggxProbability, target, direction, emission, cosine, lightPdf, scale);
+}
+
+// One candidate per reference vertex: selection and triangle UVs occupy their
+// own NILE elements, but retain the same proposal and visibility/MIS estimator.
+float3 emitterLight(float3 position, float3 normal, float3 geometric, float3 view, bool receiver,
+                    SurfaceBsdf material, float2 ab, float ggxProbability,
+                    NileSample samples, uint elements) {
+    if (params.lightCounts.y == 0u) return 0.0;
+    float3 sample = float3(nile1D(samples, elements + NILE_EMITTER_CHOICE),
+                           nile2D(samples, elements + NILE_EMITTER_POINT));
+    float3 target, direction, emission;
+    float cosine, lightPdf;
+    if (!emitterCandidate(position, normal, geometric, sample,
+            target, direction, cosine, emission, lightPdf)) return 0.0;
+    return evaluateEmitterCandidate(position, normal, geometric, view, receiver, true, false,
+        material, ab, ggxProbability, target, direction, emission, cosine, lightPdf, 0.0);
 }
 
 // Up to this many point lights are all shaded, each with its own shadow ray;
@@ -353,6 +448,29 @@ void conventionalLightResponseTracked(float3 position, float3 normal, float3 geo
 }
 
 #include "surface_cache.slang"
+
+// MSGI looks up secondary lighting in the hit's surface chart or hashed cell.
+// A cold cell gets claimed here; the receiver uses the diffuse probe fallback
+// until surfaceUpdate has visited it. No second direct-light estimate at the hit.
+bool materialGatherIncoming(Hit hit, float3 position, float3 direction, out TransportRadiance light) {
+    light = (TransportRadiance)0;
+    if ((hit.errors & HIT_QUERY_UNSUPPORTED) != 0u) return false;
+    if (hit.triangle == EMPTY) {
+        light.background = environmentRadiance(direction);
+        return true;
+    }
+    if ((sceneWord(instanceBase(hit.instance) + 6u).w & 16u) != 0u) {
+        light.background = materialBaseColor(hit).rgb;
+        return true;
+    }
+    SurfaceTexel texel;
+    if (!surfaceRead(hit, position, direction, true, texel)) return false;
+    light.background = texel.direct.background + texel.bounce.background * texel.reflectance;
+    light.emissive = texel.direct.emissive + texel.bounce.emissive * texel.reflectance;
+    light.punctual = texel.direct.punctual + texel.bounce.punctual * texel.reflectance;
+    return true;
+}
+
 float4 splitRasterMetadata(uint2 full);
 TransportRadiance clampOutgoingTransportRadiance(TransportRadiance radiance) {
     float3 total = radiance.background + radiance.emissive + radiance.punctual;
@@ -376,7 +494,7 @@ static float3 rtgiDiffuseReflectance = 0.0;
 TransportRadiance outgoingTransportRadianceTracked(float3 origin, float3 direction, Hit hit,
                                out bool querySupported,
                                inout DependencyContext dependency,
-                               uint admissionLimit = 0u) {
+                               uint admissionLimit) {
     TransportRadiance radiance = (TransportRadiance)0;
     querySupported = (hit.errors & HIT_QUERY_UNSUPPORTED) == 0u;
     if (!querySupported) return radiance;
@@ -562,6 +680,8 @@ void temporal(uint3 thread : SV_DispatchThreadID) {
     uint2 fullLocal = min(thread.xy * resolveFactor + resolveFactor / 2u,
                           params.viewport.zw - 1u);
     uint2 full = params.viewport.xy + fullLocal;
+    bool materialGather = materialSpaceGather(params);
+    uint4 currentMaterial = materialGather ? gbuffer.Load(int3(full, 0)) : uint4(0u);
     float4 receiver = splitRasterMetadata(full);
     float depth = depthTexture.Load(int3(full, 0));
     if (depth <= 0 || receiverHistoryLength(receiver) == 0) {
@@ -616,6 +736,8 @@ void temporal(uint3 thread : SV_DispatchThreadID) {
         uint2 otherLocal = min(uint2(neighbor) * resolveFactor + resolveFactor / 2u,
                                params.viewport.zw - 1u);
         uint2 otherFull = params.viewport.xy + otherLocal;
+        if (materialGather && !materialSpaceCompatible(currentMaterial,
+                gbuffer.Load(int3(otherFull, 0)))) continue;
         float otherDepth = depthTexture.Load(int3(otherFull, 0));
         if (otherDepth <= 0) continue;
         float4 otherReceiver = splitRasterMetadata(otherFull);
@@ -878,6 +1000,8 @@ void denoise(uint3 thread : SV_DispatchThreadID) {
     uint2 fullLocal = min(thread.xy * resolveFactor + resolveFactor / 2u,
                           params.viewport.zw - 1u);
     uint2 full = params.viewport.xy + fullLocal;
+    bool materialGather = materialSpaceGather(params);
+    uint4 currentMaterial = materialGather ? gbuffer.Load(int3(full, 0)) : uint4(0u);
     float depth = centerHasLighting ? center.w : depthTexture.Load(int3(full, 0));
     if (depth <= 0.0 || !isfinite(depth)) {
         irradiance.Store(pixel, 0.0); receiverHistory.Store(pixel, 0.0); return;
@@ -927,6 +1051,8 @@ void denoise(uint3 thread : SV_DispatchThreadID) {
             uint2 otherLocal = min(uint2(otherPixel) * resolveFactor + resolveFactor / 2u,
                                    params.viewport.zw - 1u);
             uint2 otherFull = params.viewport.xy + otherLocal;
+            if (materialGather && !materialSpaceCompatible(currentMaterial,
+                    gbuffer.Load(int3(otherFull, 0)))) continue;
             float3 otherPosition = worldPosition(float2(otherFull) + 0.5, value.w, params);
             if (dot(geometricNormal, otherNormal) < 0.95) continue;
             float planeDistance = surfacePlaneDistance(otherPosition - position, geometricNormal, otherNormal);
@@ -2134,18 +2260,38 @@ static const uint REFERENCE_INTERLEAVE = 1u;
 #else
 static const uint REFERENCE_INTERLEAVE = 16u;
 #endif
-static const uint REFERENCE_BOUNCES = 32u;
+static const uint REFERENCE_BOUNCES = NILE_VERTICES - 1u;
 
-float3 referencePath(float3 position, float3 normal, float3 geometric, inout uint state) {
-    SurfaceBsdf noMaterial = (SurfaceBsdf)0;
-    float3 light = emitterLight(position, normal, geometric, normal, true, true,
-        noMaterial, 0.0, state);
-    float3 direction = rtgiCosineDirection(normal, float2(rtgiRandom(state), rtgiRandom(state)));
-    if (dot(direction, geometric) <= 0.0) return light;
-    float3 origin = rayOffset(position, geometric, params.tuning.z);
+[ForceInline]
+float3 referencePath(float3 position, float3 normal, float3 geometric, uint4 deferred,
+                     bool materialReceiver, NileSample samples) {
+    float3 light, direction;
     float3 throughput = 1.0;
-    // The pdf the last direction was sampled with, for weighting emitter hits.
-    float directionPdf = max(dot(normal, direction), 0.0) / PI;
+    // The PDF of the last direction, for weighting emitter hits.
+    float directionPdf;
+    if (materialReceiver) {
+        float3 view = bsdfUnitOrZero(params.cameraPosition.xyz - position);
+        float nDotV = dot(normal, view);
+        if (!(nDotV > 0.0) || !(dot(geometric, view) > 0.0)) return 0.0;
+        SurfaceBsdf material = materialSpaceBsdf(deferred);
+        float2 ab = bsdfDfg(material.perceptualRoughness, nDotV);
+        float ggxProbability = materialGgxProbability(material, ab);
+        light = emitterLight(position, normal, geometric, view, false,
+            material, ab, ggxProbability, samples, 0u);
+        float2 xi = nile2D(samples, NILE_DIRECTION);
+        float choose = nile1D(samples, NILE_LOBE);
+        if (!sampleMaterialDirection(normal, geometric, view, material, ggxProbability,
+            xi, choose, direction, directionPdf)) return light;
+        throughput = bsdfEvaluate(material, normal, view, direction, ab)
+            * (dot(normal, direction) / directionPdf);
+    } else {
+        light = emitterLight(position, normal, geometric, normal, true,
+            (SurfaceBsdf)0, 0.0, 0.5, samples, 0u);
+        direction = rtgiCosineDirection(normal, nile2D(samples, NILE_DIRECTION));
+        if (dot(direction, geometric) <= 0.0) return light;
+        directionPdf = max(dot(normal, direction), 0.0) / PI;
+    }
+    float3 origin = rayOffset(position, geometric, params.tuning.z);
     [loop] for (uint bounce = 0u; bounce < REFERENCE_BOUNCES; ++bounce) {
         DependencyContext dependency; float start, distance, padding;
         Hit hit = traceRayTracked(origin, direction, 1e20, dependency, start, distance, padding);
@@ -2177,31 +2323,29 @@ float3 referencePath(float3 position, float3 normal, float3 geometric, inout uin
         float3 directional, punctual;
         bool supported;
         DependencyContext lightDependency = dependencyEmpty();
-        state = rtgiHash(state);
-        conventionalLightResponseTracked(at, hitNormal, hitGeometric, view, roughness, state,
+        uint elements = (bounce + 1u) * NILE_ELEMENTS_PER_VERTEX;
+        // Conventional-light RIS retains its existing estimator and candidate
+        // budget, with a separate fixed seed that cannot consume NILE elements.
+        uint conventionalSequence = transportHash(samples.pixelSeed ^ samples.index
+            ^ (bounce + 1u) * 0x85ebca6bu);
+        conventionalLightResponseTracked(at, hitNormal, hitGeometric, view, roughness, conventionalSequence,
             directional, punctual, supported, lightDependency, 0u, true, material, ab);
         light += throughput * (directional + punctual);
-        light += throughput * emitterLight(at, hitNormal, hitGeometric, view, false, true,
-            material, ab, state);
+        light += throughput * emitterLight(at, hitNormal, hitGeometric, view, false,
+            material, ab, 0.5, samples, elements);
 
-        float2 xi = float2(rtgiRandom(state), rtgiRandom(state));
+        float2 xi = nile2D(samples, elements + NILE_DIRECTION);
         float3 next;
-        if (rtgiRandom(state) < 0.5) {
-            float ggxPdf;
-            next = bsdfSampleVisibleGgx(xi, material, hitNormal, view, ggxPdf);
-            if (!(ggxPdf > 0.0)) break;
-        } else next = rtgiCosineDirection(hitNormal, xi);
-        float cosine = dot(hitNormal, next);
-        if (cosine <= 0.0 || dot(hitGeometric, next) <= 0.0) break;
-        float pdf = 0.5 * cosine / PI + 0.5 * bsdfVisibleGgxPdf(material, hitNormal, view, next);
-        if (!(pdf > 0.0)) break;
-        directionPdf = pdf;
-        throughput *= bsdfEvaluate(material, hitNormal, view, next, ab) * (cosine / pdf);
+        float choose = nile1D(samples, elements + NILE_LOBE);
+        if (!sampleMaterialDirection(hitNormal, hitGeometric, view, material, 0.5,
+            xi, choose, next, directionPdf)) break;
+        throughput *= bsdfEvaluate(material, hitNormal, view, next, ab)
+            * (dot(hitNormal, next) / directionPdf);
         if (!all(isfinite(throughput))) break;
         // Russian roulette keeps long paths unbiased without paying for all of them.
         if (bounce >= 3u) {
             float keep = clamp(max(throughput.x, max(throughput.y, throughput.z)), 0.05, 0.95);
-            if (rtgiRandom(state) >= keep) break;
+            if (nile1D(samples, elements + NILE_ROULETTE) >= keep) break;
             throughput /= keep;
         }
         origin = rayOffset(at, hitGeometric, params.tuning.z);
@@ -2210,9 +2354,8 @@ float3 referencePath(float3 position, float3 normal, float3 geometric, inout uin
     return light;
 }
 
-[shader("compute")]
-[numthreads(8, 8, 1)]
-void reference(uint3 thread : SV_DispatchThreadID) {
+[ForceInline]
+void renderReference(uint3 thread, bool materialReceiver) {
     uint2 extent = giResolveExtent(params);
     if (any(thread.xy >= extent)) return;
     uint scale = giResolveScale(params);
@@ -2237,11 +2380,15 @@ void reference(uint3 thread : SV_DispatchThreadID) {
     float3 position = worldPosition(float2(full) + 0.5, depth, params);
     float4 total = params.cacheTime.w == 0u ? 0.0 : referenceSum[at];
     if ((thread.x + thread.y * 5u + params.cacheTime.w) % REFERENCE_INTERLEAVE == 0u) {
-        uint state = transportHash(at ^ transportHash(params.frame.x * 0x9e3779b9u + 0x2545f491u));
+        // total.w counts accumulated batches, not frames. Skipped software
+        // pixels and view resets therefore do not leave gaps in the stream.
+        uint firstSample = uint(total.w) * REFERENCE_PATHS;
         transportAdmissionBypass = true;
         float3 sum = 0.0;
-        [loop] for (uint path = 0u; path < REFERENCE_PATHS; ++path)
-            sum += referencePath(position, normal, geometric, state);
+        [loop] for (uint path = 0u; path < REFERENCE_PATHS; ++path) {
+            NileSample samples = nileStart(thread.xy, firstSample + path);
+            sum += referencePath(position, normal, geometric, deferred, materialReceiver, samples);
+        }
         total += float4(sum / float(REFERENCE_PATHS), 1.0);
     }
     referenceSum[at] = total;
@@ -2249,3 +2396,11 @@ void reference(uint3 thread : SV_DispatchThreadID) {
     receiverHistory.Store(int2(thread.xy),
         receiverWithScreenHistorySupportMask(splitRasterMetadata(full), 1u));
 }
+
+[shader("compute")]
+[numthreads(8, 8, 1)]
+void reference(uint3 thread : SV_DispatchThreadID) { renderReference(thread, false); }
+
+[shader("compute")]
+[numthreads(8, 8, 1)]
+void materialReference(uint3 thread : SV_DispatchThreadID) { renderReference(thread, true); }

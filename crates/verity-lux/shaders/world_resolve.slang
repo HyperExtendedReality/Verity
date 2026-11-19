@@ -12,11 +12,10 @@ uint irradianceTexelIndex(int2 pixel) {
 
 
 struct DiffuseSources {
-    float3 background;
-    float3 emissive;
-    float3 punctual;
-    float3 coverage;
+    float4 background;
+    float4 punctual;
 };
+
 // Every spatial corner (and both LODs) uses the same normal. Compute the
 // octahedral footprint once per receiver instead of once per probe.
 struct IrradianceLookup {
@@ -40,67 +39,32 @@ IrradianceLookup irradianceLookup(float3 normal) {
 }
 
 
-float4 probeIrradiance(uint page, uint texel, uint source) {
-    if (source == BACKGROUND_SOURCE)
-        return directionalProbes[page].irradiance[texel];
-    if (source == EMISSIVE_SOURCE)
-        return directionalProbes[page].emissiveIrradiance[texel];
-    return directionalProbes[page].punctualIrradiance[texel];
-}
-
-DiffuseSources diffuseProbePage(uint page, IrradianceLookup lookup) {
+DiffuseSources diffuseProbePage(uint page, IrradianceLookup lookup, bool punctualActive) {
     DiffuseSources result = (DiffuseSources)0;
-    float3 backgroundSum = 0.0;
-    float3 emissiveSum = 0.0;
-    float3 punctualSum = 0.0;
-    float3 observedWeight = 0.0;
     [unroll] for (uint corner = 0u; corner < 4u; ++corner) {
         float bilinearWeight = lookup.weights[corner];
         if (!(bilinearWeight > 0.0)) continue;
         uint texel = lookup.texels[corner];
-        [unroll] for (uint group = 0u; group < 3u; ++group) {
-            uint source = 1u << group;
-            if (!transportSourceActive(params, source)) continue;
-            float4 sample = probeIrradiance(page, texel, source);
-            if (!(sample.w > 0.0) || !all(isfinite(sample))) continue;
-            float weight = bilinearWeight * saturate(sample.w);
-            if (group == 0u) {
-                backgroundSum += sample.xyz * weight;
-                observedWeight.x += weight;
-            } else if (group == 1u) {
-                emissiveSum += sample.xyz * weight;
-                observedWeight.y += weight;
-            } else {
-                punctualSum += sample.xyz * weight;
-                observedWeight.z += weight;
-            }
+        float4 background = directionalProbes[page].irradiance[texel];
+        if (all(isfinite(background))) result.background += background * bilinearWeight;
+        if (punctualActive) {
+            float4 punctual = directionalProbes[page].punctualIrradiance[texel];
+            if (all(isfinite(punctual))) result.punctual += punctual * bilinearWeight;
         }
     }
-    if (observedWeight.x > 0.0)
-        result.background = backgroundSum / observedWeight.x;
-    if (observedWeight.y > 0.0)
-        result.emissive = emissiveSum / observedWeight.y;
-    if (observedWeight.z > 0.0)
-        result.punctual = punctualSum / observedWeight.z;
-    result.coverage = saturate(observedWeight);
-    if (!transportSourceActive(params, EMISSIVE_SOURCE)) result.coverage.y = 1.0;
-    if (!transportSourceActive(params, PUNCTUAL_SOURCE)) result.coverage.z = 1.0;
     return result;
 }
 
 // `previous` reads the probes last frame packed, as `findIrradianceProbe` does.
 DiffuseSources diffuseAtLod(float3 position, IrradianceLookup lookup, uint lod, bool previous,
-                            inout DependencyContext dependency) {
+                            bool punctualActive, inout DependencyContext dependency) {
     DiffuseSources result = (DiffuseSources)0;
     float spacingValue = spacing(params, 0u, lod);
     float3 grid = position / spacingValue - 0.5;
     int3 base = int3(floor(grid));
     float3 fraction = frac(grid);
-    float3 backgroundSum = 0.0;
-    float3 emissiveSum = 0.0;
-    float3 punctualSum = 0.0;
-    float3 observedWeight = 0.0;
-    float potentialWeight = 0.0;
+    uint pageBase = ((params.frame.x + (previous ? 1u : 0u)) & 1u)
+        * probeDirectoryCapacity(params);
     [loop] for (uint corner = 0u; corner < 8u; ++corner) {
         uint3 bit = uint3(corner & 1u, (corner >> 1u) & 1u, corner >> 2u);
         float3 axis = float3(
@@ -109,98 +73,56 @@ DiffuseSources diffuseAtLod(float3 position, IrradianceLookup lookup, uint lod, 
             bit.z == 0u ? 1.0 - fraction.z : fraction.z);
         float spatialWeight = axis.x * axis.y * axis.z;
         if (!(spatialWeight > 0.0)) continue;
-        potentialWeight += spatialWeight;
         int4 key = int4(base + int3(bit), int(lod << 18u));
         uint slot = findIrradianceProbe(key, previous);
         if (slot == EMPTY) continue;
-        uint page = ((params.frame.x + (previous ? 1u : 0u)) & 1u)
-            * probeDirectoryCapacity(params) + slot;
-        DiffuseSources probe = diffuseProbePage(page, lookup);
+        uint page = pageBase + slot;
+        DiffuseSources probe = diffuseProbePage(page, lookup, punctualActive);
         if (previous) dependencyUnion(dependency, probeDependency(
             directionalProbes[page].dependencyMin, directionalProbes[page].dependencyMax));
-        [unroll] for (uint group = 0u; group < 3u; ++group) {
-            uint source = 1u << group;
-            if (!transportSourceActive(params, source)) continue;
-            float support = probe.coverage[group];
-            if (!(support > 0.0)) continue;
-            float weight = spatialWeight * support;
-            if (group == 0u) {
-                backgroundSum += probe.background * weight;
-                observedWeight.x += weight;
-            } else if (group == 1u) {
-                emissiveSum += probe.emissive * weight;
-                observedWeight.y += weight;
-            } else {
-                punctualSum += probe.punctual * weight;
-                observedWeight.z += weight;
-            }
-        }
+        result.background += probe.background * spatialWeight;
+        result.punctual += probe.punctual * spatialWeight;
     }
-    if (potentialWeight > 0.0) {
-        result.coverage = saturate(observedWeight / potentialWeight);
-        if (observedWeight.x > 0.0)
-            result.background = backgroundSum / observedWeight.x;
-        if (observedWeight.y > 0.0)
-            result.emissive = emissiveSum / observedWeight.y;
-        if (observedWeight.z > 0.0)
-            result.punctual = punctualSum / observedWeight.z;
-    }
-    if (!transportSourceActive(params, EMISSIVE_SOURCE)) result.coverage.y = 1.0;
-    if (!transportSourceActive(params, PUNCTUAL_SOURCE)) result.coverage.z = 1.0;
     return result;
 }
 
-float3 resolveLodSource(float3 low, float lowCoverage,
-                        float3 high, float highCoverage,
-                        float lodBlend, out float coverage) {
-    float lowWeight = lowCoverage * (1.0 - lodBlend);
-    float highWeight = highCoverage * lodBlend;
-    float totalWeight = lowWeight + highWeight;
-    coverage = saturate(totalWeight);
-    return totalWeight > 0.0
-        ? (low * lowWeight + high * highWeight) / totalWeight : 0.0;
+DiffuseSources sampleSplitProbes(float3 position, float3 normal, bool previous,
+                                 bool punctualActive, inout DependencyContext dependency) {
+    uint lowLod, highLod;
+    float lodBlend;
+    splitLodBlendForParameters(position, params, lowLod, highLod, lodBlend);
+    IrradianceLookup lookup = irradianceLookup(normal);
+    DiffuseSources result = diffuseAtLod(position, lookup, lowLod, previous,
+        punctualActive, dependency);
+    if (lodBlend > 0.0) {
+        DiffuseSources high = diffuseAtLod(position, lookup, highLod, previous,
+            punctualActive, dependency);
+        result.background = lerp(result.background, high.background, lodBlend);
+        result.punctual = lerp(result.punctual, high.punctual, lodBlend);
+    }
+    return result;
+}
+
+float3 normalizeIrradiance(float4 sample) {
+    return sample.w > 0.0 ? sample.xyz / sample.w : 0.0;
 }
 
 float3 resolveSplitDiffuse(float3 position, float3 normal, out float coverage,
                            out float3 background, out float backgroundCoverage,
                            out float anyCoverage) {
-    uint lowLod, highLod;
-    float lodBlend;
-    splitLodBlend(position, lowLod, highLod, lodBlend);
-    IrradianceLookup lookup = irradianceLookup(normal);
     DependencyContext unused = dependencyEmpty();
-    DiffuseSources low = diffuseAtLod(position, lookup, lowLod, false, unused);
-    DiffuseSources high = (DiffuseSources)0;
-    if (highLod != lowLod) high = diffuseAtLod(position, lookup, highLod, false, unused);
-    else high.coverage = 1.0;
-
-    float3 resolved = 0.0;
-    coverage = 1.0;
-    float groupCoverage;
-    background = resolveLodSource(low.background, low.coverage.x,
-        high.background, high.coverage.x, lodBlend, backgroundCoverage);
-    resolved += background;
-    coverage = min(coverage, backgroundCoverage);
+    bool punctualActive = transportSourceActive(params, PUNCTUAL_SOURCE);
+    DiffuseSources sample = sampleSplitProbes(position, normal, false, punctualActive, unused);
+    background = normalizeIrradiance(sample.background);
+    backgroundCoverage = saturate(sample.background.w);
+    coverage = backgroundCoverage;
     anyCoverage = backgroundCoverage;
-    if (transportSourceActive(params, EMISSIVE_SOURCE)) {
-        resolved += resolveLodSource(low.emissive, low.coverage.y,
-            high.emissive, high.coverage.y, lodBlend, groupCoverage);
-        coverage = min(coverage, groupCoverage);
-        anyCoverage = max(anyCoverage, groupCoverage);
+    if (punctualActive) {
+        float punctualCoverage = saturate(sample.punctual.w);
+        coverage = min(coverage, punctualCoverage);
+        anyCoverage = max(anyCoverage, punctualCoverage);
     }
-    if (transportSourceActive(params, PUNCTUAL_SOURCE)) {
-        resolved += resolveLodSource(low.punctual, low.coverage.z,
-            high.punctual, high.coverage.z, lodBlend, groupCoverage);
-        coverage = min(coverage, groupCoverage);
-        anyCoverage = max(anyCoverage, groupCoverage);
-    }
-    return resolved;
-}
-
-float3 resolveSplitDiffuse(float3 position, float3 normal, out float coverage) {
-    float3 background;
-    float backgroundCoverage, anyCoverage;
-    return resolveSplitDiffuse(position, normal, coverage, background, backgroundCoverage, anyCoverage);
+    return background + normalizeIrradiance(sample.punctual);
 }
 
 #ifndef GI_COMPOSITE_RESOLVE
@@ -213,30 +135,179 @@ TransportRadiance bounceFeedback(float3 position, float3 normal,
     TransportRadiance result = (TransportRadiance)0;
     backgroundCoverage = 0.0;
     if (params.cacheTime.z == 0u) return result;
-    uint low, high;
-    float blend;
-    splitLodBlendForParameters(position, params, low, high, blend);
-    IrradianceLookup lookup = irradianceLookup(normal);
-    DiffuseSources near = diffuseAtLod(position, lookup, low, true, dependency);
-    DiffuseSources far = (DiffuseSources)0;
-    if (high != low) far = diffuseAtLod(position, lookup, high, true, dependency);
-    float coverage;
-    result.background = resolveLodSource(near.background, near.coverage.x,
-        far.background, far.coverage.x, blend, backgroundCoverage);
-    result.emissive = resolveLodSource(near.emissive, near.coverage.y,
-        far.emissive, far.coverage.y, blend, coverage);
-    result.punctual = resolveLodSource(near.punctual, near.coverage.z,
-        far.punctual, far.coverage.z, blend, coverage);
+    bool punctualActive = transportSourceActive(params, PUNCTUAL_SOURCE);
+    DiffuseSources sample = sampleSplitProbes(position, normal, true, punctualActive, dependency);
+    result.background = normalizeIrradiance(sample.background);
+    result.punctual = normalizeIrradiance(sample.punctual);
+    backgroundCoverage = saturate(sample.background.w);
     return result;
 }
 
 float3 emitterLight(float3 position, float3 normal, float3 geometric, float3 view,
-                    bool receiver, bool weighted, SurfaceBsdf material, float2 ab,
-                    inout uint state);
+                    bool receiver, bool weighted, bool resample,
+                    SurfaceBsdf material, float2 ab, float ggxProbability, inout uint state);
 
-[shader("compute")]
-[numthreads(8, 8, 1)]
-void worldResolve(uint3 thread : SV_DispatchThreadID) {
+TransportRadiance outgoingTransportRadianceTracked(float3 origin, float3 direction, Hit hit,
+    out bool querySupported, inout DependencyContext dependency, uint admissionLimit = 0u);
+
+uint2 previousCascadeGuide(float3 position, uint lod) {
+    int4 key = int4(int3(floor(position / spacing(params, 0u, lod))), int(lod << 18u));
+    uint slot = findIrradianceProbe(key, true);
+    if (slot == EMPTY) return 0u;
+    uint page = ((params.frame.x + 1u) & 1u) * probeDirectoryCapacity(params) + slot;
+    uint4 record = directionalProbes[page].cacheGeneration;
+    return record.x + 1u == params.frame.x && record.y != 0u ? record.zw : uint2(0u);
+}
+
+uint guideMass(uint2 packed, uint bin) {
+    return (packed[bin >> 2u] >> ((bin & 3u) * 8u)) & 255u;
+}
+
+float3 sampleCascadeGuide(uint2 packed, float4 random, float3 normal, out float weight) {
+    uint total = 0u;
+    [unroll] for (uint i = 0u; i < 8u; ++i) total += guideMass(packed, i);
+    float3 direction;
+    uint bin;
+    float2 uv = min(random.zw, 0.99999994);
+    if (total == 0u) {
+        weight = 1.0;
+        return cosineDirection(normal, uv);
+    }
+    if (random.x < 0.5) {
+        float target = min(random.y, 0.99999994) * float(total);
+        bin = 0u;
+        [loop] for (; bin < 7u; ++bin) {
+            float mass = float(guideMass(packed, bin));
+            if (target < mass) break;
+            target -= mass;
+        }
+        direction = decodeDirection((float2(bin & 3u, bin >> 2u) + uv) / float2(4.0, 2.0));
+    } else {
+        direction = cosineDirection(normal, uv);
+        uint2 cell = min(uint2(encodeDirection(direction) * float2(4.0, 2.0)), uint2(3u, 1u));
+        bin = cell.x + 4u * cell.y;
+    }
+    // Eight equal-solid-angle bins cover 4π. Scale both PDFs by π so the
+    // estimator outputs irradiance / π like Split's projected diffuse probes.
+    float cosine = saturate(dot(normal, direction));
+    float pdfPi = 0.5 * cosine + float(guideMass(packed, bin)) / float(total);
+    weight = pdfPi > 0.0 ? cosine / pdfPi : 0.0;
+    return direction;
+}
+
+bool traceCascadeGather(float3 position, float3 normal, float3 geometric, uint seed,
+                        out float3 diffuse, out float3 background) {
+    diffuse = background = 0.0;
+    uint low, high;
+    float blend;
+    splitLodBlendForParameters(position, params, low, high, blend);
+    uint lod = blend < 0.5 ? low : high;
+    uint2 packed = 0u;
+    if ((params.ownerSequence.y & 3u) == 2u) packed = previousCascadeGuide(position, lod);
+    float4 random = float4(transportRandom(seed, 0u), transportRandom(seed, 1u),
+                           transportRandom(seed, 2u), transportRandom(seed, 3u));
+    float weight;
+    float3 direction = sampleCascadeGuide(packed, random, normal, weight);
+    if (weight <= 0.0 || dot(geometric, direction) <= 0.0) return true;
+    transportAdmissionBypass = true;
+    surfaceFarDistance = surfaceCacheDistance(lod);
+    float3 origin = rayOffset(position, geometric, params.tuning.z);
+    DependencyContext dependency;
+    float start, distance, padding;
+    Hit hit = traceRayTracked(origin, direction, 1e20, dependency, start, distance, padding);
+    bool supported;
+    TransportRadiance radiance = outgoingTransportRadianceTracked(origin, direction, hit,
+        supported, dependency, 0u);
+    background = (radiance.background + radiance.emissive) * weight;
+    diffuse = background + radiance.punctual * weight;
+    return supported && all(isfinite(diffuse)) && all(isfinite(background));
+}
+
+[ForceInline]
+float emitterPdf(Hit hit, float3 direction);
+bool materialGatherIncoming(Hit hit, float3 position, float3 direction, out TransportRadiance light);
+float2 rtgiGatherNoise(uint2 pixel);
+
+float materialGgxProbability(SurfaceBsdf material, float2 ab) {
+    float3 dielectric = bsdfSpecularEnergy(material, ab);
+    float3 diffuse = bsdfDiffuseColor(material) * (1.0 - dielectric);
+    float3 specular = lerp(dielectric, material.baseColor, material.metallic);
+    const float3 luma = float3(0.2126, 0.7152, 0.0722);
+    float total = dot(diffuse + specular, luma);
+    return total > 0.0 ? clamp(dot(specular, luma) / total, 0.1, 0.95) : 0.5;
+}
+
+bool sampleMaterialDirection(float3 normal, float3 geometric, float3 view,
+                             SurfaceBsdf material, float ggxProbability, float2 xi,
+                             float choose, out float3 direction, out float pdf) {
+    pdf = 0.0;
+    float ggxPdf;
+    if (choose < ggxProbability) {
+        direction = bsdfSampleVisibleGgx(xi, material, normal, view, ggxPdf);
+        if (!(ggxPdf > 0.0)) return false;
+    } else {
+        direction = cosineDirection(normal, xi);
+        ggxPdf = bsdfVisibleGgxPdf(material, normal, view, direction);
+    }
+    float cosine = dot(normal, direction);
+    if (!(cosine > 0.0) || !(dot(geometric, direction) > 0.0)) return false;
+    pdf = lerp(cosine / PI, ggxPdf, ggxProbability);
+    return pdf > 0.0 && isfinite(pdf);
+}
+
+// One BSDF-sampled ray in the receiver's local shading frame. The existing
+// transport cache approximates the radiance at the next surface; the receiver
+// itself evaluates the opaque diffuse + specular BSDF, not a Lambert albedo.
+bool traceMaterialGather(float3 position, float3 normal, float3 geometric, float3 view,
+                         SurfaceBsdf material, float2 ab, float ggxProbability,
+                         float2 xi, float choose, out float3 shaded, out float3 background,
+                         out float3 listedEmission) {
+    shaded = background = listedEmission = 0.0;
+    float3 direction;
+    float pdf;
+    if (!sampleMaterialDirection(normal, geometric, view, material, ggxProbability,
+        xi, choose, direction, pdf)) return true; // clipped draw has zero contribution
+    float3 weight = bsdfEvaluate(material, normal, view, direction, ab)
+        * (dot(normal, direction) / pdf);
+    transportAdmissionBypass = true;
+    float3 origin = rayOffset(position, geometric, params.tuning.z);
+    DependencyContext dependency;
+    float start, distance, padding;
+    Hit hit = traceRayTracked(origin, direction, 1e20, dependency, start, distance, padding);
+    TransportRadiance light;
+    if ((hit.errors & HIT_QUERY_UNSUPPORTED) != 0u) return false;
+    bool cached = materialGatherIncoming(hit, origin + direction * hit.distance, direction, light);
+    if (hit.triangle != EMPTY) {
+        // Balance the BSDF-sampled emission against the explicit emitter ray.
+        float lightPdf = emitterPdf(hit, direction);
+        float3 emission = hitEmission(hit, 0.0);
+        if (lightPdf > 0.0) listedEmission = emission * weight * (pdf / (pdf + lightPdf));
+        else light.emissive += emission;
+    }
+    // Keep the paired estimate of listed emission even when the hit cache is
+    // cold. Split's diffuse fallback does not contain first hits on that list.
+    if (!cached) return false;
+    background = (light.background + light.emissive) * weight;
+    shaded = background + light.punctual * weight;
+    return all(isfinite(shaded)) && all(isfinite(background));
+}
+
+SurfaceBsdf materialSpaceBsdf(uint4 deferred) {
+    SurfaceBsdf material;
+    material.baseColor = deferredBaseColor(deferred);
+    material.metallic = float((deferred.z >> 8u) & 255u) / 255.0;
+    material.perceptualRoughness = float(deferred.x >> 24u) / 255.0;
+    uint3 tint = (deferred.yyy >> uint3(0u, 8u, 16u)) & 255u;
+    material.specularColor = pow(float3(tint) / 255.0, 2.2);
+    // The thin G-buffer stores r, with F0 = 0.16 r² (IOR >= 1).
+    float sqrtF0 = 0.4 * float(deferred.z & 255u) / 255.0;
+    material.ior = (1.0 + sqrtF0) / (1.0 - sqrtF0);
+    return material;
+}
+
+// Specialize each entry point so the ordinary probe path cannot retain tracing code.
+[ForceInline]
+void resolveWorld(uint3 thread, bool traceGather, bool materialGather) {
     if (any(thread.xy >= giResolveExtent(params))) return;
     uint scale = giResolveScale(params);
     uint2 full = params.viewport.xy + min(thread.xy * scale + scale / 2u,
@@ -257,16 +328,57 @@ void worldResolve(uint3 thread : SV_DispatchThreadID) {
         if (all(isfinite(normal)) && dot(normal, normal) > 0.01) {
             normal = normalize(normal);
             float3 position = worldPosition(float2(full) + 0.5, depth, params);
-            diffuse = resolveSplitDiffuse(position, normal, coverage, background, backgroundCoverage, anyCoverage);
+            float3 geometric = receiverGeometricNormal(receiver.z, normal);
+            uint at = thread.y * giResolveExtent(params).x + thread.x;
+            bool traced = false;
+            bool materialSample = false;
+            float3 listedEmission = 0.0;
+            if (traceGather) {
+                uint seed = transportHash(at ^ transportHash(params.frame.x ^ 0xc017ae7u));
+                if (materialGather) {
+                    SurfaceBsdf material = materialSpaceBsdf(deferred);
+                    float3 view = bsdfUnitOrZero(params.cameraPosition.xyz - position);
+                    float nDotV = dot(normal, view);
+                    materialSample = nDotV > 0.0 && dot(geometric, view) > 0.0;
+                    if (materialSample) {
+                        float2 ab = bsdfDfg(material.perceptualRoughness, nDotV);
+                        float ggxProbability = materialGgxProbability(material, ab);
+                        traced = traceMaterialGather(position, normal, geometric, view, material, ab,
+                            ggxProbability, rtgiGatherNoise(thread.xy), transportRandom(seed, 0u),
+                            diffuse, background, listedEmission);
+                        if (params.lightCounts.y != 0u) {
+                            uint state = transportHash(seed ^ 0x51ed270bu);
+                            transportAdmissionBypass = true;
+                            listedEmission += emitterLight(position, normal, geometric, view,
+                                false, true, true, material, ab, ggxProbability, state);
+                        }
+                    }
+                } else {
+                    traced = traceCascadeGather(position, normal, geometric, seed, diffuse, background);
+                }
+            }
+            if (traced) {
+                coverage = backgroundCoverage = 1.0;
+            } else {
+                diffuse = resolveSplitDiffuse(position, normal, coverage, background, backgroundCoverage, anyCoverage);
+            }
             // Direct light from listed emitters, which the probes leave out:
             // one shadow ray a pixel a frame, smoothed by temporal and denoise.
-            if (params.lightCounts.y != 0u) {
-                uint at = thread.y * giResolveExtent(params).x + thread.x;
+            if (!materialSample && params.lightCounts.y != 0u) {
                 uint state = transportHash(at ^ transportHash(params.frame.x * 0x9e3779b9u + 0x51ed270bu));
                 transportAdmissionBypass = true;
-                diffuse += emitterLight(position, normal, receiverGeometricNormal(receiver.z, normal),
-                    normal, true, false, (SurfaceBsdf)0, 0.0, state);
+                diffuse += emitterLight(position, normal, geometric,
+                    normal, true, false, true, (SurfaceBsdf)0, 0.0, 0.5, state);
             }
+            // Unsupported queries fall back to diffuse probes in the same
+            // (material-weighted) units, without guessing a glossy value.
+            if (materialGather && !traced) {
+                float3 albedo = deferredDiffuseAlbedo(deferred);
+                diffuse *= albedo;
+                background *= albedo;
+            }
+            diffuse += listedEmission;
+            background += listedEmission;
             supported = coverage > 0.0 && all(isfinite(diffuse));
         }
     }
@@ -276,4 +388,16 @@ void worldResolve(uint3 thread : SV_DispatchThreadID) {
     backgroundOutput.Store(int2(thread.xy), float4(background,
         rawGiSupportAlpha(eligible, backgroundSupported, backgroundCoverage)));
 }
+
+[shader("compute")]
+[numthreads(8, 8, 1)]
+void worldResolve(uint3 thread : SV_DispatchThreadID) { resolveWorld(thread, false, false); }
+
+[shader("compute")]
+[numthreads(8, 8, 1)]
+void guidedResolve(uint3 thread : SV_DispatchThreadID) { resolveWorld(thread, true, false); }
+
+[shader("compute")]
+[numthreads(8, 8, 1)]
+void materialResolve(uint3 thread : SV_DispatchThreadID) { resolveWorld(thread, true, true); }
 #endif

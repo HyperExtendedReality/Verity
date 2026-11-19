@@ -81,7 +81,9 @@ impl Hardware {
         let stale = |&(at, count): &(i32, u32)| {
             let words = at as usize..at as usize + count as usize * 3;
             !wanted.contains(&(at, count))
-                || rewritten.iter().any(|r| r.start < words.end && words.start < r.end)
+                || rewritten
+                    .iter()
+                    .any(|r| r.start < words.end && words.start < r.end)
         };
         let dropped: Vec<_> = self.meshes.keys().filter(|k| stale(k)).copied().collect();
         for key in &dropped {
@@ -128,7 +130,10 @@ impl Hardware {
     }
 
     pub fn tlas(&self, slot: usize) -> Option<vk::AccelerationStructureKHR> {
-        self.slots[slot].tlas.as_ref().map(|(tlas, _, _)| tlas.handle)
+        self.slots[slot]
+            .tlas
+            .as_ref()
+            .map(|(tlas, _, _)| tlas.handle)
     }
 
     /// Bring a slot's TLAS up to the packed instances, recording the build into
@@ -159,7 +164,11 @@ impl Hardware {
             .collect();
         let count = records.len() as u32;
         let mut replaced = false;
-        if state.tlas.as_ref().is_none_or(|&(_, _, capacity)| capacity < count) {
+        if state
+            .tlas
+            .as_ref()
+            .is_none_or(|&(_, _, capacity)| capacity < count)
+        {
             if let Some((tlas, scratch, _)) = state.tlas.take() {
                 self.rt.destroy(gpu, tlas);
                 gpu::destroy_buffer(gpu.device, gpu.allocator, scratch);
@@ -172,7 +181,11 @@ impl Hardware {
         let bytes = instance_bytes(&records);
         let size = bytes.len().max(64) as u64;
         if state.instances.buffer == vk::Buffer::null() || state.instances.size < size {
-            gpu::destroy_buffer(gpu.device, gpu.allocator, std::mem::take(&mut state.instances));
+            gpu::destroy_buffer(
+                gpu.device,
+                gpu.allocator,
+                std::mem::take(&mut state.instances),
+            );
             state.instances = gpu::create_buffer(
                 gpu.device,
                 gpu.allocator,

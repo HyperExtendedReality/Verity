@@ -1,5 +1,78 @@
 # Validation
 
+## Software BVH construction
+
+Lux builds the software BLAS and TLAS in native Rust with adaptive binned
+surface-area heuristics. [TinyBVH](https://github.com/jbikker/tinybvh/blob/main/tiny_bvh_base.h)
+informed the three-axis bin sweep; [Embree](https://github.com/RenderKit/embree/blob/master/kernels/builders/bvh_builder_sah.h)
+informed the split-versus-leaf cost and depth handling. The binary layout
+and the BLAS leaf cap of eight follow the previous [obvhs fast preset](https://github.com/DGriffin91/obvhs/blob/main/src/lib.rs).
+Large BLAS subtrees build in parallel. The builder reorders triangles before
+charting but does not duplicate them, so raster lookup, charting, and the
+hardware ray-query path still consume the same triangle spans. No shader
+layout or native dependency is required.
+
+Three interleaved release runs of `cargo run --release -p verity-lux --example
+build_sponza`, measuring median scene build and pack time without glTF load:
+
+| Asset | Previous hybrid | Native SAH | Packed geometry + scene |
+| --- | ---: | ---: | ---: |
+| New Sponza Main | 940 ms | 811 ms | 343.3 → 338.0 MB |
+| Curtains | 361 ms | 249 ms | 182.9 → 181.9 MB |
+| Ivy Growth | 1.39 s | 797 ms | 505.2 → 502.5 MB |
+
+Triangle and instance counts matched in all three assets.
+
+With software rays on an RTX 4070 Laptop GPU (New Sponza Main, 640×360,
+60 stationary warm-up frames and 120 timed frames per pose), total GI GPU
+time was 6.853–6.880 ms stationary and 6.309–6.317 ms moving in two
+baseline runs, versus 6.981 and 6.372 ms in one native run. The new builder
+reduces build time and packed size, not GPU time in this scene. The relative
+L2 difference of the 16-frame HDR averages was 0.019 stationary and 0.118
+moving against the first baseline, versus 0.020 and 0.150 between the
+baseline repeats.
+
+The BLAS traversal cost is set to three triangle tests. In the same
+sampling setup, a cost of 2.75 made all three packed scenes larger and
+increased stationary GI time to 7.261 ms.
+
+### Previous hybrid baseline
+
+The previous hybrid, measured below against the older fixed-leaf SAH builder,
+used obvhs PLOC with reinsertion for static meshes of at least 65,536 triangles.
+
+On the eight largest New Sponza Main meshes, obvhs built 2.3–5.6× faster
+than serial SAH in isolation (including node conversion and primitive
+reordering), and produced 20–27% fewer nodes. Estimated traversal cost
+was mixed: −8% to +11% with equal box- and triangle-test weights. These
+are tree metrics, not GPU ray timings.
+
+Three interleaved release runs of `build_sponza`, measuring median time to
+build and pack the GI scene (excluding glTF load):
+
+| Asset | Before | After | Packed geometry + scene before → after |
+| --- | ---: | ---: | ---: |
+| New Sponza Main | 1.84 s | 1.26 s | 364.0 → 343.3 MB |
+| Curtains | 768 ms | 483 ms | 197.5 → 182.9 MB |
+| Ivy Growth | 2.08 s | 1.39 s | 537.1 → 505.2 MB |
+
+Build timings varied under shared machine load; the slowest new Main run
+took 3.83 s. Triangle and instance counts matched in all three assets.
+
+On an RTX 4070 Laptop GPU, one 640×360 software run per version used the
+same New Sponza Main scene and 60 warm-up frames. Mean total GI GPU time
+over 120 frames per pose was 35.831 → 30.998 ms stationary and
+33.701 → 29.801 ms moving. These single-run results do not establish
+cross-device performance.
+
+Embree's native [custom builder](https://github.com/RenderKit/embree/blob/master/doc/src/api/rtcBuildBVH.md)
+is not exposed by [`embree4-rs`](https://github.com/psytrx/embree4-rs/blob/main/src/scene.rs). [TinyBVH](https://github.com/jbikker/tinybvh)
+offers C++ Bonsai, spatial splits and CWBVH, but its CPU throughput does not
+measure Lux's shader path. Both libraries would add native integration.
+Recent [fused wide-BVH construction](https://doi.org/10.1111/cgf.70213) and
+[discrete oriented bounds](https://arxiv.org/abs/2506.22849) target different
+builders or traversal layouts; neither is a drop-in change to this ABI.
+
 ## Hardware ray-query traversal — October 29
 
 Same device, driver, scene and settings as the section below. With

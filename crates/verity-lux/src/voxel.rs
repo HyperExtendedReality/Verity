@@ -7,6 +7,11 @@
 //! loaded scenes' and the renderer's retained meshes' triangles: nested levels
 //! of `GRID` cells a side, each twice the size of the last. As the camera moves
 //! a level shifts by whole cells and rebuilds only the slabs that came in.
+//!
+//! With [`ScreenVoxelSettings::holographic`], voxels in one level's box take
+//! their bounce light from Holographic Radiance Cascades instead of a ray a
+//! visit: [`crate::holographic`] sliced into vertical pages, run a few batches
+//! of slices a frame in holographic.slang.
 
 #![allow(unsafe_op_in_unsafe_fn)]
 
@@ -32,6 +37,11 @@ use verity_render::{
 const SLOTS: usize = 2;
 /// Cells along each side of a clipmap level. A power of two.
 const GRID: i32 = 128;
+// Must match the 4^3 occupancy bricks in voxel.slang.
+const OCCUPANCY_BRICK: i32 = 4;
+// Must match the axis count and uint mask width in voxel_roma.slang.
+const ROMA_AXES: u32 = 16;
+const ROMA_WORD_BITS: u32 = u32::BITS;
 /// Clipmap levels at most; `MAX_LEVELS` in voxel.slang.
 const MAX_LEVELS: usize = 8;
 /// Boxes of cells voxelized in a frame at most: three slabs a level.
@@ -40,6 +50,62 @@ const MAX_JOBS: usize = 3 * MAX_LEVELS;
 const POOL: u32 = 1 << 20;
 /// Entries of the big triangles' work list; `MAX_LARGE` in voxel.slang.
 const MAX_LARGE: u64 = 65535;
+
+/// Holographic Radiance Cascades, as holographic.slang's `HRC_` constants: cells
+/// a side of the box they cover, slice cells each way from a page's middle, a
+/// slice's cells a side, the top cascade, and slices a batch.
+const HRC_GRID: u64 = 64;
+const HRC_REACH: u64 = 47;
+const HRC_SIDE: u64 = 2 * HRC_REACH + 1;
+const HRC_TOP: u32 = 8;
+const HRC_BATCH: u64 = 8;
+const HRC_CONES: u64 = (2 << (HRC_TOP + 1)) - 1;
+/// Pages over the half turn, and batches of slices a frame: a sweep of every
+/// page takes `HRC_PAGES * HRC_SIDE / (HRC_BATCH * HRC_BATCHES)` frames.
+const HRC_PAGES: u32 = 8;
+const HRC_BATCHES: u32 = 4;
+
+/// Probe columns of HRC cascade `n`.
+fn hrc_columns(n: u32) -> u64 {
+    HRC_SIDE.div_ceil(1 << n)
+}
+
+/// Rays of a slice's frustum, over every cascade.
+fn hrc_rays_each() -> u64 {
+    (0..=HRC_TOP)
+        .map(|n| hrc_columns(n) * HRC_SIDE * ((2 << n) + 1))
+        .sum()
+}
+
+/// Cones of a slice's frustum in its largest cascade.
+fn hrc_cones_each() -> u64 {
+    (0..=HRC_TOP)
+        .map(|n| hrc_columns(n) * HRC_SIDE * (1 << n))
+        .max()
+        .unwrap()
+}
+
+/// `HrcPush` in holographic.slang.
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct HrcPush {
+    level: i32,
+    first_slice: i32,
+    clip_level: i32,
+    ready: u32,
+    horizontal: [f32; 2],
+    weight: f32,
+    first_page: u32,
+}
+
+/// How far HRC's sweep over every page's slices has got.
+#[derive(Clone, Copy, Default)]
+struct HrcSweep {
+    page: u32,
+    slice: u32,
+    /// Sweeps finished; each turns its pages a little further.
+    sweeps: u32,
+}
 
 macro_rules! spirv {
     ($entry:literal) => {
@@ -67,7 +133,21 @@ const PASSES: &[(&str, &[u8])] = &[
     spirv!("atrous4"),
     spirv!("composite"),
     spirv!("capture"),
+    spirv!("hrcMediumBuild"),
+    spirv!("hrcMeasure"),
+    spirv!("hrcBase"),
+    spirv!("hrcExtend"),
+    spirv!("hrcTop"),
+    spirv!("hrcDown"),
+    spirv!("hrcPull"),
 ];
+
+const SDF_PASSES: &[(&str, &[u8])] = &[
+    spirv!("voxelSdfX"),
+    spirv!("voxelSdfY"),
+    spirv!("voxelSdfZ"),
+];
+const ROMA_PASSES: &[(&str, &[u8])] = &[spirv!("romaBuild")];
 
 use vk::DescriptorType as D;
 /// Set 0: the frame and the voxels.
@@ -88,14 +168,37 @@ const SCENE_BINDINGS: &[(u32, D)] = &[
     (15, D::STORAGE_BUFFER),
     (16, D::STORAGE_BUFFER),
     (17, D::STORAGE_BUFFER),
+    (18, D::STORAGE_BUFFER),
+    (19, D::STORAGE_BUFFER),
+    (20, D::STORAGE_BUFFER),
+    (21, D::STORAGE_BUFFER),
+    (22, D::STORAGE_BUFFER),
+    (23, D::STORAGE_BUFFER),
+    (24, D::STORAGE_BUFFER),
+    (25, D::STORAGE_BUFFER),
+    (30, D::STORAGE_BUFFER),
 ];
 /// Per slot: trace, temporal, three a-trous, composite.
 const IO_SETS: usize = 6;
 
+/// Visibility for diffuse rays through the voxel clipmap.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
+#[repr(u32)]
+pub enum VoxelVisibility {
+    /// Walk the original ray with voxel DDA.
+    #[default]
+    Dda = 0,
+    /// Skip empty space using the clipmap's distance field.
+    Sdf = 1,
+    /// Trace diffuse rays along resampled ray-aligned occupancy maps.
+    Roma = 2,
+}
+
 /// Screen and voxel GI controls. Distances are in metres.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct ScreenVoxelSettings {
-    /// How far rays follow what is on screen before walking the voxels.
+    /// How far rays follow what is on screen before walking the voxels. Zero skips the screen.
     pub max_distance: f32,
     /// How far rays walk the voxels. Surfaces further away do not bounce light.
     pub world_ray_distance: f32,
@@ -111,6 +214,20 @@ pub struct ScreenVoxelSettings {
     /// Residual GI: the voxels' light arriving at each surface is the answer,
     /// and screen rays add only how far what they see differs from the voxels.
     pub residual: bool,
+    /// Reduce temporal reuse when the screen/voxel ray sources change.
+    pub source_aware_history: bool,
+    /// Experimental empty-brick skips. Read when GI is installed.
+    pub coarse_occupancy: bool,
+    /// Diffuse voxel visibility. Read when GI is installed.
+    pub visibility: VoxelVisibility,
+    /// The level whose box Holographic Radiance Cascades light, at half its
+    /// resolution, or none to bounce light with a ray a visit everywhere. Read
+    /// when the GI is installed.
+    pub holographic: Option<u32>,
+    /// Bounce rays each voxel side keeps, 0..=64, re-reading where they went
+    /// on every visit instead of averaging one new ray over 64 visits. Costs
+    /// 8 MB per ray kept. Read when the GI is installed.
+    pub bounce_links: u32,
 }
 
 impl ScreenVoxelSettings {
@@ -134,6 +251,11 @@ impl Default for ScreenVoxelSettings {
             levels: 5,
             cell_size: 0.125,
             residual: false,
+            source_aware_history: false,
+            coarse_occupancy: false,
+            visibility: VoxelVisibility::default(),
+            holographic: None,
+            bounce_links: 0,
         }
     }
 }
@@ -195,7 +317,8 @@ fn chunk_bounds(triangles: &[GpuTriangle]) -> Vec<[[f32; 4]; 2]> {
         .par_chunks(64)
         .map(|run| {
             let corners = run.iter().flatten().map(|c| Vec3::new(c[0], c[1], c[2]));
-            let (lo, hi) = corners.fold((Vec3::MAX, Vec3::MIN), |(lo, hi), p| (lo.min(p), hi.max(p)));
+            let (lo, hi) =
+                corners.fold((Vec3::MAX, Vec3::MIN), |(lo, hi), p| (lo.min(p), hi.max(p)));
             [lo.extend(0.0).to_array(), hi.extend(0.0).to_array()]
         })
         .collect()
@@ -264,6 +387,10 @@ pub struct ScreenVoxel {
     origins: [Option<IVec3>; MAX_LEVELS],
     /// The finest cell and the levels the voxels were built with.
     built: (f32, usize),
+    built_occupancy: bool,
+    built_visibility: VoxelVisibility,
+    built_hrc_level: Option<u32>,
+    built_links: u32,
     /// Where the triangles changed since the last voxelizing.
     changed: Option<(Vec3, Vec3)>,
     /// Whether the voxel pool needs setting up.
@@ -273,10 +400,18 @@ pub struct ScreenVoxel {
     cells: Buffer,
     voxels: Buffer,
     radiance: Buffer,
+    /// `links` in voxel.slang.
+    links: Buffer,
     build: Buffer,
     free: Buffer,
     /// Big triangles' work, and its indirect dispatch.
     large: Buffer,
+    /// The selected diffuse visibility cache, if any.
+    visibility_buffer: Buffer,
+    /// HRC's medium, rays, cones, cone weights, and gathered light being summed
+    /// and last summed: bindings 18 to 23 in holographic.slang.
+    hrc: [Buffer; 6],
+    hrc_sweep: HrcSweep,
     no_capture: Buffer,
     blue_noise: Buffer,
     pipelines: Option<Pipelines>,
@@ -306,6 +441,10 @@ impl ScreenVoxel {
             triangle_count: 0,
             origins: [None; MAX_LEVELS],
             built: (0.0, 0),
+            built_occupancy: false,
+            built_visibility: VoxelVisibility::default(),
+            built_hrc_level: None,
+            built_links: 0,
             changed: None,
             reset: true,
             triangle_buffer: Buffer::default(),
@@ -313,9 +452,13 @@ impl ScreenVoxel {
             cells: Buffer::default(),
             voxels: Buffer::default(),
             radiance: Buffer::default(),
+            links: Buffer::default(),
             build: Buffer::default(),
             free: Buffer::default(),
             large: Buffer::default(),
+            visibility_buffer: Buffer::default(),
+            hrc: Default::default(),
+            hrc_sweep: HrcSweep::default(),
             no_capture: Buffer::default(),
             blue_noise: Buffer::default(),
             pipelines: None,
@@ -352,10 +495,22 @@ impl ScreenVoxel {
         // shortcut: every change uploads every triangle; upload only the changed
         // meshes' if digging terrain stalls.
         let bytes = bytemuck::cast_slice(&all);
-        upload(gpu, &mut self.command_pool, &mut self.triangle_buffer, "voxel triangles", bytes)?;
+        upload(
+            gpu,
+            &mut self.command_pool,
+            &mut self.triangle_buffer,
+            "voxel triangles",
+            bytes,
+        )?;
         let chunks = chunk_bounds(&all);
         let bytes = bytemuck::cast_slice(&chunks);
-        upload(gpu, &mut self.command_pool, &mut self.chunk_buffer, "voxel triangle runs", bytes)?;
+        upload(
+            gpu,
+            &mut self.command_pool,
+            &mut self.chunk_buffer,
+            "voxel triangle runs",
+            bytes,
+        )?;
         if self.view.is_some() {
             for slot in 0..SLOTS {
                 self.write_scene_set(gpu.device, slot, self.no_capture.buffer);
@@ -368,19 +523,52 @@ impl ScreenVoxel {
     /// frame's `reset` pass.
     unsafe fn create_voxels(&mut self, gpu: &mut Gpu) -> Result<()> {
         let levels = self.levels();
-        let cells = levels as u64 * (GRID as u64).pow(3) * 4;
+        self.built_occupancy = self.settings.coarse_occupancy;
+        let bricks = if self.built_occupancy {
+            ((GRID / OCCUPANCY_BRICK) as u64).pow(3)
+        } else {
+            0
+        };
+        let cells = levels as u64 * ((GRID as u64).pow(3) + bricks) * 4;
         let pool = u64::from(POOL);
         let usage = vk::BufferUsageFlags::STORAGE_BUFFER
+            | vk::BufferUsageFlags::TRANSFER_SRC
             | vk::BufferUsageFlags::TRANSFER_DST
             | vk::BufferUsageFlags::INDIRECT_BUFFER;
+        let grid = GRID as u64;
+        let visibility = match self.built_visibility {
+            VoxelVisibility::Dda => None,
+            VoxelVisibility::Sdf => Some((
+                &mut self.visibility_buffer,
+                "voxel distance field",
+                4 * levels as u64 * grid.pow(3),
+            )),
+            VoxelVisibility::Roma => Some((
+                &mut self.visibility_buffer,
+                "voxel ray-aligned occupancy",
+                4 * levels as u64 * u64::from(ROMA_AXES) * grid.pow(2)
+                    * grid.div_ceil(u64::from(ROMA_WORD_BITS)),
+            )),
+        };
+        self.built_links = self.settings.bounce_links.min(64);
+        // Bound either way: a uint4 when off.
+        let links = (pool * 2 * 4 * u64::from(self.built_links)).max(16);
         for (buffer, name, size) in [
             (&mut self.cells, "voxel cells", cells),
+            (&mut self.links, "voxel bounce links", links),
             (&mut self.voxels, "voxels", pool * 16),
             (&mut self.radiance, "voxel radiance", pool * 96),
             (&mut self.build, "voxel build", pool * 16),
             (&mut self.free, "free voxels", (pool + 1) * 4),
-            (&mut self.large, "voxel large triangles", (MAX_LARGE + 1) * 16),
-        ] {
+            (
+                &mut self.large,
+                "voxel large triangles",
+                (MAX_LARGE + 1) * 16,
+            ),
+        ]
+        .into_iter()
+        .chain(visibility)
+        {
             gpu::destroy_buffer(gpu.device, gpu.allocator, mem::take(buffer));
             *buffer = gpu::create_buffer(
                 gpu.device,
@@ -391,6 +579,42 @@ impl ScreenVoxel {
                 MemoryLocation::GpuOnly,
             )?;
         }
+        let cells = HRC_GRID.pow(3);
+        let names = [
+            "hrc medium",
+            "hrc rays",
+            "hrc cones",
+            "hrc measures",
+            "hrc sum",
+            "hrc gather",
+        ];
+        let sizes = [
+            cells * 2 * 16,
+            HRC_BATCH * 4 * hrc_rays_each() * 8,
+            2 * HRC_BATCH * 4 * hrc_cones_each() * 3 * 8,
+            4 * HRC_CONES * 16,
+            cells * 3 * 16,
+            cells * 3 * 16,
+        ];
+        self.built_hrc_level = self.settings.holographic.filter(|&l| l < levels as u32);
+        for ((buffer, name), size) in self.hrc.iter_mut().zip(names).zip(sizes) {
+            gpu::destroy_buffer(gpu.device, gpu.allocator, mem::take(buffer));
+            // Bound either way: a float4 when off.
+            let size = if self.built_hrc_level.is_some() {
+                size
+            } else {
+                16
+            };
+            *buffer = gpu::create_buffer(
+                gpu.device,
+                gpu.allocator,
+                name,
+                size,
+                usage,
+                MemoryLocation::GpuOnly,
+            )?;
+        }
+        self.hrc_sweep = HrcSweep::default();
         self.built = (self.settings.cell_size.max(1e-3), levels);
         self.origins = [None; MAX_LEVELS];
         self.reset = true;
@@ -438,13 +662,16 @@ impl ScreenVoxel {
             *low = new.extend(0).to_array();
             for (low, high) in boxes {
                 let cells = (high - low).element_product();
-                jobs.push([low.extend(level as i32).to_array(), high.extend(cells).to_array()]);
+                jobs.push([
+                    low.extend(level as i32).to_array(),
+                    high.extend(cells).to_array(),
+                ]);
             }
         }
         (lows, jobs)
     }
 
-    unsafe fn create_pipelines(gpu: &mut Gpu) -> Result<Pipelines> {
+    unsafe fn create_pipelines(gpu: &mut Gpu, visibility: VoxelVisibility) -> Result<Pipelines> {
         let device = gpu.device;
         let set_layout = |bindings: &[(u32, D)]| {
             let bindings: Vec<_> = bindings
@@ -465,16 +692,22 @@ impl ScreenVoxel {
         let scene_layout = set_layout(SCENE_BINDINGS)?;
         let io_layout = set_layout(IO_BINDINGS)?;
         // Set 2 is the renderer's frame set: materials and textures.
+        let push = [vk::PushConstantRange::default()
+            .stage_flags(vk::ShaderStageFlags::COMPUTE)
+            .size(mem::size_of::<HrcPush>() as u32)];
         let layout = device.create_pipeline_layout(
-            &vk::PipelineLayoutCreateInfo::default().set_layouts(&[
-                scene_layout,
-                io_layout,
-                gpu.frame_set_layout,
-            ]),
+            &vk::PipelineLayoutCreateInfo::default()
+                .set_layouts(&[scene_layout, io_layout, gpu.frame_set_layout])
+                .push_constant_ranges(&push),
             None,
         )?;
+        let visibility_passes = match visibility {
+            VoxelVisibility::Dda => &[],
+            VoxelVisibility::Sdf => SDF_PASSES,
+            VoxelVisibility::Roma => ROMA_PASSES,
+        };
         let mut passes = HashMap::new();
-        for &(name, spirv) in PASSES {
+        for &(name, spirv) in PASSES.iter().chain(visibility_passes) {
             let entry = CString::new(name)?;
             let pipeline =
                 gpu::compute_pipeline(device, vk::PipelineCache::null(), layout, spirv, &entry)?;
@@ -627,6 +860,15 @@ impl ScreenVoxel {
         let (view, targets) = (self.view.as_ref().unwrap(), self.targets.unwrap());
         let general = vk::ImageLayout::GENERAL;
         let color = Res::View(view.prev_color.view, general);
+        // Both bindings are statically used by diffuse shaders. Alias only
+        // the disabled bindings to a buffer those paths will not access.
+        let inactive = self.no_capture.buffer;
+        let cache = self.visibility_buffer.buffer;
+        let (roma, sdf) = match self.built_visibility {
+            VoxelVisibility::Dda => (inactive, inactive),
+            VoxelVisibility::Sdf => (inactive, cache),
+            VoxelVisibility::Roma => (cache, inactive),
+        };
         write_set(
             device,
             view.scene_sets[slot],
@@ -651,6 +893,15 @@ impl ScreenVoxel {
                 (15, Res::Buffer(self.free.buffer)),
                 (16, Res::Buffer(self.large.buffer)),
                 (17, Res::Buffer(self.chunk_buffer.buffer)),
+                (18, Res::Buffer(self.hrc[0].buffer)),
+                (19, Res::Buffer(self.hrc[1].buffer)),
+                (20, Res::Buffer(self.hrc[2].buffer)),
+                (21, Res::Buffer(self.hrc[3].buffer)),
+                (22, Res::Buffer(self.hrc[4].buffer)),
+                (23, Res::Buffer(self.hrc[5].buffer)),
+                (24, Res::Buffer(roma)),
+                (25, Res::Buffer(sdf)),
+                (30, Res::Buffer(self.links.buffer)),
             ],
         );
     }
@@ -665,6 +916,7 @@ impl ScreenVoxel {
             // Unused slots hold images of the format the binding declares.
             let io = |ins: [&Image; 4], outs: [&Image; 4]| {
                 let composite = [
+                    // Voxel temporal also reads the trace's source tag here, before à-trous.
                     &s.filtered[0],
                     &s.accum_depth[cur],
                     &s.filtered[1],
@@ -699,7 +951,7 @@ impl ScreenVoxel {
                     [
                         &s.trace,
                         &s.filtered_variance[0],
-                        &s.filtered[0],
+                        &s.filtered[0], // Trace source tag scratch (out2).
                         &s.variance,
                     ],
                 ),
@@ -830,7 +1082,10 @@ impl ScreenVoxel {
             self.previous_lights = key;
             self.light_age = Some(0);
         } else {
-            self.light_age = self.light_age.map(|age| age + 1).filter(|&age| changed_history(age) < 64.0);
+            self.light_age = self
+                .light_age
+                .map(|age| age + 1)
+                .filter(|&age| changed_history(age) < 64.0);
         }
         let settings = self.settings;
         let [x, y, width, height] = frame.viewport;
@@ -862,12 +1117,12 @@ impl ScreenVoxel {
         data.prev_clip_from_world = (flip * frame.previous_view_proj).to_cols_array_2d();
         data.camera = frame.eye.extend(frame.near).to_array();
         data.sizes = [width, height, trace[0], trace[1]];
-        data.origin = [x, y, 0, 0];
+        data.origin = [x, y, self.built_visibility as u32, self.built_links];
         data.misc = [
             (self.frame % 65536) as f32,
-            settings.max_distance.max(0.1),
+            settings.max_distance.max(0.0),
             settings.intensity,
-            0.0,
+            f32::from(u8::from(settings.source_aware_history)),
         ];
         data.sun_direction = sun.map_or([0.0; 4], |s| {
             (-s.direction.normalize()).extend(1.0).to_array()
@@ -889,15 +1144,12 @@ impl ScreenVoxel {
             f32::from(u8::from(settings.residual)),
             self.light_age.map_or(0.0, changed_history),
             f32::from(u8::from(unbroken)),
-            0.0,
+            f32::from(u8::from(self.built_occupancy)),
         ];
         data.reflection = [0.0, 0.0, self.built.1 as f32, self.built.0];
         data.fade = [1.0; 4];
         // `tend_capture` above has settled every buffer.
-        data.buffers[..2].copy_from_slice(&[
-            view.lights[slot].address,
-            self.blue_noise.address,
-        ]);
+        data.buffers[..2].copy_from_slice(&[view.lights[slot].address, self.blue_noise.address]);
         view.frame[slot].write(bytemuck::bytes_of(&data));
         if !lights.is_empty() {
             view.lights[slot].write(bytemuck::cast_slice(&lights));
@@ -947,7 +1199,7 @@ impl ScreenVoxel {
         barrier();
 
         // A size, or none to read it from `large`.
-        let launch = |name: &'static str, set: vk::DescriptorSet, size: Option<[u32; 2]>| {
+        let launch = |name: &'static str, set: vk::DescriptorSet, size: Option<[u32; 3]>| {
             device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, pipelines.passes[name]);
             device.cmd_bind_descriptor_sets(
                 cmd,
@@ -958,15 +1210,17 @@ impl ScreenVoxel {
                 &[],
             );
             match size {
-                Some([x, y]) => device.cmd_dispatch(cmd, x.max(1), y.max(1), 1),
+                Some([x, y, z]) => device.cmd_dispatch(cmd, x.max(1), y.max(1), z),
                 None => device.cmd_dispatch_indirect(cmd, self.large.buffer, 0),
             }
             barrier();
             timer.borrow_mut().stamp(device, cmd, slot, name);
         };
-        let dispatch = |name, set, size| launch(name, set, Some(size));
+        let dispatch = |name, set, [x, y]: [u32; 2]| launch(name, set, Some([x, y, 1]));
         let groups = |[x, y]: [u32; 2]| [x.div_ceil(8), y.div_ceil(8)];
         let sets = view.io_sets[slot];
+        let grid = GRID as u32;
+        let levels = self.built.1 as u32;
         if self.reset {
             device.cmd_fill_buffer(cmd, self.cells.buffer, 0, vk::WHOLE_SIZE, 0);
             let filled = [vk::MemoryBarrier2::default()
@@ -994,6 +1248,130 @@ impl ScreenVoxel {
                 launch("accumulateLarge", sets[0], None);
             }
             dispatch("finalize", sets[0], cells);
+            if self.built_visibility == VoxelVisibility::Sdf {
+                let lines = [grid.pow(2).div_ceil(64), levels];
+                for &(name, _) in SDF_PASSES {
+                    dispatch(name, sets[0], lines);
+                }
+            }
+        }
+        if self.built_visibility == VoxelVisibility::Roma {
+            let side = grid.div_ceil(8);
+            let maps = levels * ROMA_AXES * grid.div_ceil(ROMA_WORD_BITS);
+            launch("romaBuild", sets[0], Some([side, side, maps]));
+        }
+        let hrc_level = self.built_hrc_level;
+        if let Some(level) = hrc_level
+            && jobs.iter().any(|job| job[0][3] == level as i32)
+        {
+            // The toroidal gather addresses wrap: a scroll can alias new cells
+            // to old light, and a rebuild can invalidate any page's lighting.
+            // Let injection trace rays again until the replacement sweep completes.
+            self.hrc_sweep = HrcSweep::default();
+        }
+        let mut push = HrcPush {
+            level: 0,
+            first_slice: 0,
+            clip_level: hrc_level.map_or(-1, |l| l as i32),
+            ready: u32::from(self.hrc_sweep.sweeps > 0),
+            horizontal: [1.0, 0.0],
+            weight: 0.0,
+            first_page: 0,
+        };
+        let send = |push: &HrcPush| {
+            let bytes = bytemuck::bytes_of(push);
+            device.cmd_push_constants(
+                cmd,
+                pipelines.layout,
+                vk::ShaderStageFlags::COMPUTE,
+                0,
+                bytes,
+            );
+        };
+        send(&push);
+        if hrc_level.is_some() {
+            let mut sweep = self.hrc_sweep;
+            let one = |threads: u64| [threads.div_ceil(64) as u32, 1];
+            let slices = |per: u64| HRC_BATCH * 4 * per;
+            dispatch("hrcMediumBuild", sets[0], one(HRC_GRID.pow(3)));
+            for _ in 0..HRC_BATCHES {
+                // Each sweep turns the pages on by the golden ratio of their gap.
+                let turn = (sweep.sweeps as f32 * 0.618_034).fract();
+                let gap = PI / HRC_PAGES as f32;
+                let phi = (sweep.page as f32 + turn) * gap;
+                push.horizontal = [phi.cos(), phi.sin()];
+                push.weight = gap;
+                push.first_page = u32::from(sweep.page == 0);
+                push.first_slice = sweep.slice as i32;
+                push.level = 0;
+                send(&push);
+                if sweep.slice == 0 {
+                    dispatch("hrcMeasure", sets[0], one(4 * HRC_CONES));
+                }
+                dispatch(
+                    "hrcBase",
+                    sets[0],
+                    one(slices(hrc_columns(0) * HRC_SIDE * 3)),
+                );
+                for n in 1..=HRC_TOP {
+                    push.level = n as i32;
+                    send(&push);
+                    dispatch(
+                        "hrcExtend",
+                        sets[0],
+                        one(slices(hrc_columns(n) * HRC_SIDE * ((2 << n) + 1))),
+                    );
+                }
+                dispatch(
+                    "hrcTop",
+                    sets[0],
+                    one(slices((hrc_columns(HRC_TOP) * HRC_SIDE) << HRC_TOP)),
+                );
+                for n in (0..HRC_TOP).rev() {
+                    push.level = n as i32;
+                    send(&push);
+                    dispatch(
+                        "hrcDown",
+                        sets[0],
+                        one(slices((hrc_columns(n) * HRC_SIDE) << n)),
+                    );
+                }
+                dispatch("hrcPull", sets[0], one(HRC_GRID.pow(3)));
+                sweep.slice += HRC_BATCH as u32;
+                if u64::from(sweep.slice) >= HRC_SIDE {
+                    sweep.slice = 0;
+                    sweep.page += 1;
+                }
+                if sweep.page == HRC_PAGES {
+                    // Every page summed: keep it for `inject`, and start again.
+                    sweep.page = 0;
+                    sweep.sweeps += 1;
+                    let ready_to_copy = [vk::MemoryBarrier2::default()
+                        .src_stage_mask(S::COMPUTE_SHADER)
+                        .src_access_mask(A::SHADER_READ | A::SHADER_WRITE)
+                        .dst_stage_mask(S::ALL_TRANSFER)
+                        .dst_access_mask(A::TRANSFER_READ | A::TRANSFER_WRITE)];
+                    device.cmd_pipeline_barrier2(
+                        cmd,
+                        &vk::DependencyInfo::default().memory_barriers(&ready_to_copy),
+                    );
+                    let region = [vk::BufferCopy::default().size(self.hrc[4].size)];
+                    device.cmd_copy_buffer(cmd, self.hrc[4].buffer, self.hrc[5].buffer, &region);
+                    let copied = [vk::MemoryBarrier2::default()
+                        .src_stage_mask(S::ALL_TRANSFER)
+                        .src_access_mask(A::TRANSFER_READ | A::TRANSFER_WRITE)
+                        .dst_stage_mask(S::COMPUTE_SHADER)
+                        .dst_access_mask(A::SHADER_READ | A::SHADER_WRITE)];
+                    device.cmd_pipeline_barrier2(
+                        cmd,
+                        &vk::DependencyInfo::default().memory_barriers(&copied),
+                    );
+                    push.ready = 1;
+                }
+            }
+            self.hrc_sweep = sweep;
+            push.level = 0;
+            send(&push);
         }
         dispatch("inject", sets[0], [POOL.div_ceil(4 * 64), 1]);
         let passes = ["trace", "temporal", "atrous1", "atrous2", "atrous4"];
@@ -1073,7 +1451,9 @@ impl RenderExtension for ScreenVoxel {
                 0
             };
             scene.indices[first..first + count]
-                .chunks_exact(3)
+                .as_chunks::<3>()
+                .0
+                .iter()
                 .map(move |corners| {
                     let corner = |i: usize, w: u32| {
                         let [x, y, z, _] =
@@ -1127,7 +1507,8 @@ impl RenderExtension for ScreenVoxel {
     fn targets_changed(&mut self, gpu: &mut Gpu, targets: &Targets) -> Result<()> {
         unsafe {
             if self.pipelines.is_none() {
-                self.pipelines = Some(Self::create_pipelines(gpu)?);
+                self.built_visibility = self.settings.visibility;
+                self.pipelines = Some(Self::create_pipelines(gpu, self.built_visibility)?);
                 self.timer = Some(PassTimer::new(gpu)?);
                 self.no_capture = gpu::create_buffer(
                     gpu.device,
@@ -1188,12 +1569,17 @@ impl RenderExtension for ScreenVoxel {
                 &mut self.cells,
                 &mut self.voxels,
                 &mut self.radiance,
+                &mut self.links,
                 &mut self.build,
                 &mut self.free,
                 &mut self.large,
+                &mut self.visibility_buffer,
                 &mut self.no_capture,
                 &mut self.blue_noise,
-            ] {
+            ]
+            .into_iter()
+            .chain(&mut self.hrc)
+            {
                 gpu::destroy_buffer(device, gpu.allocator, mem::take(buffer));
             }
             if let Some(pipelines) = self.pipelines.take() {
@@ -1219,7 +1605,11 @@ mod tests {
 
     #[test]
     fn levels_centre_on_the_camera() {
-        for eye in [Vec3::new(1.0, -1.0, 0.0), Vec3::splat(-100.3), Vec3::splat(77.7)] {
+        for eye in [
+            Vec3::new(1.0, -1.0, 0.0),
+            Vec3::splat(-100.3),
+            Vec3::splat(77.7),
+        ] {
             let origin = level_origin(eye, 0.5);
             assert_eq!(origin % STEP, IVec3::ZERO);
             let at = (eye / 0.5).floor().as_ivec3() - origin;
@@ -1230,12 +1620,28 @@ mod tests {
 
     #[test]
     fn runs_of_triangles_are_bounded() {
-        let triangle = |x: f32| [[x, 0.0, 0.0, 0.0], [x + 1.0, 2.0, 0.0, 0.0], [x, 0.0, -3.0, 0.0]];
+        let triangle = |x: f32| {
+            [
+                [x, 0.0, 0.0, 0.0],
+                [x + 1.0, 2.0, 0.0, 0.0],
+                [x, 0.0, -3.0, 0.0],
+            ]
+        };
         let triangles: Vec<_> = (0..65).map(|i| triangle(i as f32)).collect();
         let runs = chunk_bounds(&triangles);
         assert_eq!(runs.len(), 2);
         assert_eq!(runs[0], [[0.0, 0.0, -3.0, 0.0], [64.0, 2.0, 0.0, 0.0]]);
         assert_eq!(runs[1], [[64.0, 0.0, -3.0, 0.0], [65.0, 2.0, 0.0, 0.0]]);
+    }
+
+    #[test]
+    fn hrc_slices_cover_the_box_in_every_page() {
+        // A page's slice grid turns about the box's middle and must hold it whole.
+        let half_diagonal = HRC_GRID as f64 / 2.0 * 2f64.sqrt();
+        assert!(HRC_REACH as f64 >= half_diagonal + 0.5);
+        // The top cascade's rays leave the slice.
+        assert!(1u64 << (HRC_TOP - 1) >= HRC_SIDE && 1u64 << (HRC_TOP - 2) < HRC_SIDE);
+        assert_eq!(hrc_cones_each(), HRC_SIDE << HRC_TOP);
     }
 
     #[test]
@@ -1246,7 +1652,11 @@ mod tests {
     #[test]
     fn scrolled_slabs_cover_the_new_cells_once() {
         let old = IVec3::new(0, 0, 0);
-        for new in [IVec3::new(3, 0, 0), IVec3::new(-2, 5, 1), IVec3::new(200, 0, 0)] {
+        for new in [
+            IVec3::new(3, 0, 0),
+            IVec3::new(-2, 5, 1),
+            IVec3::new(200, 0, 0),
+        ] {
             let slabs = scrolled(old, new);
             let volume: i32 = slabs.iter().map(|(l, h)| (*h - *l).element_product()).sum();
             // Cells in the new box and not the old one.

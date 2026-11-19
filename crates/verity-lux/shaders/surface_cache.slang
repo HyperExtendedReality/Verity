@@ -11,9 +11,13 @@
 // mass; incoming bounce light per source and diffuse reflectance; dependency
 // bounds as half floats and flags. Light is R11G11B10 floats.
 static const uint SURFACE_ATLAS_WIDTH = 2048u; // surface::ATLAS_WIDTH
-static const float SURFACE_MIN_BLEND = 0.1;
+// A texel keeps up to 1 / this visits (two bounce rays each): ten left its
+// bounce light and sampled emitters spotty. Changes it depends on reset it.
+static const float SURFACE_MIN_BLEND = 1.0 / 32.0;
 // A settled texel reshades its direct light on one visit in this many.
 static const uint SURFACE_DIRECT_EVERY = 4u;
+// Even a donor paired on every eligible visit gets a bounce every four visits.
+static const uint SURFACE_BOUNCE_REFRESH_EVERY = 4u;
 
 struct SurfaceTexel {
     TransportRadiance direct;   // outgoing direct light, diffuse, without self-emission
@@ -22,20 +26,6 @@ struct SurfaceTexel {
     float mass;
     DependencyContext dependency;
 };
-
-// Half-float bits in the low 16 bits of a uint. Slang's f16tof32/f32tof16
-// compile to 16-bit types, which need shaderInt16 and shaderFloat16; the
-// GLSL.std.450 pack/unpack stay in 32-bit registers and need neither.
-float halfToFloat(uint bits) {
-    uint low = bits & 0xffffu;
-    float2 pair = spirv_asm { OpExtInst $$float2 result glsl450 UnpackHalf2x16 $low };
-    return pair.x;
-}
-uint floatToHalf(float value) {
-    float2 pair = float2(value, 0.0);
-    uint packed = spirv_asm { OpExtInst $$uint result glsl450 PackHalf2x16 $pair };
-    return packed & 0xffffu;
-}
 
 uint packSurfaceLight(float3 value) {
     // 60000 keeps rounding below the half-float infinity exponent.
@@ -292,22 +282,41 @@ bool surfaceHashPoint(uint slot, out Hit hit, out float3 position, out float3 no
     return true;
 }
 
+// One mask for each class, built in the same subgroup operation so both ranks
+// see exactly the same participants even if the wave has not fully reconverged.
+// A 64-thread group fits in two words per class, regardless of subgroup size.
+uint surfaceBounceQuota(uint rays, uint lane, uint visit, uint phase, float mass) {
+    bool cold = mass == 0.0;
+    bool donor = mass >= float(SURFACE_DIRECT_EVERY)
+        && (visit + phase) % SURFACE_BOUNCE_REFRESH_EVERY != 0u;
+    uint bit = 1u << (lane & 31u);
+    uint2 member = lane < 32u ? uint2(bit, 0u) : uint2(0u, bit);
+    uint4 masks = WaveActiveBitOr(uint4(cold ? member : uint2(0u), donor ? member : uint2(0u)));
+    uint2 before = lane < 32u ? uint2(bit - 1u, 0u) : uint2(0xffffffffu, bit - 1u);
+    uint2 lower = (cold ? masks.xy : masks.zw) & before;
+    uint2 other = cold ? masks.zw : masks.xy;
+    bool paired = countbits(lower.x) + countbits(lower.y) < countbits(other.x) + countbits(other.y);
+    return rays + uint(cold && paired) - uint(donor && paired);
+}
+
 // One rolling share of the atlas and of the hashed cells a frame: threads
 // below params.surface.y take atlas texels, the next params.surfaceHash.y
 // take cells. Each shades its direct light as a diffuse surface seen head on,
-// traces cosine rays whose hits read other texels (so bounces build up across
+// traces bounce rays whose hits read other texels (so bounces build up across
 // frames), and blends both into its history.
 [shader("compute")]
 [numthreads(64, 1, 1)]
 void surfaceUpdate(uint3 thread : SV_DispatchThreadID) {
     uint texels = params.surface.x;
     uint budget = params.surface.y;
-    uint at;
+    uint at, visit;
     Hit hit;
     float3 position, normal;
     if (thread.x < budget) {
         // Consecutive texels share islands, so their rays stay coherent.
-        at = (params.frame.x * budget + thread.x) % texels;
+        uint cursor = params.frame.x * budget + thread.x;
+        visit = cursor / texels;
+        at = cursor - visit * texels;
         uint4 record = surfaceTexels[at];
         if (record.w == 0u) return;
         surfaceRecordPoint(record, hit, position, normal);
@@ -315,7 +324,9 @@ void surfaceUpdate(uint3 thread : SV_DispatchThreadID) {
         uint lane = thread.x - budget;
         uint cells = params.surfaceHash.x;
         if (lane >= params.surfaceHash.y || cells == 0u) return;
-        uint slot = (params.frame.x * params.surfaceHash.y + lane) % cells;
+        uint cursor = params.frame.x * params.surfaceHash.y + lane;
+        visit = cursor / cells;
+        uint slot = cursor - visit * cells;
         if (!surfaceHashPoint(slot, hit, position, normal)) return;
         at = texels + slot;
     }
@@ -323,7 +334,10 @@ void surfaceUpdate(uint3 thread : SV_DispatchThreadID) {
 
     SurfaceTexel texel = loadSurfaceTexel(at);
     // Drop history its rays or lights no longer support, as the world cache does.
-    bool reset = params.sourceHistory.y != 0u
+    // A gradually moving sun blends in, as in the world cache, instead of
+    // wiping every texel each frame it moves.
+    bool gradualSun = (params.sourceHistory.z & 1u) != 0u;
+    bool reset = (params.sourceHistory.y & ~(gradualSun ? BACKGROUND_SOURCE : 0u)) != 0u
         || dependencyIntersectsDirty(texel.dependency)
         || dependencyIntersectsEmissiveDirty(texel.dependency)
         || (params.lightDirtyMin.w > 0.5
@@ -341,7 +355,7 @@ void surfaceUpdate(uint3 thread : SV_DispatchThreadID) {
     float3 reflectance = texel.reflectance;
     // Lights and geometry that change reset the history above, so a settled
     // texel reshades its direct light on one visit in SURFACE_DIRECT_EVERY,
-    // keeping its bounce rays every visit. Picked per thread group, so a warp
+    // without changing the bounce quota. Picked per thread group, so a warp
     // shades or skips together.
     bool reuseDirect = mass >= float(SURFACE_DIRECT_EVERY)
         && transportHash((thread.x / 64u) ^ transportHash(params.frame.x ^ 0xd1ec7u))
@@ -361,10 +375,26 @@ void surfaceUpdate(uint3 thread : SV_DispatchThreadID) {
     TransportRadiance incoming = (TransportRadiance)0;
     float counted = 0.0;
     float3 origin = rayOffset(position, normal, params.tuning.z);
-    // One direction sample per block of 32 texels: neighbours share an island
-    // and nearly a normal, so a warp traces nearly parallel rays, which keeps
-    // software traversal coherent. Each frame draws new ones.
-    uint state = transportHash(at ^ transportHash(params.frame.x ^ 0x57face5u));
+    // Advance on visits, not frames: a sparse texel still gets consecutive R2
+    // samples. A fixed per-texel phase decorrelates neighbours. History resets
+    // do not replay the same directions.
+    uint rays = min(params.surface.w & 0xffu, 8u);
+    uint phase = transportHash(at ^ 0x57face5u);
+    uint sampleBase = phase + visit * rays;
+    uint quota = rays;
+    // Only lanes that reached the original bounce loop can give or take a ray.
+    // Keep the configured 0-ray disable and the existing 8-ray hard cap.
+    if ((params.ownerSequence.y & 4u) != 0u && rays > 0u && rays < 8u)
+        quota = surfaceBounceQuota(rays, thread.x % 64u, visit, phase, mass);
+    uint2 guide = 0u;
+    if (quota > 0u && (params.ownerSequence.y & 16u) != 0u) {
+        uint low, high;
+        float lodBlend;
+        splitLodBlendForParameters(position, params, low, high, lodBlend);
+        // surfaceUpdate runs before packProbes; only read the previous page.
+        guide = previousCascadeGuide(position, lodBlend < 0.5 ? low : high);
+    }
+    bool guided = any(guide != 0u);
 #ifdef GI_RAY_QUERY
     float reach = 1e20;
 #else
@@ -372,9 +402,23 @@ void surfaceUpdate(uint3 thread : SV_DispatchThreadID) {
     // software; past the reach a ray leaves the mean like an uncached hit.
     float reach = (params.surface.w >> 8u) == 0u ? 1e20 : float(params.surface.w >> 8u) * 0.01;
 #endif
-    [loop] for (uint ray = 0u; ray < min(params.surface.w & 0xffu, 8u); ++ray) {
-        float2 u = float2(rtgiRandom(state), rtgiRandom(state));
-        float3 direction = rtgiCosineDirection(normal, u);
+    [loop] for (uint ray = 0u; ray < quota; ++ray) {
+        // Donors omit their last primary sample; extras have their own visit
+        // stream, so neither allocation nor reset shifts the primary R2 index.
+        uint sampleIndex = ray < rays ? sampleBase + ray : transportHash(at ^ 0x9a6b5d1u) + visit;
+        float2 u = r2(sampleIndex);
+        float weight = 1.0;
+        float3 direction;
+        if (guided) {
+            uint seed = sampleIndex ^ 0x6db7c93u;
+            direction = sampleCascadeGuide(guide,
+                float4(transportRandom(seed, 0u), transportRandom(seed, 1u), u), normal, weight);
+            // The sampler's cosine uses this texel's geometric face normal.
+            // Below-face samples have zero target; do not trace or replace them.
+            if (weight <= 0.0) continue;
+        } else {
+            direction = rtgiCosineDirection(normal, u);
+        }
         DependencyContext rayDependency;
         float start, distance, padding;
         Hit bounce = traceRayTracked(origin, direction, reach, rayDependency, start, distance,
@@ -386,17 +430,20 @@ void surfaceUpdate(uint3 thread : SV_DispatchThreadID) {
             && !surfaceRead(bounce, origin + direction * bounce.distance, direction, true, other))
             continue;
         dependencyUnion(dependency, rayDependency);
-        counted += 1.0;
+        counted += weight;
         if (bounce.triangle == EMPTY) {
-            incoming.background += environmentRadiance(direction);
+            incoming.background += weight * environmentRadiance(direction);
             continue;
         }
-        dependencyUnion(dependency, other.dependency);
-        incoming.background += other.direct.background + other.bounce.background * other.reflectance;
-        incoming.emissive += other.direct.emissive + other.bounce.emissive * other.reflectance;
-        incoming.punctual += other.direct.punctual + other.bounce.punctual * other.reflectance;
+        // The hit texel's own dependency stays out: unioned in, bounds grew
+        // bounce by bounce over the whole scene (or to unknown), and any moving
+        // body then wiped every texel's bounce light. The hit texel resets
+        // itself, and this one follows it through the blend.
+        incoming.background += weight * (other.direct.background + other.bounce.background * other.reflectance);
+        incoming.emissive += weight * (other.direct.emissive + other.bounce.emissive * other.reflectance);
+        incoming.punctual += weight * (other.direct.punctual + other.bounce.punctual * other.reflectance);
     }
-    if (counted > 0.0) {
+    if (!guided && counted > 0.0) {
         incoming.background /= counted;
         incoming.emissive /= counted;
         incoming.punctual /= counted;
@@ -405,9 +452,20 @@ void surfaceUpdate(uint3 thread : SV_DispatchThreadID) {
     float blend = max(1.0 / (mass + 1.0), SURFACE_MIN_BLEND);
     if (mass > 0.0) dependencyUnion(dependency, texel.dependency);
     texel.direct = lerpTransport(texel.direct, direct, blend);
-    // Without a single cached hit the bounce estimate keeps its history.
-    if (counted > 0.0) texel.bounce = lerpTransport(texel.bounce, incoming, blend);
-    else if (mass == 0.0) texel.bounce = (TransportRadiance)0;
+    if (guided) {
+        // Average weighted (sample - history) over the scheduled quota. Unusable
+        // samples leave history alone, and proposal-dependent acceptance does not
+        // renormalize the PDF or change the mean of supported bounce light.
+        if (mass == 0.0) texel.bounce = (TransportRadiance)0;
+        float gain = blend / float(quota);
+        texel.bounce.background += (incoming.background - counted * texel.bounce.background) * gain;
+        texel.bounce.emissive += (incoming.emissive - counted * texel.bounce.emissive) * gain;
+        texel.bounce.punctual += (incoming.punctual - counted * texel.bounce.punctual) * gain;
+    } else if (counted > 0.0) {
+        texel.bounce = lerpTransport(texel.bounce, incoming, blend);
+    } else if (mass == 0.0) {
+        texel.bounce = (TransportRadiance)0;
+    }
     texel.reflectance = reflectance;
     texel.mass = min(mass + 1.0, 1.0 / SURFACE_MIN_BLEND);
     texel.dependency = dependency;

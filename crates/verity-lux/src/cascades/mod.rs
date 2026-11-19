@@ -11,6 +11,8 @@
 #![allow(unsafe_op_in_unsafe_fn)]
 
 mod accel;
+mod bvh;
+pub mod kd;
 pub mod scene;
 pub mod settings;
 pub mod surface;
@@ -63,34 +65,152 @@ macro_rules! spirv {
 /// Every pass this frame dispatches, with its SPIR-V for the software BVH and
 /// for hardware ray queries (`GI_RAY_QUERY`); the composite does not trace.
 const PASSES: &[(&str, &[u8], &[u8])] = &[
-    ("clear", spirv!("cascades", "clear"), spirv!("cascades", "clear", rq)),
-    ("seed", spirv!("cascades", "seed"), spirv!("cascades", "seed", rq)),
-    ("parents", spirv!("cascades", "parents"), spirv!("cascades", "parents", rq)),
-    ("rank", spirv!("cascades", "rank"), spirv!("cascades", "rank", rq)),
-    ("prefix", spirv!("cascades", "prefix"), spirv!("cascades", "prefix", rq)),
-    ("generateDirections", spirv!("cascades", "generateDirections"), spirv!("cascades", "generateDirections", rq)),
-    ("retain", spirv!("cascades", "retain"), spirv!("cascades", "retain", rq)),
-    ("trace", spirv!("cascades", "trace"), spirv!("cascades", "trace", rq)),
-    ("reduce", spirv!("cascades", "reduce"), spirv!("cascades", "reduce", rq)),
-    ("merge", spirv!("cascades", "merge"), spirv!("cascades", "merge", rq)),
-    ("seedProbes", spirv!("cascades", "seedProbes"), spirv!("cascades", "seedProbes", rq)),
-    ("packProbes", spirv!("cascades", "packProbes"), spirv!("cascades", "packProbes", rq)),
-    ("temporal", spirv!("cascades", "temporal"), spirv!("cascades", "temporal", rq)),
-    ("denoise", spirv!("cascades", "denoise"), spirv!("cascades", "denoise", rq)),
-    ("commitCache", spirv!("cascades", "commitCache"), spirv!("cascades", "commitCache", rq)),
-    ("remapProbeHeads", spirv!("cascades", "remapProbeHeads"), spirv!("cascades", "remapProbeHeads", rq)),
-    ("worldResolve", spirv!("cascades", "worldResolve"), spirv!("cascades", "worldResolve", rq)),
-    ("traceDeferred", spirv!("cascades", "traceDeferred"), spirv!("cascades", "traceDeferred", rq)),
-    ("traceRecord", spirv!("cascades", "traceRecord"), spirv!("cascades", "traceRecord", rq)),
-    ("traceVisibility", spirv!("cascades", "traceVisibility"), spirv!("cascades", "traceVisibility", rq)),
-    ("traceResolve", spirv!("cascades", "traceResolve"), spirv!("cascades", "traceResolve", rq)),
-    ("surfaceUpdate", spirv!("cascades", "surfaceUpdate"), spirv!("cascades", "surfaceUpdate", rq)),
-    ("reference", spirv!("cascades", "reference"), spirv!("cascades", "reference", rq)),
-    ("compositeAnchors", spirv!("composite", "compositeAnchors"), spirv!("composite", "compositeAnchors")),
-    ("compositeCompute", spirv!("composite", "compositeCompute"), spirv!("composite", "compositeCompute")),
-    ("compositeCapture", spirv!("composite", "compositeCapture"), spirv!("composite", "compositeCapture")),
+    (
+        "clear",
+        spirv!("cascades", "clear"),
+        spirv!("cascades", "clear", rq),
+    ),
+    (
+        "seed",
+        spirv!("cascades", "seed"),
+        spirv!("cascades", "seed", rq),
+    ),
+    (
+        "parents",
+        spirv!("cascades", "parents"),
+        spirv!("cascades", "parents", rq),
+    ),
+    (
+        "rank",
+        spirv!("cascades", "rank"),
+        spirv!("cascades", "rank", rq),
+    ),
+    (
+        "prefix",
+        spirv!("cascades", "prefix"),
+        spirv!("cascades", "prefix", rq),
+    ),
+    (
+        "generateDirections",
+        spirv!("cascades", "generateDirections"),
+        spirv!("cascades", "generateDirections", rq),
+    ),
+    (
+        "retain",
+        spirv!("cascades", "retain"),
+        spirv!("cascades", "retain", rq),
+    ),
+    (
+        "trace",
+        spirv!("cascades", "trace"),
+        spirv!("cascades", "trace", rq),
+    ),
+    (
+        "reduce",
+        spirv!("cascades", "reduce"),
+        spirv!("cascades", "reduce", rq),
+    ),
+    (
+        "merge",
+        spirv!("cascades", "merge"),
+        spirv!("cascades", "merge", rq),
+    ),
+    (
+        "seedProbes",
+        spirv!("cascades", "seedProbes"),
+        spirv!("cascades", "seedProbes", rq),
+    ),
+    (
+        "packProbes",
+        spirv!("cascades", "packProbes"),
+        spirv!("cascades", "packProbes", rq),
+    ),
+    (
+        "temporal",
+        spirv!("cascades", "temporal"),
+        spirv!("cascades", "temporal", rq),
+    ),
+    (
+        "denoise",
+        spirv!("cascades", "denoise"),
+        spirv!("cascades", "denoise", rq),
+    ),
+    (
+        "commitCache",
+        spirv!("cascades", "commitCache"),
+        spirv!("cascades", "commitCache", rq),
+    ),
+    (
+        "remapProbeHeads",
+        spirv!("cascades", "remapProbeHeads"),
+        spirv!("cascades", "remapProbeHeads", rq),
+    ),
+    (
+        "worldResolve",
+        spirv!("cascades", "worldResolve"),
+        spirv!("cascades", "worldResolve", rq),
+    ),
+    (
+        "guidedResolve",
+        spirv!("cascades", "guidedResolve"),
+        spirv!("cascades", "guidedResolve", rq),
+    ),
+    (
+        "materialResolve",
+        spirv!("cascades", "materialResolve"),
+        spirv!("cascades", "materialResolve", rq),
+    ),
+    (
+        "traceDeferred",
+        spirv!("cascades", "traceDeferred"),
+        spirv!("cascades", "traceDeferred", rq),
+    ),
+    (
+        "traceRecord",
+        spirv!("cascades", "traceRecord"),
+        spirv!("cascades", "traceRecord", rq),
+    ),
+    (
+        "traceVisibility",
+        spirv!("cascades", "traceVisibility"),
+        spirv!("cascades", "traceVisibility", rq),
+    ),
+    (
+        "traceResolve",
+        spirv!("cascades", "traceResolve"),
+        spirv!("cascades", "traceResolve", rq),
+    ),
+    (
+        "surfaceUpdate",
+        spirv!("cascades", "surfaceUpdate"),
+        spirv!("cascades", "surfaceUpdate", rq),
+    ),
+    (
+        "reference",
+        spirv!("cascades", "reference"),
+        spirv!("cascades", "reference", rq),
+    ),
+    (
+        "materialReference",
+        spirv!("cascades", "materialReference"),
+        spirv!("cascades", "materialReference", rq),
+    ),
+    (
+        "compositeAnchors",
+        spirv!("composite", "compositeAnchors"),
+        spirv!("composite", "compositeAnchors"),
+    ),
+    (
+        "compositeCompute",
+        spirv!("composite", "compositeCompute"),
+        spirv!("composite", "compositeCompute"),
+    ),
+    (
+        "compositeCapture",
+        spirv!("composite", "compositeCapture"),
+        spirv!("composite", "compositeCapture"),
+    ),
 ];
-
 
 use vk::DescriptorType as D;
 /// The cascades' set 0, as `compute_layout` in the legacy renderer (minus the
@@ -175,7 +295,10 @@ enum SunChange {
 /// How the sky and ground changed: as with the sun, a step of up to 5% keeps
 /// the cache's history blending.
 fn ambient_change(now: [Vec3; 2], before: [Vec3; 2]) -> SunChange {
-    let step = (now[0] - before[0]).abs().max((now[1] - before[1]).abs()).max_element();
+    let step = (now[0] - before[0])
+        .abs()
+        .max((now[1] - before[1]).abs())
+        .max_element();
     if step == 0.0 {
         SunChange::None
     } else if step <= 0.05 * before[0].max(before[1]).max_element() {
@@ -194,18 +317,30 @@ fn light_changes(lights: &[GiLight], previous: &[GiLight]) -> (SunChange, bool) 
             .copied()
     };
     fn points(ls: &[GiLight]) -> impl Iterator<Item = &[u8]> {
-        ls.iter().filter(|l| l.position[3] > 0.0).map(bytemuck::bytes_of)
+        ls.iter()
+            .filter(|l| l.position[3] > 0.0)
+            .map(bytemuck::bytes_of)
     }
     let sun_change = match (sun(lights), sun(previous)) {
         (None, None) => SunChange::None,
         (Some(a), Some(b)) if bytemuck::bytes_of(&a) == bytemuck::bytes_of(&b) => SunChange::None,
         (Some(a), Some(b)) => {
-            let (da, db) = (Vec3::from_slice(&a.position[..3]), Vec3::from_slice(&b.position[..3]));
-            let (ca, cb) = (Vec3::from_slice(&a.color[..3]), Vec3::from_slice(&b.color[..3]));
+            let (da, db) = (
+                Vec3::from_slice(&a.position[..3]),
+                Vec3::from_slice(&b.position[..3]),
+            );
+            let (ca, cb) = (
+                Vec3::from_slice(&a.color[..3]),
+                Vec3::from_slice(&b.color[..3]),
+            );
             // About 2.6 degrees and 5% of the brightest channel.
             let small = da.normalize().dot(db.normalize()) > 0.999
                 && (ca - cb).abs().max_element() <= 0.05 * cb.max_element();
-            if small { SunChange::Gradual } else { SunChange::Hard }
+            if small {
+                SunChange::Gradual
+            } else {
+                SunChange::Hard
+            }
         }
         _ => SunChange::Hard,
     };
@@ -225,10 +360,20 @@ fn emitter_lights(emitters: &[Emitter]) -> Vec<GiLight> {
             let pmf = e.power / total;
             cdf += pmf;
             GiLight {
-                position: e.a.extend(if e.double_sided { -2.0 } else { -1.0 }).to_array(),
+                position: e
+                    .a
+                    .extend(if e.double_sided { -2.0 } else { -1.0 })
+                    .to_array(),
                 color: [0.0, 0.0, 0.0, e.area],
                 // The last bound is exactly 1, so every selection finds an emitter.
-                direction: e.normal.extend(if index + 1 == emitters.len() { 1.0 } else { cdf }).to_array(),
+                direction: e
+                    .normal
+                    .extend(if index + 1 == emitters.len() {
+                        1.0
+                    } else {
+                        cdf
+                    })
+                    .to_array(),
                 edge1: e.edge1.extend(pmf).to_array(),
                 edge2: e.edge2.extend(0.0).to_array(),
                 source: [e.instance, e.triangle, 0, 0],
@@ -287,13 +432,21 @@ fn pipeline_cache_path() -> std::path::PathBuf {
     std::env::temp_dir().join("verity-lux-pipelines.bin")
 }
 
-/// Compile every pass in parallel through a disk-backed pipeline cache. The
+fn reference_pass(gather: FinalGather) -> &'static str {
+    match gather {
+        FinalGather::MaterialSpace => "materialReference",
+        _ => "reference",
+    }
+}
+
+/// Compile the requested passes in parallel through a disk-backed pipeline cache. The
 /// transport shaders are large: a cold driver compile takes minutes on one core.
 fn compile_passes(
     device: ash::Device,
     layout: vk::PipelineLayout,
     composite_layout: vk::PipelineLayout,
     ray_query: bool,
+    include: impl Fn(&str) -> bool,
 ) -> CompiledPasses {
     let initial = std::fs::read(pipeline_cache_path()).unwrap_or_default();
     let cache = unsafe {
@@ -310,6 +463,7 @@ fn compile_passes(
         let device = &device;
         let handles: Vec<_> = PASSES
             .iter()
+            .filter(|&&(name, _, _)| include(name))
             .map(|&(name, software, hardware)| {
                 let spirv = if ray_query { hardware } else { software };
                 scope.spawn(move || {
@@ -380,6 +534,7 @@ pub struct SplitRadianceCascades {
     command_pool: vk::CommandPool,
     schedule: CandidateSchedule,
     history_valid: bool,
+    previous_final_gather: FinalGather,
     scene_changed: bool,
     /// Models added since the scene was last uploaded.
     upload_pending: bool,
@@ -390,6 +545,8 @@ pub struct SplitRadianceCascades {
     /// Frames `Settings::reference` has averaged, and the pose it averaged them at.
     reference_frames: u32,
     reference_pose: Option<[glam::Vec4; 3]>,
+    /// Where the viewer looks, for `Settings::foveation`; `None` is the view's centre.
+    gaze: Option<Vec3>,
     started: Instant,
     /// Debugging aid: `VERITY_LUX_PASS_LIMIT=n` dispatches only the first
     /// `n` passes of each frame, to bisect GPU faults.
@@ -403,7 +560,11 @@ pub struct SplitRadianceCascades {
 impl SplitRadianceCascades {
     pub fn new(settings: Settings) -> Self {
         let mut scene = GiScene::default();
-        scene.set_surface_texel(if settings.surface_cache { settings.surface_texel } else { 0.0 });
+        scene.set_surface_texel(if settings.surface_cache {
+            settings.surface_texel
+        } else {
+            0.0
+        });
         Self {
             settings,
             scene,
@@ -425,6 +586,7 @@ impl SplitRadianceCascades {
             command_pool: vk::CommandPool::null(),
             schedule: CandidateSchedule::default(),
             history_valid: false,
+            previous_final_gather: FinalGather::Probes,
             scene_changed: true,
             upload_pending: false,
             previous_clip: None,
@@ -432,6 +594,7 @@ impl SplitRadianceCascades {
             previous_ambient: [Vec3::ZERO; 2],
             reference_frames: 0,
             reference_pose: None,
+            gaze: None,
             started: Instant::now(),
             pass_limit: std::env::var("VERITY_LUX_PASS_LIMIT")
                 .ok()
@@ -441,6 +604,12 @@ impl SplitRadianceCascades {
             readback: None,
             capture: None,
         }
+    }
+
+    /// The world direction the viewer looks along, from an eye tracker, for
+    /// [`Settings::foveation`]. `None` uses the centre of the view.
+    pub fn set_gaze(&mut self, direction: Option<Vec3>) {
+        self.gaze = direction.map(Vec3::normalize_or_zero);
     }
 
     /// Read back the next frame's HDR image; see [`Self::take_capture`].
@@ -815,8 +984,8 @@ impl SplitRadianceCascades {
                 .collect::<std::result::Result<_, _>>()?;
             uniforms.push(slot.try_into().ok().unwrap());
         }
-        let light_bytes =
-            (verity_render::MAX_LIGHTS + MAX_EMITTERS + 2) as u64 * mem::size_of::<GiLight>() as u64;
+        let light_bytes = (verity_render::MAX_LIGHTS + MAX_EMITTERS + 2) as u64
+            * mem::size_of::<GiLight>() as u64;
         let lights = [
             buffer(
                 "gi lights",
@@ -1058,7 +1227,11 @@ impl SplitRadianceCascades {
                 write_set(device, *set, &main, entries);
             }
             // The reference writes the unfiltered image directly.
-            let steps = if self.settings.reference { 0 } else { self.settings.spatial_filter_steps };
+            let steps = if self.settings.reference {
+                0
+            } else {
+                self.settings.spatial_filter_steps
+            };
             let display = &irr[composite_display_index(steps, p)];
             let display_history = if steps == 0 {
                 &meta[3 + p]
@@ -1103,7 +1276,14 @@ impl SplitRadianceCascades {
         let buffers = view
             .heads
             .into_iter()
-            .chain([view.entries, view.descriptors, view.reference_sum, view.history, view.probes, view.merge_list])
+            .chain([
+                view.entries,
+                view.descriptors,
+                view.reference_sum,
+                view.history,
+                view.probes,
+                view.merge_list,
+            ])
             .chain(view.rtgi)
             .chain(view.lights)
             .chain(view.uniforms.into_iter().flatten());
@@ -1187,7 +1367,11 @@ impl SplitRadianceCascades {
         // total power, and whether it made the cut (all did unless the list is full).
         let emitter_power: f32 = emitters.iter().map(|e| e.power).sum();
         let emitter_cutoff = if emitters.len() == MAX_EMITTERS {
-            emitters.iter().map(|e| e.power).fold(f32::INFINITY, f32::min) * 0.9999
+            emitters
+                .iter()
+                .map(|e| e.power)
+                .fold(f32::INFINITY, f32::min)
+                * 0.9999
         } else {
             0.0
         };
@@ -1201,11 +1385,16 @@ impl SplitRadianceCascades {
         let lights_changed = ambient_change != SunChange::None
             || bytemuck::cast_slice::<_, u8>(conventional_lights)
                 != bytemuck::cast_slice::<_, u8>(&self.previous_lights);
-        let first = view.fresh || self.scene_changed;
+        let first =
+            view.fresh || self.scene_changed || self.previous_final_gather != settings.final_gather;
         let history_valid = self.history_valid && !first;
         // The reference restarts when what it averages changes. TAA jitter moves
         // only the projection's x and y rows, so it compares the rest.
-        let pose = [frame.view_proj.row(2), frame.view_proj.row(3), frame.eye.extend(0.0)];
+        let pose = [
+            frame.view_proj.row(2),
+            frame.view_proj.row(3),
+            frame.eye.extend(0.0),
+        ];
         if first || lights_changed || self.reference_pose != Some(pose) {
             self.reference_frames = 0;
         }
@@ -1217,13 +1406,18 @@ impl SplitRadianceCascades {
         let (phase, quota) = self.schedule.next(samples, budget);
         let active = SOURCE_BACKGROUND | if conventional > 0 { SOURCE_PUNCTUAL } else { 0 };
         // Sunlight is stored in the background group, point lights in punctual.
-        let (sun_change, points_changed) = light_changes(conventional_lights, &self.previous_lights);
+        let (sun_change, points_changed) =
+            light_changes(conventional_lights, &self.previous_lights);
         let sun_change = sun_change.max(ambient_change);
         let changed = if first {
             active
         } else {
             (if points_changed { SOURCE_PUNCTUAL } else { 0 })
-                | (if sun_change != SunChange::None { SOURCE_BACKGROUND } else { 0 })
+                | (if sun_change != SunChange::None {
+                    SOURCE_BACKGROUND
+                } else {
+                    0
+                })
         };
         let gradual_sun = !first && sun_change == SunChange::Gradual;
         let params = Parameters {
@@ -1246,7 +1440,16 @@ impl SplitRadianceCascades {
                 settings.temporal_blend,
                 0.0,
                 f32::from(u8::from(history_valid)),
-                settings.history_frames as f32,
+                // Both clip matrices use the same jitter. Cap history only
+                // when the view actually moves, since glossy radiance shifts.
+                if !settings.reference
+                    && settings.final_gather == FinalGather::MaterialSpace
+                    && !clip.abs_diff_eq(previous_clip, 1e-6)
+                {
+                    settings.history_frames.min(4) as f32
+                } else {
+                    settings.history_frames as f32
+                },
             ],
             interval_history: [
                 settings.split_transmittance_blend,
@@ -1256,7 +1459,12 @@ impl SplitRadianceCascades {
             ],
             frame: [frame.frame_number as u32, 0, self.instances, conventional],
             // Emitters follow the conventional lights.
-            light_counts: [conventional, emitter_count, settings.emissive_samples, emitter_power.to_bits()],
+            light_counts: [
+                conventional,
+                emitter_count,
+                settings.emissive_samples,
+                emitter_power.to_bits(),
+            ],
             stability: [
                 f32::from(u8::from(history_valid)),
                 f32::from(u8::from(first || lights_changed)),
@@ -1277,7 +1485,14 @@ impl SplitRadianceCascades {
             ],
             owner_sequence: [
                 resolve_scale(&settings),
-                0,
+                (if settings.reference && settings.final_gather != FinalGather::MaterialSpace {
+                    FinalGather::Probes
+                } else {
+                    settings.final_gather
+                }) as u32
+                    | (u32::from(settings.surface_cold_priority) << 2)
+                    | (u32::from(settings.emitter_low_discrepancy) << 3)
+                    | (u32::from(settings.surface_bounce_guide) << 4),
                 quota,
                 sparse_candidate_phase_word(phase, first || camera_changed, false),
             ],
@@ -1293,7 +1508,8 @@ impl SplitRadianceCascades {
                 settings.surface_updates.min(self.surface_texels),
                 settings.surface_from_level,
                 settings.surface_bounce_rays.min(8)
-                    | ((settings.surface_software_reach.max(0.0) * 100.0) as u32).min(0xff_ffff) << 8,
+                    | ((settings.surface_software_reach.max(0.0) * 100.0) as u32).min(0xff_ffff)
+                        << 8,
             ],
             surface_hash: [
                 self.surface_hash_cells,
@@ -1301,6 +1517,14 @@ impl SplitRadianceCascades {
                 SURFACE_HASH_LIFETIME,
                 0,
             ],
+            foveation: {
+                // The view's centre: any depth inside the frustum lies along it.
+                let centre = clip.inverse().project_point3(Vec3::new(0.0, 0.0, 0.5));
+                let gaze = self
+                    .gaze
+                    .unwrap_or((centre - frame.eye).normalize_or_zero());
+                gaze.extend(settings.foveation.max(0.0)).to_array()
+            },
             // As `GetDimensions` saw them: the whole buffer, in elements.
             lengths: [
                 elements(&view.entries, ENTRY_SIZE),
@@ -1308,7 +1532,12 @@ impl SplitRadianceCascades {
                 elements(&view.heads[slot], 4),
                 elements(&view.merge_list, 4),
             ],
-            word_lengths: [elements(&self.geometry, 16), elements(&self.words, 16), 0, 0],
+            word_lengths: [
+                elements(&self.geometry, 16),
+                elements(&self.words, 16),
+                0,
+                0,
+            ],
             // Uploads and `tend_capture` happen before this; nothing moves until next frame.
             buffers: [
                 &self.geometry,
@@ -1337,7 +1566,8 @@ impl SplitRadianceCascades {
             ]
             .map(|buffer| buffer.address),
             ..Parameters::default()
-        };        for (index, uniform) in view.uniforms[slot].iter_mut().enumerate() {
+        };
+        for (index, uniform) in view.uniforms[slot].iter_mut().enumerate() {
             let mut p = params;
             if index < LEVELS {
                 p.frame[1] = index as u32;
@@ -1477,7 +1707,12 @@ impl SplitRadianceCascades {
             // clear empties the probe directory: the composite's fallback walks
             // it, and a stale one made each lookup walk all of it.
             dispatch("clear", clear[0], clear_groups, 1);
-            dispatch("reference", compute[0], shading_x, shading_y);
+            dispatch(
+                reference_pass(settings.final_gather),
+                compute[0],
+                shading_x,
+                shading_y,
+            );
             self.reference_frames += 1;
         } else {
             // Receivers, probe ranking and the cascade hierarchy.
@@ -1540,7 +1775,12 @@ impl SplitRadianceCascades {
             );
             dispatch("packProbes", compute[0], pack_x, pack_y);
             // Per-pixel irradiance, temporal history, spatial filtering.
-            dispatch("worldResolve", world_resolve, shading_x, shading_y);
+            let gather_pass = match settings.final_gather {
+                FinalGather::Probes => "worldResolve",
+                FinalGather::Cosine | FinalGather::Guided => "guidedResolve",
+                FinalGather::MaterialSpace => "materialResolve",
+            };
+            dispatch(gather_pass, world_resolve, shading_x, shading_y);
             dispatch("temporal", temporal, shading_x, shading_y);
             // Only temporal results become history; filtered display values never feed back.
             let layers = vk::ImageSubresourceLayers::default()
@@ -1607,6 +1847,7 @@ impl SplitRadianceCascades {
         }
 
         self.history_valid = true;
+        self.previous_final_gather = settings.final_gather;
         self.scene_changed = false;
         Ok(())
     }
@@ -1644,7 +1885,8 @@ impl RenderExtension for SplitRadianceCascades {
     }
 
     fn sky_reflections(&self) -> bool {
-        self.settings.sky_reflections
+        // MSGI already integrates the reflected environment along its rays.
+        self.settings.sky_reflections && self.settings.final_gather != FinalGather::MaterialSpace
     }
 
     fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
@@ -1721,8 +1963,14 @@ impl RenderExtension for SplitRadianceCascades {
                 let pipelines = Self::pipelines(gpu, ray_query)?;
                 let device = gpu.device.clone();
                 let (layout, composite_layout) = (pipelines.layout, pipelines.composite_layout);
+                // Compile optional resolve and reference kernels only on use.
                 self.compile = Some(std::thread::spawn(move || {
-                    compile_passes(device, layout, composite_layout, ray_query)
+                    compile_passes(device, layout, composite_layout, ray_query, |name| {
+                        !matches!(
+                            name,
+                            "guidedResolve" | "materialResolve" | "reference" | "materialReference"
+                        )
+                    })
                 }));
                 self.status = GiStatus::Compiling {
                     since: Instant::now(),
@@ -1786,6 +2034,32 @@ impl RenderExtension for SplitRadianceCascades {
         self.poll_compile();
         if !self.active() || self.view.is_none() || frame.viewport[2] == 0 || frame.viewport[3] == 0
         {
+            return Ok(());
+        }
+        // Compile these passes only when a view actually requests them.
+        let optional_pass = if self.settings.reference {
+            Some(reference_pass(self.settings.final_gather))
+        } else {
+            match self.settings.final_gather {
+                FinalGather::Probes => None,
+                FinalGather::Cosine | FinalGather::Guided => Some("guidedResolve"),
+                FinalGather::MaterialSpace => Some("materialResolve"),
+            }
+        };
+        if let Some(pass) = optional_pass
+            && let Some(pipelines) = self.pipelines.as_ref()
+            && !pipelines.passes.contains_key(pass)
+        {
+            let device = gpu.device.clone();
+            let (layout, composite_layout) = (pipelines.layout, pipelines.composite_layout);
+            self.status = GiStatus::Compiling {
+                since: Instant::now(),
+            };
+            self.compile = Some(std::thread::spawn(move || {
+                compile_passes(device, layout, composite_layout, hardware, |name| {
+                    name == pass
+                })
+            }));
             return Ok(());
         }
         unsafe { self.record_frame(gpu, frame) }
@@ -1863,8 +2137,15 @@ mod tests {
 
     #[test]
     fn sun_changes_are_background_changes() {
-        let point = GiLight { position: [0.0, 1.0, 0.0, 2.0], color: [1.0; 4], ..GiLight::default() };
-        let mask = GiLight { source: [1, 2, 3, 4], ..GiLight::default() };
+        let point = GiLight {
+            position: [0.0, 1.0, 0.0, 2.0],
+            color: [1.0; 4],
+            ..GiLight::default()
+        };
+        let mask = GiLight {
+            source: [1, 2, 3, 4],
+            ..GiLight::default()
+        };
         let base = [point, sun([0.0, 1.0, 0.0], [3.0; 3]), mask];
         assert_eq!(light_changes(&base, &base), (SunChange::None, false));
 
@@ -1877,7 +2158,14 @@ mod tests {
         let gone = [point, mask];
         assert_eq!(light_changes(&gone, &base), (SunChange::Hard, false));
 
-        let moved = [GiLight { position: [1.0, 1.0, 0.0, 2.0], ..point }, base[1], mask];
+        let moved = [
+            GiLight {
+                position: [1.0, 1.0, 0.0, 2.0],
+                ..point
+            },
+            base[1],
+            mask,
+        ];
         assert_eq!(light_changes(&moved, &base), (SunChange::None, true));
     }
 

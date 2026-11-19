@@ -60,6 +60,7 @@ struct Parameters {
     uint4 rayTraced;      // multi-bounce, spatial samples, reservoir history, previous frame ray traced (history valid)
     uint4 surface;        // surface cache texels (0 = off), texels updated per frame, first cascade read from the cache, bounce rays per texel (bits 0-7) and software bounce reach in cm (8-31, 0 = none)
     uint4 surfaceHash;    // hashed surface cells (0 = off), cells updated per frame, frames unread before a cell is dropped, reserved
+    float4 foveation;     // world gaze direction, degrees from it at which probe spacing doubles (0 = off)
     // Elements behind the pointers below, which have no GetDimensions.
     uint4 lengths;        // cache entries, previous entries, head words, merge-list words
     uint4 wordLengths;    // geometry words, scene words; zw unused
@@ -118,7 +119,7 @@ struct Light { float4 position, color, direction, edge1, edge2; uint4 source; };
 // background group (`clampOutgoingTransportRadiance`), so it is never active,
 // and entries carry only what the passes move.
 // One per screen sample, variant and level: the cell a visible surface seeds,
-// before transport. Kept apart from the 240-byte entries so the passes that
+// before transport. Kept apart from the 192-byte entries so the passes that
 // rank and allocate them touch one 32-byte record each, not a cache line or two.
 struct Descriptor {
     int4 key;
@@ -128,26 +129,131 @@ struct Descriptor {
     uint flags;      // bits 0-7: selected for a ray (1, or 2 while cold admission decides); bit 8: seeded
 };
 
+// Half-float bits in the low 16 bits of a uint. Slang's f16tof32/f32tof16
+// compile to 16-bit types, which need shaderInt16 and shaderFloat16; the
+// GLSL.std.450 pack/unpack stay in 32-bit registers and need neither.
+float halfToFloat(uint bits) {
+    uint low = bits & 0xffffu;
+    float2 pair = spirv_asm { OpExtInst $$float2 result glsl450 UnpackHalf2x16 $low };
+    return pair.x;
+}
+uint floatToHalf(float value) {
+    float2 pair = float2(value, 0.0);
+    uint packed = spirv_asm { OpExtInst $$uint result glsl450 PackHalf2x16 $pair };
+    return packed & 0xffffu;
+}
+
+// Entry bounds are stored as halves relative to the entry's origin, rounded
+// outward so they stay conservative: a bound only ever grows, and one that
+// overflows a half reads as unknown. They are a quarter of what the cache
+// passes move, and halving them takes an entry from 240 to 192 bytes.
+uint halfToward(float x, bool up) {
+    uint h = floatToHalf(x);
+    float y = halfToFloat(h);
+    if (isnan(x) || (up ? y >= x : y <= x)) return h;
+    if ((h & 0x7fffu) == 0u) return up ? 1u : 0x8001u; // past ±0
+    // One step away from zero for a negative half moving down, or a positive one up.
+    return ((h & 0x8000u) != 0u) == up ? h - 1u : h + 1u;
+}
+uint packHalves(uint low, uint high) { return low | (high << 16); }
+float3 unpackHalves3(uint xy, uint z) {
+    return float3(halfToFloat(xy & 0xffffu), halfToFloat(xy >> 16), halfToFloat(z & 0xffffu));
+}
+
+// A sphere: center.xyz, radius.w > 0; -1 and anything else keep w and a zero center.
+uint2 packBoundsSphere(float4 sphere, float3 origin) {
+    if (!(sphere.w > 0.0)) return uint2(0u, packHalves(0u, floatToHalf(sphere.w)));
+    float3 offset = sphere.xyz - origin;
+    uint3 h = uint3(floatToHalf(offset.x), floatToHalf(offset.y), floatToHalf(offset.z));
+    float3 error = abs(float3(halfToFloat(h.x), halfToFloat(h.y), halfToFloat(h.z)) - offset);
+    uint radius = halfToward(sphere.w + length(error), true);
+    return uint2(packHalves(h.x, h.y), packHalves(h.z, radius));
+}
+float4 unpackBoundsSphere(uint2 words, float3 origin) {
+    float w = halfToFloat(words.y >> 16);
+    if (!(w > 0.0)) return float4(0.0, 0.0, 0.0, w);
+    return float4(origin + unpackHalves3(words.x, words.y), w);
+}
+
+// A box: min.xyz and max.xyz in the first three words, and the two w flags
+// (known, has bounds) in bits 0 and 1 of the last. A box without bounds reads
+// as zero, as stored.
+float4 unpackBoxMin(uint4 words, float3 origin) {
+    bool bounded = (words.w & 2u) != 0u;
+    return float4(bounded ? origin + unpackHalves3(words.x, words.y) : 0.0,
+        (words.w & 1u) != 0u ? 1.0 : 0.0);
+}
+float4 unpackBoxMax(uint4 words, float3 origin) {
+    bool bounded = (words.w & 2u) != 0u;
+    float3 maximum = float3(halfToFloat(words.y >> 16), halfToFloat(words.z & 0xffffu),
+        halfToFloat(words.z >> 16));
+    return float4(bounded ? origin + maximum : 0.0, bounded ? 1.0 : 0.0);
+}
+uint4 packBoxMin(uint4 words, float4 minimum, float3 origin) {
+    float3 offset = minimum.xyz - origin;
+    words.x = packHalves(halfToward(offset.x, false), halfToward(offset.y, false));
+    words.y = (words.y & 0xffff0000u) | halfToward(offset.z, false);
+    words.w = (words.w & ~1u) | (minimum.w > 0.5 ? 1u : 0u);
+    return words;
+}
+uint4 packBoxMax(uint4 words, float4 maximum, float3 origin) {
+    float3 offset = maximum.xyz - origin;
+    words.y = (words.y & 0xffffu) | (halfToward(offset.x, true) << 16);
+    words.z = packHalves(halfToward(offset.y, true), halfToward(offset.z, true));
+    words.w = (words.w & ~2u) | (maximum.w > 0.5 ? 2u : 0u);
+    return words;
+}
+
+// The header (key to padding) comes first and is 48 contiguous bytes: all a
+// retained stub writes. Bounds are relative to `origin`, so set it first.
 struct Entry {
     int4 key;
-    float4 interval; // J.rgb, beta (paper Eq. 6)
-    float4 merged;   // I.rgb, valid
-    float4 origin;   // canonical world-grid center.xyz, retained transmittance sample count.w
     uint next, valid, lastSample, samples;
     uint2 identity; // x: retained sample mass; y: unchanged history slot + 1 (see commitCache)
     uint2 padding; // x: selected-descriptor / retained-cache remap; y: visible-init marker
+    float4 origin;   // canonical world-grid center.xyz, retained transmittance sample count.w
+    float4 interval; // J.rgb, beta (paper Eq. 6)
+    float4 merged;   // I.rgb, valid
     // Primary interval segment sphere (center.xyz, radius.w); zero/malformed is unknown.
     float4 normal;
-    // Local-light dependency spheres: center.xyz, radius.w > 0; w == -1 is
-    // proven lighting-independent zero; zero/malformed values are unknown.
-    float4 boundaryInterval; // Union of receiver hits contributing to retained raw J.
-    float4 boundaryMerged; // Union of supported I hits, including cascade children.
-    float4 dependencyMin; // RAW J/beta dependencies; w: 1 when measured (0 = unknown)
-    float4 dependencyMax; // xyz: union maximum, w: 1 when the measured union is nonempty
-    float4 mergedDependencyMin; // Full I includes child/visibility dependencies.
-    float4 mergedDependencyMax;
     float4 punctualInterval; // J.rgb, independent radiance mass.w
     float4 punctualMerged; // conditional I.rgb, independent support.w
+    uint2 boundaryIntervalWords;
+    uint2 boundaryMergedWords;
+    uint4 dependencyWords;
+    uint4 mergedDependencyWords;
+
+    // Local-light dependency spheres: center.xyz, radius.w > 0; w == -1 is
+    // proven lighting-independent zero; zero/malformed values are unknown.
+    // Union of receiver hits contributing to retained raw J.
+    property float4 boundaryInterval {
+        get { return unpackBoundsSphere(boundaryIntervalWords, origin.xyz); }
+        set { boundaryIntervalWords = packBoundsSphere(newValue, origin.xyz); }
+    }
+    // Union of supported I hits, including cascade children.
+    property float4 boundaryMerged {
+        get { return unpackBoundsSphere(boundaryMergedWords, origin.xyz); }
+        set { boundaryMergedWords = packBoundsSphere(newValue, origin.xyz); }
+    }
+    // RAW J/beta dependencies; w: 1 when measured (0 = unknown)
+    property float4 dependencyMin {
+        get { return unpackBoxMin(dependencyWords, origin.xyz); }
+        set { dependencyWords = packBoxMin(dependencyWords, newValue, origin.xyz); }
+    }
+    // xyz: union maximum, w: 1 when the measured union is nonempty
+    property float4 dependencyMax {
+        get { return unpackBoxMax(dependencyWords, origin.xyz); }
+        set { dependencyWords = packBoxMax(dependencyWords, newValue, origin.xyz); }
+    }
+    // Full I includes child/visibility dependencies.
+    property float4 mergedDependencyMin {
+        get { return unpackBoxMin(mergedDependencyWords, origin.xyz); }
+        set { mergedDependencyWords = packBoxMin(mergedDependencyWords, newValue, origin.xyz); }
+    }
+    property float4 mergedDependencyMax {
+        get { return unpackBoxMax(mergedDependencyWords, origin.xyz); }
+        set { mergedDependencyWords = packBoxMax(mergedDependencyWords, newValue, origin.xyz); }
+    }
 };
 
 // A dependency is the union of world-space segments that established a value.
@@ -256,17 +362,15 @@ void storeEntryMergedDependency(inout Entry entry, DependencyContext context) {
     entry.mergedDependencyMax = float4(context.maximum, context.hasBounds ? 1.0 : 0.0);
 }
 
-// Probe-major Split irradiance stores a 6x6 octahedral table. Each texel holds
-// conditional diffuse irradiance in rgb and angular coverage in w; aggregate
-// dependencies preserve conservative invalidation of packed history.
+// Each 6x6 octahedral texel stores irradiance times angular coverage in rgb
+// and angular coverage in w. The receiver normalizes after interpolation.
 struct DirectionalProbe {
-    float4 irradiance[36]; // BACKGROUND conditional diffuse irradiance and angular support
-    float4 emissiveIrradiance[36]; // EMISSIVE conditional irradiance and angular support
-    float4 punctualIrradiance[36]; // PUNCTUAL conditional irradiance and angular support
+    float4 irradiance[36];
+    float4 punctualIrradiance[36];
     float4 dependencyMin; // aggregate dependency for supported directional bins
     float4 dependencyMax;
     int4 cacheKey; // canonical position and LOD of a secondary-cache probe
-    uint4 cacheGeneration; // frame index, occupied, reserved, reserved
+    uint4 cacheGeneration; // frame index, occupied, two packed guide words
 };
 
 [ForceInline]
@@ -352,8 +456,21 @@ float3 deferredDiffuseAlbedo(uint4 packed) {
     return deferredBaseColor(packed) * (1.0 - metallic);
 }
 
+// Matches FinalGather::MaterialSpace, including when other experiment bits are set.
+bool materialSpaceGather(Parameters p) { return (p.ownerSequence.y & 3u) == 3u; }
+
 float3 deferredShadingNormal(uint4 packed) {
     return decodeNormal(float2(packed.w & 4095u,(packed.w >> 12) & 4095u)/4095.0);
+}
+
+// Pre-shaded lighting cannot be shared across a discontinuity in the BSDF.
+bool materialSpaceCompatible(uint4 a, uint4 b) {
+    uint3 x = (a.xxx >> uint3(0u, 8u, 16u)) & 255u;
+    uint3 y = (b.xxx >> uint3(0u, 8u, 16u)) & 255u;
+    return a.y == b.y && (a.z & 65535u) == (b.z & 65535u)
+        && abs(int(a.x >> 24u) - int(b.x >> 24u)) <= 6
+        && all(abs(int3(x) - int3(y)) <= 16)
+        && dot(deferredShadingNormal(a), deferredShadingNormal(b)) > 0.985;
 }
 // Move along the oriented geometric normal by both the application's world
 // bias and a coordinate-relative representable offset (Ray Tracing Gems Ch. 6).
@@ -459,6 +576,11 @@ void splitLodBlendForParameters(float3 position, Parameters p,
         float radius = max(offset.x, max(offset.y, offset.z));
         float baseDistance = max(focalPixels * p.tuning.x / float(targetPixels), p.tuning.x);
         lodScale = radius / baseDistance;
+        if (p.foveation.w > 0.0) {
+            // Acuity falls off linearly with angle from the gaze (Guenter et al. 2012).
+            float cosine = dot(normalize(position - p.cameraPosition.xyz), p.foveation.xyz);
+            lodScale *= 1.0 + degrees(acos(clamp(cosine, -1.0, 1.0))) / p.foveation.w;
+        }
     } else {
         lodScale = float(targetPixels) / max(focalPixels * p.tuning.x, 1e-20);
     }

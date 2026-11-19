@@ -10,44 +10,58 @@
 //! `--eye=X,Y,Z`, `--target=X,Y,Z`, `--updates=N` and `--uncapped` adjust it, `--no-gi-light`
 //! saves direct light alone, and `--pxtgi` (diffuse only without `--reflections`),
 //! `--voxel` and `--residual` run those instead (`--cell=M` and `--levels=N`
-//! set their finest voxel and level count). `--reference` path traces Split's own hit
-//! shading per pixel with no cache (`Settings::reference`), and
-//! `--pxtgi-reference` PXTGI's simpler Lambertian one; both need a high `--warm`.
+//! set their finest voxel and level count, `--holographic=N` lights level N's
+//! box with Holographic Radiance Cascades). `--reference` path traces Split's hit
+//! shading without a cache; add `--gather=msgi` for the visible material's full
+//! BSDF. `--pxtgi-reference` traces the simpler Lambertian model. Reference
+//! runs need a high `--warm`.
 //! H switches between hardware and software tracing while viewing.
 //! `--turn=N` looks the other way for N frames before saving the still view.
 //! `--cold` saves the first frames GI draws instead, to see how it starts.
 //! `--lights=N` hangs N point lights in two rows along the nave. `--software`
 //! traces without hardware ray queries, and `--world=M` sets PXTGI's ray reach.
+//! `--pxtgi --pxtgi-temporal-reuse` tests a previous world hit (`--screen=0`).
+//! `--surface-bounce-guide` guides the existing Split surface-cache rays.
 //! `--scene=A.glb,B.glb` loads those from `assets/packed` instead of Sponza.
 //! `--no-surface-cache` turns the surface cache off, `--no-surface-hash` only
 //! its hashed cells for uncharted surfaces; `--surface-level=N` and
 //! `--surface-texel=M` set the first cascade read from it and its texel size;
+//! `--gather=probes|cosine|guided|msgi` selects Split's final gather; `cosine`
+//! controls for the extra traced gather without using the cascade guide.
+//! `msgi` enables Ultra PBR / MSGI: one material-weighted diffuse/GGX ray per resolve texel.
+//! `--surface-cold-priority` shifts surface rays toward cold slots, and
+//! `--emitter-low-discrepancy` stratifies the emissive candidate batch.
+//! `--voxel-bricks` enables empty-brick skips in the voxel and residual methods.
+//! `--voxel-visibility=dda|sdf|roma` selects diffuse voxel tracing (default DDA).
+//! `--voxel-source-history` tests rejection of stale screen/voxel history.
 //! `--surface-updates=N` and `--surface-rays=N` its texels shaded a frame and
 //! bounce rays each; `--surface-reach=M` caps software bounce rays.
+//! `--foveation=DEG` coarsens probes away from the view's centre
+//! (`Settings::foveation`).
 use glam::Vec3;
 use std::{collections::HashMap, path::Path, sync::Arc, time::Instant};
 use verity_core::{PointLight, World};
 use verity_lux::{
     Lux, Method,
-    cascades::settings::Settings,
+    cascades::settings::{FinalGather, Settings},
     pxtgi::{Capture, PxtgiDebug, PxtgiReflections, PxtgiSettings},
-    voxel::ScreenVoxelSettings,
+    voxel::{ScreenVoxelSettings, VoxelVisibility},
 };
 use verity_render::{Renderer, Sun};
 use winit::{
     application::ApplicationHandler,
     event::WindowEvent,
-    keyboard::Key,
     event_loop::{ActiveEventLoop, EventLoop},
+    keyboard::Key,
     window::{Window, WindowId},
 };
 
 /// Frames each measurement averages or saves.
 const TIMED: u32 = 120;
-// Two cycles of the renderer's 8-frame TAA jitter, saved `SAVE_EVERY` frames
+// One cycle of the renderer's 16-frame TAA jitter, saved `SAVE_EVERY` frames
 // apart: a readback takes two frames, which would only ever see half the
-// jitter, and three steps through all eight. A cycle's mean then does not
-// depend on where it starts, and saved frames 8 apart share their jitter.
+// jitter, and three steps through all sixteen. A cycle's mean then does not
+// depend on where it starts.
 const SAVED: u32 = 16;
 const SAVE_EVERY: u32 = 3;
 
@@ -115,7 +129,11 @@ impl Bench {
             let (n, sum, peak) = self.sums[name];
             let mean = sum / frames as f32;
             total += mean;
-            let ran = if n < frames { format!("  in {n} of {frames} frames") } else { String::new() };
+            let ran = if n < frames {
+                format!("  in {n} of {frames} frames")
+            } else {
+                String::new()
+            };
             println!("{label} {name:<20} {mean:8.3} ms  peak {peak:8.3}{ran}");
         }
         println!("{label} {:<20} {total:8.3} ms", "TOTAL");
@@ -176,7 +194,10 @@ impl Bench {
             self.pose += 1.0 / 60.0;
         }
         self.tick += 1;
-        (false, matches!(self.stage, Stage::Save(_)) && self.tick.is_multiple_of(SAVE_EVERY))
+        (
+            false,
+            matches!(self.stage, Stage::Save(_)) && self.tick.is_multiple_of(SAVE_EVERY),
+        )
     }
 }
 
@@ -262,10 +283,31 @@ impl ApplicationHandler for Viewer {
                 if let Some(length) = arg("interval") {
                     settings.interval_length = length.parse().expect("--interval=M");
                 }
+                if let Some(degrees) = arg("foveation") {
+                    settings.foveation = degrees.parse().expect("--foveation=DEG");
+                }
                 if flag("--reference") {
                     settings.reference = true;
                     settings.sampling.resolve_scale =
                         arg("resolve").map_or(1, |s| s.parse().expect("--resolve=N"));
+                }
+                settings.final_gather = match arg("gather").as_deref() {
+                    None | Some("probes") => FinalGather::Probes,
+                    Some("cosine") => FinalGather::Cosine,
+                    Some("guided") => FinalGather::Guided,
+                    Some("msgi") => FinalGather::MaterialSpace,
+                    Some(_) => panic!("--gather=probes|cosine|guided|msgi"),
+                };
+                settings.surface_cold_priority = flag("--surface-cold-priority");
+                settings.surface_bounce_guide = flag("--surface-bounce-guide");
+                settings.emitter_low_discrepancy = flag("--emitter-low-discrepancy");
+                if settings.reference
+                    && !matches!(
+                        settings.final_gather,
+                        FinalGather::Probes | FinalGather::MaterialSpace
+                    )
+                {
+                    panic!("--reference requires --gather=probes or --gather=msgi");
                 }
                 let lux = Lux::new(if flag("--pxtgi-reference") {
                     Method::Pxtgi(PxtgiSettings {
@@ -278,7 +320,9 @@ impl ApplicationHandler for Viewer {
                 } else if flag("--pxtgi") {
                     Method::Pxtgi(PxtgiSettings {
                         rays_per_texel: arg("rays").map_or(2, |r| r.parse().expect("--rays=N")),
-                        world_ray_distance: arg("world").map_or(30.0, |w| w.parse().expect("--world=M")),
+                        temporal_diffuse_reuse: flag("--pxtgi-temporal-reuse"),
+                        world_ray_distance: arg("world")
+                            .map_or(30.0, |w| w.parse().expect("--world=M")),
                         debug: if flag("--world-only") {
                             PxtgiDebug::WorldOnly
                         } else {
@@ -299,9 +343,22 @@ impl ApplicationHandler for Viewer {
                         max_distance: if flag("--no-screen") { 0.0 } else { 8.0 },
                         rays_per_texel: arg("rays").map_or(4, |r| r.parse().expect("--rays=N")),
                         residual: flag("--residual"),
+                        coarse_occupancy: flag("--voxel-bricks"),
+                        visibility: match arg("voxel-visibility").as_deref() {
+                            None | Some("dda") => VoxelVisibility::Dda,
+                            Some("sdf") => VoxelVisibility::Sdf,
+                            Some("roma") => VoxelVisibility::Roma,
+                            Some(_) => panic!("--voxel-visibility=dda|sdf|roma"),
+                        },
+                        source_aware_history: flag("--voxel-source-history"),
                         cell_size: arg("cell").map_or(0.125, |m| m.parse().expect("--cell=M")),
                         levels: arg("levels").map_or(5, |n| n.parse().expect("--levels=N")),
-                        world_ray_distance: arg("world").map_or(30.0, |w| w.parse().expect("--world=M")),
+                        world_ray_distance: arg("world")
+                            .map_or(30.0, |w| w.parse().expect("--world=M")),
+                        holographic: arg("holographic")
+                            .map(|n| n.parse().expect("--holographic=N")),
+                        bounce_links: arg("voxel-links")
+                            .map_or(0, |n| n.parse().expect("--voxel-links=N")),
                         ..ScreenVoxelSettings::default()
                     })
                 } else {
@@ -353,10 +410,18 @@ impl ApplicationHandler for Viewer {
                     && !event.repeat
                     && event.logical_key == Key::Character("h".into()) =>
             {
-                if let Some(lux) = self.renderer.as_mut().and_then(|r| r.extension_mut::<Lux>()) {
+                if let Some(lux) = self
+                    .renderer
+                    .as_mut()
+                    .and_then(|r| r.extension_mut::<Lux>())
+                {
                     self.hardware_rays = !self.hardware_rays;
                     lux.set_hardware_rays(self.hardware_rays);
-                    let mode = if self.hardware_rays { "hardware" } else { "software" };
+                    let mode = if self.hardware_rays {
+                        "hardware"
+                    } else {
+                        "software"
+                    };
                     println!("tracing in {mode}");
                 }
             }
@@ -376,8 +441,13 @@ impl ApplicationHandler for Viewer {
                 let center = Vec3::new(2.0, -4.0, 3.0);
                 let orbit = Vec3::new(6.0 * t.cos(), -1.2 * t.sin(), 0.0);
                 let eye = point("eye").unwrap_or(center) + orbit * self.orbit;
-                let mut target = point("target").unwrap_or(center + Vec3::Z * 2.0) - orbit * self.orbit;
-                if self.bench.as_ref().is_some_and(|b| matches!(b.stage, Stage::Away(_))) {
+                let mut target =
+                    point("target").unwrap_or(center + Vec3::Z * 2.0) - orbit * self.orbit;
+                if self
+                    .bench
+                    .as_ref()
+                    .is_some_and(|b| matches!(b.stage, Stage::Away(_)))
+                {
                     target = eye * 2.0 - target;
                 }
                 renderer.set_camera(eye, target, 60f32.to_radians());
@@ -436,7 +506,11 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     for i in 0..count {
         let along = (i / 2) as f32 / (count.div_ceil(2).max(2) - 1) as f32;
         world.lights.push(PointLight {
-            position: [-10.0 + 22.0 * along, if i % 2 == 0 { -6.0 } else { -2.0 }, 3.0],
+            position: [
+                -10.0 + 22.0 * along,
+                if i % 2 == 0 { -6.0 } else { -2.0 },
+                3.0,
+            ],
             color: [1.0, 0.8, 0.6],
             intensity: 400.0 / count as f32,
             radius: 12.0,

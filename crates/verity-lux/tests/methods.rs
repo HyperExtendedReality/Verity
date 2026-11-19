@@ -1,6 +1,12 @@
 //! What applications rely on of the method list.
 use verity_core::LightingMethod;
-use verity_lux::{Lux, METHODS, Method, method_info, pxtgi::Pxtgi};
+use verity_lux::{
+    EXPERIMENTAL_METHODS, Lux, METHODS, Method,
+    cascades::settings::{FinalGather, Settings},
+    method_info,
+    pxtgi::{Pxtgi, PxtgiSettings},
+    voxel::ScreenVoxelSettings,
+};
 
 #[test]
 fn every_gi_lighting_method_has_a_method() {
@@ -25,9 +31,10 @@ fn every_gi_lighting_method_has_a_method() {
 
 #[test]
 fn methods_are_told_apart() {
-    for (i, a) in METHODS.iter().enumerate() {
+    let methods: Vec<_> = METHODS.iter().chain(EXPERIMENTAL_METHODS).collect();
+    for (i, a) in methods.iter().enumerate() {
         assert!(!a.name.is_empty() && !a.about.is_empty());
-        for b in &METHODS[i + 1..] {
+        for b in &methods[i + 1..] {
             assert_ne!(a.lighting, b.lighting);
             assert_ne!(a.name, b.name);
         }
@@ -46,4 +53,117 @@ fn lux_runs_the_chosen_method() {
     assert!(matches!(chosen, Method::Pxtgi(_)));
     let residual = method_info(LightingMethod::Residual).expect("a method");
     assert!(matches!((residual.method)(), Method::ScreenVoxel(s) if s.residual));
+}
+
+#[test]
+fn experimental_presets_install_with_only_the_selected_option_enabled() {
+    let split = Settings::budgeted();
+    let screen_voxel = ScreenVoxelSettings::default();
+    let residual = ScreenVoxelSettings::residual();
+    assert_eq!(split.final_gather, FinalGather::Probes);
+    assert!(!split.surface_cold_priority && !split.emitter_low_discrepancy);
+    assert!(!screen_voxel.coarse_occupancy && !residual.coarse_occupancy);
+
+    let presets = [
+        (
+            LightingMethod::SplitColdPriority,
+            Method::SplitRadianceCascades(Settings {
+                surface_cold_priority: true,
+                ..split
+            }),
+        ),
+        (
+            LightingMethod::SplitLowDiscrepancyEmitters,
+            Method::SplitRadianceCascades(Settings {
+                emitter_low_discrepancy: true,
+                ..split
+            }),
+        ),
+        (
+            LightingMethod::SplitCosineGather,
+            Method::SplitRadianceCascades(Settings {
+                final_gather: FinalGather::Cosine,
+                ..split
+            }),
+        ),
+        (
+            LightingMethod::CascadeGuided,
+            Method::SplitRadianceCascades(Settings {
+                final_gather: FinalGather::Guided,
+                ..split
+            }),
+        ),
+        (
+            LightingMethod::ScreenVoxelBricks,
+            Method::ScreenVoxel(ScreenVoxelSettings {
+                coarse_occupancy: true,
+                ..screen_voxel
+            }),
+        ),
+        (
+            LightingMethod::ResidualBricks,
+            Method::ScreenVoxel(ScreenVoxelSettings {
+                coarse_occupancy: true,
+                ..residual
+            }),
+        ),
+        (
+            LightingMethod::PxtgiTemporalDiffuse,
+            Method::Pxtgi(PxtgiSettings {
+                temporal_diffuse_reuse: true,
+                ..PxtgiSettings::default()
+            }),
+        ),
+        (
+            LightingMethod::SplitSurfaceBounceGuide,
+            Method::SplitRadianceCascades(Settings {
+                surface_bounce_guide: true,
+                ..split
+            }),
+        ),
+        (
+            LightingMethod::ScreenVoxelSourceHistory,
+            Method::ScreenVoxel(ScreenVoxelSettings {
+                source_aware_history: true,
+                ..screen_voxel
+            }),
+        ),
+        (
+            LightingMethod::ResidualSourceHistory,
+            Method::ScreenVoxel(ScreenVoxelSettings {
+                source_aware_history: true,
+                ..residual
+            }),
+        ),
+        (
+            LightingMethod::UltraPbrMsgi,
+            Method::SplitRadianceCascades(Settings {
+                final_gather: FinalGather::MaterialSpace,
+                ..split
+            }),
+        ),
+    ];
+    assert_eq!(EXPERIMENTAL_METHODS.len(), presets.len());
+    for (lighting, expected) in presets {
+        let info = method_info(lighting).expect("an experimental preset");
+        assert!(METHODS.iter().all(|info| info.lighting != lighting));
+        assert!(Lux::for_lighting(lighting).is_some());
+        match ((info.method)(), expected) {
+            (Method::SplitRadianceCascades(actual), Method::SplitRadianceCascades(expected)) => {
+                assert_eq!(actual, expected);
+            }
+            (Method::ScreenVoxel(actual), Method::ScreenVoxel(expected)) => {
+                assert_eq!(actual, expected);
+            }
+            (Method::Pxtgi(actual), Method::Pxtgi(expected)) => {
+                assert!(!PxtgiSettings::default().temporal_diffuse_reuse);
+                assert_eq!(
+                    actual.temporal_diffuse_reuse,
+                    expected.temporal_diffuse_reuse
+                );
+                assert_eq!(actual.max_distance, 0.0);
+            }
+            _ => panic!("wrong backend for {lighting:?}"),
+        }
+    }
 }

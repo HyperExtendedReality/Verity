@@ -141,8 +141,9 @@ pub(crate) const IO_BINDINGS: &[(u32, D)] = &[
     (10, D::SAMPLED_IMAGE),
     (11, D::SAMPLED_IMAGE),
 ];
-/// Per slot: trace, temporal, three a-trous, four reflection, composite.
-const IO_SETS: usize = 10;
+/// Per slot: trace, temporal, three a-trous, four reflection, composite, reference.
+const REFERENCE_IO: usize = 10;
+const IO_SETS: usize = REFERENCE_IO + 1;
 
 /// How smooth surfaces get their reflections.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -187,6 +188,9 @@ pub struct PxtgiSettings {
     /// 1 m). Give it a short reach for geometry drawn but missing from the scene.
     /// Reflections always look at the screen first.
     pub max_distance: f32,
+    /// Experimental reuse of one previous raw diffuse hit, in world-only GI.
+    /// Allocate when the view is created; leave off for the fresh-only control.
+    pub temporal_diffuse_reuse: bool,
     /// How far rays go against the scene. Surfaces further away do not bounce light.
     pub world_ray_distance: f32,
     /// Rays each traced texel sends per frame, clamped to 1..=4. More settle
@@ -212,6 +216,7 @@ impl Default for PxtgiSettings {
     fn default() -> Self {
         Self {
             max_distance: 0.0,
+            temporal_diffuse_reuse: false,
             world_ray_distance: 30.0,
             rays_per_texel: 2,
             multi_bounce: true,
@@ -247,7 +252,7 @@ pub(crate) struct FrameData {
     pub(crate) moved_min: [[f32; 4]; MAX_MOVED],
     pub(crate) moved_max: [[f32; 4]; MAX_MOVED],
     /// Lights, blue noise, then each method's `METHOD_POINTERS` in order.
-    pub(crate) buffers: [vk::DeviceAddress; 9],
+    pub(crate) buffers: [vk::DeviceAddress; 10],
 }
 
 /// `Light` in pxtgi.slang.
@@ -349,6 +354,7 @@ struct View {
     prev_color: Image,
     /// The reference's fp32 sum per traced texel.
     reference_sum: Buffer,
+    diffuse_history: Option<Buffer>,
     frame: [Buffer; SLOTS],
     lights: [Buffer; SLOTS],
     pool: vk::DescriptorPool,
@@ -513,12 +519,22 @@ impl Pxtgi {
 
     /// Keep a BLAS for every static mesh, rebuilding those over `rewritten`
     /// geometry words. The GPU must be idle.
-    unsafe fn sync_hardware(&mut self, gpu: &mut Gpu, rewritten: &[std::ops::Range<usize>]) -> Result<()> {
+    unsafe fn sync_hardware(
+        &mut self,
+        gpu: &mut Gpu,
+        rewritten: &[std::ops::Range<usize>],
+    ) -> Result<()> {
         let Some(hardware) = &mut self.hardware else {
             return Ok(());
         };
         let wanted = self.statics.iter().map(|m| (m.triangles_at, m.triangles));
-        hardware.sync_meshes(gpu, &mut self.command_pool, &self.geometry, wanted, rewritten)
+        hardware.sync_meshes(
+            gpu,
+            &mut self.command_pool,
+            &self.geometry,
+            wanted,
+            rewritten,
+        )
     }
 
     /// The scene rays run against, for tests and CPU queries.
@@ -566,14 +582,20 @@ impl Pxtgi {
                     )
             };
             let (shape, instance) = match (&item.shape, item.source) {
-                (RayShape::Collider(verity_physics::Collider::Cuboid { half_extents: h }), _) => {
-                    ([KIND_BOX, h.x, h.y, h.z], Instance::boxed(unit(Vec3::ZERO, *h)))
-                }
+                (RayShape::Collider(verity_physics::Collider::Cuboid { half_extents: h }), _) => (
+                    [KIND_BOX, h.x, h.y, h.z],
+                    Instance::boxed(unit(Vec3::ZERO, *h)),
+                ),
                 // Ground never reaches the scene: rays see the mesh drawn for it.
                 (RayShape::Collider(verity_physics::Collider::Ground), _) => continue,
                 // shortcut: the GI shader has no capsule primitive, so capsules
                 // cast no GI; add a KIND_CAPSULE to pxtgi.slang when one needs to.
                 (RayShape::Collider(verity_physics::Collider::Capsule { .. }), _) => continue,
+                // shortcut: no hull primitive either, so hulls cast no GI; pack
+                // their faces as a soft-style mesh when one needs to.
+                (RayShape::Collider(verity_physics::Collider::Hull(_)), _) => continue,
+                // RayScene shows mesh colliders as RayShape::Mesh, so never here.
+                (RayShape::Collider(verity_physics::Collider::Mesh(_)), _) => continue,
                 (RayShape::Collider(verity_physics::Collider::Sphere { radius }), _) => (
                     [KIND_SPHERE, *radius, 0.0, 0.0],
                     Instance::boxed(unit(Vec3::ZERO, Vec3::splat(*radius))),
@@ -641,9 +663,15 @@ impl Pxtgi {
         for &(name, software, traced) in PASSES {
             let entry = CString::new(name)?;
             let cache = vk::PipelineCache::null();
-            passes.insert(name, gpu::compute_pipeline(device, cache, layout, software, &entry)?);
+            passes.insert(
+                name,
+                gpu::compute_pipeline(device, cache, layout, software, &entry)?,
+            );
             if ray_query {
-                hardware.insert(name, gpu::compute_pipeline(device, cache, layout, traced, &entry)?);
+                hardware.insert(
+                    name,
+                    gpu::compute_pipeline(device, cache, layout, traced, &entry)?,
+                );
             }
         }
         Ok(Pipelines {
@@ -709,6 +737,18 @@ impl Pxtgi {
             vk::BufferUsageFlags::STORAGE_BUFFER,
             MemoryLocation::GpuOnly,
         )?;
+        let diffuse_history = if self.settings.temporal_diffuse_reuse {
+            Some(gpu::create_buffer(
+                device,
+                gpu.allocator,
+                "pxtgi diffuse candidates",
+                u64::from(trace.width) * u64::from(trace.height) * 2 * 64,
+                vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::TRANSFER_DST,
+                MemoryLocation::GpuOnly,
+            )?)
+        } else {
+            None
+        };
 
         let mut host = |name: &str, size: usize, usage| {
             gpu::create_buffer(
@@ -791,6 +831,7 @@ impl Pxtgi {
             reflect_filtered,
             prev_color,
             reference_sum,
+            diffuse_history,
             frame,
             lights,
             pool,
@@ -842,7 +883,7 @@ impl Pxtgi {
         let view = self.view.as_ref().unwrap();
         let general = vk::ImageLayout::GENERAL;
         let s = view;
-        for slot in 0..SLOTS {
+        for (slot, sets) in view.io_sets.iter().enumerate() {
             let (cur, prev) = (slot, 1 - slot);
             // Unused slots hold images the pass neither reads nor writes, of
             // the format the binding declares.
@@ -945,8 +986,13 @@ impl Pxtgi {
                     [&s.trace, &s.trace, &s.trace, &s.trace],
                     [&s.reflect_trace, spare[0], spare[1], spare[2]],
                 ),
+                // Reference writes the composite's light and guide directly.
+                io(
+                    [&s.trace; 4],
+                    [&s.filtered[0], &s.accum_depth[cur], spare[1], spare[2]],
+                ),
             ];
-            for (set, entries) in view.io_sets[slot].iter().zip(&groups) {
+            for (set, entries) in sets.iter().zip(&groups) {
                 write_set(device, *set, IO_BINDINGS, entries);
             }
         }
@@ -959,7 +1005,10 @@ impl Pxtgi {
     ) {
         device.destroy_descriptor_pool(view.pool, None);
         let buffers = view.frame.into_iter().chain(view.lights);
-        for buffer in buffers.chain([view.reference_sum]) {
+        for buffer in buffers
+            .chain([view.reference_sum])
+            .chain(view.diffuse_history)
+        {
             gpu::destroy_buffer(device, allocator, buffer);
         }
         let groups = [
@@ -1179,15 +1228,17 @@ impl Pxtgi {
         let settings = self.settings;
         let [x, y, width, height] = frame.viewport;
         let primitives = self.packed.primitives.len() as u32;
+        let reference = settings.debug == PxtgiDebug::Reference;
 
         // History needs the frame right before this one, in the same place.
         let unbroken = self.last_frame.is_some_and(|f| f + 1 == frame.frame_number)
             && self.last_viewport == frame.viewport;
-        let reflection_history = unbroken && self.last_reflections == settings.reflections;
+        let view = self.view.as_mut().unwrap();
+        let history = unbroken && !view.fresh && !reference && self.reference_view.is_none();
+        let reflection_history = history && self.last_reflections == settings.reflections;
         self.last_frame = Some(frame.frame_number);
         self.last_viewport = frame.viewport;
         self.last_reflections = settings.reflections;
-        let view = self.view.as_mut().unwrap();
         let pipelines = self.pipelines.as_ref().unwrap();
         let hardware = settings.hardware_rays && pipelines.ray_query && primitives > 0;
 
@@ -1211,19 +1262,24 @@ impl Pxtgi {
             moved_max[i] = region.max.extend(0.0).to_array();
         }
         let sun = frame.sun.filter(|s| s.color.max_element() > 0.0);
-        let mode = match settings.reflections {
-            PxtgiReflections::Off => 0.0,
-            PxtgiReflections::Screen => 1.0,
-            PxtgiReflections::Traced => 2.0,
+        let mode = match (reference, settings.reflections) {
+            (true, _) | (_, PxtgiReflections::Off) => 0.0,
+            (_, PxtgiReflections::Screen) => 1.0,
+            (_, PxtgiReflections::Traced) => 2.0,
         };
-        let reference = settings.debug == PxtgiDebug::Reference;
         let cache_on = settings.multi_bounce && primitives > 0 && !reference;
-        if self.reference_view != Some(clip) {
+        let reference_frames = if reference {
+            if !unbroken || view.fresh || self.reference_view != Some(clip) {
+                self.reference_frames = 0;
+            }
             self.reference_view = Some(clip);
-            self.reference_frames = 0;
-        }
-        let reference_frames = self.reference_frames;
-        self.reference_frames += 1;
+            let frames = self.reference_frames;
+            self.reference_frames += 1;
+            frames
+        } else {
+            self.reference_view = None;
+            0
+        };
         let data = FrameData {
             clip_from_world: clip.to_cols_array_2d(),
             world_from_clip: clip.inverse().to_cols_array_2d(),
@@ -1259,10 +1315,12 @@ impl Pxtgi {
                 settings.rays_per_texel.clamp(1, 4),
             ],
             extra: [
-                0.0,
+                f32::from(u8::from(
+                    settings.temporal_diffuse_reuse && view.diffuse_history.is_some(),
+                )),
                 self.light_age
                     .map_or(0.0, |age| (CHANGED_HISTORY + age) as f32),
-                f32::from(u8::from(unbroken)),
+                f32::from(u8::from(history)),
                 f32::from(u8::from(reflection_history)),
             ],
             reflection: [
@@ -1285,6 +1343,9 @@ impl Pxtgi {
                 self.geometry_buffer.address,
                 self.slots[slot].soft.address,
                 view.reference_sum.address,
+                view.diffuse_history
+                    .as_ref()
+                    .map_or(0, |buffer| buffer.address),
             ],
         };
         view.frame[slot].write(bytemuck::bytes_of(&data));
@@ -1302,7 +1363,12 @@ impl Pxtgi {
             if built.record(gpu, cmd, slot, &self.packed.instances, self.packed.revision)? {
                 let tlas = built.tlas(slot).expect("just built");
                 let set = view.scene_sets[slot];
-                write_set(device, set, &scene_bindings(true), &[(TLAS_BINDING.0, Res::Accel(tlas))]);
+                write_set(
+                    device,
+                    set,
+                    &scene_bindings(true),
+                    &[(TLAS_BINDING.0, Res::Accel(tlas))],
+                );
             }
             timer.borrow_mut().stamp(device, cmd, slot, "tlas");
         }
@@ -1344,6 +1410,9 @@ impl Pxtgi {
             );
             device.cmd_fill_buffer(cmd, self.cache_keys.buffer, 0, vk::WHOLE_SIZE, 0);
             device.cmd_fill_buffer(cmd, self.cells.buffer, 0, vk::WHOLE_SIZE, 0);
+            if let Some(history) = &view.diffuse_history {
+                device.cmd_fill_buffer(cmd, history.buffer, 0, vk::WHOLE_SIZE, 0);
+            }
             view.fresh = false;
         }
         barrier();
@@ -1372,9 +1441,7 @@ impl Pxtgi {
         }
         let diffuse = ["trace", "temporal", "atrous1", "atrous2", "atrous4"];
         if reference {
-            // The composite's light is the depth of `temporal`, then this mean.
-            dispatch("temporal", sets[1], groups(trace));
-            dispatch("reference", sets[2], groups(trace));
+            dispatch("reference", sets[REFERENCE_IO], groups(trace));
         } else {
             for (name, &set) in diffuse.into_iter().zip(&sets) {
                 dispatch(name, set, groups(trace));
@@ -1515,7 +1582,9 @@ impl RenderExtension for Pxtgi {
                 let (first, count) = (p.first_index as usize, p.index_count as usize);
                 let indices = &scene.indices[first..first + count];
                 let triangles: Vec<[u32; 3]> = indices
-                    .chunks_exact(3)
+                    .as_chunks::<3>()
+                    .0
+                    .iter()
                     .map(|t| [t[0], t[1], t[2]])
                     .collect();
                 // Only what this primitive uses: vertices are shared per scene.
@@ -1750,7 +1819,11 @@ impl RenderExtension for Pxtgi {
                 hardware.destroy(gpu);
             }
             if let Some(pipelines) = self.pipelines.take() {
-                for pipeline in pipelines.passes.into_values().chain(pipelines.hardware.into_values()) {
+                for pipeline in pipelines
+                    .passes
+                    .into_values()
+                    .chain(pipelines.hardware.into_values())
+                {
                     device.destroy_pipeline(pipeline, None);
                 }
                 device.destroy_pipeline_layout(pipelines.layout, None);

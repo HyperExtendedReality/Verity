@@ -465,6 +465,193 @@ Hit traceTriangle(float3 origin, float3 direction, TriangleRay ray, float3 world
     }
     return hit;
 }
+
+[ForceInline]
+uint2 boundedTriangleSpan(uint first, uint count, uint4 geometry, out bool truncated) {
+    uint begin = max(first, geometry.y);
+    uint instanceEnd = geometry.y + geometry.z;
+    uint requestedEnd = first + count;
+    uint end = min(requestedEnd, instanceEnd);
+    uint boundedEnd = min(end, begin + min(MAX_LEAF_TRIANGLES, 0xffffffffu - begin));
+    truncated = first < geometry.y || instanceEnd < geometry.y || requestedEnd < first
+        || requestedEnd > instanceEnd || count > MAX_LEAF_TRIANGLES || boundedEnd < end;
+    if (requestedEnd < first || instanceEnd < geometry.y) boundedEnd = begin;
+    return uint2(begin, boundedEnd);
+}
+
+// Immutable software BLAS arena, as packed by scene/wide.rs. A reference's
+// high nibble tags the bounds/leaf format; the remaining bits are local to
+// this mesh. Zero is unused, 0 is a branch, 1–8 are inline span counts, and
+// 9 denotes a full-sized span record.
+static const uint WIDE_KIND_SHIFT = 28u;
+static const uint WIDE_PAYLOAD = 0x0fffffffu;
+static const uint WIDE_INLINE_COUNT = 8u;
+static const uint WIDE_FULL_SPAN = 9u;
+static const uint WIDE_RECORD_WORDS = 4u;
+static const uint WIDE_HEADER_WORDS = 2u;
+// The packer skips two levels of the depth-48 binary tree per wide level.
+// With four children, at most three deferred entries per level are live.
+static const uint WIDE_STACK_SIZE = 72u;
+
+uint wideSceneCapacity() {
+#ifdef GI_TRAVERSAL_CHECK
+    uint count, stride;
+    sceneWords.GetDimensions(count, stride);
+    return count;
+#else
+    if (params.scenePages.x == 0u) return params.wordLengths.y;
+    uint width, height, layers;
+    scenePageTexture.GetDimensions(width, height, layers);
+    uint side = params.scenePages.y;
+    uint pageWords = side * side * layers;
+    return params.sceneOverlay.x + params.sceneOverlay.y
+        + (pageWords - min(pageWords, params.sceneOverlay.z));
+#endif
+}
+
+[ForceInline]
+float3 wideDecodeBound(float3 frameMin, float3 frameMax, float3 gridStep, uint3 bin) {
+    // The step has a 16-bit significand, so the 8-bit bin multiply is exact.
+    // The exact frame endpoints also cover flat axes and overflowing spans.
+    float3 interpolated = frameMin + gridStep * float3(bin);
+    return select(bin == 0u, frameMin, select(bin == 255u, frameMax, interpolated));
+}
+
+[ForceInline]
+uint2 wideChildEntry(uint reference, uint shift, uint3 lower, uint3 upper,
+                     float3 frameMin, float3 frameMax, float3 gridStep,
+                     float3 origin, float3 direction, float limit) {
+    if (reference != 0u) {
+        BvhNode child = (BvhNode)0;
+        child.minimum = wideDecodeBound(frameMin, frameMax, gridStep, (lower >> shift) & 255u);
+        child.maximum = wideDecodeBound(frameMin, frameMax, gridStep, (upper >> shift) & 255u);
+        float entry = boxEntryDistance(origin, direction, child, limit);
+        if (entry >= 0.0) return uint2(reference, asuint(entry) & 0x7fffffffu);
+    }
+    // The unsigned sort below puts absent or missed children last.
+    return uint2(0u, 0xffffffffu);
+}
+
+[ForceInline]
+void orderWideEntries(inout uint2 a, inout uint2 b) {
+    if (a.y > b.y) {
+        uint2 swap = a;
+        a = b;
+        b = swap;
+    }
+}
+
+// Leaf addressing is separate from bounds decoding. Noncontiguous references
+// can add a leaf kind without changing the ordinary span or triangle path.
+bool wideLeafSpan(uint kind, uint payload, uint records, uint recordCount, out uint2 span) {
+    span = uint2(payload, kind);
+    if (kind <= WIDE_INLINE_COUNT) return true;
+    if (kind != WIDE_FULL_SPAN || payload == 0u || payload > recordCount) return false;
+    span = sceneWord(records + (payload - 1u) * WIDE_RECORD_WORDS).xy;
+    return span.y != 0u;
+}
+
+[ForceInline]
+Hit traceWideInstance(float3 origin, float3 direction, float3 worldDirection,
+                      uint instance, uint base, uint flags, uint4 geometry, uint4 geometryHeader,
+                      Hit hit, bool anyHit, bool shadow, float coneWidth, float coneSpread) {
+    uint capacity = wideSceneCapacity();
+    uint rootWord = geometry.w;
+    if (rootWord <= base || rootWord > capacity || capacity - rootWord < WIDE_HEADER_WORDS) {
+        hit.errors |= HIT_QUERY_UNSUPPORTED;
+        return hit;
+    }
+    uint4 a = sceneWord(rootWord), b = sceneWord(rootWord + 1u);
+    uint records = rootWord + WIDE_HEADER_WORDS;
+    uint recordCount = a.w;
+    uint current = b.w;
+    if (current == 0u || recordCount > (capacity - records) / WIDE_RECORD_WORDS) {
+        hit.errors |= HIT_QUERY_UNSUPPORTED;
+        return hit;
+    }
+    BvhNode root = (BvhNode)0;
+    root.minimum = asfloat(a.xyz); root.maximum = asfloat(b.xyz);
+    if (!intersectBox(origin, direction, root, hit.distance)) return hit;
+
+    TriangleRay ray = triangleRay(direction);
+    uint2 stack[WIDE_STACK_SIZE];
+    uint count = 0u, steps = 0u;
+    [loop] while (current != 0u || count != 0u) {
+        if (++steps > MAX_TRAVERSAL_STEPS) {
+            hit.errors |= HIT_QUERY_UNSUPPORTED;
+            break;
+        }
+        if (current == 0u) {
+            uint2 deferred = stack[--count];
+            if (!shadow && asfloat(deferred.y) > hit.distance) continue;
+            current = deferred.x;
+        }
+        uint kind = current >> WIDE_KIND_SHIFT;
+        uint payload = current & WIDE_PAYLOAD;
+        current = 0u;
+        uint first = 0u, triangles = 0u;
+        if (kind == 0u) {
+            if (payload == 0u || payload > recordCount) {
+                hit.errors |= HIT_QUERY_UNSUPPORTED;
+                continue;
+            }
+            uint at = records + (payload - 1u) * WIDE_RECORD_WORDS;
+            uint4 m = sceneWord(at), n = sceneWord(at + 1u);
+            uint4 q = sceneWord(at + 2u), r = sceneWord(at + 3u);
+            float3 frameMin = asfloat(m.xyz), frameMax = asfloat(n.xyz);
+            precise float3 extent = frameMax - frameMin;
+            float3 grid = asfloat(asuint(extent) & 0xffffff00u);
+            float3 gridStep = select(isfinite(grid), grid * (1.0 / 256.0), float3(0.0));
+            uint3 lo = uint3(q.x, q.z, r.x), hi = uint3(q.y, q.w, r.y);
+            uint2 child0 = wideChildEntry(m.w,  0u, lo, hi, frameMin, frameMax, gridStep, origin, direction, hit.distance);
+            uint2 child1 = wideChildEntry(n.w,  8u, lo, hi, frameMin, frameMax, gridStep, origin, direction, hit.distance);
+            uint2 child2 = wideChildEntry(r.z, 16u, lo, hi, frameMin, frameMax, gridStep, origin, direction, hit.distance);
+            uint2 child3 = wideChildEntry(r.w, 24u, lo, hi, frameMin, frameMax, gridStep, origin, direction, hit.distance);
+            orderWideEntries(child0, child1);
+            orderWideEntries(child2, child3);
+            orderWideEntries(child0, child2);
+            orderWideEntries(child1, child3);
+            orderWideEntries(child1, child2);
+            uint deferredCount = uint(child1.x != 0u) + uint(child2.x != 0u) + uint(child3.x != 0u);
+            if (count + deferredCount <= WIDE_STACK_SIZE) {
+                if (child3.x != 0u) stack[count++] = child3;
+                if (child2.x != 0u) stack[count++] = child2;
+                if (child1.x != 0u) stack[count++] = child1;
+                current = child0.x;
+                continue;
+            }
+            // As in binary traversal, try the full primitive span if the
+            // topology violates the packing depth limit.
+            hit.errors |= 1u;
+            first = geometry.y; triangles = geometry.z;
+            count = 0u;
+        } else {
+            uint2 leaf;
+            if (!wideLeafSpan(kind, payload, records, recordCount, leaf) || leaf.x > 0xffffffffu - geometry.y) {
+                hit.errors |= HIT_QUERY_UNSUPPORTED;
+                continue;
+            }
+            first = geometry.y + leaf.x; triangles = leaf.y;
+        }
+        bool truncated;
+        uint2 range = boundedTriangleSpan(first, triangles, geometry, truncated);
+        if (truncated) hit.errors |= HIT_QUERY_UNSUPPORTED;
+        [loop] for (uint i = range.x; i < range.y; ++i) {
+            if (shadow) {
+                if (occludedTriangle(origin, direction, ray, i, instance, flags, hit.distance, geometryHeader)) {
+                    hit.triangle = i;
+                    return hit;
+                }
+            } else {
+                hit = traceTriangle(origin, direction, ray, worldDirection, coneWidth, coneSpread,
+                                    i, instance, base, flags, geometryHeader, hit);
+                if (anyHit && hit.triangle != EMPTY) return hit;
+            }
+        }
+    }
+    return hit;
+}
+
 Hit traceInstance(float3 origin, float3 direction, uint instance, Hit hit, bool anyHit,
                   float coneWidth, float coneSpread, uint4 geometryHeader) {
     uint base = instanceBase(instance);
@@ -481,8 +668,11 @@ Hit traceInstance(float3 origin, float3 direction, uint instance, Hit hit, bool 
     // Keep this unnormalized so triangle/box distances remain world distances.
     float3 localDirection = float3(dot(row0, vector), dot(row1, vector), dot(row2, vector));
     uint flags = instanceRecord.w;
-    uint2 stack[49]; uint count = 0;
     uint4 geometry = sceneWord(base + 8);
+    if (geometry.w != 0u)
+        return traceWideInstance(localOrigin, localDirection, direction, instance, base, flags,
+                                 geometry, geometryHeader, hit, anyHit, false, coneWidth, coneSpread);
+    uint2 stack[49]; uint count = 0;
     uint currentNode = geometry.x;
     BvhNode node = sceneNode(currentNode);
     bool currentNodeReady = intersectBox(localOrigin, localDirection, node, hit.distance);
@@ -541,16 +731,10 @@ Hit traceInstance(float3 origin, float3 direction, uint instance, Hit hit, bool 
         }
         // A clipped closest-hit scan cannot prove that a reported hit is
         // nearest, or that a miss is actually empty.
-        uint triangleBegin = max(node.first, geometry.y);
-        uint triangleLimit = geometry.y + geometry.z;
-        uint requestedEnd = node.first + node.count;
-        uint triangleEnd = min(requestedEnd, triangleLimit);
-        bool truncated = node.first < geometry.y || requestedEnd < node.first
-            || requestedEnd > triangleLimit || node.count > MAX_LEAF_TRIANGLES;
-        uint boundedEnd = min(triangleEnd, triangleBegin + MAX_LEAF_TRIANGLES);
-        truncated = truncated || boundedEnd < triangleEnd;
+        bool truncated;
+        uint2 range = boundedTriangleSpan(node.first, node.count, geometry, truncated);
         if (truncated) hit.errors |= HIT_QUERY_UNSUPPORTED;
-        [loop] for (uint i = triangleBegin; i < boundedEnd; ++i) {
+        [loop] for (uint i = range.x; i < range.y; ++i) {
             hit = traceTriangle(localOrigin, localDirection, ray, direction, coneWidth, coneSpread,
                                 i, instance, base, flags, geometryHeader, hit);
             if (anyHit && hit.triangle != EMPTY) return hit;
@@ -788,8 +972,17 @@ bool occludedInstance(float3 origin, float3 direction, uint instance, float limi
     float3 localOrigin = float3(dot(row0, point), dot(row1, point), dot(row2, point));
     float3 localDirection = float3(dot(row0, vector), dot(row1, vector), dot(row2, vector));
     uint flags = instanceRecord.w;
-    uint stack[49]; uint count = 0;
     uint4 geometry = sceneWord(base+8);
+    if (geometry.w != 0u) {
+        Hit hit = (Hit)0;
+        hit.distance = limit; hit.triangle = EMPTY; hit.instance = EMPTY;
+        hit = traceWideInstance(localOrigin, localDirection, direction, instance, base, flags,
+                                geometry, geometryHeader, hit, true, true, 0.0, 0.0);
+        bool blocked = hit.triangle != EMPTY;
+        querySupported = blocked || (hit.errors & HIT_QUERY_UNSUPPORTED) == 0u;
+        return blocked;
+    }
+    uint stack[49]; uint count = 0;
     uint currentNode = geometry.x;
     BvhNode node = sceneNode(currentNode);
     bool currentNodeReady = intersectBox(localOrigin,localDirection,node,limit);
@@ -845,16 +1038,10 @@ bool occludedInstance(float3 origin, float3 direction, uint instance, float limi
         // Scan only the proven primitive range and preserve incompleteness if
         // an oversized or malformed range was clipped. A real accepted hit is
         // still a complete proof that this shadow ray is blocked.
-        uint triangleBegin = max(node.first, geometry.y);
-        uint triangleLimit = geometry.y + geometry.z;
-        uint requestedEnd = node.first + node.count;
-        uint triangleEnd = min(requestedEnd, triangleLimit);
-        bool truncated = node.first < geometry.y || requestedEnd < node.first
-            || requestedEnd > triangleLimit || node.count > MAX_LEAF_TRIANGLES;
-        uint boundedEnd = min(triangleEnd, triangleBegin + MAX_LEAF_TRIANGLES);
-        truncated = truncated || boundedEnd < triangleEnd;
+        bool truncated;
+        uint2 range = boundedTriangleSpan(node.first, node.count, geometry, truncated);
         incomplete = incomplete || truncated;
-        [loop] for (uint i = triangleBegin; i < boundedEnd; ++i) {
+        [loop] for (uint i = range.x; i < range.y; ++i) {
             if (occludedTriangle(localOrigin,localDirection,ray,i,instance,flags,limit,geometryHeader))
                 return true;
         }

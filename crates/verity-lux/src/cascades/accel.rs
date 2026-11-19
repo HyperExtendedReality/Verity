@@ -124,7 +124,11 @@ impl SceneAccel {
         // shortcut: sends every position and index for any change; send only
         // the changed spans if retained edits ever make this slow.
         let positions: Vec<[u32; 3]> = (0..vertices)
-            .map(|v| geometry[(vertex_base + v * vertex_words) as usize].truncate().to_array())
+            .map(|v| {
+                geometry[(vertex_base + v * vertex_words) as usize]
+                    .truncate()
+                    .to_array()
+            })
             .collect();
         let indices: Vec<[u32; 3]> = (geometry[1..vertex_base as usize].iter())
             .map(|w| w.truncate().to_array())

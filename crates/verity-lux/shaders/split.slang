@@ -324,7 +324,7 @@ uint findEntry(int4 key, bool previous = false) {
     uint limit = previous ? min(cacheHistoryQuota(params), count) : count;
     [loop] for (uint visited = 0u; index != EMPTY && visited < limit; ++visited) {
         if (index >= count) return EMPTY;
-        // Hash-chain traversal needs only the link and key, not the 240-byte
+        // Hash-chain traversal needs only the link and key, not the 192-byte
         // radiance record. A conditional aggregate load expands to every field.
         uint next = previous ? previousEntries[index].next : entries[index].next;
         if (next == index) return EMPTY;
@@ -1465,7 +1465,7 @@ void traceResolve(uint3 thread : SV_DispatchThreadID) {
 }
 
 // Reduce leaves one canonical entry per key, and only those merge. Listing them
-// here spares merge a scan of the whole 240-byte-strided pool for every level.
+// here spares merge a scan of the whole 192-byte-strided pool for every level.
 void queueMerge(uint index, uint level) {
     uint words = params.lengths.w;
     uint ticket = mergeList[level * 4u + 3u].add(1u);
@@ -1897,13 +1897,35 @@ void seedProbes(uint3 thread : SV_DispatchThreadID) {
 }
 
 groupshared float4 packProbeBackground[32];
-groupshared float4 packProbeEmissive[32];
 groupshared float4 packProbePunctual[32];
 groupshared uint packProbeSource[32];
 groupshared uint packProbeActive;
 groupshared uint packProbeSlot;
 groupshared int4 packProbeKey;
-groupshared float3 packProbeDirection[32];
+groupshared float3 packProbeDirection[16];
+
+// Collapse the 8x4 incident bins to eight equal-solid-angle bins (4x2).
+// Only relative mass matters: quantize against the brightest coarse bin.
+uint2 packCascadeGuide() {
+    float mass[8] = { 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0 };
+    float peak = 0.0;
+    [unroll] for (uint bin = 0u; bin < 8u; ++bin) {
+        uint first = (bin & 3u) * 2u + (bin >> 2u) * 16u;
+        [unroll] for (uint j = 0u; j < 4u; ++j) {
+            uint i = first + (j & 1u) + (j >> 1u) * 8u;
+            mass[bin] += max(luminance(packProbeBackground[i].xyz + packProbePunctual[i].xyz), 0.0);
+        }
+        peak = max(peak, mass[bin]);
+    }
+    uint2 packed = 0u;
+    if (peak > 0.0 && isfinite(peak)) {
+        [unroll] for (uint i = 0u; i < 8u; ++i) {
+            uint weight = uint(round(saturate(mass[i] / peak) * 255.0));
+            packed[i >> 2u] |= weight << ((i & 3u) * 8u);
+        }
+    }
+    return packed;
+}
 
 [shader("compute")]
 [numthreads(64, 1, 1)]
@@ -1915,8 +1937,10 @@ void packProbes(uint3 groupId : SV_GroupID, uint lane : SV_GroupIndex) {
         bool active = ordinal < currentCapacity() / CASCADES;
         if (active) {
             uint index = ordinal * CASCADES;
-            key = descriptors[index].key;
-            slot = findProbeNodeSlot(key);
+            if ((descriptors[index].flags & DESCRIPTOR_SEEDED) != 0u) {
+                key = descriptors[index].key;
+                slot = findProbeNodeSlot(key);
+            }
             active = slot != EMPTY
                 && heads[probeDirectoryHead(0u, slot, params)].load() == index;
         }
@@ -1928,32 +1952,27 @@ void packProbes(uint3 groupId : SV_GroupID, uint lane : SV_GroupIndex) {
     // The decision is group-uniform, including at the next barrier.
     if (packProbeActive == 0u) return;
 
+    bool punctualActive = transportSourceActive(params, PUNCTUAL_SOURCE);
     if (lane < 32u) {
         uint source = EMPTY;
         float4 background = 0.0;
-        float4 emissive = transportSourceActive(params, EMISSIVE_SOURCE)
-            ? 0.0 : float4(0.0, 0.0, 0.0, 1.0);
-        float4 punctual = transportSourceActive(params, PUNCTUAL_SOURCE)
-            ? 0.0 : float4(0.0, 0.0, 0.0, 1.0);
-        packProbeDirection[lane] = binDirection(lane, 0u);
+        float4 punctual = 0.0;
+        if (lane < 16u) packProbeDirection[lane] = binDirection(lane, 0u);
         {
             uint lodBits = uint(packProbeKey.w) & PROBE_LOD;
             int4 directionKey = int4(packProbeKey.xyz, int(lane | lodBits));
             source = findEntry(directionKey, false);
             if (source != EMPTY) {
                 background = mergedOf(source);
-                if (transportSourceActive(params, PUNCTUAL_SOURCE))
-                    punctual = punctualMergedOf(source);
+                if (punctualActive) punctual = punctualMergedOf(source);
             }
         }
         // Validate once per direction, not once per output texel. Unsupported
         // and non-finite values contribute neither energy nor dependency bounds.
-        if (!(background.w > 0.0) || !all(isfinite(background))) background = 0.0;
-        if (!(emissive.w > 0.0) || !all(isfinite(emissive))) emissive = 0.0;
-        if (!(punctual.w > 0.0) || !all(isfinite(punctual))) punctual = 0.0;
+        background = all(isfinite(background)) ? float4(background.xyz, 1.0) * saturate(background.w) : 0.0;
+        punctual = all(isfinite(punctual)) ? float4(punctual.xyz, 1.0) * saturate(punctual.w) : 0.0;
         packProbeSource[lane] = source;
         packProbeBackground[lane] = background;
-        packProbeEmissive[lane] = emissive;
         packProbePunctual[lane] = punctual;
     }
     GroupMemoryBarrierWithGroupSync();
@@ -1966,63 +1985,32 @@ void packProbes(uint3 groupId : SV_GroupID, uint lane : SV_GroupIndex) {
         uint x = lane % 6u;
         uint y = lane / 6u;
         float3 normal = decodeNormal((float2(x, y) + 0.5) / 6.0);
-        float3 backgroundSum = 0.0;
-        float3 emissiveSum = 0.0;
-        float3 punctualSum = 0.0;
+        float4 backgroundSum = 0.0;
+        float4 punctualSum = 0.0;
         float nominalCosine = 0.0;
-        float3 observedCosine = 0.0;
-        [loop] for (uint direction = 0u; direction < 32u; ++direction) {
-            float cosine = max(dot(normal, packProbeDirection[direction]), 0.0);
+        // The 8×4 equal-area grid has antipodal pairs. Only one bin of a
+        // pair can have a positive cosine; share its dot product and load
+        // just the contributing sample, including when the opposite bin is cold.
+        [loop] for (uint direction = 0u; direction < 16u; ++direction) {
+            float signedCosine = dot(normal, packProbeDirection[direction]);
+            uint bin = signedCosine >= 0.0 ? direction : direction ^ 28u;
+            float cosine = abs(signedCosine);
             nominalCosine += cosine;
-            if (cosine <= 0.0) continue;
-            float4 background = packProbeBackground[direction];
-            if (background.w > 0.0) {
-                float weight = cosine * saturate(background.w);
-                backgroundSum += background.xyz * weight;
-                observedCosine.x += weight;
-            }
-            float4 emissive = packProbeEmissive[direction];
-            if (emissive.w > 0.0) {
-                float weight = cosine * saturate(emissive.w);
-                emissiveSum += emissive.xyz * weight;
-                observedCosine.y += weight;
-            }
-            float4 punctual = packProbePunctual[direction];
-            if (punctual.w > 0.0) {
-                float weight = cosine * saturate(punctual.w);
-                punctualSum += punctual.xyz * weight;
-                observedCosine.z += weight;
-            }
+            backgroundSum += packProbeBackground[bin] * cosine;
+            if (punctualActive) punctualSum += packProbePunctual[bin] * cosine;
         }
-        float4 backgroundValue = 0.0;
-        float4 emissiveValue = 0.0;
-        float4 punctualValue = 0.0;
-        if (nominalCosine > 0.0) {
-            float scale = nominalCosine * (4.0 / 32.0);
-            if (observedCosine.x > 0.0)
-                backgroundValue = float4(backgroundSum / observedCosine.x * scale,
-                    saturate(observedCosine.x / nominalCosine));
-            if (observedCosine.y > 0.0)
-                emissiveValue = float4(emissiveSum / observedCosine.y * scale,
-                    saturate(observedCosine.y / nominalCosine));
-            if (observedCosine.z > 0.0)
-                punctualValue = float4(punctualSum / observedCosine.z * scale,
-                    saturate(observedCosine.z / nominalCosine));
-        }
-        directionalProbes[output].irradiance[lane] = backgroundValue;
-        directionalProbes[output].emissiveIrradiance[lane] = emissiveValue;
-        directionalProbes[output].punctualIrradiance[lane] = punctualValue;
+        // Normalize the discrete Lambert kernel to unit gain (irradiance / pi).
+        float invCosine = nominalCosine > 0.0 ? 1.0 / nominalCosine : 0.0;
+        directionalProbes[output].irradiance[lane] = backgroundSum * invCosine;
+        directionalProbes[output].punctualIrradiance[lane] = punctualSum * invCosine;
     }
     if (lane == 0u) {
         DependencyContext packedDependency = dependencyEmpty();
         [loop] for (uint direction = 0u; direction < 32u; ++direction) {
             uint source = packProbeSource[direction];
             if (source == EMPTY) continue;
-            bool supported = packProbeBackground[direction].w > 0.0;
-            if (transportSourceActive(params, EMISSIVE_SOURCE))
-                supported = supported || packProbeEmissive[direction].w > 0.0;
-            if (transportSourceActive(params, PUNCTUAL_SOURCE))
-                supported = supported || packProbePunctual[direction].w > 0.0;
+            bool supported = packProbeBackground[direction].w > 0.0
+                || packProbePunctual[direction].w > 0.0;
             if (supported)
                 dependencyUnion(packedDependency,
                     mergedDependencyOf(source));
@@ -2032,6 +2020,8 @@ void packProbes(uint3 groupId : SV_GroupID, uint lane : SV_GroupIndex) {
             directionalProbes[output].cacheKey = int4(packProbeKey.xyz,
                 int(uint(packProbeKey.w) & PROBE_LOD));
             directionalProbes[output].cacheGeneration = uint4(params.frame.x, 1u, 0u, 0u);
+        } else if ((params.ownerSequence.y & 3u) == 2u || (params.ownerSequence.y & 16u) != 0u) {
+            directionalProbes[output].cacheGeneration = uint4(params.frame.x, 1u, packCascadeGuide());
         }
         heads[2u * params.size.w + 9u].add(1);
     }

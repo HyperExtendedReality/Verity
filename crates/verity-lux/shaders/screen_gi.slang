@@ -372,6 +372,58 @@ float4 march(float3 origin, float3 dir, float reach, int steps, float jitter) {
     return 0.0;
 }
 
+#ifdef VOXEL_SOURCE_HISTORY
+bool sourceAwareHistory() { return f.misc.w > 0.5; }
+
+// Fractions in twelfths cover every ray budget (1..4) exactly. Both nibbles
+// plus the residual-proxy bit fit exactly in half-float. Zero means no tag.
+float packVoxelSources(uint2 counts, uint rays, bool proxy) {
+    uint2 q = counts * (12u / rays);
+    return float(1u + (q.x | (q.y << 4u) | (proxy ? 256u : 0u)));
+}
+
+float sourceTrust(float current, float previous) {
+    if (current < 1.0 || previous < 1.0) return 0.0;
+    uint a = uint(current) - 1u, b = uint(previous) - 1u;
+    if (((a ^ b) & 256u) != 0u) return 0.0; // The residual base appeared or disappeared.
+    int x = int(a & 15u) - int(b & 15u);
+    int y = int((a >> 4u) & 15u) - int((b >> 4u) & 15u);
+    // The uncounted rays are uncovered (normal) or proxy-only (residual).
+    // Tolerate half the rays changing due to jitter; larger shifts keep less
+    // history, but even a full shift can occur by chance at these ray counts.
+    float delta = float(max(max(abs(x), abs(y)), abs(x + y))) / 12.0;
+    return 1.0 - 0.75 * smoothstep(0.5, 1.0, delta);
+}
+
+// Test each contributing history tap before blending; a nearest tag would
+// allow the other taps to import incompatible light and moment estimates.
+float voxelHistory(float2 at, int2 size, float source, out float4 light, out float4 moments) {
+    float2 c = at - 0.5;
+    int2 b = int2(floor(c));
+    float2 frac = c - float2(b);
+    light = 0.0;
+    moments = 0.0;
+    float retained = 0.0;
+    [unroll] for (int i = 0; i < 4; i++) {
+        int2 o = int2(i & 1, i >> 1);
+        float2 w = lerp(1.0 - frac, frac, float2(o));
+        int3 q = int3(clamp(b + o, 0, size - 1), 0);
+        float4 m = in3.Load(q);
+        float weight = w.x * w.y * sourceTrust(source, m.w);
+        if (weight <= 0.0) continue;
+        // Tags are categorical; only the first three lanes are moments.
+        light += in1.Load(q) * weight;
+        moments.xyz += m.xyz * weight;
+        retained += weight;
+    }
+    if (retained > 0.0) {
+        light /= retained;
+        moments /= retained;
+    }
+    return saturate(retained);
+}
+#endif
+
 
 // This frame's rays blended into what the same surface accumulated before
 // (reprojected onto last frame; a different depth there starts over). Light
@@ -397,6 +449,11 @@ void temporal(uint3 id : SV_DispatchThreadID) {
     }
     float3 p = worldFromPixel(float2(fp) + 0.5, depth);
     float4 now = in0.Load(int3(px, 0));
+#ifdef VOXEL_SOURCE_HISTORY
+    // Voxel trace wrote into the future filtered GI image, bound here as giLight.
+    bool trackSources = sourceAwareHistory();
+    float source = trackSources ? giLight.Load(int3(px, 0)).r : 0.0;
+#endif
     float l = luminance(now.rgb);
     float4 result = now;
     float3 m = float3(l, l * l, 1.0); // mean, mean of the square, frames of history
@@ -421,8 +478,16 @@ void temporal(uint3 id : SV_DispatchThreadID) {
             int2 tp = clamp(int2(at), 0, size - 1);
             float was = in2.Load(int3(tp, 0)).r;
             if (abs(was - pp.z) < 0.05 * pp.z) {
-                float4 wasLight = bilinear(in1, at, size);
-                float4 wasM = bilinear(in3, at, size);
+                float4 wasLight, wasM;
+#ifdef VOXEL_SOURCE_HISTORY
+                float retained = 1.0;
+                if (trackSources) retained = voxelHistory(at, size, source, wasLight, wasM);
+                else
+#endif
+                {
+                    wasLight = bilinear(in1, at, size);
+                    wasM = bilinear(in3, at, size);
+                }
                 if (!bad(wasLight) && !bad(wasM)) {
                     float fade = luminance(f.fade.rgb);
                     wasLight.rgb *= f.fade.rgb;
@@ -433,6 +498,14 @@ void temporal(uint3 id : SV_DispatchThreadID) {
                     float limit = f.extra.y > 0.0 ? f.extra.y : (movedNear(p) ? 4.0 : steady);
                     float frames = min(wasM.z + 1.0, limit);
                     float alpha = 1.0 / frames;
+#ifdef VOXEL_SOURCE_HISTORY
+                    if (retained < 1.0) {
+                        // Attenuate actual reuse, not just the frame cap; the
+                        // moments age must match the new blend weight.
+                        alpha = lerp(1.0, alpha, retained);
+                        frames = 1.0 / alpha;
+                    }
+#endif
                     result = lerp(wasLight, now, alpha);
                     m = float3(lerp(wasM.xy, float2(l, l * l), alpha), frames);
                 }
@@ -446,7 +519,11 @@ void temporal(uint3 id : SV_DispatchThreadID) {
     if (m.z < 4.0) variance = max(variance, 0.25 * m.x * m.x + 0.01);
     out0.Store(px, result);
     out1.Store(px, float2(linearDepth(depth), packedNormal(g)));
+#ifdef VOXEL_SOURCE_HISTORY
+    out2.Store(px, float4(m, source));
+#else
     out2.Store(px, float4(m, 0.0));
+#endif
     out3.Store(px, variance);
 }
 

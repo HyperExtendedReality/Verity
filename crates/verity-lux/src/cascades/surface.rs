@@ -140,7 +140,15 @@ pub fn island_size(extent: Vec2, density: f32) -> Option<[u32; 2]> {
 pub fn pack(sizes: &[[u32; 2]]) -> (Vec<Rect>, u32) {
     let mut order: Vec<usize> = (0..sizes.len()).collect();
     order.sort_unstable_by_key(|&i| std::cmp::Reverse(sizes[i][1]));
-    let mut rects = vec![Rect { x: 0, y: 0, w: 0, h: 0 }; sizes.len()];
+    let mut rects = vec![
+        Rect {
+            x: 0,
+            y: 0,
+            w: 0,
+            h: 0
+        };
+        sizes.len()
+    ];
     let (mut x, mut y, mut shelf) = (0, 0, 0);
     for i in order {
         let [w, h] = sizes[i];
@@ -331,8 +339,10 @@ mod tests {
                 assert!((uv[i].distance(uv[(i + 1) % 3]) - world).abs() < 1.0e-4);
             }
             let extent = charts.extents[charts.island[t] as usize];
-            assert!(uv.iter().all(|p| p.cmpge(-Vec2::splat(1e-5)).all()
-                && p.cmple(extent + 1e-5).all()));
+            assert!(
+                uv.iter()
+                    .all(|p| p.cmpge(-Vec2::splat(1e-5)).all() && p.cmple(extent + 1e-5).all())
+            );
         }
     }
 
@@ -348,13 +358,16 @@ mod tests {
 
     #[test]
     fn packed_rects_never_overlap() {
-        let sizes: Vec<[u32; 2]> = (0..500u32).map(|i| [2 + (i * 7) % 64, 2 + (i * 13) % 40]).collect();
+        let sizes: Vec<[u32; 2]> = (0..500u32)
+            .map(|i| [2 + (i * 7) % 64, 2 + (i * 13) % 40])
+            .collect();
         let (rects, height) = pack(&sizes);
         for (i, a) in rects.iter().enumerate() {
             assert_eq!([a.w, a.h], sizes[i]);
             assert!(a.x + a.w <= ATLAS_WIDTH && a.y + a.h <= height);
             for b in &rects[i + 1..] {
-                let apart = a.x + a.w <= b.x || b.x + b.w <= a.x || a.y + a.h <= b.y || b.y + b.h <= a.y;
+                let apart =
+                    a.x + a.w <= b.x || b.x + b.w <= a.x || a.y + a.h <= b.y || b.y + b.h <= a.y;
                 assert!(apart, "{a:?} {b:?}");
             }
         }
@@ -391,7 +404,10 @@ mod tests {
                 let distance = world.min(Vec3::ONE - world).min_element().abs();
                 assert!(distance < 1.0e-4, "{world}");
                 // Interior texels sit at their own centre.
-                let (x, y) = ((at as u32 % rect.w) as f32 + 0.5, (at as u32 / rect.w) as f32 + 0.5);
+                let (x, y) = (
+                    (at as u32 % rect.w) as f32 + 0.5,
+                    (at as u32 / rect.w) as f32 + 0.5,
+                );
                 let uv = charts.uv[j];
                 let texel_uv = (uv[0] * (1.0 - b - c) + uv[1] * b + uv[2] * c) * density;
                 let inside = x < rect.w as f32 - 1.0 && y < rect.h as f32 - 1.0;

@@ -15,6 +15,7 @@
 #include "materials.slang"
 #include "brdf.slang"
 #include "terrain.slang"
+#define VOXEL_SOURCE_HISTORY
 #include "screen_gi.slang"
 
 static const int MAX_VOXEL_STEPS = 512;
@@ -28,6 +29,7 @@ static const int SAMPLES = 4;
 static const float COVER_ONE = 4096.0;
 
 // Per level, per cell (toroidal): 0 when empty, else its voxel's index + 1.
+// The optional tail holds one finalized occupied-cell count per 4^3 brick.
 [[vk::binding(4, 0)]] RWStructuredBuffer<uint> cells;
 // Per voxel: cell (as `cellIndex`) or FREE, material, normal as signed bytes,
 // terrain ground as `pack_ground` in pxtgi.rs packs it.
@@ -45,6 +47,9 @@ static const float COVER_ONE = 4096.0;
 [[vk::binding(9, 0)]] RWStructuredBuffer<int> build;
 // The count of free voxels, then their indices.
 [[vk::binding(15, 0)]] RWStructuredBuffer<int> freeVoxels;
+// Bounce links (f.origin.w a side, 0 when off): per voxel and side, a ring of
+// where its last bounce rays went, as `packLink` packs them.
+[[vk::binding(30, 0)]] RWStructuredBuffer<uint> links;
 // Big triangles' work: an indirect dispatch's group count, 1, 1, unused, then
 // per entry the triangle, the job, its first column and nothing.
 [[vk::binding(16, 0)]] RWStructuredBuffer<uint> large;
@@ -66,6 +71,13 @@ uint cellIndex(int level, int3 c) {
     return uint(level) * uint(g * g * g) + uint((t.z * g + t.y) * g + t.x);
 }
 
+// Same toroidal mapping as the fine cells, in world-aligned bricks.
+uint brickIndex(int level, int3 brick) {
+    int g = gridSize(), b = g >> 2;
+    int3 w = brick & (b - 1);
+    return uint(levels() * g * g * g + ((level * b + w.z) * b + w.y) * b + w.x);
+}
+
 // The finest level holding p.
 int levelAt(float3 p) {
     for (int l = 0; l < levels() - 1; l++) {
@@ -75,15 +87,53 @@ int levelAt(float3 p) {
     return levels() - 1;
 }
 
-float3 voxelNormal(uint packed) {
-    int3 bytes = int3(int(packed << 24u), int(packed << 16u), int(packed << 8u)) >> 24;
-    return normalize(float3(bytes));
+#include "voxel_sdf.slang"
+#include "voxel_roma.slang"
+
+float3 voxelNormalBytes(uint packed) {
+    return float3(int3(int(packed << 24u), int(packed << 16u), int(packed << 8u)) >> 24);
 }
+
+float3 voxelNormal(uint packed) { return normalize(voxelNormalBytes(packed)); }
 
 uint packNormal(float3 n) {
     int3 b = int3(round(n * 127.0)) & 255;
     return uint(b.x) | uint(b.y) << 8u | uint(b.z) << 16u;
 }
+
+// Merge up to four original DDA events per axis, through the first brick exit.
+// Use the same rounded additions and X/Y/Z tie priority, not geometric re-entry.
+int3 eventsThrough(float3 times, float t, bool3 ties) {
+    return int3(select(ties, times <= t, times < t));
+}
+
+bool hopBrick(int3 world, int3 step, float3 delta, float end, int size,
+              inout int3 c, inout float3 next, inout float t, inout int i) {
+    int3 local = world & 3;
+    int3 exit = select(step > 0, 3 - local, local);
+    precise float3 e1 = next + delta;
+    precise float3 e2 = e1 + delta;
+    precise float3 e3 = e2 + delta;
+    float3 edges = select(exit == 0, next, select(exit == 1, e1, select(exit == 2, e2, e3)));
+    int axis = edges.x <= edges.y && edges.x <= edges.z ? 0 : (edges.y <= edges.z ? 1 : 2);
+    float edge = edges[axis];
+    if (!(edge <= end) || any(isnan(next))) return false;
+    bool3 ties = int3(0, 1, 2) <= axis;
+    int3 taken = min(exit + 1, eventsThrough(next, edge, ties) + eventsThrough(e1, edge, ties)
+                            + eventsThrough(e2, edge, ties) + eventsThrough(e3, edge, ties));
+    int3 after = c + step * taken;
+    int count = taken.x + taken.y + taken.z;
+    // A level/reach break does not charge the last step; let the fine loop own it.
+    if (any(after < 0) || any(after >= size) || i + count > MAX_VOXEL_STEPS) return false;
+    precise float3 e4 = e3 + delta;
+    next = select(taken == 0, next, select(taken == 1, e1,
+           select(taken == 2, e2, select(taken == 3, e3, e4))));
+    c = after;
+    t = edge;
+    i += count;
+    return true;
+}
+
 
 // The first voxel along a ray within reach, as its index + 1, or 0. It starts in
 // the finest level holding o and steps to coarser ones as it leaves each.
@@ -109,8 +159,22 @@ uint walk(float3 o, float3 d, float reach) {
         if (t >= end) continue;
         int3 c = clamp(int3(floor(p + d * (t + 1e-3))), 0, size - 1);
         float3 next = (float3(c) + select(d >= 0.0, float3(1.0), float3(0.0)) - p) * inv;
-        [loop] for (; i < MAX_VOXEL_STEPS; i++) {
-            uint found = cells[cellIndex(l, c + low)];
+        int3 tried = int3(0x7fffffff);
+        [loop] for (; i < MAX_VOXEL_STEPS;) {
+            int3 world = c + low;
+            if (f.extra.w != 0.0) {
+                int3 brick = world >> 2;
+                if (any(brick != tried)) {
+                    tried = brick;
+                    if (cells[brickIndex(l, brick)] == 0u) {
+                        if (hopBrick(world, step, delta, end, size, c, next, t, i)) {
+                            clear = true;
+                            continue;
+                        }
+                    }
+                }
+            }
+            uint found = cells[cellIndex(l, world)];
             if (found != 0u && (clear || i >= MAX_START_CELLS)) return found;
             clear = clear || found == 0u;
             if (next.x <= next.y && next.x <= next.z) {
@@ -121,6 +185,7 @@ uint walk(float3 o, float3 d, float reach) {
                 t = next.z; next.z += delta.z; c.z += step.z;
             }
             if (t > end || any(c < 0) || any(c >= size)) break;
+            i++;
         }
         if (t > reach / cell || i >= MAX_VOXEL_STEPS) return 0u;
         travelled = end * cell;
@@ -128,13 +193,38 @@ uint walk(float3 o, float3 d, float reach) {
     return 0u;
 }
 
+// Values of VoxelVisibility in voxel.rs.
+static const uint VOXEL_VISIBILITY_SDF = 1u;
+static const uint VOXEL_VISIBILITY_ROMA = 2u;
+
+// Reuses the exact ray for residual screen correction and as the fallback
+// for a visibility cache that could not answer. Only diffuse rays may snap.
+uint walkDiffuse(float3 o, inout float3 d, float3 n, float reach, bool allowSnap) {
+    // f.origin.z is the installed VoxelVisibility mode. The host builds the
+    // selected cache before any diffuse queries in this frame.
+    uint mode = f.origin.z;
+    if (mode == VOXEL_VISIBILITY_SDF) {
+        uint found;
+        if (voxelSdfTrace(o, d, reach, true, found)) return found;
+    } else if (mode == VOXEL_VISIBILITY_ROMA && allowSnap) {
+        RomaTrace hit = romaTraceDiffuse(o, d, n, reach);
+        if (hit.supported) {
+            d = hit.direction;
+            return hit.found;
+        }
+    }
+    return walk(o, d, reach);
+}
+
 // The light a ray along d gets from a voxel, from the side it arrives at. Sides
 // light separately, so a wall one voxel thick does not pass light through it.
 float3 voxelSeen(uint found, float3 d) {
     uint index = found - 1u;
-    uint side = dot(voxelNormal(voxels[index].z), d) > 0.0 ? 1u : 0u;
+    uint side = dot(voxelNormalBytes(voxels[index].z), d) > 0.0 ? 1u : 0u;
     return radiance[index * 6u + side * 3u].rgb;
 }
+
+#include "holographic.slang"
 
 // The start of the renderer's `Globals` (lib/common.slang), through its sun
 // shadow cascades, and its shadow map: set 2 is the renderer's frame set.
@@ -219,6 +309,78 @@ float3 voxelSampled(float3 x, float3 n, float3 o, inout uint seed) {
     return c;
 }
 
+// A (0,2) base-2 sequence: reversed visit bits and the reversed binary Pascal
+// transform (Sobol's second dimension). The two digital shifts preserve the
+// stratification of every aligned power-of-two block and vary it by cell/side.
+float2 bounceSample(uint visit, uint voxel, uint side) {
+    uint y = visit;
+    y ^= (y >> 1u) & 0x55555555u;
+    y ^= (y >> 2u) & 0x33333333u;
+    y ^= (y >> 4u) & 0x0f0f0f0fu;
+    y ^= (y >> 8u) & 0x00ff00ffu;
+    y ^= y >> 16u;
+    uint shift = hashU(voxel ^ (side << 31u));
+    uint2 bits = uint2(reversebits(visit) ^ shift, reversebits(y) ^ hashU(shift ^ 0x9e3779b9u));
+    // Convert only the top 24 bits, after mixing in the full integer visit.
+    return float2(bits >> 8u) / 16777216.0;
+}
+
+uint bounceLinks() { return f.origin.w; }
+
+// A link: 0 empty, LINK_MISS for a ray that found no voxel, else LINK_HIT, the
+// voxel's index (under POOL = 2^20) and 11 bits of its cell's hash, so a voxel
+// freed or reused elsewhere since stops counting.
+static const uint LINK_MISS = 1u;
+static const uint LINK_HIT = 0x80000000u;
+static const float LINK_HISTORY = 4.0;
+
+uint linkTag(uint cell) { return (hashU(cell) & 0x7ffu) << 20u; }
+
+uint packLink(uint found) {
+    if (found == 0u) return LINK_MISS;
+    uint index = found - 1u;
+    return LINK_HIT | linkTag(voxels[index].x) | index;
+}
+
+// The voxel a hit link reached, as `walk` returns it, or 0 when it has gone.
+// shortcut: a reused voxel whose new cell hashes to the same 11 bits still
+// counts, 1 in 2048; store the whole cell if that ever shows.
+uint linkVoxel(uint link) {
+    uint index = link & 0xfffffu;
+    uint cell = voxels[index].x;
+    return cell != FREE && (link & 0x7ff00000u) == linkTag(cell) ? index + 1u : 0u;
+}
+
+// The arriving light of a side's links: this visit's ray goes in its ring, and
+// every ray there reads the light its voxel leaves now, so a light change
+// reaches the next visit instead of fading in over 64. A link keeps the visit
+// it was traced on, by its place in the ring, so its direction is recomputed.
+float3 linkedArriving(uint index, uint key, uint side, float3 n, float3 o, uint visit, out float3 came) {
+    uint count = bounceLinks();
+    uint base = (index * 2u + side) * count;
+    uint now = visit % count;
+    float2 uv = bounceSample(visit, key, side);
+    float3 dir = cosineDir(n, uv.x, 6.2831853 * uv.y);
+    links[base + now] = packLink(walkDiffuse(o, dir, n, f.sky.w, true));
+    float3 sum = 0.0;
+    came = 0.0;
+    float rays = 0.0;
+    [loop] for (uint k = 0u; k < count; k++) {
+        uint link = links[base + k];
+        if (link == 0u) continue;
+        uint found = link == LINK_MISS ? 0u : linkVoxel(link);
+        if (link != LINK_MISS && found == 0u) continue;
+        float2 s = bounceSample(visit - (now + count - k) % count, key, side);
+        float3 d = cosineDir(n, s.x, 6.2831853 * s.y);
+        float3 seen = found != 0u ? voxelSeen(found, d) : background(d);
+        sum += seen;
+        came += luminance(seen) * d;
+        rays += 1.0;
+    }
+    came /= max(rays, 1.0);
+    return sum / max(rays, 1.0);
+}
+
 // A quarter of the voxels a frame, one side at a time: direct light and a bounce ray.
 [shader("compute")]
 [numthreads(64, 1, 1)]
@@ -247,20 +409,31 @@ void inject(uint3 id : SV_DispatchThreadID) {
     float3 o = x + n * (1.5 * cell);
     uint slot = index * 6u + side * 3u;
 
-    uint seed = hashU(index ^ hashU(frame));
-    float u = float(seed >> 8u) / 16777216.0;
-    float phi = 6.2831853 * float(hashU(seed) >> 8u) / 16777216.0;
-    float3 dir = cosineDir(n, u, phi);
-    uint found = walk(o, dir, f.sky.w);
-    float3 seen = found != 0u ? voxelSeen(found, dir) : background(dir);
-    uint lightSeed = hashU(seed ^ 0x68bc21ebu);
+    float3 seen, came;
+    // Inside Holographic Radiance Cascades' box, what they gathered from every
+    // way; elsewhere the bounce links, or a bounce ray.
+    bool hrc = hrcArriving(x, n, seen, came);
+    bool linked = !hrc && bounceLinks() != 0u;
+    if (linked) {
+        seen = linkedArriving(index, voxel.x, side, n, o, frame >> 3u, came);
+    } else if (!hrc) {
+        // Four index lanes, then two sides: this side gets one visit per eight frames.
+        float2 uv = bounceSample(frame >> 3u, voxel.x, side);
+        float3 dir = cosineDir(n, uv.x, 6.2831853 * uv.y);
+        uint found = walkDiffuse(o, dir, n, f.sky.w, true);
+        seen = found != 0u ? voxelSeen(found, dir) : background(dir);
+        came = luminance(seen) * dir;
+    }
+    uint lightSeed = hashU(hashU(index ^ hashU(frame)) ^ 0x68bc21ebu);
     float3 sampled = voxelSampled(x, n, o, lightSeed);
-    float3 came = luminance(seen) * dir;
     seen += sampled;
 
     // The last 64 visits; a few while the lights change.
     float4 arriving = radiance[slot + 1u];
+    // Links already average their rays: a short history only smooths the
+    // ring's turnover and the sampled point lights.
     float frames = min(arriving.w + 1.0, f.extra.y > 0.0 ? f.extra.y : 64.0);
+    if (linked) frames = min(frames, LINK_HISTORY);
     arriving = float4(lerp(arriving.rgb, seen, 1.0 / frames), frames);
     radiance[slot + 1u] = bad(arriving) ? float4(0.0) : arriving;
     float3 leaving = voxelAlbedo(voxel, x, n) * (voxelDirect(x, n, o, cell) + arriving.rgb);
@@ -324,6 +497,7 @@ void clear(uint3 id : SV_DispatchThreadID) {
     if (found == 0u) return;
     release(found - 1u);
     cells[at] = 0u;
+    if (f.extra.w != 0.0) InterlockedAdd(cells[brickIndex(level, c >> 2)], 0xffffffffu);
 }
 
 // The bounds of the part of triangle abc inside the box lo..hi, or false when
@@ -424,8 +598,9 @@ bool jobSpan(Raster r, uint j, out int level, out int3 from, out int3 to) {
 // Samples landing in the same cell as the last are merged, saving atomics on
 // coarse levels, where many triangles share a voxel.
 void addSamples(uint index, int samples, Raster r) {
+    if (samples == 0) return; // No prior sample: index can be FREE.
     uint found = cells[index];
-    if (samples == 0 || found == 0u) return;
+    if (found == 0u) return;
     uint voxel = found - 1u;
     InterlockedAdd(build[voxel * 4u], r.cover * samples);
     InterlockedAdd(build[voxel * 4u + 1u], r.normal.x * samples);
@@ -609,9 +784,11 @@ void finalize(uint3 id : SV_DispatchThreadID) {
         cells[at] = 0u;
         return;
     }
+    if (f.extra.w != 0.0) InterlockedAdd(cells[brickIndex(level, c >> 2)], 1u);
     float3 sum = float3(build[voxel * 4u + 1u], build[voxel * 4u + 2u], build[voxel * 4u + 3u]);
     if (length(sum) > 0.1 * 127.0) voxels[voxel].z = packNormal(normalize(sum));
     for (uint i = 0u; i < 6u; i++) radiance[voxel * 6u + i] = 0.0;
+    for (uint i = 0u; i < 2u * bounceLinks(); i++) links[voxel * 2u * bounceLinks() + i] = 0u;
 }
 
 // ---------------------------------------------------------------- screen
@@ -621,9 +798,8 @@ void finalize(uint3 id : SV_DispatchThreadID) {
 // centres as a texture is filtered; false where none has. Each gives the side
 // facing n, and voxels facing across it (the other wall of a corner) count
 // for less.
-bool voxelArriving(float3 p, float3 n, out float3 arriving) {
+bool voxelArriving(float3 p, float3 n, int level, out float3 arriving) {
     arriving = 0.0;
-    int level = levelAt(p);
     float cell = levelCell(level);
     int3 low = levelLow(level);
     // A little into the surface, whose voxels may sit just behind it.
@@ -680,47 +856,69 @@ void trace(uint3 id : SV_DispatchThreadID) {
     int2 fp = framePixel(px, traceSize());
     float depth = loadDepth(fp);
     uint4 g = loadGbuffer(fp);
+    bool trackSources = sourceAwareHistory();
     if (!receives(depth, g)) {
         out0.Store(px, 0.0);
+        if (trackSources) out2.Store(px, 0.0);
         return;
     }
     float3 p = worldFromPixel(float2(fp) + 0.5, depth);
     float3 n = gbufferNormal(g);
-    float3 noise = blueNoise(px).xyz;
-    int rays = clamp(int(f.cache.w), 1, 4);
+    int rays = int(f.cache.w); // Clamped to 1..4 on the host.
+    bool useScreen = f.misc.y > 0.0 && f.extra.z > 0.5;
+    int level = levelAt(p);
     float3 light = 0.0;
     float hits = 0.0;
-    float3 origin = p + n * (0.02 + 0.002 * linearDepth(depth));
-    float3 voxelOrigin = p + n * (1.5 * levelCell(levelAt(p)));
     float3 proxy;
-    bool residual = f.extra.x > 0.5 && voxelArriving(p, n, proxy);
-    [loop] for (int r = 0; r < rays; r++) {
-        float index = f.misc.x * float(rays) + float(r);
-        float u = frac(noise.x + index * 0.7548776662);
-        float phi = 6.2831853 * frac(noise.y + index * 0.5698402910);
-        float3 dir = cosineDir(n, u, phi);
-        float jitter = frac(noise.z + index * 0.6180339887);
-        float4 seen = march(origin, dir, f.misc.y, STEPS, jitter);
-        if (residual) {
-            if (seen.w > 0.5) {
-                uint found = walk(voxelOrigin, dir, f.sky.w);
-                light += clampFirefly(seen.rgb) - (found != 0u ? voxelSeen(found, dir) : background(dir));
-            }
-        } else if (seen.w > 0.5) {
-            light += clampFirefly(seen.rgb);
-            hits += 1.0;
-        } else {
-            uint found = walk(voxelOrigin, dir, f.sky.w);
-            if (found != 0u) {
-                light += clampFirefly(voxelSeen(found, dir));
+    bool residual = f.extra.x > 0.5 && voxelArriving(p, n, level, proxy);
+    uint2 sources = 0u;
+    // With no usable screen image, a settled proxy is already the whole estimate.
+    if (useScreen || !residual) {
+        float3 noise = blueNoise(px).xyz;
+        float3 origin = p + n * (0.02 + 0.002 * linearDepth(depth));
+        float3 voxelOrigin = p + n * (1.5 * levelCell(level));
+        [loop] for (int r = 0; r < rays; r++) {
+            float index = f.misc.x * float(rays) + float(r);
+            float u = frac(noise.x + index * 0.7548776662);
+            float phi = 6.2831853 * frac(noise.y + index * 0.5698402910);
+            float3 dir = cosineDir(n, u, phi);
+            float jitter = frac(noise.z + index * 0.6180339887);
+            float4 seen = 0.0;
+            if (useScreen) seen = march(origin, dir, f.misc.y, STEPS, jitter);
+            if (residual) {
+                if (seen.w > 0.5) {
+                    // Both sides of the correction must use the same ray.
+                    uint found = walkDiffuse(voxelOrigin, dir, n, f.sky.w, false);
+                    light += clampFirefly(seen.rgb) - (found != 0u ? voxelSeen(found, dir) : background(dir));
+                    if (trackSources) {
+                        if (found != 0u) sources.x++; // Screen correction against a voxel.
+                        else sources.y++;              // Screen correction against the background.
+                    }
+                }
+            } else if (seen.w > 0.5) {
+                light += clampFirefly(seen.rgb);
                 hits += 1.0;
+                if (trackSources) sources.x++;
+            } else {
+                uint found = walkDiffuse(voxelOrigin, dir, n, f.sky.w, true);
+                if (found != 0u) {
+                    light += clampFirefly(voxelSeen(found, dir));
+                    hits += 1.0;
+                    if (trackSources) sources.y++;
+                }
             }
         }
     }
     // A residual texel's light covers the sky too: nothing is left open.
     float4 result = residual ? float4(max(proxy + light / float(rays), 0.0), 1.0)
                              : float4(light, hits) / float(rays);
-    out0.Store(px, bad(result) ? float4(0.0) : result);
+    bool invalid = bad(result);
+    out0.Store(px, invalid ? float4(0.0) : result);
+    // Binding 6 is the first à-trous light image, still scratch until filtering.
+    if (trackSources) {
+        float source = invalid ? 0.0 : packVoxelSources(sources, uint(rays), residual);
+        out2.Store(px, float4(source, 0.0, 0.0, 0.0));
+    }
 }
 
 // Adds the filtered light to the image, and keeps the result for next frame's rays.

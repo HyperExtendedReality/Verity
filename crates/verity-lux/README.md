@@ -10,6 +10,8 @@ hemisphere ambient belong to `verity-render`; they do not require Lux.
 | PXTGI | `pxtgi` | The physics scene |
 | Screen and voxel GI | `voxel` | The depth buffer, then a voxel copy of the scene |
 | Residual GI | `voxel` | The voxels' settled light, corrected along the depth buffer |
+| Ultra PBR / MSGI (experimental) | `cascades` | Material-weighted rays against Split's surface cache |
+| Sliced Holographic Radiance Cascades (experimental) | `voxel` / `holographic` | Radiance through one voxel clipmap level, or through a standalone volume |
 
 Install `Lux` with `Renderer::set_extension` before loading the geometry that
 should take part:
@@ -64,6 +66,11 @@ keep the cost of a frame down:
   geometry merges them all.
 - `seed` writes only the fields descriptors use, not whole 240-byte entries.
 
+Split's deterministic diffuse projection and gather should preserve a unit
+constant Lambertian field regardless of surface normal. The gather combines
+angular and spatial weighted sums, normalizes each active light source by its
+own weight sum, and keeps confidence separate from the light estimate.
+
 `Settings::multi_bounce`, on by default, carries light past the first bounce: a
 ray's hit reflects the irradiance last frame's probes hold there. Each bounce
 takes about one trip through the receivers, and hits outside every probe, off
@@ -88,6 +95,38 @@ these surfaces now bring their light instead of being left out. On the Bistro
 street view at 1920×1080 (RTX 4070 Laptop, runs alternating off and on) the
 cells add 0.22–0.28 ms to `surfaceUpdate` and 0.15–0.31 ms to the GI total.
 
+Surface-cache bounces take consecutive samples from a fixed-point R2 sequence
+on each scheduled texel or hash-slot visit. A different phase per slot avoids
+sampling every surface in the same direction; indexing by visits keeps the
+sequence dense even when a slot is touched only every few frames, without
+changing the cosine weighting. `Settings::budgeted` uses one bounce ray per
+visit; `Settings::default` and `Settings::landscape` keep two. Set
+`surface_bounce_rays` to two in the budgeted preset if startup flicker matters
+more than the cost of the surface-cache pass.
+
+In the editor, open **Scene Lighting → Method → Experimental GI** to try these
+presets, including empty-brick skipping for Screen and voxel GI or Residual GI.
+Choosing a preset saves it with the scene; the standard methods are unchanged.
+
+Experimental Split options in `sponza_gi`:
+
+- `--surface-cold-priority` lends rays from settled surface slots to new or
+  invalidated ones in the same GPU wave, without raising the bounce budget.
+  Settled slots still get periodic refreshes. This is opt-in.
+- `--surface-bounce-guide` proposes directions from last frame's cascade guide
+  for the existing surface-cache bounce rays. It keeps a cosine component and
+  weights the result by the mixture PDF. Probe interpolation at receivers is
+  unchanged.
+- `--emitter-low-discrepancy` changes the eight final-gather emissive candidates
+  from hash draws to a shifted 3D R3 sequence (triangle selection and two
+  area coordinates). The light PDF and reference tracer are unchanged.
+- `--gather=guided` replaces probe interpolation at the receiver with a traced
+  diffuse gather. It mixes cosine sampling with an eight-bin incident-light
+  guide built from the previous frame's Split data, then reads the existing
+  surface cache at hits. `--gather=cosine` is the unguided control;
+  `--gather=probes` is the default. Benchmark the whole GI pipeline, including
+  `packProbes` and `guidedResolve`, before choosing the guided mode.
+
 Materials with `KHR_materials_diffuse_transmission` pass that share of their
 diffuse light through: lights behind a leaf shine through it in the
 transmission color, both in the renderer's direct light and at GI hits, and at
@@ -104,8 +143,9 @@ traces one sky ray.
 Emissive materials (glTF `emissiveFactor`, `KHR_materials_emissive_strength`
 and `emissiveTexture`) glow in the renderer and light the scene through GI.
 The brightest `MAX_EMITTERS` (4096) emissive triangles go in a light list,
-picked in proportion to area times emission. Each shaded pixel samples one a
-frame with a shadow ray (`worldResolve`), and so does each ray hit; probe rays
+picked in proportion to area times emission. Each shaded pixel draws eight a
+frame and keeps one in proportion to its unshadowed light there (resampled
+importance sampling), behind one shadow ray (`worldResolve`); each ray hit samples one; probe rays
 leave their emission out so it is not counted twice. Emitters past the cap
 reach the scene only through rays that hit them. Emitted light shares the background group's history, so
 an emitter that changes needs the scene reloaded. PXTGI and the voxel method
@@ -145,14 +185,54 @@ candidate grid and half-size resolve lost nothing on Sponza, and what they save
 buys 2048 updates a frame and about a million cached entries. The cache is what
 sets its accuracy.
 
+### Ultra PBR / MSGI (experimental)
+
+Choose **Scene lighting → Method → Experimental GI → Ultra PBR / MSGI**, or run:
+
+```sh
+cargo run --release -p verity-lux --example sponza_gi -- --gi --gather=msgi --eye=4,0,1.7 --target=-4,1.5,2.5
+```
+
+MSGI draws one ray per resolve texel from an energy-weighted cosine/GGX mixture
+in the visible material's shading frame. It samples the stronger lobe more
+often, advances the direction on a blue-noise-shifted R2 sequence, and divides
+the full diffuse and glossy response by the same mixture PDF used for emissive
+MIS. It shares Split's surface cache and emitter candidate resampling; eight
+candidates still cost at most one visibility ray. When the secondary-hit cache
+is cold, Split's diffuse probes replace the missing transport, but lighting
+from listed emitters keeps the same paired estimate.
+
+Direct lighting is unchanged. MSGI is an opaque, cached final gather, not a
+full glossy multi-bounce path tracer or a new material format. Use
+`--gather=cosine` for the one-ray diffuse control, or `--gather=probes` for
+ordinary Split. For an uncached material-weighted reference, run
+`--reference --gather=msgi`; plain `--reference` keeps the Lambertian
+receiver used to compare diffuse-probe methods.
+
+For an A/B capture, hold the render size, camera, scene, AA mode and warm-up
+fixed. The Desktop AA jitter has 16 phases; average all 16 saved still images
+instead of comparing individual frames. Compare MSGI with the material-weighted
+reference and Split probes with the diffuse reference. Their lighting models
+are different, so the resulting errors do not rank the two methods directly.
+
+```sh
+cargo run --release -p verity-lux --example sponza_gi -- --bench=tmp/msgi-run --gather=msgi --size=640x360 --warm=96 --eye=4,0,1.7 --target=-4,1.5,2.5
+cargo run --release -p verity-lux --example sponza_gi -- --bench=tmp/msgi-ref --reference --gather=msgi --size=640x360 --warm=300 --eye=4,0,1.7 --target=-4,1.5,2.5
+```
+
+The standard Split preset does not compile the guided, material, or reference
+kernels at startup. Each is compiled only when selected. Split's probe packer
+projects one cosine per antipodal bin pair, without changing the directional
+samples or their coverage.
+
 ## Measuring against a reference
 
 `examples/sponza_gi.rs --bench=DIR` prints GPU time per pass and saves frames as
-PFM (`--cold` saves the first frames GI draws), and `--reference` saves a
-path-traced image of the same view:
-`PxtgiDebug::Reference` traces diffuse light with no cache or filter, and hits
-take mean colours as PXTGI's do. `--pxtgi` leaves reflections off to compare
-diffuse with diffuse; add `--reflections` for what PXTGI normally costs.
+PFM (`--cold` saves the first frames GI draws). `--reference` traces the
+Split scene without a cache. `--pxtgi-reference` traces diffuse light on the
+physics scene with the same mean material colors as PXTGI and without its
+cache or filter. `--pxtgi` leaves reflections off for that comparison; add
+`--reflections` to measure the usual PXTGI configuration.
 
 `examples/flip.rs` shows where a run differs from the reference, as a viewer
 would see it: HDR-FLIP ([Andersson et al.](https://research.nvidia.com/publication/2021-05_hdr-flip-visualizing-errors-rendered-high-dynamic-range-images),
@@ -162,6 +242,33 @@ heatmap beside each as `.flip.png`:
 ```bash
 cargo run --release -p verity-lux --example flip -- ref/still15.pfm run/still*.pfm
 ```
+
+### Native GI A/B: Sponza courtyard
+
+RTX 4070 Laptop, 640×360, 96 warm-up frames, 120 timed frames per camera phase.
+Error is the absolute difference of 8×8 luminance blocks averaged over 16 still
+captures, divided by the reference's mean indirect light. Split uses its
+diffuse reference, MSGI its material-weighted reference, and the other diffuse
+methods the PXTGI reference. References warm up for 300 frames. The timings are
+individual runs on one device, not speedup guarantees.
+
+| Mode | Still GPU ms (before → after) | Moving GPU ms (before → after) | Still error (before → after) |
+| --- | ---: | ---: | ---: |
+| Split | 2.863 → 2.242 | 3.467 → 2.191 | 0.206 → 0.208 |
+| Ultra PBR / MSGI | 3.618 → 2.657 | 4.481 → 2.800 | 0.257 → 0.256 |
+| PXTGI diffuse | 0.673 → 0.457 | 0.547 → 0.288 | 0.111 → 0.111 |
+| PXTGI with reflections | 0.617 → 0.429 | 0.656 → 0.355 | — |
+| Screen and voxel | 1.184 → 0.788 | 1.139 → 0.641 | 0.236 → 0.236 |
+| Residual (four-ray benchmark) | 0.975 → 0.695 | 0.992 → 0.570 | 0.233 → 0.235 |
+| Screen/voxel + HRC level 0 | 12.526 → 4.954 | 9.882 → 4.765 | 0.244 → 0.244 |
+
+On a separate 320×180 fixture with a small emissive card reflected by a
+metallic plate, MSGI's normalized luminance-block error against the material
+reference fell from 0.080 to 0.061. Still GPU time was 0.806 → 0.816 ms.
+
+The standalone 64³ HRC volume stayed at 10.1% slice error against brute force
+with eight azimuth pages. HRC remains opt-in: its integration is faster here,
+but the voxel-only method still costs less and scored lower diffuse error.
 
 Sponza at 1280×720 on an RTX 4070 Laptop GPU, 300 frames after starting, against
 that reference. Error is the mean absolute difference over 8×8 pixel blocks, as a
@@ -450,6 +557,68 @@ With the merge fixed, the `remapProbeHeads` search above still made every view
 worse (courtyard 0.219–0.222, corridor 0.399, Bistro 0.171), adding 3–4% light
 to images already at or above the reference's, so the old mapping stays.
 
+### Foveated probes
+
+Probes already coarsen with distance: `splitLodBlend` doubles a point's probe
+spacing and intervals each time its distance doubles, blending across the
+boundary. `Settings::foveation` (degrees, 0 = off) also coarsens them away
+from the gaze, by `1 + angle / foveation`, the linear falloff of visual acuity
+(Guenter et al. 2012). Intervals scale with the spacing, so a coarser point
+loses no near interval and needs no separate contact term. The gaze is the
+view's centre unless `SplitRadianceCascades::set_gaze` gives an eye
+tracker's direction. `sponza_gi --foveation=DEG` sets it.
+
+Sponza courtyard, 1280×720, `budgeted`, against a 1200-frame `--reference`:
+mean HDR-FLIP (`examples/flip.rs`) of the last four still frames against the
+reference's last.
+
+| Run | GPU time | FLIP |
+| --- | --- | --- |
+| Off | 3.48 ms | 0.296 |
+| 10° | 3.51 ms | 0.299 |
+| 5° | 3.69 ms | 0.295 |
+| 1° | 3.28 ms | 0.299 |
+| Off, 1024 updates | 3.39 ms | 0.295 |
+| 5°, 1024 updates | 3.39 ms | 0.294 |
+
+On a flat screen it buys nothing yet. Halving the update budget costs this
+view nothing either, so the budget is not what limits it, and foveation has
+nothing to move toward the centre. It should pay where receivers outrun the
+budget: both eyes of a headset at full resolution. That is untested, and so
+is how fast the fovea's fine probes warm up after a saccade. It stays off by
+default.
+
+### 192-byte entries
+
+The cache passes move entries, so their size sets their cost. A quarter of
+each entry was bounds: two light-hit spheres and two dependency boxes, 96
+bytes of fp32. They are now halves relative to the entry's `origin`, rounded
+outward (box minima down, maxima up, a sphere's radius grown by its centre's
+rounding error), so a bound only ever grows and one past a half's range reads
+as unknown. Both make an entry more likely to be invalidated, never less.
+They live behind properties on `Entry` (`common.slang`), so readers and
+writers kept their field names; because they are relative, `origin` must be
+set before them. Radiance stays fp32: history blending takes small steps that
+a half loses, as the reference's running mean did. The header (key to
+`padding`) now comes first, so a retained stub is 48 contiguous bytes.
+
+Sponza courtyard, 1280×720, `budgeted`, two runs of each build alternating;
+error is the mean HDR-FLIP of the last four still frames against the
+foveation section's reference.
+
+| Pass | 240 bytes | 192 bytes |
+| --- | --- | --- |
+| `retain` | 0.254–0.259 ms | 0.186–0.188 ms |
+| `reduce` | 0.331–0.332 ms | 0.240–0.241 ms |
+| `merge` | 0.522–0.527 ms | 0.441–0.478 ms |
+| `commitCache` | 0.225–0.226 ms | 0.249 ms |
+| Still frame | 3.65–3.69 ms | 3.38–3.57 ms |
+| Error | 0.296–0.298 | 0.293–0.294 |
+
+The four cache passes went from 1.34 to 1.12–1.15 ms. `commitCache` lost
+0.02 ms, likely to the conversions. The corridor and Bistro views were not
+re-measured.
+
 ## Screen and voxel GI
 
 A ray follows the depth buffer and takes its light from last frame's image. Past
@@ -458,18 +627,45 @@ Each frame a quarter of the voxels update one side's direct light and send a bou
 ray, so light bounces further over time. History and filtering are PXTGI's, shared
 through `shaders/screen_gi.slang`.
 
+`--voxel-bricks` tests conservative empty-brick skipping in both `--voxel`
+and `--residual`. A 4³ brick is only skipped when its finalized occupancy is
+zero; crossing a brick still consumes the corresponding fine-DDA steps.
+Compare total GI time with and without the flag, including occupancy updates.
+
+`--voxel-source-history` enables per-tap history rejection for both modes.
+It attenuates large changes in screen, voxel and uncovered-ray coverage and
+rejects history when Residual's voxel baseline appears or disappears. It does
+not change the screen/voxel estimator or add rays.
+
+Without a valid previous color image, the voxel methods go directly to their
+voxel estimates. `--no-screen` also bypasses screen tracing on a warm view.
+Residual uses the settled voxel estimate alone whenever a screen correction
+cannot be sampled.
+
+`--holographic=N` replaces voxel bounce walks inside clipmap level `N` with
+the sliced HRC gather once its azimuth sweep completes. It integrates each
+cone's solid angle and first directional moment analytically. Scrolling or
+rebuilding that clipmap invalidates the sweep; injection uses regular voxel
+rays until the replacement has finished. This is not the default voxel GI
+path. `--example holographic` measures the CPU volume version against a
+brute-force slice.
+
+Outside the Holographic Radiance Cascades volume, voxel injection traces one
+cosine-weighted bounce ray per side every eight frames. A per-cell scrambled
+digital net changes only the ray directions, with no extra rays, passes, or
+storage. In a synthetic directional-moment test, RMSE fell from 0.26940 to
+0.12063 at 8 visits and from 0.09173 to 0.01673 at 64 versus independent hash jitter.
+
 A cell a surface barely clips stays solid only in proportion to the surface in it.
 Marking them all plugs narrow openings: in Sponza's corridor that left 0.60 of the
 reference's light rather than 0.74, and keeping too few leaks (1.83).
 
 This is a first version, and these are its limits:
 
-- Scenes voxelize on the CPU as they load, and the whole grid rebuilds with each
-  scene loaded.
+- Static scene geometry is voxelized on the GPU as the clipmap levels scroll.
 - Terrain and other retained meshes are not voxelized, and neither are moving
   bodies, so they appear only through the screen rays.
-- One grid covers everything, so cells grow with the scene, and it is too coarse
-  for a landscape. There are no clipmaps yet.
+- Coarse clipmap levels cover more distance but lose thin surfaces and openings.
 - Light reaching deep into a scene through small openings comes up short, as the
   corridor above shows.
 - A voxel's colour is its material's mean colour, and materials have no emission.
@@ -558,6 +754,18 @@ answers CPU rays with `RayScene::ray`. Diffuse rays trace the scene, where a
 hashed radiance cache carries further bounces; `max_distance` lets them follow
 the screen first for geometry drawn but missing from it. Reflection rays follow
 the screen first, taking their light from the previous frame's lit image.
+
+World-cache reads pair radiance with the mass of the last completed shade
+pass, so gathering a new cell cannot mark it ready ahead of shaded data.
+Glossy history stays at the exact texel on a still view; during motion only
+depth- and normal-compatible taps survive reprojection.
+
+`--pxtgi --pxtgi-temporal-reuse` reprojects one previous raw first diffuse hit.
+It verifies that the current closest hit still matches, re-shades it, and
+averages its density-adjusted contribution with the first fresh hit. It does
+not reuse RGB or chain history. Misses, moving physics and bad reconnections
+use the fresh result. This is an opt-in, biased world-only comparison
+(`--screen=0`), not a reference tracer or a full ReSTIR PT implementation.
 
 Cache cells double in size with each doubling of distance past 8 m, and each
 cell claims its parent one size up, which stays alive while the cell is used.

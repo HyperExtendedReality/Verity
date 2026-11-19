@@ -16,10 +16,10 @@
 // Buffers, as pointers ending `Frame` (`FrameData::buffers`): primitives, their
 // tree, the radiance cache's keys and cells, static mesh tree nodes (two each)
 // and triangles (three corners), the same for soft bodies (rewritten as they
-// deform), and the reference path tracer's fp32 sum.
+// deform), the reference path tracer's fp32 sum, and optional diffuse history.
 #define METHOD_POINTERS \
     Primitive* prims; Node* nodes; Atomic<uint>* cacheKeys; Cell* cells; \
-    float4* geo; float4* softGeo; float4* referenceSum;
+    float4* geo; float4* softGeo; float4* referenceSum; DiffuseCandidate* diffuseHistory;
 #include "screen_gi.slang"
 #include "wave_batch.slang"
 
@@ -58,13 +58,22 @@ struct Node {
 };
 
 // Radiance cache cell: where it was hit (w: frame last used, as bits), normal
-// (w: refinements), albedo, bounce light arriving, light leaving.
+// (w: gathered samples), albedo, bounce light arriving, light leaving (w: published samples).
 struct Cell {
     float4 pos;
     float4 normal;
     float4 albedo;
     float4 incoming;
     float4 outgoing;
+};
+
+// The raw first world hit only: never own a reused candidate for another frame.
+// Four 16-byte rows, two pages indexed by the frame parity.
+struct DiffuseCandidate {
+    float4 origin;         // w: frame stamp as bits
+    float4 receiverNormal;
+    float4 vertex;         // w: primitive index as bits
+    float4 vertexNormal;
 };
 
 // ---------------------------------------------------------------- scene trace
@@ -155,9 +164,9 @@ bool hitMesh(bool soft, int nodesAt, int tris, float3 o, float3 d, inout float t
                 float th = dot(e2, qv) * invDet;
                 if (th > 0.0 && th < t) {
                     t = th;
-                    n = cross(e1, e2);
                     found = true;
                     if (anyHit) return true;
+                    n = cross(e1, e2);
                     hitCorners = tris + k * 3;
                 }
             }
@@ -202,12 +211,14 @@ bool hitPrimitive(Primitive q, float3 o, float3 d, inout float best, out float3 
         t = max(max(loT.x, loT.y), loT.z);
         float outT = min(min(hiT.x, hiT.y), hiT.z);
         if (t > outT || t <= 0.0 || t >= best) return false;
-        if (t == loT.x) {
-            n = float3(-sign(ld.x), 0.0, 0.0);
-        } else if (t == loT.y) {
-            n = float3(0.0, -sign(ld.y), 0.0);
-        } else {
-            n = float3(0.0, 0.0, -sign(ld.z));
+        if (!anyHit) {
+            if (t == loT.x) {
+                n = float3(-sign(ld.x), 0.0, 0.0);
+            } else if (t == loT.y) {
+                n = float3(0.0, -sign(ld.y), 0.0);
+            } else {
+                n = float3(0.0, 0.0, -sign(ld.z));
+            }
         }
     } else {
         float a = dot(ld, ld);
@@ -217,9 +228,10 @@ bool hitPrimitive(Primitive q, float3 o, float3 d, inout float best, out float3 
         if (h < 0.0) return false;
         t = (-b - sqrt(h)) / a;
         if (t <= 0.0 || t >= best) return false;
-        n = lo + ld * t;
+        if (!anyHit) n = lo + ld * t;
     }
     best = t;
+    if (anyHit) return true;
     // Local to world for a normal: the transpose of the world-to-local rows.
     normal = normalize(n.x * q.r0.xyz + n.y * q.r1.xyz + n.z * q.r2.xyz);
     return true;
@@ -259,6 +271,7 @@ int walkWorld(float3 o, float3 d, inout float t, out float3 normal, bool anyHit)
     }
     if (q.CommittedStatus() == COMMITTED_NOTHING) return -1;
     int hit = q.CommittedInstanceID();
+    if (anyHit) return hit;
     t = q.CommittedRayT();
     if (q.CommittedStatus() == COMMITTED_PROCEDURAL_PRIMITIVE_HIT) {
         normal = boxNormal;
@@ -474,6 +487,7 @@ void claimCell(int slot, float3 x, float3 n, float3 albedo) {
     f.cells[slot].normal = float4(n, 0.0);
     f.cells[slot].albedo = float4(albedo, 0.0);
     f.cells[slot].incoming = 0.0;
+    f.cells[slot].outgoing = 0.0;
 }
 
 // ---------------------------------------------------------------- lighting
@@ -521,31 +535,43 @@ static const uint SEEN_DIFFUSE = 0u;
 static const uint SEEN_GLOSSY = 1u;
 static const uint SEEN_MIRROR = 2u;
 
-// The light leaving a surface toward the ray: for a reflection, last frame's
-// image where that point was on it; otherwise its cache cell once refined (or
-// while young, its coarser parent), or else the direct light on its albedo. Diffuse rays skip the image: its
-// shading (shadow maps, Hammon diffuse as it then was, normal-map spread) ran
-// brighter than the scene's own Lambertian light, and against a path-traced
-// reference of the courtyard taking it cost 0.13 error where the cache gave
-// 0.08. A pixel's ray
-// claims the cell and keeps it alive. A
-// reflection shows the point itself, so it takes the cells around it blended;
-// a mirror's lights the point directly and takes only their bounce light (lit
-// directly, a glossy surface's scattered rays would flicker between light and
-// shadow).
-float3 worldLight(float3 x, float3 n, int hit, bool fromPixels, uint seenAs) {
-    float3 s = project(f.clipFromWorld, x);
-    int debug = int(f.misc.w);
-    bool worldOnly = debug >= DEBUG_WORLD_ONLY && debug <= DEBUG_WORLD_POSITION;
-    if (!worldOnly && seenAs != SEEN_DIFFUSE && f.extra.z > 0.5 && s.z > f.camera.w && onScreen(s.xy) && abs(surfaceDepth(s.xy) - s.z) < 0.1 + 0.02 * s.z) {
-        float2 pc;
-        if (previousSurface(x, pc)) return lastImage(pc);
+// A gather only reads the previous shade's published outgoing and readiness.
+// A gather's fresh incoming/count must not make an unshaded cell look ready.
+float3 cacheBounce(float3 x, float3 n, int hit) {
+    uint level = cacheLevel(x);
+    [unroll] for (uint parent = 0u; parent < 2u; parent++) {
+        bool unused;
+        int slot = cacheSlot(x, n, level + parent, false, unused);
+        if (slot >= 0) {
+            float4 outgoing = f.cells[slot].outgoing;
+            if (outgoing.w > 0.5) return outgoing.rgb * f.fade.rgb;
+        }
+    }
+    uint seed = positionSeed(x);
+    return hitAlbedo(hit, x, n) * (directLight(x, n) + sampledLight(x, n, seed));
+}
+
+// A reflection first tries the last frame's image, then the cache. Diffuse
+// skips the image: in the courtyard it gave 0.13 reference error vs 0.08 for
+// the cache. A glossy ray blends outgoing cells to avoid hard shadow noise;
+// a mirror lights the hit itself and only takes bounce light from the cache.
+float3 worldLight(float3 x, float3 n, int hit, uint seenAs) {
+    if (seenAs != SEEN_DIFFUSE && f.extra.z > 0.5) {
+        int debug = int(f.misc.w);
+        bool worldOnly = debug >= DEBUG_WORLD_ONLY && debug <= DEBUG_WORLD_POSITION;
+        if (!worldOnly) {
+            float3 s = project(f.clipFromWorld, x);
+            if (s.z > f.camera.w && onScreen(s.xy) && abs(surfaceDepth(s.xy) - s.z) < 0.1 + 0.02 * s.z) {
+                float2 pc;
+                if (previousSurface(x, pc)) return lastImage(pc);
+            }
+        }
     }
     float3 albedo = hitAlbedo(hit, x, n);
     if (f.cache.z != 0u) {
         uint level = cacheLevel(x);
         bool claimed;
-        int slot = cacheSlot(x, n, level, fromPixels, claimed);
+        int slot = cacheSlot(x, n, level, true, claimed);
         float own = 0.0;
         if (slot >= 0 && claimed) {
             claimCell(slot, x, n, albedo);
@@ -555,12 +581,11 @@ float3 worldLight(float3 x, float3 n, int hit, bool fromPixels, uint seenAs) {
             int parent = cacheSlot(x, n, level + 1u, true, parentClaimed);
             if (parentClaimed) claimCell(parent, x, n, albedo);
         } else if (slot >= 0) {
-            if (fromPixels) f.cells[slot].pos.w = asfloat(f.cache.x);
+            f.cells[slot].pos.w = asfloat(f.cache.x);
             own = f.cells[slot].normal.w;
         }
         float3 incoming = own > 0.5 ? f.cells[slot].incoming.rgb : 0.0;
         float known = own;
-        int parent = -1;
         if (own < 4.0) {
             // A cell with fewer than four rays leans on its parent, the more the
             // younger it is: a surface come into view starts soft, not dark or
@@ -570,21 +595,14 @@ float3 worldLight(float3 x, float3 n, int hit, bool fromPixels, uint seenAs) {
             int p = cacheSlot(x, n, level + 1u, false, unused);
             float coarse = p >= 0 ? f.cells[p].normal.w : 0.0;
             if (coarse > own) {
-                parent = p;
                 incoming = lerp(f.cells[p].incoming.rgb, incoming, own / 4.0);
                 known = coarse;
             }
         }
         if (known > 0.5) {
-            // A pixel's ray lights the hit itself and takes only the cell's
-            // bounce light: the cell's outgoing light is the direct light where
-            // it was claimed, which leaks sun across shadow edges a cell
-            // straddles (0.155 to 0.146 error). The cache's own rays gained
-            // nothing from it, and read only `outgoing`, which no cell writes
-            // while they run. Trace runs after the cache took its fade; the
-            // cache's own rays don't.
-            if (seenAs == SEEN_DIFFUSE && fromPixels) return albedo * (directLight(x, n) + incoming);
-            if (seenAs == SEEN_DIFFUSE) return f.cells[own > 0.5 ? slot : parent].outgoing.rgb * f.fade.rgb;
+            // Pixel rays light the hit itself where possible: cached direct
+            // light leaks sun across shadow edges that straddle a cell.
+            if (seenAs == SEEN_DIFFUSE) return albedo * (directLight(x, n) + incoming);
             if (seenAs == SEEN_GLOSSY) return smoothCache(x, n, true);
             return albedo * (directLight(x, n) + smoothCache(x, n, false));
         }
@@ -617,9 +635,8 @@ bool historyPrior(float3 p, float3 n, out float4 prior) {
 }
 
 // The arriving half of a cache update: one ray per due cell, into a running
-// mean. It reads other cells' `outgoing` and writes only its own `incoming`;
-// `cache_shade` then turns that into `outgoing`. Split like this no cell is
-// read while it is written, so a bounce never sees a half-updated neighbour.
+// mean. It reads previously shaded `outgoing` and writes this visit's
+// `incoming`; `cache_shade` publishes the radiance and its sample count.
 [shader("compute")]
 [numthreads(8, 8, 1)]
 void cache_gather(uint3 id : SV_DispatchThreadID) {
@@ -647,7 +664,7 @@ void cache_gather(uint3 id : SV_DispatchThreadID) {
     float3 wn;
     int hit = walkWorld(origin, dir, far, wn, false);
     if (hit >= 0) {
-        arriving = clampFirefly(worldLight(origin + dir * far, wn, hit, false, SEEN_DIFFUSE));
+        arriving = clampFirefly(cacheBounce(origin + dir * far, wn, hit));
     } else if (escapes(origin, dir, f.sky.w)) {
         arriving = background(dir);
     }
@@ -671,18 +688,63 @@ void cache_shade(uint3 id : SV_DispatchThreadID) {
     Cell cell = f.cells[slot];
     if (!cacheDue(slot, cell)) return;
     float3 n = normalize(cell.normal.xyz);
-    f.cells[slot].outgoing = float4(cell.albedo.rgb * (directLight(cell.pos.xyz, n) + cell.incoming.rgb), 0.0);
+    f.cells[slot].outgoing = float4(cell.albedo.rgb * (directLight(cell.pos.xyz, n) + cell.incoming.rgb), cell.normal.w);
 }
 
-// A few cosine-weighted rays per texel, marched against the depth buffer (a
-// hit takes that point's light on last frame's image), continuing against the
-// scene. Writes the hits' light / rays and the fraction that hit.
+// Reconnect and re-shade once. No recursive history or cached RGB is reused.
+float3 reuseDiffuseHit(float3 p, float3 origin, float3 n, float3 fresh) {
+    if (f.extra.z <= 0.5 || f.cache.x <= 1u || f.counts.w != 0u) return fresh;
+    float3 projected = project(f.prevClipFromWorld, p);
+    if (!(projected.z > 0.0) || !onScreen(projected.xy)) return fresh;
+    int2 size = traceSize();
+    int2 previousPx = clamp(int2(projected.xy * float2(size) / frameSize()), 0, size - 1);
+    uint stride = uint(size.x * size.y);
+    uint previousPage = ((f.cache.x - 1u) & 1u) * stride;
+    DiffuseCandidate previous = f.diffuseHistory[previousPage + uint(previousPx.x + previousPx.y * size.x)];
+    uint primitive = asuint(previous.vertex.w);
+    if (asuint(previous.origin.w) != f.cache.x - 1u || primitive >= f.counts.x
+        || dot(previous.receiverNormal.xyz, n) < 0.995) return fresh;
+    float3 offset = origin - previous.origin.xyz;
+    if (dot(offset, offset) > 0.04 || abs(dot(offset, n)) > 0.02) return fresh;
+
+    float3 delta = previous.vertex.xyz - origin;
+    float3 oldDelta = previous.vertex.xyz - previous.origin.xyz;
+    float distance = length(delta), oldDistance = length(oldDelta);
+    if (!(distance > 0.02 && distance < f.sky.w && oldDistance > 0.02)) return fresh;
+    float3 direction = delta / distance, oldDirection = oldDelta / oldDistance;
+    float3 vertexNormal = previous.vertexNormal.xyz;
+    float cosine = dot(n, direction), oldCosine = dot(previous.receiverNormal.xyz, oldDirection);
+    float vertexCosine = -dot(vertexNormal, direction), oldVertexCosine = -dot(vertexNormal, oldDirection);
+    if (min(min(cosine, oldCosine), min(vertexCosine, oldVertexCosine)) < 0.05) return fresh;
+    float jacobian = (vertexCosine / oldVertexCosine) * (oldDistance * oldDistance / (distance * distance));
+    float ratio = jacobian * (cosine / oldCosine);
+    // A deliberately conservative, biased real-time reuse gate, not a reference estimator.
+    if (!(ratio >= 0.25 && ratio <= 4.0)) return fresh;
+
+    // A closest hit within the endpoint tolerance confirms the current segment,
+    // primitive and side, and supplies current triangle/material data to worldLight.
+    float tolerance = max(0.002, distance * 0.0002);
+    float t = min(distance + tolerance, f.sky.w);
+    float3 wn;
+    int hit = walkWorld(origin, direction, t, wn, false);
+    if (hit != int(primitive) || abs(t - distance) > tolerance || dot(wn, vertexNormal) < 0.995)
+        return fresh;
+    float3 reused = clampFirefly(worldLight(origin + direction * t, wn, hit, SEEN_DIFFUSE));
+    // Both contributions have already been evaluated, so average those
+    // contributions directly instead of adding a reservoir selection coin.
+    float3 combined = 0.5 * fresh + (0.5 * ratio) * reused;
+    return all(isfinite(combined)) ? combined : fresh;
+}
+
+// Cosine rays march the screen first when enabled, then trace the physics
+// scene. Writes hit radiance / rays and the fraction that hit.
 [shader("compute")]
 [numthreads(8, 8, 1)]
 void trace(uint3 id : SV_DispatchThreadID) {
     int2 px = int2(id.xy);
-    if (any(px >= traceSize())) return;
-    int2 fp = framePixel(px, traceSize());
+    int2 size = traceSize();
+    if (any(px >= size)) return;
+    int2 fp = framePixel(px, size);
     float depth = loadDepth(fp);
     uint4 g = loadGbuffer(fp);
     if (!receives(depth, g)) {
@@ -696,7 +758,7 @@ void trace(uint3 id : SV_DispatchThreadID) {
     int debug = int(f.misc.w);
     // The world-only debug views show the scene's light alone: no screen march.
     bool screen = f.misc.y > 0.0 && !(debug >= DEBUG_WORLD_ONLY && debug <= DEBUG_WORLD_POSITION);
-    int steps = screen ? STEPS : 0;
+    bool temporal = f.extra.x > 0.5 && !screen && debug == 0;
     float3 light = 0.0;
     float hits = 0.0;
     float3 origin = p + n * (0.02 + 0.002 * linearDepth(depth));
@@ -705,8 +767,7 @@ void trace(uint3 id : SV_DispatchThreadID) {
         float u = frac(noise.x + index * 0.7548776662);
         float phi = 6.2831853 * frac(noise.y + index * 0.5698402910);
         float3 dir = cosineDir(n, u, phi);
-        float jitter = frac(noise.z + index * 0.6180339887);
-        float4 seen = march(origin, dir, f.misc.y, steps, jitter);
+        float4 seen = screen ? march(origin, dir, f.misc.y, STEPS, frac(noise.z + index * 0.6180339887)) : 0.0;
         if (seen.w > 0.5) {
             light += clampFirefly(seen.rgb);
             hits += 1.0;
@@ -716,7 +777,19 @@ void trace(uint3 id : SV_DispatchThreadID) {
             float3 wn;
             int hit = walkWorld(origin, dir, t, wn, false);
             if (hit >= 0) {
-                light += clampFirefly(worldLight(origin + dir * t, wn, hit, true, SEEN_DIFFUSE));
+                float3 vertex = origin + dir * t;
+                float3 sample = clampFirefly(worldLight(vertex, wn, hit, SEEN_DIFFUSE));
+                if (temporal && r == 0) {
+                    uint current = (f.cache.x & 1u) * uint(size.x * size.y) + uint(px.x + px.y * size.x);
+                    DiffuseCandidate raw;
+                    raw.origin = float4(origin, asfloat(f.cache.x));
+                    raw.receiverNormal = float4(n, 0.0);
+                    raw.vertex = float4(vertex, asfloat(uint(hit)));
+                    raw.vertexNormal = float4(wn, 0.0);
+                    f.diffuseHistory[current] = raw;
+                    sample = reuseDiffuseHit(p, origin, n, sample);
+                }
+                light += sample;
                 hits += 1.0;
             } else if (escapes(origin, dir, f.sky.w)) {
                 // The sky along this ray, as the cache and reference take it: the
@@ -746,7 +819,7 @@ void reflect_trace(uint3 id : SV_DispatchThreadID) {
     float depth = loadDepth(fp);
     uint4 g = loadGbuffer(fp);
     float rough = gbufferRoughness(g);
-    if (!receives(depth, g) || f.reflection.x < 0.5 || rough > f.reflection.y) {
+    if (!receives(depth, g) || f.reflection.x < 0.5 || rough >= f.reflection.y) {
         out0.Store(px, 0.0);
         return;
     }
@@ -771,17 +844,28 @@ void reflect_trace(uint3 id : SV_DispatchThreadID) {
         int hit = walkWorld(origin, dir, far, wn, false);
         if (hit >= 0) {
             uint seenAs = rough < 0.06 ? SEEN_MIRROR : SEEN_GLOSSY;
-            result = float4(worldLight(origin + dir * far, wn, hit, true, seenAs), 1.0);
+            result = float4(worldLight(origin + dir * far, wn, hit, seenAs), 1.0);
         }
     }
     out0.Store(px, bad(result) ? float4(0.0) : result);
+}
+
+// Reject incompatible taps individually before mixing radiance. The surviving
+// fraction of the footprint controls the history weight at disocclusions.
+float4 reflectionHistoryTap(int2 at, float z, float3 n, float w, inout float retained) {
+    float2 guide = in2.Load(int3(at, 0)).rg;
+    if (guide.x <= 0.0 || abs(guide.x - z) >= 0.05 * z || dot(n, guideNormal(guide.y)) < 0.9) return 0.0;
+    float4 light = in1.Load(int3(at, 0));
+    if (bad(light)) return 0.0;
+    retained += w;
+    return light * w;
 }
 
 // The reflection rays blended into what the same surface accumulated before:
 // a mirror keeps a short history so its reflection follows the camera, a
 // rough surface a longer one; each side weighted down by its brightness so a
 // lone glint does not flare for frames.
-// in0 this frame's rays, in1 previous light, in2 previous depth; out0 light, out1 depth.
+// in0 this frame's rays, in1 previous light, in2 previous guide; out0 light, out1 guide.
 [shader("compute")]
 [numthreads(8, 8, 1)]
 void reflect_temporal(uint3 id : SV_DispatchThreadID) {
@@ -791,34 +875,55 @@ void reflect_temporal(uint3 id : SV_DispatchThreadID) {
     int2 fp = framePixel(px, size);
     float depth = loadDepth(fp);
     uint4 g = loadGbuffer(fp);
-    if (!receives(depth, g)) {
+    float rough = gbufferRoughness(g);
+    if (!receives(depth, g) || rough >= f.reflection.y) {
         out0.Store(px, 0.0);
         out1.Store(px, 0.0);
         return;
     }
-    float3 p = worldFromPixel(float2(fp) + 0.5, depth);
-    float rough = gbufferRoughness(g);
+    float z = linearDepth(depth);
     float4 now = in0.Load(int3(px, 0));
     float4 result = now;
     if (f.extra.w > 0.5) {
-        float3 pp = project(f.prevClipFromWorld, p);
-        if (onScreen(pp.xy)) {
-            float2 at = pp.xy * float2(size) / frameSize();
-            int2 tp = clamp(int2(at), 0, size - 1);
-            float was = in2.Load(int3(tp, 0)).r;
-            float4 wasLight = bilinear(in1, at, size);
-            if (abs(was - pp.z) < 0.05 * pp.z && !bad(wasLight)) {
-                wasLight.rgb *= f.fade.rgb;
-                float take = lerp(0.45, 0.06, min(sqrt(rough * 2.5), 1.0));
-                if (f.extra.y > 0.0 || movedNear(p)) take = max(take, 0.45);
-                float wWas = (1.0 - take) / (1.0 + luminance(wasLight.rgb));
-                float wNow = take / (1.0 + luminance(now.rgb));
-                result = (wasLight * wWas + now * wNow) / (wWas + wNow);
+        float3 n = gbufferNormal(g);
+        float retained = 0.0;
+        float4 history = 0.0;
+        bool still = cameraStill();
+        if (still) {
+            history = reflectionHistoryTap(px, z, n, 1.0, retained);
+        } else {
+            float3 p = worldFromPixel(float2(fp) + 0.5, depth);
+            float3 pp = project(f.prevClipFromWorld, p);
+            if (pp.z > f.camera.w && onScreen(pp.xy)) {
+                // Undo the full-resolution pixel-centre offset before
+                // interpolating between the reflection texels' centres.
+                float2 c = (pp.xy - 0.5) * float2(size) / frameSize() - 0.5;
+                int2 base = int2(floor(c));
+                float2 fr = c - float2(base);
+                [unroll] for (int i = 0; i < 4; i++) {
+                    int2 o = int2(i & 1, i >> 1);
+                    float2 w = lerp(1.0 - fr, fr, float2(o));
+                    float weight = w.x * w.y;
+                    if (weight > 0.0) {
+                        history += reflectionHistoryTap(clamp(base + o, 0, size - 1), pp.z, n, weight, retained);
+                    }
+                }
             }
+        }
+        if (retained > 1e-4) {
+            float4 wasLight = history / retained;
+            wasLight.rgb *= f.fade.rgb;
+            float take = lerp(0.45, 0.06, min(sqrt(rough * 2.5), 1.0));
+            if (f.extra.y > 0.0 || (f.counts.w != 0u && movedNear(worldFromPixel(float2(fp) + 0.5, depth)))) {
+                take = max(take, 0.45);
+            }
+            float wWas = retained * (1.0 - take) / (1.0 + luminance(wasLight.rgb));
+            float wNow = take / (1.0 + luminance(now.rgb));
+            result = (wasLight * wWas + now * wNow) / (wWas + wNow);
         }
     }
     out0.Store(px, result);
-    out1.Store(px, float2(linearDepth(depth), 0.0));
+    out1.Store(px, float2(z, packedNormal(g)));
 }
 
 // One pass of an edge-avoiding a-trous filter over the accumulated
@@ -829,11 +934,15 @@ void reflectFilter(int2 px, int step) {
     if (any(px >= size)) return;
     float4 c = in0.Load(int3(px, 0));
     float z = in1.Load(int3(px, 0)).r;
+    if (z <= 0.0) {
+        out0.Store(px, c);
+        return;
+    }
     int2 fp = framePixel(px, size);
     uint4 g = loadGbuffer(fp);
     float rough = gbufferRoughness(g);
     float reach = 16.0 * rough;
-    if (z <= 0.0 || reach < 0.3 || rough > f.reflection.y) {
+    if (reach < 0.3) {
         out0.Store(px, c);
         return;
     }
@@ -876,7 +985,7 @@ void reflect_filter2(uint3 id : SV_DispatchThreadID) { reflectFilter(int2(id.xy)
 // more the rougher it is: rgb the light, a how much of it was found (faded out
 // over the last quarter of the cutoff).
 float4 resolveReflection(int2 fp, float3 n, float d, float rough) {
-    if (f.reflection.x < 0.5 || rough > f.reflection.y) return 0.0;
+    if (f.reflection.x < 0.5 || rough >= f.reflection.y) return 0.0;
     int2 size = reflectSize();
     float2 rc = (float2(fp) + 0.5) * float2(size) / frameSize() - 0.5;
     int2 rb = int2(floor(rc));
@@ -886,9 +995,10 @@ float4 resolveReflection(int2 fp, float3 n, float d, float rough) {
     [loop] for (int y = -1; y <= 2; y++) {
         [loop] for (int x = -1; x <= 2; x++) {
             int2 t = clamp(rb + int2(x, y), 0, size - 1);
-            float tz = reflectDepth.Load(int3(t, 0)).r;
+            float2 guide = reflectDepth.Load(int3(t, 0)).rg;
+            float tz = guide.x;
             if (tz <= 0.0) continue;
-            float3 tn = gbufferNormal(loadGbuffer(framePixel(t, size)));
+            float3 tn = guideNormal(guide.y);
             float2 o = float2(t) - rc;
             float4 rt = reflectLight.Load(int3(t, 0));
             // A lone bright texel among dim ones is a glint, not the surface.
@@ -907,10 +1017,11 @@ float4 resolveReflection(int2 fp, float3 n, float d, float rough) {
 // What the debug views show in place of the lit image, w 1 when they do.
 float4 debugView(int2 fp, float3 p, float4 gi, float4 reflection) {
     int debug = int(f.misc.w);
-    // The pixel the reconstructed point projects back to: red where it lands
-    // away from this one.
-    float err = length(project(f.clipFromWorld, p).xy - (float2(fp) + 0.5));
-    if (debug == DEBUG_ROUND_TRIP) return float4(saturate(err), saturate(1.0 - err), 0.0, 1.0);
+    if (debug == DEBUG_ROUND_TRIP) {
+        // Red where the reconstructed point lands away from its source pixel.
+        float err = length(project(f.clipFromWorld, p).xy - (float2(fp) + 0.5));
+        return float4(saturate(err), saturate(1.0 - err), 0.0, 1.0);
+    }
     // One-metre bands: a floor at z = 0 shows a clean band edge at its surface.
     if (debug == DEBUG_WORLD_POSITION) return float4(frac(p), 1.0);
     if (debug == DEBUG_BOUNCE_LIGHT) return float4(gi.rgb * f.misc.z, 1.0);
@@ -966,15 +1077,17 @@ void composite(uint3 id : SV_DispatchThreadID) {
 // image the composite reads, through direct light at each bounce. The sum is
 // kept in fp32: a running mean in that half-float image stops taking small
 // steps after a few hundred frames, and drifted 13% dark over 1200.
-static const int REFERENCE_PATHS = 16;
+static const int REFERENCE_STRATA = 4;
+static const int REFERENCE_PATHS = REFERENCE_STRATA * REFERENCE_STRATA;
 static const int REFERENCE_BOUNCES = 8;
 
 [shader("compute")]
 [numthreads(8, 8, 1)]
 void reference(uint3 id : SV_DispatchThreadID) {
     int2 px = int2(id.xy);
-    if (any(px >= traceSize())) return;
-    int2 fp = framePixel(px, traceSize());
+    int2 size = traceSize();
+    if (any(px >= size)) return;
+    int2 fp = framePixel(px, size);
     float depth = loadDepth(fp);
     uint4 g = loadGbuffer(fp);
     uint at = uint(px.y) * uint(f.sizes.z) + uint(px.x);
@@ -983,21 +1096,29 @@ void reference(uint3 id : SV_DispatchThreadID) {
         // whatever the slot held (stale words read as huge floats stick).
         f.referenceSum[at] = 0.0;
         out0.Store(px, 0.0);
+        out1.Store(px, 0.0);
         return;
     }
     float3 start = worldFromPixel(float2(fp) + 0.5, depth);
     float3 startNormal = gbufferNormal(g);
     float3 light = 0.0;
-    uint seed = hashU(uint(px.x) + uint(px.y) * 4099u + uint(f.reflection.z) * 16777619u);
+    uint seedBase = hashU(uint(px.x) + uint(px.y) * 4099u + uint(f.reflection.z) * 16777619u);
     [loop] for (int path = 0; path < REFERENCE_PATHS; path++) {
+        // Separate each path's first stratum from the previous path's length.
+        uint seed = max(hashU(seedBase ^ uint(path)), 1u);
         float3 x = start + startNormal * 0.02;
         float3 n = startNormal;
         float3 weight = 1.0;
         [loop] for (int bounce = 0; bounce < REFERENCE_BOUNCES; bounce++) {
-            seed = hashU(seed);
-            float u = float(seed >> 8u) / 16777216.0;
-            seed = hashU(seed);
-            float3 dir = cosineDir(n, u, 6.2831853 * float(seed >> 8u) / 16777216.0);
+            float u = random01(seed);
+            float azimuth = random01(seed);
+            if (bounce == 0) {
+                // One jittered sample in each equal-probability cell of
+                // the cosine warp; later bounces keep independent samples.
+                u = (float(path % REFERENCE_STRATA) + u) / float(REFERENCE_STRATA);
+                azimuth = (float(path / REFERENCE_STRATA) + azimuth) / float(REFERENCE_STRATA);
+            }
+            float3 dir = cosineDir(n, u, 2.0 * PI * azimuth);
             float t = f.sky.w;
             float3 hitNormal;
             int hit = walkWorld(x, dir, t, hitNormal, false);
@@ -1008,6 +1129,7 @@ void reference(uint3 id : SV_DispatchThreadID) {
             float3 at = x + dir * t;
             n = dot(hitNormal, dir) > 0.0 ? -hitNormal : hitNormal;
             weight *= hitAlbedo(hit, at, n);
+            if (all(weight == 0.0)) break;
             light += weight * (directLight(at, n) + sampledLight(at, n, seed));
             x = at + n * 0.02;
         }
@@ -1020,4 +1142,5 @@ void reference(uint3 id : SV_DispatchThreadID) {
     // w counts this pixel's own samples, which is fewer than `frames` for one
     // that started receiving after the restart.
     out0.Store(px, sum / max(sum.w, 1.0));
+    out1.Store(px, float2(linearDepth(depth), packedNormal(g)));
 }

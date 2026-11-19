@@ -7,11 +7,11 @@ use bytemuck::{Pod, Zeroable};
 /// Cascade levels; mirrors the shaders.
 pub const LEVELS: usize = 4;
 /// Bytes per interval cache entry.
-pub const ENTRY_SIZE: u64 = 240;
+pub const ENTRY_SIZE: u64 = 192;
 /// Bytes per descriptor (`Descriptor` in common.slang).
 pub const DESCRIPTOR_SIZE: u64 = 32;
-/// Bytes per directional irradiance probe record.
-pub const PROBE_SIZE: u64 = 1792;
+/// Bytes per directional irradiance probe record (two 6x6 tables and four vectors).
+pub const PROBE_SIZE: u64 = (2 * 36 + 4) * 16;
 pub const CACHE_WORK_GROUPS: u64 = 2;
 pub const CACHE_HISTORY_PER_BUCKET: u64 = 4;
 pub const SPARSE_HISTORY_RESET_FLAG: u32 = 1 << 31;
@@ -29,6 +29,20 @@ const DEFERRED_SLOT_WORDS: u64 = 32;
 const DEFERRED_QUERY_WORDS: u64 = 12;
 /// The receiver-grid safety cap when `max_receiver_cells` is zero.
 const MAX_RECEIVERS: u32 = 131_072;
+
+/// Experimental alternatives to interpolating Split's diffuse probes.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[repr(u32)]
+pub enum FinalGather {
+    #[default]
+    Probes = 0,
+    /// One cosine-sampled ray per resolve texel, as a control for `Guided`.
+    Cosine = 1,
+    /// One ray sampled from a mixture of cosine and a previous-frame cascade guide.
+    Guided = 2,
+    /// One diffuse/GGX mixture ray, resolved as material-weighted radiance.
+    MaterialSpace = 3,
+}
 
 /// Split Radiance Cascades quality and lighting controls. Distances are in
 /// metres.
@@ -92,12 +106,27 @@ pub struct Settings {
     /// the GI scene's own tree. Changing it recompiles the passes, and GI shows
     /// the hemisphere until they are ready, as when it starts.
     pub hardware_rays: bool,
+    /// Foveated probes: degrees from the gaze at which probe spacing and
+    /// intervals double, on top of the coarsening with distance. Spacing grows
+    /// as `1 + angle / foveation`, the linear falloff of visual acuity, so
+    /// peripheral pixels read coarser cascades and the update budget goes to
+    /// the fovea. The gaze is the view's centre unless
+    /// [`SplitRadianceCascades::set_gaze`](super::SplitRadianceCascades::set_gaze)
+    /// gives one. Zero turns it off.
+    pub foveation: f32,
     /// Path trace each shaded pixel's indirect light with the cache's own hit
     /// shading and no cache, probe or filter, averaging until the view or a
     /// light changes: a reference to measure the rest of these settings
     /// against. Use `resolve_scale` 1 for one per pixel. Hundreds of times the
     /// cost of the cache, and it takes hundreds of frames to settle.
     pub reference: bool,
+    pub final_gather: FinalGather,
+    /// Redistribute surface bounce rays from settled slots to cold ones.
+    pub surface_cold_priority: bool,
+    /// Guide existing surface-cache bounce rays with the previous cascade proposal.
+    pub surface_bounce_guide: bool,
+    /// Use 3D low-discrepancy draws for emissive candidates.
+    pub emitter_low_discrepancy: bool,
 }
 
 impl Default for Settings {
@@ -126,7 +155,12 @@ impl Default for Settings {
             surface_hash_cells: 1 << 16,
             surface_hash_updates: 8_192,
             hardware_rays: true,
+            foveation: 0.0,
             reference: false,
+            final_gather: FinalGather::Probes,
+            surface_cold_priority: false,
+            surface_bounce_guide: false,
+            emitter_low_discrepancy: false,
         }
     }
 }
@@ -141,6 +175,7 @@ impl Settings {
             probe_spacing: 4.0,
             interval_length: 6.0,
             sky_reflections: true,
+            surface_bounce_rays: Self::default().surface_bounce_rays,
             ..Self::budgeted()
         }
     }
@@ -156,10 +191,12 @@ impl Settings {
     /// from spreading thin: in Sponza's courtyard they took the error from 0.30
     /// to 0.26 and the frame from 9.9 ms to 4.9 ms (quarter-metre ones suit the
     /// uncapped default).
+    /// Uses one low-discrepancy surface-cache bounce ray per visit instead of two.
     pub fn budgeted() -> Self {
         Self {
             probe_spacing: 0.5,
             interval_length: 0.8,
+            surface_bounce_rays: 1,
             sampling: Sampling {
                 grid_divisor: 4,
                 resolve_scale: 3,
@@ -236,6 +273,8 @@ pub struct Parameters {
     /// Hashed surface cells: capacity (0 = off), cells updated per frame and
     /// frames a cell may go unread before it is dropped.
     pub surface_hash: [u32; 4],
+    /// World gaze direction, then [`Settings::foveation`] in degrees (0 = off).
+    pub foveation: [f32; 4],
     /// Elements in the cache entries, previous entries, head words and
     /// merge-list words: the shaders reach them through pointers, which have
     /// no length of their own.
@@ -443,9 +482,16 @@ mod tests {
     use super::*;
 
     #[test]
+    fn budgeted_reduces_surface_bounce_work() {
+        assert_eq!(Settings::budgeted().surface_bounce_rays, 1);
+        assert_eq!(Settings::default().surface_bounce_rays, 2);
+        assert_eq!(Settings::landscape().surface_bounce_rays, 2);
+    }
+
+    #[test]
     fn parameters_match_the_shader_block() {
-        // 4 matrices, 33 vec4s and 23 pointers, no padding.
-        assert_eq!(std::mem::size_of::<Parameters>(), 4 * 64 + 33 * 16 + 23 * 8);
+        // 4 matrices, 34 vec4s and 23 pointers, no padding.
+        assert_eq!(std::mem::size_of::<Parameters>(), 4 * 64 + 34 * 16 + 23 * 8);
     }
 
     #[test]

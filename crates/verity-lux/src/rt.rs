@@ -46,10 +46,10 @@ pub(crate) enum Geometry {
 }
 
 impl Geometry {
-    fn describe(
+    fn describe<'a>(
         &self,
     ) -> (
-        vk::AccelerationStructureGeometryKHR<'static>,
+        vk::AccelerationStructureGeometryKHR<'a>,
         u32,
         vk::AccelerationStructureTypeKHR,
     ) {
@@ -121,13 +121,29 @@ pub(crate) fn instance(
     custom_index: u32,
     blas: vk::DeviceAddress,
 ) -> vk::AccelerationStructureInstanceKHR {
-    let flags = vk::GeometryInstanceFlagsKHR::TRIANGLE_FACING_CULL_DISABLE.as_raw() as u8;
+    instance_with_flags(
+        world_from_local,
+        custom_index,
+        blas,
+        vk::GeometryInstanceFlagsKHR::TRIANGLE_FACING_CULL_DISABLE,
+    )
+}
+
+pub(crate) fn instance_with_flags(
+    world_from_local: [f32; 12],
+    custom_index: u32,
+    blas: vk::DeviceAddress,
+    flags: vk::GeometryInstanceFlagsKHR,
+) -> vk::AccelerationStructureInstanceKHR {
     vk::AccelerationStructureInstanceKHR {
         transform: vk::TransformMatrixKHR {
             matrix: world_from_local,
         },
         instance_custom_index_and_mask: vk::Packed24_8::new(custom_index, 0xff),
-        instance_shader_binding_table_record_offset_and_flags: vk::Packed24_8::new(0, flags),
+        instance_shader_binding_table_record_offset_and_flags: vk::Packed24_8::new(
+            0,
+            flags.as_raw() as u8,
+        ),
         acceleration_structure_reference: vk::AccelerationStructureReferenceKHR {
             device_handle: blas,
         },
@@ -136,9 +152,7 @@ pub(crate) fn instance(
 
 pub(crate) fn instance_bytes(instances: &[vk::AccelerationStructureInstanceKHR]) -> &[u8] {
     // SAFETY: a plain repr(C) struct of integers and floats, with no padding.
-    unsafe {
-        std::slice::from_raw_parts(instances.as_ptr().cast(), size_of_val(instances))
-    }
+    unsafe { std::slice::from_raw_parts(instances.as_ptr().cast(), size_of_val(instances)) }
 }
 
 pub(crate) struct RayTracing {
@@ -170,7 +184,7 @@ impl RayTracing {
             gpu.device,
             gpu.allocator,
             name,
-            bytes.len() as u64,
+            (bytes.len() as u64).max(1),
             vk::BufferUsageFlags::ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_KHR
                 | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS,
             MemoryLocation::CpuToGpu,
@@ -188,9 +202,40 @@ impl RayTracing {
         geometries: &[Geometry],
     ) -> Result<Vec<Accel>> {
         let described: Vec<_> = geometries.iter().map(Geometry::describe).collect();
+        self.build_described(gpu, pool, &described)
+    }
+
+    /// Build an immutable triangle BLAS with the micromap attached during both
+    /// sizing and recording. The caller keeps the map alive with its BLAS.
+    pub(crate) unsafe fn build_micromapped(
+        &self,
+        gpu: &mut Gpu,
+        pool: &mut vk::CommandPool,
+        triangles: Geometry,
+        mut attachment: vk::AccelerationStructureTrianglesOpacityMicromapEXT<'_>,
+    ) -> Result<Accel> {
+        let (mut geometry, count, ty) = triangles.describe();
+        assert_eq!(geometry.geometry_type, vk::GeometryTypeKHR::TRIANGLES);
+        // SAFETY: the geometry type selects this union member.
+        let triangles = unsafe { geometry.geometry.triangles }.push_next(&mut attachment);
+        geometry.geometry = vk::AccelerationStructureGeometryDataKHR { triangles };
+        let mut built = self.build_described(gpu, pool, &[(geometry, count, ty)])?;
+        Ok(built.pop().expect("one triangle geometry was submitted"))
+    }
+
+    unsafe fn build_described(
+        &self,
+        gpu: &mut Gpu,
+        pool: &mut vk::CommandPool,
+        described: &[(
+            vk::AccelerationStructureGeometryKHR<'_>,
+            u32,
+            vk::AccelerationStructureTypeKHR,
+        )],
+    ) -> Result<Vec<Accel>> {
         let mut built = Vec::with_capacity(described.len());
         let mut scratch = Vec::with_capacity(described.len());
-        let result = self.record(gpu, pool, &described, &mut built, &mut scratch);
+        let result = self.record(gpu, pool, described, &mut built, &mut scratch);
         for buffer in scratch {
             gpu::destroy_buffer(gpu.device, gpu.allocator, buffer);
         }
@@ -210,7 +255,7 @@ impl RayTracing {
         gpu: &mut Gpu,
         pool: &mut vk::CommandPool,
         described: &[(
-            vk::AccelerationStructureGeometryKHR<'static>,
+            vk::AccelerationStructureGeometryKHR<'_>,
             u32,
             vk::AccelerationStructureTypeKHR,
         )],
@@ -242,7 +287,8 @@ impl RayTracing {
                 vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS,
                 MemoryLocation::GpuOnly,
             )?;
-            let device_address = address(gpu.device, &buffer).next_multiple_of(self.scratch_alignment);
+            let device_address =
+                address(gpu.device, &buffer).next_multiple_of(self.scratch_alignment);
             scratch.push(buffer);
             infos.push(
                 info.dst_acceleration_structure(handle)
@@ -382,7 +428,8 @@ impl RayTracing {
             }
         };
         let address = self.loader.get_acceleration_structure_device_address(
-            &vk::AccelerationStructureDeviceAddressInfoKHR::default().acceleration_structure(handle),
+            &vk::AccelerationStructureDeviceAddressInfoKHR::default()
+                .acceleration_structure(handle),
         );
         Ok(Accel {
             handle,

@@ -19,10 +19,6 @@
 [[vk::binding(17, 0)]] StructuredBuffer<float4> rtgiField;
 #include "rtgi_field.slang"
 
-void splitLodBlend(float3 position, out uint lowLod, out uint highLod, out float blend) {
-    splitLodBlendForParameters(position, params, lowLod, highLod, blend);
-}
-
 uint findIrradianceProbe(int4 key, bool previous) {
     if (previous) return EMPTY;
     uint capacity = probeDirectoryCapacity(params);
@@ -58,7 +54,7 @@ VertexOutput vertex(uint index : SV_VertexID) {
     return output;
 }
 
-// The anchor-side half of compositeCompatibleCandidate. About scale² full-
+// The anchor-side half of compositeCandidateWeight. About scale² full-
 // resolution pixels test each display anchor, so its own checks, world
 // position and geometric normal are resolved once here. Position w is one
 // for a compatible anchor.
@@ -98,25 +94,32 @@ void compositeAnchors(uint3 thread : SV_DispatchThreadID) {
     anchorNormalOutput.Store(samplePixel, float4(rasterNormal, 0.0));
 }
 
-bool compositeCompatibleCandidate(int2 samplePixel, uint2 targetIdentity,
-                                  float3 targetPosition, float3 targetNormal,
-                                  float tolerance, out float3 value) {
+float compositeCandidateWeight(int2 samplePixel, uint2 targetIdentity,
+                               float3 targetPosition, float3 targetNormal,
+                               uint4 targetMaterial, float invTolerance, out float3 value) {
     value = 0.0;
     uint2 extent = giResolveExtent(params);
-    if (any(samplePixel < 0) || any(samplePixel >= int2(extent))) return false;
+    if (any(samplePixel < 0) || any(samplePixel >= int2(extent))) return 0.0;
     // compositeAnchors resolved the anchor-side checks, position and normal.
     float4 anchor = anchorPosition.Load(int3(samplePixel, 0));
-    if (anchor.w == 0.0) return false;
+    if (anchor.w == 0.0) return 0.0;
     float4 receiver = receiverHistory.Load(int3(samplePixel, 0));
-    if (any(asuint(receiver.xy) != targetIdentity)) return false;
+    if (any(asuint(receiver.xy) != targetIdentity)) return 0.0;
     float3 sampleNormal = receiverNormal(receiver);
     float3 rasterNormal = anchorNormal.Load(int3(samplePixel, 0)).xyz;
-    if (dot(targetNormal, sampleNormal) <= 0.97
-        || dot(targetNormal, rasterNormal) <= 0.97
-        || surfacePlaneDistance(anchor.xyz - targetPosition, targetNormal, rasterNormal) > tolerance)
-        return false;
+    if (dot(targetNormal, sampleNormal) <= 0.97 || dot(targetNormal, rasterNormal) <= 0.97)
+        return 0.0;
+    float distance = surfacePlaneDistance(anchor.xyz - targetPosition, targetNormal, rasterNormal);
+    float planeWeight = saturate(1.0 - distance * invTolerance);
+    if (!(planeWeight > 0.0)) return 0.0;
+    if (materialSpaceGather(params)) {
+        uint scale = giResolveScale(params);
+        uint2 local = min(uint2(samplePixel) * scale + scale / 2u, params.viewport.zw - 1u);
+        if (!materialSpaceCompatible(targetMaterial,
+                gbuffer.Load(int3(params.viewport.xy + local, 0)))) return 0.0;
+    }
     value = irradiance.Load(int3(samplePixel, 0)).xyz;
-    return true;
+    return planeWeight;
 }
 
 float3 reconstructCompositeGi(uint2 pixel, float depth, uint4 deferred) {
@@ -139,7 +142,7 @@ float3 reconstructCompositeGi(uint2 pixel, float depth, uint4 deferred) {
     float2 left = min(float2(base * int(scale) + int(scale / 2u)), last);
     float2 right = min(float2((base + 1) * int(scale) + int(scale / 2u)), last);
     float2 fraction = saturate((local - left) / max(right - left, 1.0));
-    float tolerance = surfaceTolerance(params);
+    float invTolerance = 1.0 / surfaceTolerance(params);
     float3 sum = 0.0;
     float support = 0.0;
     // Bilinear taps that were evaluated and rejected; the test is deterministic.
@@ -151,8 +154,9 @@ float3 reconstructCompositeGi(uint2 pixel, float depth, uint4 deferred) {
         float weight = axisWeight.x * axisWeight.y;
         if (!(weight > 0.0)) continue;
         float3 candidate;
-        if (!compositeCompatibleCandidate(samplePixel, targetRaster.xy,
-                                          position, normal, tolerance, candidate)) {
+        weight *= compositeCandidateWeight(samplePixel, targetRaster.xy,
+            position, normal, deferred, invTolerance, candidate);
+        if (!(weight > 0.0)) {
             rejectedTaps |= 1u << tap;
             continue;
         }
@@ -160,34 +164,26 @@ float3 reconstructCompositeGi(uint2 pixel, float depth, uint4 deferred) {
         support += weight;
     }
     // Bilinear anchors can all land on adjacent facets around a thin receiver.
-    // Only when no compatible bilinear support exists, use the nearest supported
-    // sample within two resolve cells; a supported black result remains black.
+    // Blend nearby compatible anchors when the bilinear footprint misses a thin facet.
     if (support <= 1e-6) {
-        float nearestDistanceSquared = 4.0;
-        float3 nearest = 0.0;
-        bool found = false;
-        [loop] for (int y = -2; y <= 2; ++y) {
-            [loop] for (int x = -2; x <= 2; ++x) {
+        sum = 0.0;
+        support = 0.0;
+        [loop] for (int y = -1; y <= 3; ++y) {
+            [loop] for (int x = -1; x <= 3; ++x) {
                 int2 samplePixel = base + int2(x, y);
-                if (any(samplePixel < 0) || any(samplePixel >= int2(extent))) continue;
-                uint2 sampleLocal = min(uint2(samplePixel) * scale + scale / 2u,
-                                        params.viewport.zw - 1u);
-                float2 delta = (float2(sampleLocal) - local) / float(scale);
-                float distanceSquared = dot(delta, delta);
-                if (distanceSquared > nearestDistanceSquared) continue;
                 if (uint(x) <= 1u && uint(y) <= 1u
                     && (rejectedTaps & (1u << (uint(x) + 2u * uint(y)))) != 0u) continue;
+                if (any(samplePixel < 0) || any(samplePixel >= int2(extent))) continue;
+                float2 sampleLocal = min(float2(samplePixel * int(scale) + int(scale / 2u)), last);
+                float2 delta = (sampleLocal - local) / float(scale);
+                float weight = 1.0 - dot(delta, delta) * 0.25;
+                if (!(weight > 0.0)) continue;
                 float3 candidate;
-                if (!compositeCompatibleCandidate(samplePixel, targetRaster.xy,
-                                                  position, normal, tolerance, candidate)) continue;
-                nearestDistanceSquared = distanceSquared;
-                nearest = candidate;
-                found = true;
+                weight *= compositeCandidateWeight(samplePixel, targetRaster.xy,
+                    position, normal, deferred, invTolerance, candidate);
+                sum += candidate * weight;
+                support += weight;
             }
-        }
-        if (found) {
-            sum = nearest;
-            support = 1.0;
         }
     }
     if (support > 1e-6) return sum / support;
@@ -200,6 +196,7 @@ float3 reconstructCompositeGi(uint2 pixel, float depth, uint4 deferred) {
     float3 background;
     float3 fallback = resolveSplitDiffuse(position, normalize(shadingNormal),
         coverage, background, backgroundCoverage, anyCoverage);
+    if (materialSpaceGather(params)) fallback *= deferredDiffuseAlbedo(deferred);
     return anyCoverage > 0.0 && all(isfinite(fallback)) ? fallback : 0.0;
 }
 
@@ -278,6 +275,10 @@ float3 reconstructRtgi(uint2 pixel, float depth, uint4 deferred) {
 }
 
 float4 composeGi(uint2 pixel, uint4 deferred, float3 diffuseGi) {
+    // MSGI is already BSDF-weighted and traces occlusion. Do not tint it a
+    // second time, or apply the diffuse-only AO term to its glossy lobe.
+    if (materialSpaceGather(params))
+        return float4(diffuseGi * params.tuning.w * params.environment.w, 0.0);
     float3 diffuseOcclusion = 1.0;
     if ((params.layers.z & 1u) != 0u) {
         diffuseOcclusion = float((deferred.z >> 16u) & 255u) / 255.0;

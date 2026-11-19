@@ -20,12 +20,15 @@ const CASCADE_ENTRIES: &[&str] = &[
     "commitCache",
     "remapProbeHeads",
     "worldResolve",
+    "guidedResolve",
+    "materialResolve",
     "traceDeferred",
     "traceRecord",
     "traceVisibility",
     "traceResolve",
     "surfaceUpdate",
     "reference",
+    "materialReference",
 ];
 
 /// PXTGI's compute passes, all in `pxtgi.slang`.
@@ -56,6 +59,10 @@ const VOXEL_ENTRIES: &[&str] = &[
     "accumulate",
     "accumulateLarge",
     "finalize",
+    "voxelSdfX",
+    "voxelSdfY",
+    "voxelSdfZ",
+    "romaBuild",
     "inject",
     "trace",
     "temporal",
@@ -64,6 +71,13 @@ const VOXEL_ENTRIES: &[&str] = &[
     "atrous4",
     "composite",
     "capture",
+    "hrcMediumBuild",
+    "hrcMeasure",
+    "hrcBase",
+    "hrcExtend",
+    "hrcTop",
+    "hrcDown",
+    "hrcPull",
 ];
 
 /// Writes `OUT_DIR/{file}.{entry}.spv` for each entry point, compiling in
