@@ -6,3 +6,6 @@
 
 # Cloud source VDBs (gigabytes); scripts/convert_clouds.py reads them.
 /assets/packed/clouds/*.vdb
+# Local agent tool state
+/.agent-guard/
+/.pi/harness/

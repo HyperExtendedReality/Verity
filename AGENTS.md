@@ -24,3 +24,7 @@ cargo clippy --workspace --exclude verity-box3d --exclude verity-physics
 `verity-physics` itself builds without Box3D. Its tests and benchmarks are the one
 place Box3D is needed, because it is their dev-dependency, so only touch it when
 you are changing or measuring `verity-physics`.
+
+<!-- pi-harness2:rules:start -->
+- When encountering complex or repeated operations with `bash`, load the `bash-best-practices` skill.
+<!-- pi-harness2:rules:end -->
