@@ -36,6 +36,7 @@
 
 mod collide;
 mod component;
+mod hull;
 mod link;
 mod query;
 mod soft;
@@ -46,6 +47,7 @@ pub use component::{
     SoftPreset, SoftShape,
 };
 use glam::{Mat3, Quat, Vec3, Vec3A};
+pub use hull::{ConvexHull, MAX_HULL_VERTICES};
 pub use query::{
     Bounds, Bvh, BvhNode, RayHit, RayItem, RayScene, RayShape, RaySource, RaySync, TriMesh,
 };
@@ -111,8 +113,8 @@ pub enum RigidBody {
     Dynamic,
 }
 
-/// One centered collider per body, in metres.
-#[derive(Debug, Clone, Copy, PartialEq)]
+/// One collider per body, in metres, centered but for [`Collider::Mesh`].
+#[derive(Debug, Clone)]
 pub enum Collider {
     Cuboid {
         half_extents: Vec3,
@@ -129,6 +131,40 @@ pub enum Collider {
     /// The shape given to [`PhysicsWorld::set_ground`], in this body's frame.
     /// Ground is solid and unbounded: give it to one static body.
     Ground,
+    /// A convex hull centred on its centroid, for anything a box, sphere or
+    /// capsule fits badly. [`ConvexHull::new`] makes one from a mesh's points.
+    Hull(Arc<ConvexHull>),
+    /// Triangles in this body's frame, for level geometry: from
+    /// [`TriMesh::collision`] or [`TriMesh::new`]. Massless like ground, so it
+    /// moves only when kinematic, and meets every collider but ground and
+    /// other meshes. Triangles are thin: keep fast bodies thicker than a
+    /// step's travel or rely on speculative contacts, as for any wall.
+    Mesh(Arc<TriMesh>),
+}
+
+/// Hulls and meshes compare by identity: content would cost a whole shape
+/// each time a step checks whether a body changed.
+impl PartialEq for Collider {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Cuboid { half_extents: a }, Self::Cuboid { half_extents: b }) => a == b,
+            (Self::Sphere { radius: a }, Self::Sphere { radius: b }) => a == b,
+            (
+                Self::Capsule {
+                    radius: ra,
+                    half_height: ha,
+                },
+                Self::Capsule {
+                    radius: rb,
+                    half_height: hb,
+                },
+            ) => ra == rb && ha == hb,
+            (Self::Ground, Self::Ground) => true,
+            (Self::Hull(a), Self::Hull(b)) => Arc::ptr_eq(a, b),
+            (Self::Mesh(a), Self::Mesh(b)) => Arc::ptr_eq(a, b),
+            _ => false,
+        }
+    }
 }
 
 /// Solid ground of any shape, asked about points in the frame of the body whose
@@ -144,9 +180,10 @@ pub trait Ground: Send + Sync {
 }
 
 impl Collider {
-    /// Mass and body-space principal moments of inertia for a density.
-    fn mass_properties(self, density: f32) -> (f32, Vec3) {
-        match self {
+    /// Mass and body-space inertia tensor for a density.
+    fn mass_properties(&self, density: f32) -> (f32, Mat3) {
+        let (mass, moment) = match *self {
+            Self::Hull(ref hull) => return hull.mass_properties(density),
             Self::Cuboid { half_extents: h } => {
                 assert!(
                     h.is_finite() && h.min_element() > 0.0,
@@ -185,9 +222,10 @@ impl Collider {
                 let along = cylinder * r2 / 2.0 + caps * 0.4 * r2;
                 (cylinder + caps, Vec3::new(across, across, along))
             }
-            // Massless, so it never moves, whatever the body's type.
-            Self::Ground => (0.0, Vec3::ZERO),
-        }
+            // Massless, so it never moves unless kinematic.
+            Self::Ground | Self::Mesh(_) => (0.0, Vec3::ZERO),
+        };
+        (mass, Mat3::from_diagonal(moment))
     }
 }
 
@@ -518,12 +556,12 @@ impl std::fmt::Display for InvalidEntity {
 }
 impl std::error::Error for InvalidEntity {}
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct CachedMass {
     collider: Collider,
     density: f32,
     mass: f32,
-    moment: Vec3,
+    moment: Mat3,
 }
 
 #[derive(Clone, Copy)]
@@ -996,7 +1034,7 @@ impl PhysicsWorld {
         let aligned = bodies.len() == self.slots.len();
         let obstacles: Vec<_> = (bodies.iter().filter(|_| aligned))
             .map(|b| soft::Obstacle {
-                shape: b.shape,
+                shape: b.shape.clone(),
                 ground: (b.shape == Collider::Ground)
                     .then(|| self.solver.ground())
                     .flatten(),
@@ -1139,7 +1177,7 @@ impl PhysicsWorld {
                         || body.material.friction < 0.0
                         || !body.material.static_friction.is_finite()
                         || body.material.static_friction < 0.0
-                        || !slot.mass_properties.is_some_and(|m| {
+                        || !slot.mass_properties.as_ref().is_some_and(|m| {
                             m.collider == body.collider && m.density == body.material.density
                         })
                     {
@@ -1290,14 +1328,14 @@ fn solver_body(slot: &mut Slot, transform: &Transform, dt: f32) -> solver::Body 
         "impulses must be finite"
     );
 
-    let (mut mass, moment) = match slot.mass_properties {
+    let (mut mass, moment) = match &slot.mass_properties {
         Some(cached) if cached.collider == body.collider && cached.density == density => {
             (cached.mass, cached.moment)
         }
         _ => {
             let (mass, moment) = body.collider.mass_properties(density);
             slot.mass_properties = Some(CachedMass {
-                collider: body.collider,
+                collider: body.collider.clone(),
                 density,
                 mass,
                 moment,
@@ -1314,7 +1352,7 @@ fn solver_body(slot: &mut Slot, transform: &Transform, dt: f32) -> solver::Body 
         _ => {
             let rotation = rotation.normalize();
             let basis = Mat3::from_quat(rotation);
-            let inertia = basis * Mat3::from_diagonal(moment) * basis.transpose();
+            let inertia = basis * moment * basis.transpose();
             let cached = CachedPose {
                 rotation_bits,
                 rotation,
@@ -1328,24 +1366,25 @@ fn solver_body(slot: &mut Slot, transform: &Transform, dt: f32) -> solver::Body 
     let (rotation, basis, mut inertia) = (pose.rotation, pose.basis, pose.inertia);
     let (mut velocity, mut angular_velocity) = (v.linear, v.angular);
     match body.body_type {
-        RigidBody::Dynamic => {
+        RigidBody::Dynamic if mass > 0.0 => {
             velocity += (f.force * dt + body.impulse.linear) / mass;
             let angular = f.torque * dt + body.impulse.angular;
             // Most bodies get no torque: skip building the inverse inertia.
             if angular != Vec3::ZERO {
-                let inverse = basis * Mat3::from_diagonal(moment.recip()) * basis.transpose();
+                let inverse = basis * moment.inverse() * basis.transpose();
                 angular_velocity += inverse * angular;
             }
         }
         RigidBody::Kinematic => (mass, inertia) = (0.0, Mat3::ZERO),
-        RigidBody::Static => {
+        // A massless collider on a dynamic body cannot be moved by forces.
+        RigidBody::Static | RigidBody::Dynamic => {
             (mass, inertia) = (0.0, Mat3::ZERO);
             (velocity, angular_velocity) = (Vec3::ZERO, Vec3::ZERO);
         }
     }
     solver::Body {
         key: key(slot.entity),
-        shape: body.collider,
+        shape: body.collider.clone(),
         position,
         rotation,
         initial_position: position,

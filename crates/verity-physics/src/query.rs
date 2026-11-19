@@ -6,9 +6,10 @@
 //! in verity-lux does. It also reports where things moved, which is exactly
 //! where light changed: a renderer alone could only guess that from pixels.
 //!
-//! Static meshes answer rays only. They make no contacts, so bodies fall
-//! through them; give level geometry colliders too.
+//! Static meshes added here answer rays only. For contacts, give a body a
+//! [`Collider::Mesh`]; [`TriMesh::collision`] cooks one from a render mesh.
 
+use crate::hull::triangle_nearest;
 use crate::{Collider, PhysicsWorld, SoftBody, SoftId};
 use glam::{Affine3A, Mat3A, Quat, Vec3, Vec3A};
 use std::{collections::HashMap, sync::Arc};
@@ -140,6 +141,36 @@ impl Bvh {
                     .fold(Bounds::EMPTY, |all, &item| all.union(bounds[item as usize]))
             };
             self.nodes[i] = node(fitted, a as u32, count as u32);
+        }
+    }
+
+    /// Calls `visit(slot in order)` for items whose boxes may overlap `bounds`.
+    pub(crate) fn overlap(&self, bounds: Bounds, mut visit: impl FnMut(usize)) {
+        let touches = |at: usize| {
+            let b = node_bounds(&self.nodes[at]);
+            b.min.cmple(bounds.max).all() && bounds.min.cmple(b.max).all()
+        };
+        if self.nodes.is_empty() || !touches(0) {
+            return;
+        }
+        // Depth is bounded by `SAH_DEPTH` plus a median split's log2.
+        let mut stack = [0usize; 64];
+        let mut len = 1;
+        while len > 0 {
+            len -= 1;
+            let at = stack[len];
+            let [lo, hi] = self.nodes[at];
+            let (a, count) = (lo[3].to_bits() as usize, hi[3].to_bits() as usize);
+            if count > 0 {
+                (a..a + count).for_each(&mut visit);
+                continue;
+            }
+            for child in [at + 1, a] {
+                if touches(child) && len < stack.len() {
+                    stack[len] = child;
+                    len += 1;
+                }
+            }
         }
     }
 
@@ -373,11 +404,19 @@ fn median_split(centers: &[Vec3A], items: &mut [u32]) -> usize {
     middle
 }
 
+/// Neighbouring triangles closer than this to coplanar share an inactive edge
+/// (cos 5 degrees, as Jolt uses).
+const ACTIVE_EDGE_COS: f32 = 0.996_194_7;
+
 /// Triangles under a tree, stored in leaf order.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct TriMesh {
     tree: Bvh,
     triangles: Vec<[Vec3; 3]>,
+    /// Per triangle, bit k: edge k (corner k to k + 1) is active, a convex
+    /// crease or a border. Contacts push off active edges only, so a body
+    /// sliding over a flat seam is not caught on it.
+    active: Vec<u8>,
 }
 
 impl TriMesh {
@@ -385,12 +424,83 @@ impl TriMesh {
         let corners = |t: &[u32; 3]| t.map(|i| positions[i as usize]);
         let bounds: Vec<_> = indices.iter().map(|t| corner_bounds(corners(t))).collect();
         let tree = Bvh::build(&bounds);
-        let triangles = tree
+        let triangles: Vec<[Vec3; 3]> = tree
             .order()
             .iter()
             .map(|&i| corners(&indices[i as usize]))
             .collect();
-        Self { tree, triangles }
+        let active = active_edges(&triangles);
+        Self {
+            tree,
+            triangles,
+            active,
+        }
+    }
+
+    /// A collision mesh cooked from a render mesh. Vertices split along UV
+    /// and normal seams are welded, then meshoptimizer's quadric edge
+    /// collapse (Garland and Heckbert 1997, as games ship it) removes every
+    /// triangle it can while the surface moves at most `tolerance` metres,
+    /// and drops pieces smaller than that. Open borders stay put, so tiles
+    /// cooked apart still meet.
+    pub fn collision(positions: &[Vec3], indices: &[[u32; 3]], tolerance: f32) -> Self {
+        assert!(
+            tolerance.is_finite() && tolerance >= 0.0,
+            "collision tolerance must be finite and nonnegative"
+        );
+        let mut welded: Vec<[f32; 3]> = Vec::new();
+        let mut index: HashMap<[u32; 3], u32> = HashMap::new();
+        let remap: Vec<u32> = (positions.iter())
+            .map(|p| {
+                *index.entry(p.to_array().map(f32::to_bits)).or_insert_with(|| {
+                    welded.push(p.to_array());
+                    (welded.len() - 1) as u32
+                })
+            })
+            .collect();
+        let flat: Vec<u32> = (indices.iter())
+            .flat_map(|t| t.map(|i| remap[i as usize]))
+            .collect();
+        let options = meshopt::SimplifyOptions::ErrorAbsolute
+            | meshopt::SimplifyOptions::LockBorder
+            | meshopt::SimplifyOptions::Prune;
+        let kept = meshopt::simplify_decoder(&flat, &welded, 0, tolerance, options, None);
+        let points: Vec<Vec3> = welded.into_iter().map(Vec3::from_array).collect();
+        let triangles: Vec<[u32; 3]> = kept.as_chunks::<3>().0.to_vec();
+        Self::new(&points, &triangles)
+    }
+
+    /// Triangles whose boxes may overlap `bounds`, by slot in [`Self::triangles`].
+    pub(crate) fn overlapping(&self, bounds: Bounds, visit: impl FnMut(usize)) {
+        self.tree.overlap(bounds, visit);
+    }
+
+    /// Bit k set: the triangle's edge from corner k is active.
+    pub(crate) fn active(&self, slot: usize) -> u8 {
+        self.active.get(slot).copied().unwrap_or(0b111)
+    }
+
+    /// The surface point nearest `point` within `reach`, and the normal there:
+    /// away from the surface, or the triangle's front where it touches.
+    pub(crate) fn nearest(&self, point: Vec3, reach: f32) -> Option<(Vec3, Vec3)> {
+        let mut best: Option<(f32, Vec3, usize)> = None;
+        let window = Bounds {
+            min: point - reach,
+            max: point + reach,
+        };
+        self.tree.overlap(window, |slot| {
+            let [a, b, c] = self.triangles[slot];
+            let (_, q) = triangle_nearest(point, a, b, c);
+            let d = point.distance_squared(q);
+            if d <= reach * reach && best.is_none_or(|(e, ..)| d < e) {
+                best = Some((d, q, slot));
+            }
+        });
+        let (d, q, slot) = best?;
+        let [a, b, c] = self.triangles[slot];
+        let face = (b - a).cross(c - a).normalize_or_zero();
+        let normal = if d > 1.0e-12 { (point - q) / d.sqrt() } else { face };
+        Some((q, normal))
     }
 
     pub fn nodes(&self) -> &[BvhNode] {
@@ -459,6 +569,55 @@ fn corner_bounds(corners: [Vec3; 3]) -> Bounds {
     corners.into_iter().fold(Bounds::EMPTY, Bounds::with)
 }
 
+/// Active edge bits per triangle: borders, edges shared by more than two
+/// triangles, and convex creases sharper than [`ACTIVE_EDGE_COS`]. Flat and
+/// concave edges are inactive: from outside, the faces either side cover them.
+fn active_edges(triangles: &[[Vec3; 3]]) -> Vec<u8> {
+    let key = |p: Vec3, q: Vec3| {
+        let (p, q) = (p.to_array().map(f32::to_bits), q.to_array().map(f32::to_bits));
+        if p < q { (p, q) } else { (q, p) }
+    };
+    let mut sharing: HashMap<([u32; 3], [u32; 3]), Vec<usize>> = HashMap::new();
+    for (t, corners) in triangles.iter().enumerate() {
+        for k in 0..3 {
+            sharing.entry(key(corners[k], corners[(k + 1) % 3])).or_default().push(t);
+        }
+    }
+    let normal = |[a, b, c]: [Vec3; 3]| (b - a).cross(c - a).normalize_or_zero();
+    (triangles.iter().enumerate())
+        .map(|(t, &corners)| {
+            let n = normal(corners);
+            (0..3).fold(0u8, |bits, k| {
+                let active = match sharing[&key(corners[k], corners[(k + 1) % 3])].as_slice() {
+                    &[x, y] => {
+                        let u = if x == t { y } else { x };
+                        // The neighbour's corner off this edge, against this face.
+                        let far = (triangles[u].iter())
+                            .map(|&p| n.dot(p - corners[k]))
+                            .fold(0.0f32, |m, d| if d.abs() > m.abs() { d } else { m });
+                        n.dot(normal(triangles[u])) < ACTIVE_EDGE_COS && far < 0.0
+                    }
+                    _ => true,
+                };
+                bits | u8::from(active) << k
+            })
+        })
+        .collect()
+}
+
+/// `bounds` carried into the frame `pose` maps to.
+fn transformed(bounds: Bounds, pose: &Affine3A) -> Bounds {
+    let Bounds { min, max } = bounds;
+    (0..8).fold(Bounds::EMPTY, |all, i| {
+        let corner = Vec3::select(
+            glam::BVec3::new(i & 1 != 0, i & 2 != 0, i & 4 != 0),
+            max,
+            min,
+        );
+        all.with(pose.transform_point3(corner))
+    })
+}
+
 /// Where `origin + direction t` enters a Z-aligned capsule at the origin,
 /// and the outward normal there: a negative `t` when `origin` is inside.
 pub(crate) fn capsule_ray(
@@ -505,8 +664,8 @@ impl Collider {
     /// The nearest entry of a ray from outside, in the collider's own frame,
     /// and the outward normal there. `direction` need not be unit length: `t`
     /// is in units of it.
-    pub fn ray(self, origin: Vec3, direction: Vec3, max: f32) -> Option<(f32, Vec3)> {
-        match self {
+    pub fn ray(&self, origin: Vec3, direction: Vec3, max: f32) -> Option<(f32, Vec3)> {
+        match *self {
             Self::Cuboid { half_extents } => {
                 let inverse = safe_inverse(direction);
                 let (t0, t1) = (
@@ -540,14 +699,18 @@ impl Collider {
                 half_height,
             } => capsule_ray(origin, direction, radius, half_height)
                 .filter(|&(t, _)| t > 0.0 && t < max),
+            Self::Hull(ref hull) => hull.ray(origin, direction, max),
+            Self::Mesh(ref mesh) => mesh.ray(origin, direction, max),
             // Rays see ground as the mesh drawn for it, not through its body.
             Self::Ground => None,
         }
     }
 
-    fn world_bounds(self, pose: &Affine3A) -> Bounds {
+    fn world_bounds(&self, pose: &Affine3A) -> Bounds {
         let center = Vec3::from(pose.translation);
-        let reach = match self {
+        let reach = match *self {
+            Self::Hull(ref hull) => return transformed(hull.bounds(), pose),
+            Self::Mesh(ref mesh) => return transformed(mesh.bounds(), pose),
             Self::Sphere { radius } => Vec3::splat(radius),
             Self::Capsule {
                 radius,
@@ -571,10 +734,21 @@ impl Collider {
 }
 
 /// What a [`RayScene`] item shows to rays.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone)]
 pub enum RayShape {
     Collider(Collider),
     Mesh(Arc<TriMesh>),
+}
+
+/// Meshes compare by identity: by content would cost a whole mesh per sync.
+impl PartialEq for RayShape {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Collider(a), Self::Collider(b)) => a == b,
+            (Self::Mesh(a), Self::Mesh(b)) => Arc::ptr_eq(a, b),
+            _ => false,
+        }
+    }
 }
 
 /// Where a [`RayScene`] item comes from. A static item's number is the caller's.
@@ -599,17 +773,7 @@ impl RayItem {
     fn new(shape: RayShape, source: RaySource, pose: Affine3A) -> Self {
         let bounds = match &shape {
             RayShape::Collider(collider) => collider.world_bounds(&pose),
-            RayShape::Mesh(mesh) => {
-                let Bounds { min, max } = mesh.bounds();
-                (0..8).fold(Bounds::EMPTY, |all, i| {
-                    let corner = Vec3::select(
-                        glam::BVec3::new(i & 1 != 0, i & 2 != 0, i & 4 != 0),
-                        max,
-                        min,
-                    );
-                    all.with(pose.transform_point3(corner))
-                })
-            }
+            RayShape::Mesh(mesh) => transformed(mesh.bounds(), &pose),
         };
         Self {
             shape,
@@ -786,7 +950,7 @@ impl RayScene {
                 continue;
             };
             if body.collider != Collider::Ground {
-                added |= self.place(entity, body.collider, found.transform);
+                added |= self.place(entity, body.collider.clone(), found.transform);
             }
         }
         if boxes {
@@ -852,7 +1016,11 @@ impl RayScene {
     /// Add or update an entity's item; `true` when it is new.
     fn place(&mut self, entity: EntityHandle, collider: Collider, transform: &Transform) -> bool {
         let source = RaySource::Body(entity);
-        let shape = RayShape::Collider(collider);
+        // Mesh colliders show as meshes, which GPU tracers already walk.
+        let shape = match collider {
+            Collider::Mesh(mesh) => RayShape::Mesh(mesh),
+            collider => RayShape::Collider(collider),
+        };
         let pose = pose_of(transform);
         if let Some(&i) = self.index.get(&source) {
             let item = &mut self.items[i];

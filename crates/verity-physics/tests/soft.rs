@@ -264,7 +264,7 @@ fn struck_plate(drop_height: f32, density: f32) -> (SoftBody, f32, f32) {
         half_extents: Vec3::new(0.2, 2.0, 0.5),
     };
     for x in [-0.9, 0.9] {
-        let support = PhysicsBody::new(RigidBody::Static, shape);
+        let support = PhysicsBody::new(RigidBody::Static, shape.clone());
         spawn(&mut world, &mut physics, Vec3::new(x, 0.0, 0.5), support);
     }
     let plate = SoftBody::lattice(

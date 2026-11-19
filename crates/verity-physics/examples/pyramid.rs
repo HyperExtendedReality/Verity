@@ -40,7 +40,7 @@ fn main() {
             add(
                 &mut world,
                 Vec3::new(x * 1.01, 0.0, 0.5 + row as f32),
-                PhysicsBody::new(RigidBody::Dynamic, cube),
+                PhysicsBody::new(RigidBody::Dynamic, cube.clone()),
             );
         }
     }

@@ -3523,6 +3523,7 @@ name = "verity-physics"
 version = "0.1.0"
 dependencies = [
  "glam",
+ "meshopt",
  "rayon",
  "serde",
  "verity-box3d",

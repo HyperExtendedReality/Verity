@@ -701,6 +701,11 @@ impl Obstacle {
                 radius,
                 half_height,
             } => radius + half_height,
+            Collider::Hull(ref hull) => hull.radius(),
+            Collider::Mesh(ref mesh) => {
+                let b = mesh.bounds();
+                b.min.abs().max(b.max.abs()).length()
+            }
             Collider::Ground => UNBOUNDED,
         }
     }
@@ -772,6 +777,14 @@ impl Obstacle {
                 let normal = ground.normal(local);
                 (local - normal * distance, normal)
             }
+            Collider::Hull(ref hull) => {
+                let (surface, normal, distance) = hull.nearest(local);
+                if distance > reach {
+                    return None;
+                }
+                (surface, normal)
+            }
+            Collider::Mesh(ref mesh) => mesh.nearest(local, reach)?,
         };
         Some((
             self.position + self.rotation * surface,
@@ -830,6 +843,13 @@ impl Obstacle {
                 // Starting inside the padding is already touching.
                 (enter.max(0.0), normal)
             }
+            Collider::Hull(ref hull) => hull.sweep(a, d, pad)?,
+            Collider::Mesh(ref mesh) => match mesh.ray(a, d, 1.0) {
+                // Back off until the padding touches, not the point.
+                Some((t, normal)) => ((t - pad / (-d.dot(normal)).max(1.0e-6)).max(0.0), normal),
+                // Sliding along it within the padding still touches.
+                None => return self.nearest(from + (to - from), pad),
+            },
             // `narrowest` keeps paths from sweeping: `nearest` works from inside.
             Collider::Ground => return None,
         };
@@ -848,6 +868,9 @@ impl Obstacle {
         match self.shape {
             Collider::Cuboid { half_extents } => half_extents.min_element(),
             Collider::Sphere { radius } | Collider::Capsule { radius, .. } => radius,
+            Collider::Hull(ref hull) => hull.inner(),
+            // Thin everywhere: any move sweeps.
+            Collider::Mesh(_) => 0.0,
             Collider::Ground => UNBOUNDED,
         }
     }

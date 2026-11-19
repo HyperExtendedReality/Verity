@@ -226,7 +226,7 @@ fn the_scene_tree_matches_brute_force_after_many_refits_and_rebuilds() {
             let (o, d) = (rng.vec(20.0), rng.vec(1.0).normalize());
             let every = scene.items().iter().enumerate().filter_map(|(i, item)| {
                 let m = item.local_from_world;
-                let RayShape::Collider(c) = item.shape else {
+                let RayShape::Collider(c) = &item.shape else {
                     unreachable!()
                 };
                 c.ray(m.transform_point3(o), m.transform_vector3(d), 100.0)

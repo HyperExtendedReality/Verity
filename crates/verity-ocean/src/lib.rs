@@ -330,8 +330,34 @@ fn submerged(
                 apply(offset, share * volume / N as f32, s);
             }
         }
-        // Ground is not something water lifts.
-        Collider::Ground => {}
+        Collider::Hull(ref hull) => {
+            // 4³ cells of the hull's box; those whose centers lie inside
+            // share its volume, each submerged as a cuboid cell is.
+            const N: usize = 4;
+            let (lo, hi) = (hull.vertices().iter()).fold(
+                (Vec3::INFINITY, Vec3::NEG_INFINITY),
+                |(lo, hi), &v| (lo.min(v), hi.max(v)),
+            );
+            let sub = (hi - lo) / (2 * N) as f32;
+            let reach = Mat3::from_quat(rotation).row(2).abs().dot(sub);
+            let cells: Vec<Vec3> = (0..N * N * N)
+                .map(|i| {
+                    let cell = Vec3::new((i % N) as f32, (i / N % N) as f32, (i / (N * N)) as f32);
+                    lo + (cell * 2.0 + 1.0) * sub
+                })
+                .filter(|&local| hull.contains(local))
+                .collect();
+            let volume = hull.volume() / cells.len().max(1) as f32;
+            for local in cells {
+                let offset = rotation * local;
+                let s = water.sample((center + offset).truncate());
+                let covered =
+                    ((s.height - center.z - offset.z) / (2.0 * reach) + 0.5).clamp(0.0, 1.0);
+                apply(offset, covered * volume, s);
+            }
+        }
+        // Ground and meshes are not something water lifts.
+        Collider::Ground | Collider::Mesh(_) => {}
     }
 }
 

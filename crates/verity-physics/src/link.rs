@@ -103,8 +103,16 @@ struct Ends {
 }
 
 /// A shape's full widths, for the angular constraint's length scale.
-fn size(shape: Collider) -> Vec3 {
-    match shape {
+fn size(shape: &Collider) -> Vec3 {
+    match *shape {
+        Collider::Hull(ref hull) => {
+            let b = hull.bounds();
+            b.max - b.min
+        }
+        Collider::Mesh(ref mesh) => {
+            let b = mesh.bounds();
+            b.max - b.min
+        }
         Collider::Cuboid { half_extents } => half_extents * 2.0,
         Collider::Sphere { radius } => Vec3::splat(radius * 2.0),
         Collider::Capsule {
@@ -304,7 +312,7 @@ impl Link {
     pub fn initialize(&mut self, bodies: &[Body], settings: &PhysicsSettings, dt: f32) {
         let (a, b) = (self.a.map(|i| &bodies[i]), &bodies[self.b]);
         self.scale = a.map_or(0.0, |a| a.mass).max(b.mass).max(f32::MIN_POSITIVE);
-        self.arm = (a.map_or(Vec3::ZERO, |a| size(a.shape)) + size(b.shape)).length_squared();
+        self.arm = (a.map_or(Vec3::ZERO, |a| size(&a.shape)) + size(&b.shape)).length_squared();
         let e = self.ends(a, b);
         (self.arm0_a, self.arm0_b) = (e.arm_a, e.arm_b);
         let spin = a.map_or(0.0, |a| a.angular_velocity.length());

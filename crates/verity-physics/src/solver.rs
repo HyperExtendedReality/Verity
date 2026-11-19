@@ -160,6 +160,8 @@ impl Body {
             let swing = match self.shape {
                 Collider::Cuboid { half_extents } => self.bound() - half_extents.min_element(),
                 Collider::Capsule { radius, .. } => self.bound() - radius,
+                Collider::Hull(ref hull) => hull.radius() - hull.inner(),
+                Collider::Mesh(_) => self.bound(),
                 Collider::Sphere { .. } | Collider::Ground => 0.0,
             };
             (
@@ -231,8 +233,8 @@ impl Body {
     fn gyroscopic(&self) -> bool {
         match self.shape {
             Collider::Cuboid { half_extents: h } => h.x != h.y || h.y != h.z,
-            Collider::Capsule { .. } => true,
-            Collider::Sphere { .. } | Collider::Ground => false,
+            Collider::Capsule { .. } | Collider::Hull(_) => true,
+            Collider::Sphere { .. } | Collider::Ground | Collider::Mesh(_) => false,
         }
     }
     /// World inertia after the rotation `w` from the step start.
@@ -261,6 +263,11 @@ impl Body {
                 radius,
                 half_height,
             } => radius + half_height,
+            Collider::Hull(ref hull) => hull.radius(),
+            Collider::Mesh(ref mesh) => {
+                let b = mesh.bounds();
+                b.min.abs().max(b.max.abs()).length()
+            }
             Collider::Ground => 0.0,
         }
     }
@@ -271,6 +278,16 @@ impl Body {
             Collider::Sphere { .. } | Collider::Capsule { .. }
         )
     }
+}
+
+/// Half the world box of a shape's local `bounds`, moving `center` to the
+/// box's: hulls and meshes need not be symmetric about the body.
+fn offset_extent(body: &Body, bounds: Bounds, center: &mut Vec3) -> Vec3 {
+    let m = body.initial_basis;
+    let half = 0.5 * (bounds.max - bounds.min);
+    *center += m * bounds.center();
+    let abs = |row: Vec3| row.abs().dot(half);
+    Vec3::new(abs(m.row(0)), abs(m.row(1)), abs(m.row(2)))
 }
 
 /// `spin`, the result of turning `start` at constant `momentum`, with no more
@@ -356,6 +373,9 @@ pub(crate) struct Manifold {
 
 struct CollisionData {
     key: (u64, u64),
+    /// Which of a mesh pair's manifolds this is, from 1; 0 for other pairs,
+    /// which have one manifold.
+    part: u8,
     /// Basis and relative pose when the contacts were generated.
     local_basis: [Vec3; 3],
     relative: (Vec3, Quat),
@@ -1191,8 +1211,20 @@ impl Manifold {
         prepare: Option<&PhysicsSettings>,
         ground: Option<&dyn Ground>,
     ) -> Option<Self> {
+        let (basis, contacts, len) = collide::collide(&bodies[a], &bodies[b], ground)?;
+        Some(Self::build(bodies, (a, b), (basis, contacts, len), 0, previous, prepare))
+    }
+
+    /// A manifold from fresh contacts.
+    fn build(
+        bodies: &[Body],
+        (a, b): (usize, usize),
+        (basis, mut contacts, len): ([Vec3; 3], [Contact; collide::MAX_CONTACTS], usize),
+        part: u8,
+        previous: Option<&Manifold>,
+        prepare: Option<&PhysicsSettings>,
+    ) -> Self {
         let (ba, bb) = (&bodies[a], &bodies[b]);
-        let (basis, mut contacts, len) = collide::collide(ba, bb, ground)?;
         let warm = if let Some(previous) = previous {
             previous.warm(ba, bb, &mut contacts[..len])
         } else {
@@ -1210,6 +1242,7 @@ impl Manifold {
             rows: Mat3A::from_cols(basis[0].into(), basis[1].into(), basis[2].into()).transpose(),
             cold: Box::new(CollisionData {
                 key: (ba.key, bb.key),
+                part,
                 local_basis: basis.map(|v| inverse * v),
                 relative: (inverse * (bb.position - ba.position), inverse * bb.rotation),
                 contacts,
@@ -1232,7 +1265,7 @@ impl Manifold {
         if let Some(settings) = prepare {
             m.prepare(ba, bb, basis, settings);
         }
-        Some(m)
+        m
     }
 
     /// Bring a kept manifold up to this step: reuse its contacts while B
@@ -2240,6 +2273,8 @@ pub(crate) struct Solver {
     /// New pairs and their manifolds, reused across narrowphase passes.
     fresh: Vec<(usize, usize)>,
     found: Vec<Option<Manifold>>,
+    /// Pairs with a mesh: collided afresh each pass, into several manifolds.
+    mesh_pairs: Vec<(usize, usize)>,
     /// Counts narrowphase passes, to spot manifolds no pair matched.
     pass: u32,
     /// Time in the broadphase and narrowphase during the last step.
@@ -2804,7 +2839,10 @@ impl Solver {
             return;
         }
         let bounds = |(i, b): (usize, &Body)| {
+            let mut center = b.position;
             let extent = match b.shape {
+                Collider::Hull(ref hull) => offset_extent(b, hull.bounds(), &mut center),
+                Collider::Mesh(ref mesh) => offset_extent(b, mesh.bounds(), &mut center),
                 Collider::Cuboid { half_extents } => {
                     let m = b.initial_basis;
                     let abs = |row: Vec3| row.abs().dot(half_extents);
@@ -2821,8 +2859,8 @@ impl Solver {
             let flags =
                 u32::from(b.dynamic()) | u32::from(b.active()) << 1 | u32::from(b.asleep) << 2;
             Aabb {
-                min: b.position - extent + b.travel.min(Vec3::ZERO),
-                max: b.position + extent + b.travel.max(Vec3::ZERO),
+                min: center - extent + b.travel.min(Vec3::ZERO),
+                max: center + extent + b.travel.max(Vec3::ZERO),
                 index: i as u32,
                 flags,
             }
@@ -2965,9 +3003,16 @@ impl Solver {
         self.pass = self.pass.wrapping_add(1);
         let pass = self.pass;
         self.fresh.clear();
+        self.mesh_pairs.clear();
         for &(a, b) in &self.pairs {
             let key = (self.bodies[a].key, self.bodies[b].key);
             if self.linked.contains_key(&key) {
+                continue;
+            }
+            if matches!(self.bodies[a].shape, Collider::Mesh(_))
+                || matches!(self.bodies[b].shape, Collider::Mesh(_))
+            {
+                self.mesh_pairs.push((a, b));
                 continue;
             }
             match self.cache.get(&key) {
@@ -2977,6 +3022,14 @@ impl Solver {
                 }
                 None => self.fresh.push((a, b)),
             }
+        }
+        // Mesh manifolds are rebuilt below; keep last pass's to warm start them.
+        let mut old_parts = Vec::new();
+        if self.manifolds.iter().any(|m| m.cold.part != 0) {
+            let (parts, rest) = std::mem::take(&mut self.manifolds)
+                .into_iter()
+                .partition(|m| m.cold.part != 0);
+            (old_parts, self.manifolds) = (parts, rest);
         }
         let bodies = &self.bodies;
         let ground = self.ground.as_deref();
@@ -3036,6 +3089,7 @@ impl Solver {
             changed |= self.found.iter().any(Option::is_some);
             self.manifolds.extend(self.found.drain(..).flatten());
         }
+        changed |= self.mesh_narrowphase(old_parts, serial, prepare);
         if changed {
             self.recolor = true;
             self.cache.clear();
@@ -3046,6 +3100,51 @@ impl Solver {
                     .map(|(i, m)| (m.cold.key, i)),
             );
         }
+    }
+
+    /// Collide the mesh pairs: one manifold per direction the mesh pushes a
+    /// body, so a box in a corner gets floor and wall, not their average.
+    /// Warm starts from `old`, matched by pair and part. True if the set of
+    /// manifolds changed.
+    fn mesh_narrowphase(
+        &mut self,
+        old: Vec<Manifold>,
+        serial: bool,
+        prepare: Option<&PhysicsSettings>,
+    ) -> bool {
+        if self.mesh_pairs.is_empty() {
+            return !old.is_empty();
+        }
+        let index: HashMap<(u64, u64, u8), usize> = (old.iter().enumerate())
+            .map(|(i, m)| ((m.cold.key.0, m.cold.key.1, m.cold.part), i))
+            .collect();
+        let bodies = &self.bodies;
+        let build = |&(a, b): &(usize, usize)| {
+            let (parts, count) = collide::collide_mesh(&bodies[a], &bodies[b]);
+            (parts.into_iter().take(count))
+                .map(|part| {
+                    let id = (bodies[a].key, bodies[b].key, part.id);
+                    let previous = index.get(&id).map(|&i| &old[i]);
+                    let contacts = (part.basis, part.contacts, part.len);
+                    let m = Manifold::build(bodies, (a, b), contacts, part.id, previous, prepare);
+                    (m, previous.is_some())
+                })
+                .collect::<Vec<_>>()
+        };
+        let built: Vec<(Manifold, bool)> = if serial || self.mesh_pairs.len() < PAIR_BATCH {
+            self.mesh_pairs.iter().flat_map(build).collect()
+        } else {
+            (self.mesh_pairs.par_iter())
+                .with_min_len(PAIR_BATCH)
+                .flat_map_iter(build)
+                .collect()
+        };
+        // Adjacency holds manifold indices: any reordering must recolor.
+        let changed = built.len() != old.len()
+            || (built.iter().zip(&old))
+                .any(|((m, _), o)| (m.cold.key, m.cold.part) != (o.cold.key, o.cold.part));
+        self.manifolds.extend(built.into_iter().map(|(m, _)| m));
+        changed
     }
 
     /// Build body-to-manifold adjacency and greedily color dynamic bodies so no
@@ -3439,6 +3538,7 @@ mod tests {
             )),
             cold: Box::new(CollisionData {
                 key: (0, 0),
+                part: 0,
                 local_basis: [Vec3::ZERO; 3],
                 relative: (Vec3::ZERO, Quat::IDENTITY),
                 contacts: [Contact::default(); collide::MAX_CONTACTS],

@@ -1865,7 +1865,7 @@ fn capsules_rest_crossed_on_capsules_and_hold_spheres() {
         &mut world,
         &mut physics,
         Vec3::ZERO,
-        PhysicsBody::new(RigidBody::Static, capsule),
+        PhysicsBody::new(RigidBody::Static, capsule.clone()),
     );
     world.get_mut(log).unwrap().transform.rotation =
         Quat::from_rotation_arc(Vec3::Z, Vec3::X).to_array();
@@ -1873,7 +1873,7 @@ fn capsules_rest_crossed_on_capsules_and_hold_spheres() {
         &mut world,
         &mut physics,
         Vec3::new(0.0, 0.0, 1.0),
-        PhysicsBody::new(RigidBody::Dynamic, capsule),
+        PhysicsBody::new(RigidBody::Dynamic, capsule.clone()),
     );
     world.get_mut(top).unwrap().transform.rotation =
         Quat::from_rotation_arc(Vec3::Z, Vec3::Y).to_array();

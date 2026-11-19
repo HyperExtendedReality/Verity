@@ -87,7 +87,7 @@ fn bodies_come_to_rest_on_the_surface() {
         half_extents: Vec3::new(1.0, 0.75, 0.5),
     };
     let a = drop(&mut world, &mut physics, sphere, Vec3::new(0.0, 0.0, 4.0));
-    let b = drop(&mut world, &mut physics, cuboid, Vec3::new(6.0, 0.0, 4.0));
+    let b = drop(&mut world, &mut physics, cuboid.clone(), Vec3::new(6.0, 0.0, 4.0));
     run(&mut world, &mut physics, 4.0);
     let (sphere_at, cuboid_at) = (position(&world, a), position(&world, b));
     // A sphere on a gentle bump touches within a few centimetres of the surface
@@ -133,7 +133,7 @@ fn friction_holds_a_box_on_a_gentle_slope_and_not_a_steep_one() {
         let normal = Ramp(slope).normal(Vec3::ZERO);
         let tilt = glam::Quat::from_rotation_arc(Vec3::Z, normal);
         let start = normal * 0.51;
-        let entity = drop(&mut world, &mut physics, cuboid, start);
+        let entity = drop(&mut world, &mut physics, cuboid.clone(), start);
         let found = world.get_mut(entity).expect("alive");
         found.transform.rotation = tilt.to_array();
         run(&mut world, &mut physics, 2.0);
@@ -152,8 +152,8 @@ fn digging_under_a_sleeping_body_wakes_it_and_it_falls() {
     let cuboid = Collider::Cuboid {
         half_extents: Vec3::splat(0.5),
     };
-    let dug = drop(&mut world, &mut physics, cuboid, Vec3::new(0.0, 0.0, 2.0));
-    let far = drop(&mut world, &mut physics, cuboid, Vec3::new(40.0, 0.0, 2.0));
+    let dug = drop(&mut world, &mut physics, cuboid.clone(), Vec3::new(0.0, 0.0, 2.0));
+    let far = drop(&mut world, &mut physics, cuboid.clone(), Vec3::new(40.0, 0.0, 2.0));
     run(&mut world, &mut physics, 8.0);
     assert!(physics.is_sleeping(dug) && physics.is_sleeping(far));
     let rest = position(&world, dug);
@@ -273,7 +273,7 @@ fn bodies_settle_and_sleep_wherever_they_land() {
                     -80.0 + (i / 10) as f32 * 16.1,
                 );
                 let z = terrain.landscape.height(x, y) + 2.0;
-                drop(&mut world, &mut physics, cuboid, Vec3::new(x, y, z))
+                drop(&mut world, &mut physics, cuboid.clone(), Vec3::new(x, y, z))
             })
             .collect();
         run(&mut world, &mut physics, 10.0);
