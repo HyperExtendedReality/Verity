@@ -185,6 +185,26 @@ pub struct Clouds {
     pub cirrus: f32,
     /// Picks one of many skies with the same settings.
     pub seed: u32,
+    /// An authored voxel cloudscape over the world origin, its base on the
+    /// layer's; the layer's own clouds give way around it.
+    pub cloudscape: Cloudscape,
+}
+
+/// The voxel cloudscapes the renderer ships with.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Cloudscape {
+    #[default]
+    None,
+    /// Disney's cumulus congestus, some 2 km across.
+    Cumulus,
+    /// Guerrilla's Nubis "Parkouring" cloud.
+    Parkouring,
+    /// Guerrilla's Nubis "Stormbird" cloud.
+    Stormbird,
+}
+
+impl Cloudscape {
+    pub const ALL: [Self; 4] = [Self::None, Self::Cumulus, Self::Parkouring, Self::Stormbird];
 }
 
 impl Default for Clouds {
@@ -198,6 +218,7 @@ impl Default for Clouds {
             wind: [10.0, 4.0],
             cirrus: 0.3,
             seed: 0,
+            cloudscape: Cloudscape::None,
         }
     }
 }

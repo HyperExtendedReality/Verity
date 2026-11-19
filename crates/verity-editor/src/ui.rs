@@ -1992,6 +1992,17 @@ impl Panels<'_> {
                     changed |= scalar(ui, "Wind X", &mut clouds.wind[0], -100.0..=100.0, 0.1);
                     changed |= scalar(ui, "Wind Y", &mut clouds.wind[1], -100.0..=100.0, 0.1);
                     changed |= scalar(ui, "Cirrus", &mut clouds.cirrus, 0.0..=1.0, 0.01);
+                    ui.label(RichText::new("Voxel cloudscape").size(11.5).color(MUTED));
+                    egui::ComboBox::from_id_salt("cloudscape")
+                        .width(ui.available_width())
+                        .selected_text(format!("{:?}", clouds.cloudscape))
+                        .show_ui(ui, |ui| {
+                            for kind in verity_core::Cloudscape::ALL {
+                                changed |= ui
+                                    .selectable_value(&mut clouds.cloudscape, kind, format!("{kind:?}"))
+                                    .changed();
+                            }
+                        });
                 }
             }
             Selection::Terrain => changed |= terrain_inspector(ui, scene, tools),

@@ -16,7 +16,7 @@ use std::{
     sync::Arc,
     time::{Duration, Instant},
 };
-use verity_core::World;
+use verity_core::{Cloudscape, Clouds, World};
 use verity_render::{
     asset::{Draw, MaterialData, Primitive, SceneData},
     Renderer, Sun, Vertex,
@@ -337,6 +337,17 @@ fn main() -> Result<(), Box<dyn Error>> {
             .collect();
         (v.len() == 6).then(|| (Vec3::new(v[0], v[1], v[2]), Vec3::new(v[3], v[4], v[5])))
     });
+    // `--clouds cumulus` (or parkouring, stormbird, none): a cloudy sky with that voxel cloudscape.
+    let mut world = World::new();
+    if let Some(name) = args.iter().position(|a| a == "--clouds").and_then(|at| args.get(at + 1)) {
+        let cloudscape = (Cloudscape::ALL.into_iter())
+            .find(|kind| format!("{kind:?}").eq_ignore_ascii_case(name))
+            .ok_or_else(|| format!("unknown cloudscape {name}"))?;
+        world.lighting.clouds = Some(Clouds {
+            cloudscape,
+            ..Clouds::default()
+        });
+    }
     EventLoop::new()?.run_app(&mut Viewer {
         options: Options {
             trees: number(&args, "--trees", 10_000),
@@ -351,7 +362,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                 .and_then(|at| args.get(at + 1).cloned()),
             view,
         },
-        world: World::new(),
+        world,
         window: None,
         renderer: None,
         start: Instant::now(),

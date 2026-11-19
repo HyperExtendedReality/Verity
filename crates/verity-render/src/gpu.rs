@@ -276,7 +276,7 @@ pub unsafe fn create_volume(
 
 /// A 2D image when `extent.depth` is 1, otherwise a 3D one.
 #[allow(clippy::too_many_arguments)]
-unsafe fn create_image_of(
+pub(crate) unsafe fn create_image_of(
     device: &ash::Device,
     allocator: &mut Allocator,
     name: &str,

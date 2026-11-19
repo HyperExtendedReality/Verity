@@ -3,3 +3,6 @@
 # CocoIndex Code (ccc)
 /.cocoindex_code/
 /assets/raw
+
+# Cloud source VDBs (gigabytes); scripts/convert_clouds.py reads them.
+/assets/packed/clouds/*.vdb

@@ -13,6 +13,14 @@
 //   jitter and steps that lengthen with distance, then reprojected through the
 //   cloud's depth and accumulated.
 // - Sky: single-scattering Rayleigh + Mie atmosphere over a spherical planet.
+// - Voxel cloudscape (Nubis³): an authored dimensional profile, detail type
+//   and density scale, up-rezzed with Guerrilla's curly-alligator and
+//   alligator noise (mip by distance, twice-folded noise near the camera) and
+//   sphere traced, with sunlight summed into its own voxel grid. Storage
+//   follows VQVDB (Zephir 2025) rather than Nubis' dense grids: only cloudy
+//   8^3 bricks, as one-byte codes into a codebook of 2^3 blocks, decoded once
+//   into a brick atlas; the brick table holds, for empty bricks, the distance
+//   to the nearest cloudy one, which replaces Nubis' dense SDF.
 
 #include "lib/common.slang"
 
@@ -29,8 +37,6 @@ static const float DETAIL_SCALE = 1.0 / 1000.0;
 static const float WEATHER_SCALE = 1.0 / 60000.0;
 static const float SUN_RADIUS = 0.0047;
 static const float CIRRUS_ALTITUDE = 9000.0;
-/// Spreads the alligator noise, which sits near 0.15, over 0..1.
-static const float ALLIGATOR_GAIN = 2.5;
 /// Farthest the light grid sums density toward the sun.
 static const float LIGHT_REACH = 16.0e3;
 
@@ -43,11 +49,18 @@ struct Params {
     uint4 frame;
     /// Cloud shadow map: world xy of its corner, its size; w unused.
     float4 region;
+    /// Voxel cloudscape: xyz its world box's low corner; w metres per voxel,
+    /// 0 with no cloudscape.
+    float4 scape_min;
+    /// xyz: bricks along x, y, z; w: atlas bricks along x.
+    uint4 scape_grid;
+    /// x: atlas bricks along y; y: cloudy bricks; z: codebook entries.
+    uint4 scape_info;
 };
 [[vk::push_constant]] ConstantBuffer<Params> params;
 
 [[vk::binding(0, 1)]] [[vk::image_format("rgba8")]] RWTexture3D<float4> shape_out;
-[[vk::binding(1, 1)]] [[vk::image_format("rgba8")]] RWTexture3D<float4> detail_out;
+[[vk::binding(1, 1)]] [[vk::image_format("r8")]] RWTexture3D<float> atlas_out;
 [[vk::binding(2, 1)]] Texture3D<float4> shape_noise;
 [[vk::binding(3, 1)]] Texture3D<float4> detail_noise;
 [[vk::binding(4, 1)]] SamplerState wrap_sampler;
@@ -57,6 +70,14 @@ struct Params {
 [[vk::binding(8, 1)]] [[vk::image_format("r32f")]] RWTexture2D<float> shadow_out;
 [[vk::binding(9, 1)]] [[vk::image_format("rgba16f")]] RWTexture3D<float4> light_out;
 [[vk::binding(10, 1)]] Texture3D<float4> light_grid;
+/// The cloudscape's decoded dimensional profile, a brick per 10^3 cell.
+[[vk::binding(11, 1)]] Texture3D<float> atlas;
+/// Per brick: its atlas slot when cloudy; else EMPTY | bricks to the nearest cloudy one.
+[[vk::binding(12, 1)]] Texture3D<uint> leaves;
+/// The .vqcloud payload: codebook, bricks, gains, attributes, codes.
+[[vk::binding(13, 1)]] StructuredBuffer<uint> vq;
+[[vk::binding(14, 1)]] [[vk::image_format("rgba16f")]] RWTexture3D<float4> scape_light_out;
+[[vk::binding(15, 1)]] Texture3D<float4> scape_light;
 
 float remap(float v, float a, float b, float c, float d) {
     return c + (v - a) / (b - a) * (d - c);
@@ -136,53 +157,6 @@ void shapeMain(uint3 id: SV_DispatchThreadID) {
     float base = saturate(perlin_fbm(p, 4) * 0.5 + 0.5);
     float perlin_worley = saturate(remap(base, w - 1.0, 1.0, 0.0, 1.0));
     shape_out[id] = float4(perlin_worley, w, worley_fbm(p, 8), worley_fbm(p, 16));
-}
-
-/// SideFX's alligator noise, tiling every `period` cells: the gap between the
-/// two strongest of the bumps around a point, which creases like cloud billows
-/// where inverted Worley packs spheres.
-float alligator(float3 p, int period) {
-    p *= period;
-    int3 cell = int3(floor(p));
-    float3 f = frac(p);
-    float first = 0.0, second = 0.0;
-    for (int z = -1; z <= 1; ++z)
-        for (int y = -1; y <= 1; ++y)
-            for (int x = -1; x <= 1; ++x) {
-                int3 o = int3(x, y, z);
-                float3 r = hash3(cell + o, period);
-                float bump = frac(dot(r, float3(127.1, 311.7, 74.7)))
-                           * smoothstep(0.0, 1.0, 1.0 - length(float3(o) + r - f));
-                if (bump > first) {
-                    second = first;
-                    first = bump;
-                } else {
-                    second = max(second, bump);
-                }
-            }
-    return first - second;
-}
-
-float alligator_fbm(float3 p, int period) {
-    float sum = alligator(p, period) * 0.625 + alligator(p, period * 2) * 0.25 + alligator(p, period * 4) * 0.125;
-    return saturate(sum * ALLIGATOR_GAIN);
-}
-
-/// Erosion for the up-rez, as in Nubis³. RG: low and high frequency curled
-/// alligator noise, which eats the bumps and leaves wisps between them; BA:
-/// low and high frequency inverted alligator noise, which eats the creases
-/// and leaves billows.
-[shader("compute")]
-[numthreads(4, 4, 4)]
-void detailMain(uint3 id: SV_DispatchThreadID) {
-    uint size;
-    uint unused;
-    detail_out.GetDimensions(size, unused, unused);
-    float3 p = (float3(id) + 0.5) / float(size);
-    // shortcut: a Perlin warp stands in for curl noise, so wisps stretch as well as curl; swap in a curl field if they read as smeared.
-    float3 curled = p + 0.2 * float3(perlin(p, 4), perlin(p + 0.37, 4), perlin(p + 0.71, 4));
-    detail_out[id] = float4(alligator_fbm(curled, 3), alligator_fbm(curled, 6),
-                            1.0 - alligator_fbm(p, 3), 1.0 - alligator_fbm(p, 6));
 }
 
 // ---- Atmosphere ---------------------------------------------------------
@@ -287,6 +261,16 @@ float height_profile(float h, float genus) {
     return smoothstep(g.x, g.y, h) * (1.0 - smoothstep(g.z, g.w, h));
 }
 
+/// 0 over the voxel cloudscape's footprint rising to 1 two kilometres out:
+/// the layer's own clouds give way to it.
+float scape_clearing(float2 xy) {
+    if (params.scape_min.w <= 0.0)
+        return 1.0;
+    float2 low = params.scape_min.xy;
+    float2 high = low + float2(params.scape_grid.xy) * 8.0 * params.scape_min.w;
+    return saturate((length(max(max(low - xy, xy - high), 0.0)) - 300.0) / 1700.0);
+}
+
 /// Where the noise is read for world position `p`: blown along by the wind,
 /// which shears tops downwind as convective clouds lean.
 float3 noise_position(float3 p, float h) {
@@ -324,25 +308,29 @@ float cloud_profile(float3 p, float h, out float type) {
     float shape = saturate(remap(n.r, fbm - 1.0, 1.0, 0.0, 1.0));
     shape = saturate(remap(shape, 0.6, 0.9, 0.0, 1.0));
     float cloudiness = (shape * 0.6 + weather_n * 0.4) * height_profile(h, genus);
-    return saturate(remap(cloudiness, threshold, 1.0, 0.0, 1.0));
+    return saturate(remap(cloudiness, threshold, 1.0, 0.0, 1.0)) * scape_clearing(p.xy);
 }
 
-/// Nubis³ up-rez: cloud density (0..1) from a nonzero `profile`, eroded by
-/// detail noise and sharpened.
-float cloud_detail(float3 p, float h, float profile, float type) {
-    float4 n = detail_noise.SampleLevel(wrap_sampler, noise_position(p, h) * DETAIL_SCALE, 0);
-    // Finer noise deeper in; billows only dent the surface, wisps tear it.
-    float wispy = lerp(n.r, n.g, profile) * 0.7;
-    float billowy = lerp(n.b, n.a, pow(profile, 0.25)) * 0.45;
-    float erosion = lerp(wispy, billowy, type);
-    return pow(saturate(remap(profile, erosion, 1.0, 0.0, 1.0)), 0.6);
+/// Nubis' noise composite at a profile and type: wisps grow finer toward the
+/// edge, billows rounder (Nubis³, the up-rez).
+float noise_composite(float4 n, float profile, float type) {
+    float wispy = lerp(n.r, n.g, profile);
+    float billowy = lerp(n.b * 0.3, n.a * 0.3, pow(profile, 0.25));
+    return lerp(wispy, billowy, type);
+}
+
+/// Nubis up-rez of the layer: cloud density (0..1) from a nonzero `profile`,
+/// eroded by detail noise read at mip `lod`, and sharpened.
+float cloud_detail(float3 p, float h, float profile, float type, float lod) {
+    float4 n = detail_noise.SampleLevel(wrap_sampler, noise_position(p, h) * DETAIL_SCALE, lod);
+    return pow(saturate(remap(profile, noise_composite(n, profile, type), 1.0, 0.0, 1.0)), 0.6);
 }
 
 /// Cloud density (0..1) at world position `p`, `h` up through the layer.
-float cloud_density(float3 p, float h) {
+float cloud_density(float3 p, float h, float lod) {
     float type;
     float profile = cloud_profile(p, h, type);
-    return profile > 0.0 ? cloud_detail(p, h, profile, type) : 0.0;
+    return profile > 0.0 ? cloud_detail(p, h, profile, type, lod) : 0.0;
 }
 
 /// Toward the sun, held off the horizon so paths through the layer stay finite.
@@ -389,6 +377,236 @@ float2 layer_span(float3 origin, float3 direction) {
     }
     span.y = min(span.y, span.x + MAX_MARCH);
     return span;
+}
+
+// ---- Voxel cloudscape ---------------------------------------------------
+
+/// Set in a brick table entry for an empty brick.
+static const uint EMPTY = 0x80000000u;
+/// Atlas cells hold a brick with a voxel of its neighbours around it, so
+/// hardware filtering crosses bricks seamlessly.
+static const int CELL = 10;
+/// The detail noise drops a mip every this many metres from the camera (Nubis³).
+static const float NOISE_MIP_DISTANCE = 500.0;
+
+bool has_scape() {
+    return params.scape_min.w > 0.0;
+}
+
+float3 scape_extent() {
+    return float3(params.scape_grid.xyz) * 8.0 * params.scape_min.w;
+}
+
+/// The brick table entry for brick `b`; past the grid, empty with nothing to skip.
+uint brick_entry(int3 b) {
+    if (any(b < 0) || any(b >= int3(params.scape_grid.xyz)))
+        return EMPTY;
+    return leaves.Load(int4(b, 0));
+}
+
+/// One voxel of the cloudscape's dimensional profile, from its brick's codes.
+float decode_voxel(int3 v) {
+    uint slot = brick_entry(v >> 3);
+    if ((slot & EMPTY) != 0)
+        return 0.0;
+    uint codes = params.scape_info.z, bricks = params.scape_info.y;
+    uint3 local = uint3(v & 7);
+    uint code_index = slot * 64 + (local.x >> 1) + 4 * (local.y >> 1) + 16 * (local.z >> 1);
+    uint code = (vq[codes * 8 + 3 * bricks + code_index / 4] >> (8 * (code_index % 4))) & 255u;
+    uint entry = (local.x & 1) + 2 * (local.y & 1) + 4 * (local.z & 1);
+    return asfloat(vq[code * 8 + entry]) * asfloat(vq[codes * 8 + bricks + slot]);
+}
+
+uint3 atlas_cell(uint slot) {
+    uint across = params.scape_grid.w, deep = params.scape_info.x;
+    return uint3(slot % across, slot / across % deep, slot / (across * deep));
+}
+
+/// VQVDB's decode: every atlas texel from its brick's codes, once per cloudscape.
+[shader("compute")]
+[numthreads(4, 4, 4)]
+void decodeMain(uint3 id: SV_DispatchThreadID) {
+    uint3 size;
+    atlas_out.GetDimensions(size.x, size.y, size.z);
+    if (any(id >= size))
+        return;
+    uint3 cell = id / CELL;
+    uint slot = cell.x + params.scape_grid.w * (cell.y + params.scape_info.x * cell.z);
+    if (slot >= params.scape_info.y)
+        return;
+    uint packed = vq[params.scape_info.z * 8 + slot];
+    int3 brick = int3(packed & 1023u, (packed >> 10) & 1023u, packed >> 20);
+    atlas_out[id] = decode_voxel(brick * 8 + int3(id % CELL) - 1);
+}
+
+/// The cloudscape's modeling data at a point (Nubis' NVDFs).
+struct Nvdf {
+    float profile;
+    float type;
+    float scale;
+    /// Metres surely clear around the point; 0 in or beside a cloudy brick.
+    float clear;
+};
+
+Nvdf sample_nvdf(float3 p) {
+    Nvdf n;
+    n.profile = 0.0;
+    n.type = 0.0;
+    n.scale = 0.0;
+    n.clear = 0.0;
+    float3 g = (p - params.scape_min.xyz) / params.scape_min.w;
+    int3 brick = int3(floor(g / 8.0));
+    uint slot = brick_entry(brick);
+    if ((slot & EMPTY) != 0) {
+        n.clear = float(slot & 255u) * 8.0 * params.scape_min.w;
+        return n;
+    }
+    uint3 size;
+    atlas.GetDimensions(size.x, size.y, size.z);
+    float3 uvw = (float3(atlas_cell(slot) * CELL) + 1.0 + g - float3(brick * 8)) / float3(size);
+    n.profile = atlas.SampleLevel(clamp_sampler, uvw, 0);
+    uint attributes = vq[params.scape_info.z * 8 + 2 * params.scape_info.y + slot];
+    n.type = float(attributes & 255u) / 255.0;
+    n.scale = float((attributes >> 8) & 255u) / 255.0;
+    return n;
+}
+
+/// Nubis³ up-rez: cloud density (0..1) at `p`, `distance` from the camera,
+/// from its nonzero profile.
+float scape_density(float3 p, Nvdf n, float distance) {
+    float lod = log2(1.0 + distance / NOISE_MIP_DISTANCE);
+    float4 noise = detail_noise.SampleLevel(wrap_sampler, (p - float3(params.shape.yz, 0.0)) * 0.01, lod);
+    float composite = noise_composite(noise, n.profile, n.type);
+    // 0 within 50 m of the camera, 1 past 150 m.
+    float near = saturate((distance - 50.0) / 100.0);
+    if (near < 1.0) {
+        // Twice-folded noise: finer detail up close without another fetch.
+        float folded = saturate(lerp(1.0 - pow(abs(abs(noise.g * 2.0 - 1.0) * 2.0 - 1.0), 4.0),
+                                     pow(abs(abs(noise.a * 2.0 - 1.0) * 2.0 - 1.0), 2.0), n.type));
+        composite = lerp(folded, composite, lerp(0.9, 1.0, near));
+    }
+    float scale = pow(saturate(n.scale), 4.0);
+    float density = saturate(remap(n.profile, composite, 1.0, 0.0, 1.0)) * scale;
+    // Sharper where thin, which brings out low density detail.
+    density = pow(density, lerp(0.3, 0.6, max(1.0e-4, scale)));
+    // Softer up close, which hides under-sampling there.
+    return near < 1.0 ? pow(density, lerp(0.5, 1.0, near)) * lerp(0.666, 1.0, near) : density;
+}
+
+/// x: where a ray from `origin` enters the cloudscape's box; y: where it leaves.
+float2 scape_span(float3 origin, float3 direction) {
+    float3 low = params.scape_min.xyz;
+    float3 inverse = 1.0 / direction;
+    float3 a = (low - origin) * inverse;
+    float3 b = (low + scape_extent() - origin) * inverse;
+    float3 near = min(a, b);
+    float3 far = max(a, b);
+    return float2(max(max(near.x, near.y), max(near.z, 0.0)), min(min(far.x, far.y), min(far.z, MAX_MARCH)));
+}
+
+/// The cloudscape's light grid: density (profile times density scale) summed
+/// in metres to the box's edge, r toward the sun and g straight up, as Nubis³
+/// sums it. One slice in eight is redrawn per frame.
+[shader("compute")]
+[numthreads(8, 8, 1)]
+void scapeLightMain(uint3 id: SV_DispatchThreadID) {
+    uint3 size;
+    scape_light_out.GetDimensions(size.x, size.y, size.z);
+    uint3 voxel = params.frame.y != 0 ? uint3(id.xy, id.z * 8 + params.frame.x % 8) : id;
+    if (!has_scape() || any(voxel >= size))
+        return;
+    float3 p = params.scape_min.xyz + (float3(voxel) + 0.5) / float3(size) * scape_extent();
+    float3 to_sun = raised_sun();
+    float2 summed = 0.0;
+    float reach = scape_span(p, to_sun).y;
+    const int STEPS = 16;
+    for (int i = 0; i < STEPS; ++i) {
+        // Quadratic spacing: fine near the voxel, coarse far from it.
+        float inner = float(i * i) / (STEPS * STEPS);
+        float outer = float((i + 1) * (i + 1)) / (STEPS * STEPS);
+        Nvdf n = sample_nvdf(p + to_sun * (reach * (inner + outer) * 0.5));
+        summed.r += n.profile * n.scale * reach * (outer - inner);
+    }
+    float rise = scape_span(p, float3(0.0, 0.0, 1.0)).y;
+    const int UP = 6;
+    for (int i = 0; i < UP; ++i) {
+        Nvdf n = sample_nvdf(p + float3(0.0, 0.0, rise * (i + 0.5) / UP));
+        summed.g += n.profile * n.scale * rise / UP;
+    }
+    scape_light_out[voxel] = float4(summed, 0.0, 0.0);
+}
+
+// ---- Lighting -----------------------------------------------------------
+
+/// Light a sample sends toward the eye per unit scattering coefficient:
+/// Wrenninge's octaves of sunlight through `optical` metres of unit density
+/// (extinction a = 0.25, scattering b = 0.6, eccentricity c = 0.5; a <= b
+/// keeps it energy conserving), whose scattered octaves build up with depth
+/// into the cloud (`profile`) for Nubis' inner glow and dark edges; skylight
+/// let through by `open` (Nubis' ambient: strongest at the edges); and
+/// ground bounce, which reaches the bases.
+float3 sample_radiance(float optical, float open, float profile, float h, float3 light, float phases[4],
+                       float3 sky_light, float3 ground_light) {
+    float extinct = params.layer.w;
+    float glow = lerp(0.4, 1.0, saturate(profile * 2.0));
+    float3 radiance = 0.0;
+    for (int o = 0; o < 4; ++o)
+        radiance += (o == 0 ? 1.0 : glow * pow(0.6, o)) * light * exp(-optical * extinct * pow(0.25, o)) * phases[o];
+    return radiance + sky_light * open * sqrt(1.0 - profile) + ground_light * lerp(1.0, 0.2, h);
+}
+
+/// Add a step of `dt` metres at distance `t` with extinction `sigma_t`, by
+/// Hillaire's analytic integral of in-scatter over the step.
+void integrate(float sigma_t, float3 radiance, float t, float dt, inout float3 scattered,
+               inout float transmittance, inout float2 depth_sum) {
+    float3 in_scatter = radiance * sigma_t * 0.99;
+    float step_transmittance = exp(-sigma_t * dt);
+    scattered += transmittance * (in_scatter - in_scatter * step_transmittance) / max(sigma_t, 1.0e-7);
+    depth_sum += float2(t, 1.0) * transmittance * (1.0 - step_transmittance);
+    transmittance *= step_transmittance;
+}
+
+/// Sphere trace the cloudscape over `box` (Nubis³): steps as long as the brick
+/// table says is clear, else growing with the square root of distance; the
+/// jitter animates near the camera and holds still beyond, so distant clouds
+/// do not shimmer.
+void march_scape(float3 eye, float3 direction, float2 box, float still, float jitter, float3 light,
+                 float phases[4], float3 sky_light, float3 ground_light, inout float3 scattered,
+                 inout float transmittance, inout float2 depth_sum) {
+    float extinct = params.layer.w;
+    float3 to_sun = raised_sun();
+    float stride = 4.0 * params.scape_min.w;
+    // shortcut: a floor on the step caps a ray at ~384 samples; Nubis renders the near 200 m at quarter resolution instead, which would let this go.
+    float least = (box.y - box.x) / 384.0;
+    float t = box.x;
+    for (int i = 0; i < 512 && t < box.y && transmittance > 0.01; ++i) {
+        float adaptive = max(max(1.0, sqrt(t) * 0.08), least);
+        Nvdf n = sample_nvdf(eye + direction * t);
+        float step = max(n.clear, adaptive);
+        if (n.clear == 0.0) {
+            float s = t + (t < 250.0 ? jitter : still) * step;
+            float3 p = eye + direction * s;
+            Nvdf m = sample_nvdf(p);
+            float density = m.profile > 0.0 ? scape_density(p, m, s) : 0.0;
+            if (density > 0.0) {
+                // Two detailed samples toward the sun, then the light grid beyond them.
+                float optical = 0.0;
+                for (int j = 0; j < 2; ++j) {
+                    float3 q = p + to_sun * (stride * (j + 0.5));
+                    Nvdf l = sample_nvdf(q);
+                    optical += (l.profile > 0.0 ? scape_density(q, l, s) : 0.0) * stride;
+                }
+                float3 uvw = (p + to_sun * 2.0 * stride - params.scape_min.xyz) / scape_extent();
+                float2 summed = all(uvw >= 0.0) && all(uvw <= 1.0) ? scape_light.SampleLevel(clamp_sampler, uvw, 0).rg : 0.0;
+                optical += summed.r;
+                float open = 1.0 / (1.0 + 0.11 * summed.g * extinct);
+                float h = saturate((p.z - params.scape_min.z) / scape_extent().z);
+                float3 radiance = sample_radiance(optical, open, m.profile, h, light, phases, sky_light, ground_light);
+                integrate(density * extinct, radiance, s, step, scattered, transmittance, depth_sum);
+            }
+        }
+        t += step;
+    }
 }
 
 [shader("compute")]
@@ -449,28 +667,38 @@ void traceMain(uint3 id: SV_DispatchThreadID) {
     float3 scattered = 0.0;
     float transmittance = 1.0;
     float depth = 1.0e5;
+    float2 depth_sum = 0.0;
+    float extinct = params.layer.w;
+    float thickness = params.layer.y - params.layer.x;
+    float3 light = sun * sun_transmittance(mid_point, to_sun);
+    float phases[4];
+    for (int o = 0; o < 4; ++o)
+        phases[o] = lerp(1.0 / (4.0 * PI), phase0, pow(0.5, o));
+    // Interleaved gradient noise; `jitter` rotates by the golden ratio every frame.
+    float still = frac(52.9829189 * frac(dot(float2(id.xy), float2(0.06711056, 0.00583715))));
+    float jitter = frac(still + float(params.frame.x % 64u) * 0.618034);
+    // The cloudscape is marched where the layer's steps reach it.
+    float2 box = has_scape() ? scape_span(eye, direction) : float2(1.0, 0.0);
+    bool box_done = box.y <= box.x;
     float2 span = layer_span(origin, direction);
     if (span.y > span.x && span.x < MAX_MARCH) {
-        float extinct = params.layer.w;
-        float thickness = params.layer.y - params.layer.x;
-        float3 light = sun * sun_transmittance(mid_point, to_sun);
-        float phases[4];
-        for (int o = 0; o < 4; ++o)
-            phases[o] = lerp(1.0 / (4.0 * PI), phase0, pow(0.5, o));
         float horizon = 1.0 - abs(direction.z);
         int steps = int(lerp(64.0, 128.0, horizon));
         // Steps lengthen in proportion to distance (plus the layer's
         // thickness, so they stop shrinking up close): far clouds need less.
         float growth = pow((span.y + thickness) / (span.x + thickness), 1.0 / steps);
-        // Interleaved gradient noise, rotated by the golden ratio every frame.
-        float jitter = frac(52.9829189 * frac(dot(float2(id.xy), float2(0.06711056, 0.00583715)))
-                            + float(params.frame.x % 64u) * 0.618034);
         float light_step = thickness / 64.0;
-        float weighted_depth = 0.0, weight = 0.0;
         for (int i = 0; i < steps && transmittance > 0.01; ++i) {
             float start = (span.x + thickness) * pow(growth, float(i));
             float dt = start * (growth - 1.0);
             float t = start - thickness + dt * jitter;
+            if (!box_done && t >= box.x) {
+                march_scape(eye, direction, box, still, jitter, light, phases, sky_light, ground_light,
+                            scattered, transmittance, depth_sum);
+                box_done = true;
+            }
+            if (t >= box.x && t <= box.y)
+                continue;
             float3 relative = origin + direction * t;
             float h = layer_height(relative);
             float3 world = float3(eye.xy + direction.xy * t, params.layer.x + h * thickness);
@@ -478,7 +706,8 @@ void traceMain(uint3 id: SV_DispatchThreadID) {
             float profile = cloud_profile(world, h, type);
             if (profile <= 0.0)
                 continue;
-            float density = cloud_detail(world, h, profile, type);
+            float lod = log2(1.0 + t / 7000.0);
+            float density = cloud_detail(world, h, profile, type, lod);
             if (density <= 0.0)
                 continue;
             // Optical depth toward the sun: three detailed samples keep the
@@ -488,7 +717,7 @@ void traceMain(uint3 id: SV_DispatchThreadID) {
                 float stride = light_step * float(1 << j) * 0.5;
                 travelled += stride;
                 float reach = travelled - 0.5 * stride;
-                optical += cloud_density(world + to_sun * reach, layer_height(relative + to_sun * reach)) * stride;
+                optical += cloud_density(world + to_sun * reach, layer_height(relative + to_sun * reach), lod) * stride;
             }
             float3 coord = light_coord(world.xy + to_sun.xy * travelled, layer_height(relative + to_sun * travelled));
             float2 border = min(coord.xy, 1.0 - coord.xy);
@@ -504,36 +733,22 @@ void traceMain(uint3 id: SV_DispatchThreadID) {
             }
             float2 summed = inside > 0.0 ? light_grid.SampleLevel(clamp_sampler, coord, 0).rg : 0.0;
             optical += lerp(beyond, summed.r, inside);
-            float sigma_t = density * extinct;
-            float sigma_s = sigma_t * 0.99;
-            // Wrenninge octaves: extinction a = 0.25, scattering b = 0.6,
-            // eccentricity c = 0.5 (a <= b keeps it energy conserving). The
-            // scattered octaves build up with depth into the cloud, which
-            // gives Nubis' inner glow and dark edges.
-            float glow = lerp(0.4, 1.0, saturate(profile * 2.0));
-            float3 radiance = 0.0;
-            for (int o = 0; o < 4; ++o)
-                radiance += (o == 0 ? 1.0 : glow * pow(0.6, o)) * light * exp(-optical * extinct * pow(0.25, o)) * phases[o];
-            // Skylight is strongest at the wispy edges and under open sky: the
-            // cloud above passes what a scattering slab of g = 0.85 would.
+            // Skylight under open sky; the cloud above passes what a
+            // scattering slab of g = 0.85 would.
             float open = lerp(lerp(0.4, 1.0, h), 1.0 / (1.0 + 0.11 * summed.g * extinct), inside);
-            // Ground bounce reaches the bases.
-            radiance += sky_light * open * sqrt(1.0 - profile) + ground_light * lerp(1.0, 0.2, h);
-            radiance *= sigma_s;
-            // Hillaire's analytic integral of in-scatter over the step.
-            float step_transmittance = exp(-sigma_t * dt);
-            scattered += transmittance * (radiance - radiance * step_transmittance) / max(sigma_t, 1.0e-7);
-            weighted_depth += t * transmittance * (1.0 - step_transmittance);
-            weight += transmittance * (1.0 - step_transmittance);
-            transmittance *= step_transmittance;
+            float3 radiance = sample_radiance(optical, open, profile, h, light, phases, sky_light, ground_light);
+            integrate(density * extinct, radiance, t, dt, scattered, transmittance, depth_sum);
         }
-        if (weight > 1.0e-4)
-            depth = weighted_depth / weight;
-        // Far clouds fade into the haze.
-        float haze = exp(-max(depth, span.x) * 1.5e-5);
-        scattered *= haze;
-        transmittance = lerp(1.0, transmittance, haze);
     }
+    if (!box_done && transmittance > 0.01)
+        march_scape(eye, direction, box, still, jitter, light, phases, sky_light, ground_light,
+                    scattered, transmittance, depth_sum);
+    if (depth_sum.y > 1.0e-4)
+        depth = depth_sum.x / depth_sum.y;
+    // Far clouds fade into the haze.
+    float haze = exp(-depth * 1.5e-5);
+    scattered *= haze;
+    transmittance = lerp(1.0, transmittance, haze);
 
     float4 result = float4(sky * transmittance + scattered, transmittance);
     if (params.frame.y != 0) {
@@ -569,6 +784,17 @@ void shadowMain(uint3 id: SV_DispatchThreadID) {
         optical += cloud_profile(p, (p.z - params.layer.x) / (params.layer.y - params.layer.x), unused_type);
     }
     optical *= span / STEPS * params.layer.w;
+    if (has_scape()) {
+        float3 ground = float3(xy, 0.0);
+        float2 box = scape_span(ground, to_sun);
+        const int SCAPE_STEPS = 24;
+        float summed = 0.0;
+        for (int i = 0; i < SCAPE_STEPS && box.y > box.x; ++i) {
+            Nvdf n = sample_nvdf(ground + to_sun * lerp(box.x, box.y, (i + 0.5) / SCAPE_STEPS));
+            summed += n.profile * n.scale;
+        }
+        optical += summed * max(box.y - box.x, 0.0) / SCAPE_STEPS * params.layer.w;
+    }
     shadow_out[id.xy] = 0.7 * exp(-optical) + 0.3 * exp(-optical * 0.1);
 }
 

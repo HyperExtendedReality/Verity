@@ -624,6 +624,81 @@ pub fn decode_volume(bytes: &[u8]) -> Result<VolumeData> {
     })
 }
 
+/// A sparse voxel cloudscape from `scripts/convert_clouds.py`: its cloudy 8^3
+/// bricks, each 64 one-byte codes into a shared codebook of 2^3 blocks.
+pub struct VqCloud {
+    /// Bricks along x, y and z; z is up.
+    pub grid: [u32; 3],
+    /// Metres per voxel.
+    pub voxel: f32,
+    /// Each cloudy brick's coordinates, x | y << 10 | z << 20.
+    pub bricks: Vec<u32>,
+    pub codes: u32,
+    /// What the GPU decodes: codebook, bricks, gains, attributes and codes,
+    /// as the file lays them out.
+    pub payload: Vec<u8>,
+    /// Per brick, x fastest: bricks to the nearest cloudy one, rounded down.
+    pub distance: Vec<u8>,
+    /// The file's JSON, with the source credit.
+    pub metadata: String,
+}
+
+impl VqCloud {
+    fn word(&self, index: usize) -> u32 {
+        u32::from_le_bytes(self.payload[index * 4..index * 4 + 4].try_into().unwrap())
+    }
+
+    /// The dimensional profile at a voxel; what the GPU decode writes.
+    pub fn profile(&self, [x, y, z]: [u32; 3]) -> f32 {
+        let key = (x / 8) | ((y / 8) << 10) | ((z / 8) << 20);
+        // Bricks are listed z, y, x major to minor, so their keys ascend.
+        let Ok(slot) = self.bricks.binary_search(&key) else {
+            return 0.0;
+        };
+        let (codes, count) = (self.codes as usize, self.bricks.len());
+        let (local, block) = ([x % 8, y % 8, z % 8], |a: u32, b: u32, c: u32| (a + 4 * b + 16 * c) as usize);
+        let code_index = (codes * 8 + 3 * count) * 4 + slot * 64 + block(local[0] / 2, local[1] / 2, local[2] / 2);
+        let code = self.payload[code_index] as usize;
+        let entry = (local[0] % 2 + 2 * (local[1] % 2) + 4 * (local[2] % 2)) as usize;
+        f32::from_bits(self.word(code * 8 + entry)) * f32::from_bits(self.word(codes * 8 + count + slot))
+    }
+}
+
+/// Read a `.vqcloud`.
+pub fn decode_vq_cloud(bytes: &[u8]) -> Result<VqCloud> {
+    let word = |at: usize| -> Result<u32> {
+        bytes
+            .get(at..at + 4)
+            .map(|b| u32::from_le_bytes(b.try_into().unwrap()))
+            .ok_or_else(|| invalid("vqcloud is truncated"))
+    };
+    if bytes.get(..8) != Some(b"VQCLOUD1") {
+        return Err(invalid("not a vqcloud (re-run scripts/convert_clouds.py)"));
+    }
+    let grid = [word(8)?, word(12)?, word(16)?];
+    let (count, codes) = (word(20)? as usize, word(24)?);
+    let voxel = f32::from_bits(word(28)?);
+    let json = word(32)? as usize;
+    let start = 36 + json;
+    let payload_size = (codes as usize * 8 + 3 * count) * 4 + count * 64;
+    let cells = grid.iter().map(|&n| n as usize).product::<usize>();
+    let end = start + payload_size;
+    if bytes.len() < end + cells || grid.iter().any(|&n| n == 0 || n >= 1024) {
+        return Err(invalid("vqcloud is truncated or its grid is out of range"));
+    }
+    let payload = bytes[start..end].to_vec();
+    let bricks: Vec<u32> = (0..count).map(|i| word(start + (codes as usize * 8 + i) * 4)).collect::<Result<_>>()?;
+    Ok(VqCloud {
+        grid,
+        voxel,
+        bricks,
+        codes,
+        payload,
+        distance: bytes[end..end + cells].to_vec(),
+        metadata: String::from_utf8_lossy(&bytes[36..start]).trim_end().to_owned(),
+    })
+}
+
 /// Expand BC3 blocks, row by row, to RGBA8.
 fn decode_bc3(blocks: &[u8], width: u32, height: u32) -> Vec<u8> {
     let (width, height) = (width as usize, height as usize);
@@ -759,26 +834,58 @@ mod tests {
         assert_eq!(noise.levels.len(), 8);
         assert_eq!(noise.levels[7].len(), 4);
         assert!(noise.metadata.contains("\"noise\""));
+    }
+
+    #[test]
+    fn cloudscapes_decode() {
         for name in ["parkouring", "stormbird", "wdas"] {
-            let path = packed(&format!("clouds/{name}.ktx2")).unwrap();
-            let volume = decode_volume(&fs::read(path).unwrap()).unwrap();
-            assert!(volume.metadata.contains("\"cloudscape\""), "{name}");
-            let [width, height, depth] = volume.size.map(|n| n as usize);
-            let texels = volume.levels[0].as_chunks::<4>().0;
-            // Profile in R; the distance in A drops below its zero point inside.
-            assert!(texels.iter().any(|t| t[0] > 0), "{name} has no cloud");
-            assert!(texels.iter().any(|t| t[0] == 0), "{name} is not padded");
+            let Some(path) = packed(&format!("clouds/{name}.vqcloud")) else {
+                continue;
+            };
+            let cloud = decode_vq_cloud(&fs::read(path).unwrap()).unwrap();
+            assert!(cloud.metadata.contains("source"), "{name}");
+            let [width, height, depth] = cloud.grid.map(|n| n as usize * 8);
             // z is up: clouds have flat bases, so they are wider a tenth of
             // the way up than nine tenths (the extreme slices are stray wisps).
             let area = |z: usize| {
-                let slice = &texels[z * width * height..(z + 1) * width * height];
-                slice.iter().filter(|t| t[0] > 0).count()
+                (0..height)
+                    .flat_map(|y| (0..width).map(move |x| [x, y, z]))
+                    .filter(|&v| cloud.profile(v.map(|n| n as u32)) > 0.0)
+                    .count()
             };
             let cloudy: Vec<_> = (0..depth).filter(|&z| area(z) > 0).collect();
+            assert!(!cloudy.is_empty(), "{name} has no cloud");
             let at = |fraction: f32| area(cloudy[(fraction * (cloudy.len() - 1) as f32) as usize]);
             let (bottom, top) = (at(0.1), at(0.9));
-            assert!(bottom > top, "{name}: base {bottom} texels, top {top}");
+            assert!(bottom > top, "{name}: base {bottom} voxels, top {top}");
         }
+    }
+
+    #[test]
+    fn vq_cloud_round_trips() {
+        // One brick at (1, 0, 0) of a 2x1x1 grid; code 1 is a ramp along x.
+        let mut codebook = vec![0.0f32; 16];
+        codebook[8..16].copy_from_slice(&[0.0, 1.0, 0.0, 1.0, 0.0, 1.0, 0.0, 1.0]);
+        let mut bytes = b"VQCLOUD1".to_vec();
+        for word in [2u32, 1, 1, 1, 2] {
+            bytes.extend(word.to_le_bytes());
+        }
+        bytes.extend(8.0f32.to_le_bytes());
+        bytes.extend(4u32.to_le_bytes());
+        bytes.extend(b"{}  ");
+        bytes.extend(bytemuck::cast_slice(&codebook));
+        bytes.extend(1u32.to_le_bytes());
+        bytes.extend(0.5f32.to_le_bytes());
+        bytes.extend((200u32 | 100 << 8).to_le_bytes());
+        bytes.extend([1u8; 64]);
+        bytes.extend([1u8, 0]);
+        let cloud = decode_vq_cloud(&bytes).unwrap();
+        assert_eq!((cloud.grid, cloud.bricks.len(), cloud.voxel), ([2, 1, 1], 1, 8.0));
+        assert_eq!(cloud.distance, [1, 0]);
+        assert_eq!(cloud.profile([9, 3, 5]), 0.5);
+        assert_eq!(cloud.profile([10, 3, 5]), 0.0);
+        assert_eq!(cloud.profile([3, 3, 5]), 0.0);
+        assert!(decode_vq_cloud(&bytes[..bytes.len() - 1]).is_err());
     }
 
     #[test]
