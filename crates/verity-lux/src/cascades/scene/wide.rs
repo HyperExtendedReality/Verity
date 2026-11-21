@@ -1,28 +1,36 @@
 //! Immutable 4-wide software BLAS records, mirrored by `traversal.slang`.
 //!
-//! A mesh starts with two words: `(root min, record count)` and `(root max,
-//! root reference)`. References have a four-bit kind and a 28-bit payload. Zero
+//! A mesh starts with two words: `(root min, record count | enhanced flag)`
+//! and `(root max, root reference)`. References have a four-bit kind and a
+//! 28-bit payload. The count's high bit enables extended bounds/leaf decoding. Zero
 //! is unused; kind 0 points to a four-word record (one-based); kinds 1–8 give
 //! the count of an inline triangle span, with a mesh-relative first triangle.
 //! Kind 9 points to a record containing the full relative `(first, count)`.
-//! Other kinds are available for other bounds or leaf reference formats.
+//! Kinds 10–12 are branch records in the xy, xz and yz frames, respectively.
+//! Kind 13 points to a record holding a reference count followed by up to
+//! eight mesh-relative source triangle IDs; vertices and indices stay shared.
 //!
 //! An AABB record is `(frame min, ref0)`, `(frame max, ref1)`,
 //! `(loX, hiX, loY, hiY)`, `(loZ, hiZ, ref2, ref3)`. Each coordinate field
 //! holds one byte per child, least significant first. Bins 0 and 255 select
 //! the frame endpoints; interior bins interpolate at q/256 of the grid span.
 
+use std::{cell::Cell, ops::Range};
+
 use glam::{UVec4, Vec3};
 
-use super::{BvhNode, vec_word};
+use super::{BvhNode, oriented, vec_word};
 
 const LANES: usize = 4;
 const RECORD_WORDS: usize = 4;
 const HEADER_WORDS: usize = 2;
 const KIND_SHIFT: u32 = 28;
 const PAYLOAD_MASK: u32 = (1 << KIND_SHIFT) - 1;
+const ENHANCED: u32 = 1 << 31;
 const MAX_INLINE_COUNT: u32 = 8;
 const FULL_SPAN: u32 = 9;
+const ORIENTED_XY: u32 = 10;
+const INDIRECT_SPAN: u32 = 13;
 const TOP_BIN: u32 = 255;
 const BINS: f32 = 256.0;
 // Keep at most 16 significand bits so scaling by an 8-bit bin is exact,
@@ -30,16 +38,60 @@ const BINS: f32 = 256.0;
 const GRID_MASK: u32 = 0xffff_ff00;
 
 pub(super) fn pack(nodes: &[BvhNode]) -> Vec<UVec4> {
+    pack_impl::<false, false>(nodes, &[], &[])
+}
+
+pub(super) fn pack_static(
+    nodes: &[BvhNode],
+    corners: Option<&[[Vec3; 3]]>,
+    references: &[u32],
+) -> Vec<UVec4> {
+    match (corners, references.is_empty()) {
+        (Some(corners), true) => pack_impl::<true, false>(nodes, corners, &[]),
+        (Some(corners), false) => pack_impl::<true, true>(nodes, corners, references),
+        (None, false) => pack_impl::<false, true>(nodes, &[], references),
+        (None, true) => pack(nodes),
+    }
+}
+
+fn pack_impl<const ORIENTED: bool, const SPATIAL: bool>(
+    nodes: &[BvhNode],
+    corners: &[[Vec3; 3]],
+    references: &[u32],
+) -> Vec<UVec4> {
     let Some(root) = nodes.first() else {
         return Vec::new();
     };
     // A represented inner node other than the root has a skipped binary
-    // parent, which can supply at most two such nodes. This bounds capacity.
-    let mut words = Vec::with_capacity(HEADER_WORDS + RECORD_WORDS * (nodes.len() / 3));
+    // parent, which can supply at most two such nodes. Indirect leaves also
+    // allocate their own records.
+    let records = if SPATIAL {
+        nodes.len()
+    } else {
+        nodes.len() / 3
+    };
+    let mut words = Vec::with_capacity(HEADER_WORDS + RECORD_WORDS * records);
     words.extend([UVec4::ZERO; HEADER_WORDS]);
-    let reference = pack_reference(&mut words, nodes, root);
+    let mut spans = Vec::new();
+    if ORIENTED {
+        spans.resize(nodes.len(), 0..0);
+        collect_spans(nodes, &mut spans, 0);
+    }
+    let inputs = PackInputs {
+        nodes,
+        corners,
+        references,
+        spans: &spans,
+        used_orientation: Cell::new(false),
+    };
+    let reference = pack_reference::<ORIENTED, SPATIAL>(&mut words, &inputs, 0);
     let records = ((words.len() - HEADER_WORDS) / RECORD_WORDS) as u32;
-    words[0] = vec_word(root.min, records);
+    let enhanced = if SPATIAL || (ORIENTED && inputs.used_orientation.get()) {
+        ENHANCED
+    } else {
+        0
+    };
+    words[0] = vec_word(root.min, records | enhanced);
     words[1] = vec_word(root.max, reference);
     words
 }
@@ -55,8 +107,46 @@ fn reserve_record(words: &mut Vec<UVec4>) -> (usize, u32) {
     (at, index as u32)
 }
 
-fn pack_reference(words: &mut Vec<UVec4>, nodes: &[BvhNode], node: &BvhNode) -> u32 {
+fn collect_spans(nodes: &[BvhNode], spans: &mut [Range<usize>], at: usize) -> Range<usize> {
+    let node = nodes[at];
+    let first = node.first as usize;
+    let span = if node.count > 0 {
+        first..first + node.count as usize
+    } else {
+        let left = collect_spans(nodes, spans, first);
+        let right = collect_spans(nodes, spans, first + 1);
+        // Object and spatial builders may emit their contiguous leaves in opposite orders.
+        left.start.min(right.start)..left.end.max(right.end)
+    };
+    spans[at] = span.clone();
+    span
+}
+
+struct PackInputs<'mesh> {
+    nodes: &'mesh [BvhNode],
+    corners: &'mesh [[Vec3; 3]],
+    references: &'mesh [u32],
+    spans: &'mesh [Range<usize>],
+    used_orientation: Cell<bool>,
+}
+
+fn pack_reference<const ORIENTED: bool, const SPATIAL: bool>(
+    words: &mut Vec<UVec4>,
+    inputs: &PackInputs<'_>,
+    node_index: usize,
+) -> u32 {
+    let node = &inputs.nodes[node_index];
     if node.count != 0 {
+        if SPATIAL {
+            let (at, index) = reserve_record(words);
+            let first = node.first as usize;
+            let ids = &inputs.references[first..first + node.count as usize];
+            words[at].x = node.count;
+            for (i, &id) in (1..).zip(ids) {
+                words[at + i / 4][i % 4] = id;
+            }
+            return (INDIRECT_SPAN << KIND_SHIFT) | index;
+        }
         if node.first <= PAYLOAD_MASK && node.count <= MAX_INLINE_COUNT {
             return (node.count << KIND_SHIFT) | node.first;
         }
@@ -66,30 +156,57 @@ fn pack_reference(words: &mut Vec<UVec4>, nodes: &[BvhNode], node: &BvhNode) -> 
     }
 
     let (at, index) = reserve_record(words);
-    let frame: [Axis; 3] = std::array::from_fn(|axis| Axis::new(node.min[axis], node.max[axis]));
+    let mut children = [0; LANES];
+    let mut len = 0;
+    let left = node.first as usize;
+    // Expand both internal children, skipping two binary levels per wide level.
+    for (lane, child) in inputs.nodes[left..left + 2].iter().enumerate() {
+        if child.count == 0 {
+            let first = child.first as usize;
+            children[len..len + 2].copy_from_slice(&[first, first + 1]);
+            len += 2;
+        } else {
+            children[len] = left + lane;
+            len += 1;
+        }
+    }
+
+    let mut bounds = [(Vec3::ZERO, Vec3::ZERO); LANES];
+    for (lane, &child) in children[..len].iter().enumerate() {
+        let node = inputs.nodes[child];
+        bounds[lane] = (node.min, node.max);
+    }
+    let (mut min, mut max) = (node.min, node.max);
+    let mut kind = 0;
+    if ORIENTED {
+        let spans = children.map(|index| inputs.spans[index].clone());
+        if let Some(projected) = oriented::choose_indexed(
+            inputs.corners,
+            inputs.references,
+            &spans[..len],
+            &bounds[..len],
+        ) {
+            inputs.used_orientation.set(true);
+            kind = ORIENTED_XY + projected.frame;
+            bounds = projected.bounds;
+            (min, max) = bounds[0];
+            for &(lo, hi) in &bounds[1..len] {
+                min = min.min(lo);
+                max = max.max(hi);
+            }
+        }
+    }
+    let frame: [Axis; 3] = std::array::from_fn(|axis| Axis::new(min[axis], max[axis]));
     let mut refs = [0; LANES];
     let mut quantized = [[0; 2]; 3];
-    let left = node.first as usize;
-    let mut lane = 0;
-    let mut pack_child = |child: &BvhNode| {
-        refs[lane] = pack_reference(words, nodes, child);
+    for (lane, &child) in children[..len].iter().enumerate() {
+        refs[lane] = pack_reference::<ORIENTED, SPATIAL>(words, inputs, child);
+        let (min, max) = bounds[lane];
         for (axis, frame) in frame.iter().enumerate() {
-            let [lo, hi] = frame.quantize(child.min[axis], child.max[axis]);
+            let [lo, hi] = frame.quantize(min[axis], max[axis]);
             let shift = lane * 8;
             quantized[axis][0] |= lo << shift;
             quantized[axis][1] |= hi << shift;
-        }
-        lane += 1;
-    };
-    // Expand both internal children, never reorder their leaf spans. Every
-    // nested wide node skips two binary levels, bounding the shader stack.
-    for child in &nodes[left..left + 2] {
-        if child.count == 0 {
-            let first = child.first as usize;
-            pack_child(&nodes[first]);
-            pack_child(&nodes[first + 1]);
-        } else {
-            pack_child(child);
         }
     }
     words[at..at + RECORD_WORDS].copy_from_slice(&[
@@ -109,7 +226,7 @@ fn pack_reference(words: &mut Vec<UVec4>, nodes: &[BvhNode], node: &BvhNode) -> 
         ),
         UVec4::new(quantized[2][0], quantized[2][1], refs[2], refs[3]),
     ]);
-    index
+    (kind << KIND_SHIFT) | index
 }
 
 struct Axis {
@@ -198,13 +315,15 @@ pub(super) mod packed {
 
     pub(in super::super) enum Reference {
         Branch(usize),
+        Oriented(usize, u32),
+        Indirect(usize, u32),
         Span(u32, u32),
     }
 
     pub(in super::super) fn root(words: &[UVec4], base: usize) -> (Vec3, Vec3, u32, &[UVec4]) {
         let [a, b] = [words[base], words[base + 1]];
         let begin = base + HEADER_WORDS;
-        let end = begin + a.w as usize * RECORD_WORDS;
+        let end = begin + (a.w & !ENHANCED) as usize * RECORD_WORDS;
         (point(a), point(b), b.w, &words[begin..end])
     }
 
@@ -213,6 +332,13 @@ pub(super) mod packed {
         let kind = reference >> KIND_SHIFT;
         match kind {
             0 => Reference::Branch((payload as usize - 1) * RECORD_WORDS),
+            ORIENTED_XY..=12 => {
+                Reference::Oriented((payload as usize - 1) * RECORD_WORDS, kind - ORIENTED_XY)
+            }
+            INDIRECT_SPAN => {
+                let at = (payload as usize - 1) * RECORD_WORDS;
+                Reference::Indirect(at, words[at].x)
+            }
             FULL_SPAN => {
                 let span = words[(payload as usize - 1) * RECORD_WORDS];
                 Reference::Span(span.x, span.y)
@@ -220,6 +346,11 @@ pub(super) mod packed {
             1..=MAX_INLINE_COUNT => Reference::Span(payload, kind),
             _ => panic!("unknown packed wide reference {reference:#x}"),
         }
+    }
+
+    pub(in super::super) fn source(words: &[UVec4], at: usize, index: u32) -> u32 {
+        let index = index as usize + 1;
+        words[at + index / 4][index % 4]
     }
 
     pub(in super::super) fn children(

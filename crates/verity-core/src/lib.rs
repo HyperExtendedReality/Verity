@@ -156,6 +156,10 @@ pub enum LightingMethod {
     ResidualSourceHistory,
     /// Ultra PBR: material-space diffuse and glossy global illumination.
     UltraPbrMsgi,
+    /// GI chosen for the GPU it runs on: hardware rays where there are ray
+    /// queries, a software BVH on other desktop GPUs, and voxel GI on mobile
+    /// and low-memory ones.
+    HardwareGi,
 }
 
 /// Scene-wide ambient lighting, expressed as linear RGB radiance.
@@ -1070,6 +1074,7 @@ mod tests {
             LightingMethod::ScreenVoxelSourceHistory,
             LightingMethod::ResidualSourceHistory,
             LightingMethod::UltraPbrMsgi,
+            LightingMethod::HardwareGi,
         ] {
             let mut scene = Scene::default();
             scene.lighting.method = method;

@@ -20,7 +20,8 @@ const MAX_CLIP_SIDE: u32 = BRICK_SIDE << BRICK_AXIS_BITS;
 const MAX_PACKED_WORDS: usize = (u32::MAX / 4) as usize;
 const HASH_HEADER_WORDS: usize = 2;
 const HASH_SLOT_WORDS: usize = 3;
-const HASH_MAX_SLOTS: usize = 1 << ((MAX_PACKED_WORDS - HASH_HEADER_WORDS) / HASH_SLOT_WORDS).ilog2();
+const HASH_MAX_SLOTS: usize =
+    1 << ((MAX_PACKED_WORDS - HASH_HEADER_WORDS) / HASH_SLOT_WORDS).ilog2();
 
 /// An axis-aligned clip cube addressed by signed integer cell positions.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -40,7 +41,10 @@ impl ClipRegion {
         if !side.is_power_of_two() || side > MAX_CLIP_SIDE {
             return Err(SparseBuildError::InvalidSide(side));
         }
-        if origin.iter().any(|&start| start > i32::MAX - (side - 1) as i32) {
+        if origin
+            .iter()
+            .any(|&start| start > i32::MAX - (side - 1) as i32)
+        {
             return Err(SparseBuildError::RegionOverflow { origin, side });
         }
         Ok(Self { origin, side })
@@ -49,7 +53,8 @@ impl ClipRegion {
     fn local(self, cell: [i32; 3]) -> Option<[u32; 3]> {
         // Shader equivalent: `uint3(cell) - uint3(origin)` then `all(local < side)`.
         // The constructor rules out a valid region wrapping across i32::MAX.
-        let local = std::array::from_fn(|axis| (cell[axis] as u32).wrapping_sub(self.origin[axis] as u32));
+        let local =
+            std::array::from_fn(|axis| (cell[axis] as u32).wrapping_sub(self.origin[axis] as u32));
         local.iter().all(|&axis| axis < self.side).then_some(local)
     }
 }
@@ -67,10 +72,20 @@ pub(crate) enum SparseBuildError {
 impl fmt::Display for SparseBuildError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::InvalidSide(side) => write!(f, "clip side {side} is not a power of two in 1..={MAX_CLIP_SIDE}"),
-            Self::RegionOverflow { origin, side } => write!(f, "clip at {origin:?} with side {side} exceeds signed cell coordinates"),
-            Self::CellOutsideRegion(cell) => write!(f, "occupied cell {cell:?} is outside the clip region"),
-            Self::SizeLimit => f.write_str("sparse voxel build exceeds the packed format size limit"),
+            Self::InvalidSide(side) => write!(
+                f,
+                "clip side {side} is not a power of two in 1..={MAX_CLIP_SIDE}"
+            ),
+            Self::RegionOverflow { origin, side } => write!(
+                f,
+                "clip at {origin:?} with side {side} exceeds signed cell coordinates"
+            ),
+            Self::CellOutsideRegion(cell) => {
+                write!(f, "occupied cell {cell:?} is outside the clip region")
+            }
+            Self::SizeLimit => {
+                f.write_str("sparse voxel build exceeds the packed format size limit")
+            }
             Self::Allocation(_) => f.write_str("could not allocate sparse voxel storage"),
         }
     }
@@ -156,15 +171,24 @@ impl HashBricks {
 
     /// Reads a cell directly from packed words; cells outside the clip miss.
     pub(crate) fn occupied(&self, cell: [i32; 3]) -> bool {
-        self.region.local(cell).is_some_and(|local| self.occupied_local(local))
+        self.region
+            .local(cell)
+            .is_some_and(|local| self.occupied_local(local))
     }
 
     /// Traces the packed grid for the first occupied cell in `[0, max_t)`.
     ///
     /// Only positive-length cell visits count. The direction need not be
     /// normalized. Non-finite inputs, a zero direction, and `max_t <= 0` miss.
-    pub(crate) fn trace(&self, origin: [f64; 3], direction: [f64; 3], max_t: f64) -> Option<VoxelHit> {
-        trace_cells(self.region, origin, direction, max_t, |cell| self.occupied_local(cell))
+    pub(crate) fn trace(
+        &self,
+        origin: [f64; 3],
+        direction: [f64; 3],
+        max_t: f64,
+    ) -> Option<VoxelHit> {
+        trace_cells(self.region, origin, direction, max_t, |cell| {
+            self.occupied_local(cell)
+        })
     }
 
     fn occupied_local(&self, cell: [u32; 3]) -> bool {
@@ -271,14 +295,23 @@ impl VoxelDag {
 
     /// Reads a cell directly from packed words; cells outside the clip miss.
     pub(crate) fn occupied(&self, cell: [i32; 3]) -> bool {
-        self.region.local(cell).is_some_and(|local| self.occupied_local(local))
+        self.region
+            .local(cell)
+            .is_some_and(|local| self.occupied_local(local))
     }
 
     /// Traces the packed DAG for the first occupied cell in `[0, max_t)`.
     ///
     /// Uses the same finite ray and half-open cell contract as [`HashBricks::trace`].
-    pub(crate) fn trace(&self, origin: [f64; 3], direction: [f64; 3], max_t: f64) -> Option<VoxelHit> {
-        trace_cells(self.region, origin, direction, max_t, |cell| self.occupied_local(cell))
+    pub(crate) fn trace(
+        &self,
+        origin: [f64; 3],
+        direction: [f64; 3],
+        max_t: f64,
+    ) -> Option<VoxelHit> {
+        trace_cells(self.region, origin, direction, max_t, |cell| {
+            self.occupied_local(cell)
+        })
     }
 
     fn occupied_local(&self, cell: [u32; 3]) -> bool {
@@ -301,7 +334,9 @@ fn collect_bricks(
 ) -> Result<HashMap<u32, u64>, SparseBuildError> {
     let mut bricks = HashMap::new();
     for cell in occupied {
-        let local = region.local(cell).ok_or(SparseBuildError::CellOutsideRegion(cell))?;
+        let local = region
+            .local(cell)
+            .ok_or(SparseBuildError::CellOutsideRegion(cell))?;
         let key = brick_morton(local);
         let bit = 1u64 << brick_bit(local);
         if bricks.len() == bricks.capacity() || bricks.len() == max_bricks {
@@ -413,7 +448,8 @@ fn trace_cells(
     {
         return None;
     }
-    let origin: [f64; 3] = std::array::from_fn(|axis| origin[axis] - f64::from(region.origin[axis]));
+    let origin: [f64; 3] =
+        std::array::from_fn(|axis| origin[axis] - f64::from(region.origin[axis]));
     let side = region.side as i32;
     let side_f64 = f64::from(side);
     let mut step = [0; 3];
@@ -451,7 +487,9 @@ fn trace_cells(
             // outside due to cancellation in the ray equation.
             return if step[axis] > 0 { 0 } else { side - 1 };
         }
-        let point = direction[axis].mul_add(t, origin[axis]).clamp(0.0, side_f64);
+        let point = direction[axis]
+            .mul_add(t, origin[axis])
+            .clamp(0.0, side_f64);
         let floor = point.floor();
         let retreat = i32::from(step[axis] < 0 && point == floor);
         (floor as i32 - retreat).clamp(0, side - 1)
@@ -499,15 +537,22 @@ mod tests {
         let region = ClipRegion::new([0; 3], 16).expect("valid clip region");
         let cells = [[1, 2, 3], [5, 2, 3], [9, 2, 3], [13, 2, 3]];
         let dag = VoxelDag::from_cells(region, cells).expect("pack repeated occupancy");
-        let reordered = VoxelDag::from_cells(region, cells.into_iter().rev()).expect("repack reversed occupancy");
+        let reordered = VoxelDag::from_cells(region, cells.into_iter().rev())
+            .expect("repack reversed occupancy");
         let words = dag.words();
         assert_eq!(words, reordered.words());
         assert_eq!(words.len(), 1 + 2 + 8 + 8);
         let root = words[0] as usize;
         let branch = words[root] as usize;
-        assert_eq!(&words[root..root + 8], &[branch as u32, branch as u32, 0, 0, 0, 0, 0, 0]);
+        assert_eq!(
+            &words[root..root + 8],
+            &[branch as u32, branch as u32, 0, 0, 0, 0, 0, 0]
+        );
         let leaf = words[branch] as usize;
-        assert_eq!(&words[branch..branch + 8], &[leaf as u32, leaf as u32, 0, 0, 0, 0, 0, 0]);
+        assert_eq!(
+            &words[branch..branch + 8],
+            &[leaf as u32, leaf as u32, 0, 0, 0, 0, 0, 0]
+        );
         assert_eq!(&words[leaf..leaf + 2], &[0, 1 << 25]);
         for x in 0..16 {
             let cell = [x, 2, 3];
@@ -531,12 +576,18 @@ mod tests {
         }
         let origin = [-10.5, 11.5, -0.5];
         let direction = [1.0, 0.0, 0.0];
-        let hit = Some(VoxelHit { cell: [0, 11, -1], t: 10.5 });
+        let hit = Some(VoxelHit {
+            cell: [0, 11, -1],
+            t: 10.5,
+        });
         assert_eq!(bricks.trace(origin, direction, 20.0), hit);
         assert_eq!(dag.trace(origin, direction, 20.0), hit);
         let origin = [8.0, 10.5, -1.5];
         let direction = [-2.0, 0.0, 0.0];
-        let hit = Some(VoxelHit { cell: [-4, 10, -2], t: 5.5 });
+        let hit = Some(VoxelHit {
+            cell: [-4, 10, -2],
+            t: 5.5,
+        });
         assert_eq!(bricks.trace(origin, direction, 20.0), hit);
         assert_eq!(dag.trace(origin, direction, 20.0), hit);
     }
@@ -550,8 +601,12 @@ mod tests {
             let key = brick_morton(cell.map(|axis| axis as u32)) + 1;
             by_slot[(hash_slot(key) & 3) as usize].push(cell);
         }
-        let colliding = by_slot.iter().max_by_key(|cells| cells.len()).expect("four home slots");
-        let bricks = HashBricks::from_cells(region, [colliding[0], colliding[1]]).expect("pack colliding bricks");
+        let colliding = by_slot
+            .iter()
+            .max_by_key(|cells| cells.len())
+            .expect("four home slots");
+        let bricks = HashBricks::from_cells(region, [colliding[0], colliding[1]])
+            .expect("pack colliding bricks");
         assert_eq!(&bricks.words()[..2], &[3, 2]);
         assert!(bricks.occupied(colliding[0]));
         assert!(bricks.occupied(colliding[1]));
@@ -561,21 +616,43 @@ mod tests {
     #[test]
     fn corner_touches_and_terminal_points_are_not_ray_hits() {
         let region = ClipRegion::new([0; 3], 8).expect("valid clip region");
-        let dag = VoxelDag::from_cells(region, [[1, 0, 0], [0, 1, 0], [2, 2, 0]]).expect("pack diagonal occupancy");
+        let dag = VoxelDag::from_cells(region, [[1, 0, 0], [0, 1, 0], [2, 2, 0]])
+            .expect("pack diagonal occupancy");
         let origin = [0.5; 3];
         let direction = [1.0, 1.0, 0.0];
         assert_eq!(dag.trace(origin, direction, 1.5), None);
-        assert_eq!(dag.trace(origin, direction, 2.0), Some(VoxelHit { cell: [2, 2, 0], t: 1.5 }));
+        assert_eq!(
+            dag.trace(origin, direction, 2.0),
+            Some(VoxelHit {
+                cell: [2, 2, 0],
+                t: 1.5
+            })
+        );
     }
 
     #[test]
     fn clip_limits_and_empty_snapshots_do_not_alias_keys() {
-        assert!(matches!(ClipRegion::new([0; 3], 3), Err(SparseBuildError::InvalidSide(3))));
-        assert!(matches!(ClipRegion::new([0; 3], 8192), Err(SparseBuildError::InvalidSide(8192))));
-        assert!(matches!(ClipRegion::new([i32::MAX; 3], 2), Err(SparseBuildError::RegionOverflow { .. })));
+        assert!(matches!(
+            ClipRegion::new([0; 3], 3),
+            Err(SparseBuildError::InvalidSide(3))
+        ));
+        assert!(matches!(
+            ClipRegion::new([0; 3], 8192),
+            Err(SparseBuildError::InvalidSide(8192))
+        ));
+        assert!(matches!(
+            ClipRegion::new([i32::MAX; 3], 2),
+            Err(SparseBuildError::RegionOverflow { .. })
+        ));
         let region = ClipRegion::new([i32::MAX; 3], 1).expect("last representable cell is valid");
-        assert!(matches!(HashBricks::from_cells(region, [[i32::MIN; 3]]), Err(SparseBuildError::CellOutsideRegion(_))));
-        assert!(matches!(VoxelDag::from_cells(region, [[i32::MIN; 3]]), Err(SparseBuildError::CellOutsideRegion(_))));
+        assert!(matches!(
+            HashBricks::from_cells(region, [[i32::MIN; 3]]),
+            Err(SparseBuildError::CellOutsideRegion(_))
+        ));
+        assert!(matches!(
+            VoxelDag::from_cells(region, [[i32::MIN; 3]]),
+            Err(SparseBuildError::CellOutsideRegion(_))
+        ));
         let bricks = HashBricks::from_cells(region, []).expect("pack empty hash grid");
         let dag = VoxelDag::from_cells(region, []).expect("pack empty DAG");
         assert_eq!(bricks.words(), &[0; 5]);
@@ -585,11 +662,20 @@ mod tests {
 
         let region = ClipRegion::new([0; 3], MAX_CLIP_SIDE).expect("valid maximum clip side");
         let last = [(MAX_CLIP_SIDE - 1) as i32; 3];
-        let bricks = HashBricks::from_cells(region, [[0; 3], last]).expect("pack both extreme keys");
+        let bricks =
+            HashBricks::from_cells(region, [[0; 3], last]).expect("pack both extreme keys");
         let dag = VoxelDag::from_cells(region, [[0; 3], last]).expect("pack deepest DAG");
         let slots = &bricks.words()[HASH_HEADER_WORDS..];
-        assert!(slots.chunks_exact(HASH_SLOT_WORDS).any(|slot| slot == [1, 1, 0]));
-        assert!(slots.chunks_exact(HASH_SLOT_WORDS).any(|slot| slot == [0x4000_0000, 0, 1 << 31]));
+        assert!(
+            slots
+                .chunks_exact(HASH_SLOT_WORDS)
+                .any(|slot| slot == [1, 1, 0])
+        );
+        assert!(
+            slots
+                .chunks_exact(HASH_SLOT_WORDS)
+                .any(|slot| slot == [0x4000_0000, 0, 1 << 31])
+        );
         for cell in [[0; 3], last] {
             assert!(bricks.occupied(cell));
             assert!(dag.occupied(cell));

@@ -89,15 +89,15 @@ unsafe fn partition<T>(
             counts[2][z] += 1;
         }
     };
-    let mut pairs = elements.chunks_exact(2);
-    for pair in &mut pairs {
-        let lo = bounds(&pair[0]);
-        let hi = bounds(&pair[1]);
+    let (pairs, tail) = elements.as_chunks::<2>();
+    for [a, b] in pairs {
+        let lo = bounds(a);
+        let hi = bounds(b);
         let coords = map_centers(lo.center(), hi.center());
         add(arch::_mm256_castsi256_si128(coords), lo);
         add(arch::_mm256_extracti128_si256::<1>(coords), hi);
     }
-    if let [element] = pairs.remainder() {
+    if let [element] = tail {
         let item = bounds(element);
         let coords = map_centers(item.center(), Vec3A::ZERO);
         add(arch::_mm256_castsi256_si128(coords), item);

@@ -4,6 +4,12 @@
 
 #![allow(unsafe_op_in_unsafe_fn)]
 
+mod cluster;
+mod dgf;
+mod dgf_build;
+pub(crate) mod micromap;
+pub(crate) mod partition;
+
 use ash::vk;
 use gpu_allocator::MemoryLocation;
 use verity_render::{
@@ -17,6 +23,32 @@ pub(crate) struct Accel {
     pub handle: vk::AccelerationStructureKHR,
     pub address: vk::DeviceAddress,
     buffer: Buffer,
+}
+
+/// A buffer-backed BLAS retaining the clusters it references.
+pub(crate) struct ClusterBlas(cluster::ClusterBlas);
+
+impl ClusterBlas {
+    /// Geometry index plus primitive index recovers the original local triangle.
+    pub(crate) fn build(
+        gpu: &mut Gpu,
+        pool: &mut vk::CommandPool,
+        positions: &[[f32; 3]],
+        indices: &[[u32; 3]],
+    ) -> Result<Self> {
+        cluster::ClusterBlas::build(gpu, pool, positions, indices).map(Self)
+    }
+
+    pub(crate) fn address(&self) -> vk::DeviceAddress {
+        self.0.address()
+    }
+
+    /// # Safety
+    /// The owning GPU must be done with the BLAS and with the TLASes referencing it.
+    pub(crate) unsafe fn destroy(self, gpu: &mut Gpu) {
+        // SAFETY: The caller guarantees the device and completion of all uses.
+        unsafe { self.0.destroy(gpu) };
+    }
 }
 
 /// What one acceleration structure is built over; addresses are device addresses.
@@ -173,25 +205,28 @@ impl RayTracing {
         }
     }
 
-    /// A host-visible buffer of build input, and its address.
+    /// A host-visible build input with a 16-byte-aligned device address.
     pub unsafe fn input(
         &self,
         gpu: &mut Gpu,
         name: &str,
         bytes: &[u8],
     ) -> Result<(Buffer, vk::DeviceAddress)> {
+        // Vulkan requires 16-byte alignment even for an empty instance array.
+        const ALIGNMENT: u64 = 16;
         let mut buffer = gpu::create_buffer(
             gpu.device,
             gpu.allocator,
             name,
-            (bytes.len() as u64).max(1),
+            (bytes.len() as u64).max(1) + ALIGNMENT - 1,
             vk::BufferUsageFlags::ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_KHR
                 | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS,
             MemoryLocation::CpuToGpu,
         )?;
-        buffer.write(bytes);
-        let address = address(gpu.device, &buffer);
-        Ok((buffer, address))
+        let base = address(gpu.device, &buffer);
+        let aligned = base.next_multiple_of(ALIGNMENT);
+        buffer.write_at((aligned - base) as usize, bytes);
+        Ok((buffer, aligned))
     }
 
     /// Build one acceleration structure per geometry and wait for them.

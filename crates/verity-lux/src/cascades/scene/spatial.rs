@@ -3,7 +3,7 @@
 use glam::{DVec3, Vec3};
 use std::cmp::Ordering::{self, Equal, Greater, Less};
 
-use super::{BvhNode, bvh};
+use super::BvhNode;
 
 const MAX_LEAF: usize = 8;
 const MAX_DEPTH: u32 = 48;
@@ -12,9 +12,13 @@ const OBJECT_BINS: usize = 16;
 const SPATIAL_BINS: usize = 8;
 const PLANES: usize = SPATIAL_BINS - 1;
 // Avoid scoring clips for negligible overlap, or taking a marginal gain in exchange for indirection.
+// Overlap is measured against the node. Measured against the root instead (Stich et al. 2009,
+// alpha = 1e-5), builds were twice as fast, but the trees made software GI 20% slower on Sponza.
 const MIN_OVERLAP: f64 = 0.001;
 const PROFIT_RATIO: f64 = 0.98;
 const DUPLICATION_DIVISOR: usize = 4;
+/// Subtrees with at least this many references build on their own thread.
+const PARALLEL_REFERENCES: usize = 32 * 1024;
 
 /// A binary BLAS with adjacent siblings and indirect, mesh-relative leaf spans.
 #[derive(Debug)]
@@ -24,9 +28,11 @@ pub(super) struct SpatialTree {
 }
 
 /// Builds a spatial BLAS only when duplication improves the object tree's estimated ray cost.
-pub(super) fn build(corners: &[[Vec3; 3]]) -> Option<SpatialTree> {
+pub(super) fn build(corners: &[[Vec3; 3]], object: &[BvhNode]) -> Option<SpatialTree> {
     let count = u32::try_from(corners.len()).ok()?;
-    let limit = corners.len().saturating_add(corners.len() / DUPLICATION_DIVISOR)
+    let limit = corners
+        .len()
+        .saturating_add(corners.len() / DUPLICATION_DIVISOR)
         .min(u32::MAX as usize);
     let duplicates_left = limit - corners.len();
     if duplicates_left == 0 {
@@ -40,7 +46,10 @@ pub(super) fn build(corners: &[[Vec3; 3]]) -> Option<SpatialTree> {
         }
         let fragment = Bounds::triangle(triangle);
         bounds.extend(fragment);
-        pending.push(Reference { source, bounds: fragment });
+        pending.push(Reference {
+            source,
+            bounds: fragment,
+        });
     }
     if bounds.area() == 0.0 {
         return None;
@@ -52,6 +61,7 @@ pub(super) fn build(corners: &[[Vec3; 3]]) -> Option<SpatialTree> {
         nodes: vec![BvhNode::default()],
         references: Vec::with_capacity(corners.len()),
         duplicates_left,
+        reserved: false,
     };
     builder.descend(0, 0, 0, bounds)?;
     if builder.duplicates_left == duplicates_left {
@@ -60,23 +70,28 @@ pub(super) fn build(corners: &[[Vec3; 3]]) -> Option<SpatialTree> {
 
     // A better immediate partition can still make later partitions worse.
     // Compare the full trees only once the spatial build has actually used clipping.
-    let mut sources: Vec<u32> = (0..count).collect();
-    let object = bvh::build_mesh(&mut sources, |&source| {
-        let bounds = Bounds::triangle(&corners[source as usize]);
-        (bounds.min, bounds.max)
-    });
-    (tree_cost(&builder.nodes) < tree_cost(&object) * PROFIT_RATIO).then_some(SpatialTree {
+    (tree_cost(&builder.nodes) < tree_cost(object) * PROFIT_RATIO).then_some(SpatialTree {
         nodes: builder.nodes,
         references: builder.references,
     })
 }
 
 fn tree_cost(nodes: &[BvhNode]) -> f64 {
-    nodes.iter().map(|node| {
-        let bounds = Bounds { min: node.min, max: node.max };
-        let cost = if node.count == 0 { TRAVERSAL_COST } else { f64::from(node.count) };
-        bounds.area() * cost
-    }).sum()
+    nodes
+        .iter()
+        .map(|node| {
+            let bounds = Bounds {
+                min: node.min,
+                max: node.max,
+            };
+            let cost = if node.count == 0 {
+                TRAVERSAL_COST
+            } else {
+                f64::from(node.count)
+            };
+            bounds.area() * cost
+        })
+        .sum()
 }
 
 #[derive(Clone, Copy)]
@@ -86,10 +101,16 @@ struct Bounds {
 }
 
 impl Bounds {
-    const EMPTY: Self = Self { min: Vec3::splat(f32::INFINITY), max: Vec3::splat(f32::NEG_INFINITY) };
+    const EMPTY: Self = Self {
+        min: Vec3::splat(f32::INFINITY),
+        max: Vec3::splat(f32::NEG_INFINITY),
+    };
 
     fn triangle(&[a, b, c]: &[Vec3; 3]) -> Self {
-        Self { min: a.min(b).min(c), max: a.max(b).max(c) }
+        Self {
+            min: a.min(b).min(c),
+            max: a.max(b).max(c),
+        }
     }
 
     fn extend(&mut self, other: Self) {
@@ -103,7 +124,10 @@ impl Bounds {
     }
 
     fn intersection(self, other: Self) -> Self {
-        Self { min: self.min.max(other.min), max: self.max.min(other.max) }
+        Self {
+            min: self.min.max(other.min),
+            max: self.max.min(other.max),
+        }
     }
 
     fn overlaps(self, other: Self, min_area: f64) -> bool {
@@ -116,7 +140,12 @@ impl Bounds {
     }
 
     fn node(self, first: u32, count: u32) -> BvhNode {
-        BvhNode { min: self.min, max: self.max, first, count }
+        BvhNode {
+            min: self.min,
+            max: self.max,
+            first,
+            count,
+        }
     }
 }
 
@@ -133,7 +162,10 @@ struct Summary {
 }
 
 impl Summary {
-    const EMPTY: Self = Self { bounds: Bounds::EMPTY, count: 0 };
+    const EMPTY: Self = Self {
+        bounds: Bounds::EMPTY,
+        count: 0,
+    };
 
     fn add(&mut self, bounds: Bounds) {
         self.bounds.extend(bounds);
@@ -146,7 +178,11 @@ impl Summary {
     }
 
     fn cost(self) -> f64 {
-        if self.count == 0 { 0.0 } else { self.bounds.area() * self.count as f64 }
+        if self.count == 0 {
+            0.0
+        } else {
+            self.bounds.area() * self.count as f64
+        }
     }
 }
 
@@ -191,6 +227,8 @@ struct Builder<'mesh> {
     nodes: Vec<BvhNode>,
     references: Vec<u32>,
     duplicates_left: usize,
+    /// Whether the reference arrays already hold room for every duplicate.
+    reserved: bool,
 }
 
 impl Builder<'_> {
@@ -207,33 +245,47 @@ impl Builder<'_> {
             }
             let first = u32::try_from(self.references.len()).ok()?;
             self.nodes[at] = bounds.node(first, u32::try_from(count).ok()?);
-            self.references.extend(self.pending.drain(start..).map(|reference| reference.source));
+            self.references.extend(
+                self.pending
+                    .drain(start..)
+                    .map(|reference| reference.source),
+            );
             return Some(());
         };
 
         let mid = start + split.left.count;
         match split.partition {
             Partition::Object { grid, boundary } => {
-                partition(&mut self.pending[start..], |r| grid.bin(r.bounds) < boundary);
+                partition(&mut self.pending[start..], |r| {
+                    grid.bin(r.bounds) < boundary
+                });
             }
             Partition::Median => {}
             Partition::Spatial { axis, plane } => {
                 let extra = split.left.count + split.right.count - count;
-                if self.references.capacity() == self.corners.len() {
+                if !self.reserved {
                     // Reserve the entire bounded growth at the first accepted split, not once per node.
-                    self.references.reserve_exact(self.corners.len() + self.duplicates_left - self.references.len());
-                    self.pending.reserve_exact(self.corners.len() + self.duplicates_left - self.pending.len());
+                    self.reserved = true;
+                    self.references
+                        .reserve(self.pending.len() + self.duplicates_left);
+                    self.pending.reserve(self.duplicates_left);
                 }
                 self.duplicates_left -= extra;
                 for i in start..self.pending.len() {
                     let reference = &mut self.pending[i];
                     if reference.bounds.min[axis] < plane && plane < reference.bounds.max[axis] {
                         let triangle = &self.corners[reference.source as usize];
-                        let [left, right] = Polygon::bounded(triangle, reference.bounds)?
-                            .split(reference.bounds, axis, plane)?;
+                        let [left, right] = Polygon::bounded(triangle, reference.bounds)?.split(
+                            reference.bounds,
+                            axis,
+                            plane,
+                        )?;
                         reference.bounds = left;
                         let source = reference.source;
-                        self.pending.push(Reference { source, bounds: right });
+                        self.pending.push(Reference {
+                            source,
+                            bounds: right,
+                        });
                     }
                 }
                 partition(&mut self.pending[start..], |r| r.bounds.max[axis] <= plane);
@@ -244,8 +296,72 @@ impl Builder<'_> {
         u32::try_from(children.checked_add(1)?).ok()?;
         self.nodes[at] = bounds.node(children as u32, 0);
         self.nodes.extend([BvhNode::default(); 2]);
+        if self.pending.len() - start >= PARALLEL_REFERENCES {
+            return self.descend_parallel(children, start, mid, depth + 1, split);
+        }
         self.descend(children + 1, mid, depth + 1, split.right.bounds)?;
         self.descend(children, start, depth + 1, split.left.bounds)
+    }
+
+    /// Build both children of a large node on separate threads, each from its
+    /// own references and a share of the duplication budget in proportion to
+    /// them, then graft the subtrees into `children` and `children + 1`.
+    fn descend_parallel(
+        &mut self,
+        children: usize,
+        start: usize,
+        mid: usize,
+        depth: u32,
+        split: Split,
+    ) -> Option<()> {
+        let right = self.pending.split_off(mid);
+        let left = self.pending.split_off(start);
+        let total = left.len() + right.len();
+        let right_budget = self.duplicates_left * right.len() / total;
+        let left_budget = self.duplicates_left - right_budget;
+        let subtree = |pending: Vec<Reference>, budget: usize, bounds: Bounds| {
+            let mut builder = Builder {
+                corners: self.corners,
+                references: Vec::with_capacity(pending.len()),
+                pending,
+                nodes: vec![BvhNode::default()],
+                duplicates_left: budget,
+                reserved: false,
+            };
+            builder.descend(0, 0, depth, bounds).map(|()| builder)
+        };
+        let (right, left) = rayon::join(
+            || subtree(right, right_budget, split.right.bounds),
+            || subtree(left, left_budget, split.left.bounds),
+        );
+        let (right, left) = (right?, left?);
+        self.duplicates_left = right.duplicates_left + left.duplicates_left;
+        // Left first keeps leaf references in the order the serial build writes them.
+        self.graft(children, left)?;
+        self.graft(children + 1, right)
+    }
+
+    /// Put a subtree's root at `slot` and append the rest of its nodes and its
+    /// references, rebasing child and reference indices.
+    fn graft(&mut self, slot: usize, subtree: Builder) -> Option<()> {
+        // Subtree node i > 0 lands at `base + i - 1`.
+        let base = u32::try_from(self.nodes.len()).ok()?;
+        let references = u32::try_from(self.references.len()).ok()?;
+        u32::try_from(self.nodes.len() + subtree.nodes.len()).ok()?;
+        u32::try_from(self.references.len() + subtree.references.len()).ok()?;
+        let rebase = |mut node: BvhNode| {
+            if node.count == 0 {
+                node.first = base + node.first - 1;
+            } else {
+                node.first += references;
+            }
+            node
+        };
+        let mut nodes = subtree.nodes.into_iter();
+        self.nodes[slot] = rebase(nodes.next()?);
+        self.nodes.extend(nodes.map(rebase));
+        self.references.extend(subtree.references);
+        Some(())
     }
 
     fn choose_split(&mut self, start: usize, depth: u32, bounds: Bounds) -> Option<Split> {
@@ -278,18 +394,36 @@ impl Builder<'_> {
                 summary
             };
             let (left, right) = references.split_at(mid);
-            best = Some(Split { partition: Partition::Median, left: summarize(left), right: summarize(right) });
+            best = Some(Split {
+                partition: Partition::Median,
+                left: summarize(left),
+                right: summarize(right),
+            });
         }
 
         let leaf_cost = area * (count as f64 - TRAVERSAL_COST);
-        if self.duplicates_left != 0 && area > 0.0 && best.is_none_or(|split| {
-            split.left.bounds.overlaps(split.right.bounds, area * MIN_OVERLAP)
-        }) {
-            let cost_limit = best.map_or(f64::INFINITY, Split::cost)
-                .min(if fits_leaf { leaf_cost } else { f64::INFINITY });
-            if let Some(split) = spatial_split(self.corners, references, bounds, child_limit,
-                self.duplicates_left, cost_limit * PROFIT_RATIO)
-            {
+        if self.duplicates_left != 0
+            && area > 0.0
+            && best.is_none_or(|split| {
+                split
+                    .left
+                    .bounds
+                    .overlaps(split.right.bounds, area * MIN_OVERLAP)
+            })
+        {
+            let cost_limit = best.map_or(f64::INFINITY, Split::cost).min(if fits_leaf {
+                leaf_cost
+            } else {
+                f64::INFINITY
+            });
+            if let Some(split) = spatial_split(
+                self.corners,
+                references,
+                bounds,
+                child_limit,
+                self.duplicates_left,
+                cost_limit * PROFIT_RATIO,
+            ) {
                 best = Some(split);
             }
         }
@@ -323,7 +457,11 @@ fn object_split(references: &[Reference], child_limit: usize) -> Option<Split> {
         if span == 0.0 {
             continue;
         }
-        let grid = Grid { axis, origin: lo[axis], scale: OBJECT_BINS as f64 / span };
+        let grid = Grid {
+            axis,
+            origin: lo[axis],
+            scale: OBJECT_BINS as f64 / span,
+        };
         let mut bins = [Summary::EMPTY; OBJECT_BINS];
         for reference in references {
             bins[grid.bin(reference.bounds)].add(reference.bounds);
@@ -345,7 +483,11 @@ fn object_split(references: &[Reference], child_limit: usize) -> Option<Split> {
             if right.count == 0 || left.count > child_limit || right.count > child_limit {
                 continue;
             }
-            let split = Split { partition: Partition::Object { grid, boundary }, left, right };
+            let split = Split {
+                partition: Partition::Object { grid, boundary },
+                left,
+                right,
+            };
             let cost = split.cost();
             let imbalance = left.count.abs_diff(right.count);
             if best.is_none_or(|(old, diff, _)| cost < old || (cost == old && imbalance < diff)) {
@@ -368,7 +510,8 @@ fn spatial_split(
     for axis in 0..3 {
         let (lo, hi) = (bounds.min[axis], bounds.max[axis]);
         let step = (f64::from(hi) - f64::from(lo)) / SPATIAL_BINS as f64;
-        let planes: [f32; PLANES] = std::array::from_fn(|i| (f64::from(lo) + (i + 1) as f64 * step) as f32);
+        let planes: [f32; PLANES] =
+            std::array::from_fn(|i| (f64::from(lo) + (i + 1) as f64 * step) as f32);
         let mut bins = std::array::from_fn::<_, PLANES, _>(|i| {
             (lo < planes[i] && planes[i] < hi && (i == 0 || planes[i - 1] != planes[i]))
                 .then_some([Summary::EMPTY; 2])
@@ -387,7 +530,9 @@ fn spatial_split(
             right_ends[before.min(after)].add(reference.bounds);
             let mut polygon = None;
             for i in before.min(after)..after {
-                let Some([left, right]) = &mut bins[i] else { continue };
+                let Some([left, right]) = &mut bins[i] else {
+                    continue;
+                };
                 if left.count == budget {
                     bins[i] = None;
                     continue;
@@ -395,7 +540,10 @@ fn spatial_split(
                 let fragment = polygon.get_or_insert_with(|| {
                     Polygon::bounded(&corners[reference.source as usize], reference.bounds)
                 });
-                if let Some([l, r]) = fragment.as_ref().and_then(|p| p.split(reference.bounds, axis, planes[i])) {
+                if let Some([l, r]) = fragment
+                    .as_ref()
+                    .and_then(|p| p.split(reference.bounds, axis, planes[i]))
+                {
                     left.add(l);
                     right.add(r);
                 } else {
@@ -414,7 +562,9 @@ fn spatial_split(
         let mut left = Summary::EMPTY;
         for i in 0..PLANES {
             left.merge(left_starts[i]);
-            let Some([mut clipped, right]) = bins[i] else { continue };
+            let Some([mut clipped, right]) = bins[i] else {
+                continue;
+            };
             if clipped.count == 0 {
                 continue;
             }
@@ -423,7 +573,10 @@ fn spatial_split(
                 continue;
             }
             let split = Split {
-                partition: Partition::Spatial { axis, plane: planes[i] },
+                partition: Partition::Spatial {
+                    axis,
+                    plane: planes[i],
+                },
                 left: clipped,
                 right,
             };
@@ -450,7 +603,10 @@ struct Polygon {
 
 impl Polygon {
     fn empty() -> Self {
-        Self { vertices: [[Interval::exact(0.0); 3]; POLYGON_CAPACITY], count: 0 }
+        Self {
+            vertices: [[Interval::exact(0.0); 3]; POLYGON_CAPACITY],
+            count: 0,
+        }
     }
 
     fn bounded(triangle: &[Vec3; 3], bounds: Bounds) -> Option<Self> {
@@ -488,7 +644,11 @@ impl Polygon {
         for next in vertices {
             let side = next[axis].side(plane)?;
             if prev_side != side && prev_side != Equal && side != Equal {
-                let (low, high) = if prev_side == Less { (prev, next) } else { (next, prev) };
+                let (low, high) = if prev_side == Less {
+                    (prev, next)
+                } else {
+                    (next, prev)
+                };
                 vertex(&edge_intersection(low, high, axis, plane)?, Equal)?;
             }
             vertex(next, side)?;
@@ -556,17 +716,26 @@ impl Interval {
 
     // Bounds on a nonnegative distance from either endpoint to the plane.
     fn gap(lo: f64, hi: f64) -> Self {
-        Self { lo: lo.next_down().max(0.0), hi: hi.next_up() }
+        Self {
+            lo: lo.next_down().max(0.0),
+            hi: hi.next_up(),
+        }
     }
 
     fn ratio(self, denom: Self) -> Self {
-        Self { lo: (self.lo / denom.hi).next_down().max(0.0), hi: (self.hi / denom.lo).next_up().min(1.0) }
+        Self {
+            lo: (self.lo / denom.hi).next_down().max(0.0),
+            hi: (self.hi / denom.lo).next_up().min(1.0),
+        }
     }
 
     fn weighted(self, weight: Self) -> Self {
         let lo = self.lo * if self.lo < 0.0 { weight.hi } else { weight.lo };
         let hi = self.hi * if self.hi < 0.0 { weight.lo } else { weight.hi };
-        Self { lo: lo.next_down(), hi: hi.next_up() }
+        Self {
+            lo: lo.next_down(),
+            hi: hi.next_up(),
+        }
     }
 }
 
@@ -586,12 +755,18 @@ fn edge_intersection(low: &Vertex, high: &Vertex, axis: usize, plane: f64) -> Op
             return Interval::exact(plane);
         }
         let (a, b) = (low[i], high[i]);
-        let hull = Interval { lo: a.lo.min(b.lo), hi: a.hi.max(b.hi) };
+        let hull = Interval {
+            lo: a.lo.min(b.lo),
+            hi: a.hi.max(b.hi),
+        };
         if hull.lo == hull.hi {
             return hull;
         }
         let (a, b) = (a.weighted(low_weight), b.weighted(high_weight));
-        Interval { lo: (a.lo + b.lo).next_down().max(hull.lo), hi: (a.hi + b.hi).next_up().min(hull.hi) }
+        Interval {
+            lo: (a.lo + b.lo).next_down().max(hull.lo),
+            hi: (a.hi + b.hi).next_up().min(hull.hi),
+        }
     }))
 }
 
@@ -601,7 +776,10 @@ struct Extents {
 }
 
 impl Extents {
-    const EMPTY: Self = Self { lo: DVec3::splat(f64::INFINITY), hi: DVec3::splat(f64::NEG_INFINITY) };
+    const EMPTY: Self = Self {
+        lo: DVec3::splat(f64::INFINITY),
+        hi: DVec3::splat(f64::NEG_INFINITY),
+    };
 
     fn add(&mut self, point: &Vertex) {
         self.lo = self.lo.min(DVec3::from_array(point.map(|v| v.lo)));
@@ -617,7 +795,10 @@ impl Extents {
             let f = v as f32;
             if f64::from(f) < v { f.next_up() } else { f }
         });
-        Bounds { min: Vec3::from_array(min), max: Vec3::from_array(max) }
+        Bounds {
+            min: Vec3::from_array(min),
+            max: Vec3::from_array(max),
+        }
     }
 }
 
@@ -625,18 +806,35 @@ impl Extents {
 mod tests {
     use super::*;
 
+    fn build_with_object(corners: &[[Vec3; 3]]) -> Option<SpatialTree> {
+        let mut sources: Vec<_> = (0..corners.len()).collect();
+        let object = super::super::bvh::build_mesh(&mut sources, |&source| {
+            let bounds = Bounds::triangle(&corners[source]);
+            (bounds.min, bounds.max)
+        });
+        build(corners, &object)
+    }
+
     #[test]
     fn clipping_tightens_other_axes_and_keeps_shared_boundary() {
-        let triangle = [Vec3::ZERO, Vec3::new(4.0, 4.0, 0.0), Vec3::new(4.0, 0.0, 0.0)];
+        let triangle = [
+            Vec3::ZERO,
+            Vec3::new(4.0, 4.0, 0.0),
+            Vec3::new(4.0, 0.0, 0.0),
+        ];
         let bounds = Bounds::triangle(&triangle);
-        let [left, right] = Polygon::bounded(&triangle, bounds).expect("source polygon")
-            .split(bounds, 0, 1.0).expect("triangle straddles x = 1");
+        let [left, right] = Polygon::bounded(&triangle, bounds)
+            .expect("source polygon")
+            .split(bounds, 0, 1.0)
+            .expect("triangle straddles x = 1");
         assert_eq!(left.max.x, 1.0);
         assert_eq!(right.min.x, 1.0);
         assert!((1.0..=1.0_f32.next_up()).contains(&left.max.y));
         assert_eq!(right.max.y, 4.0);
-        let [_, top] = Polygon::bounded(&triangle, left).expect("reconstructed left fragment")
-            .split(left, 1, 0.5).expect("fragment straddles y = 0.5");
+        let [_, top] = Polygon::bounded(&triangle, left)
+            .expect("reconstructed left fragment")
+            .split(left, 1, 0.5)
+            .expect("fragment straddles y = 0.5");
         assert!(top.min.x <= 0.5 && top.min.x >= 0.5_f32.next_down());
         assert_eq!(top.min.y, 0.5);
         assert_eq!(top.max.x, 1.0);
@@ -646,9 +844,11 @@ mod tests {
     fn clusters() -> Vec<[Vec3; 3]> {
         let mut triangles = Vec::new();
         for i in 0..8 {
-            for (x, y) in [(-8.5, -8.0), (8.0, 8.0)] {
-                let a = Vec3::new(x, y + 0.125 * i as f32, 1.0);
-                triangles.push([a, a + Vec3::X * 0.25, a + Vec3::Y * 0.0625]);
+            // Inside the straddler's AABB in the same plane: an object split
+            // cannot isolate it cheaply on the third axis.
+            for (x, y) in [(-7.5, -7.75), (7.5, 6.875)] {
+                let a = Vec3::new(x, y + 0.125 * i as f32, 0.0);
+                triangles.push([a, a + Vec3::X * 0.5, a + Vec3::Y * 0.0625]);
             }
         }
         triangles
@@ -658,9 +858,23 @@ mod tests {
     fn chooses_spatial_sah_and_preserves_actual_source_hits() {
         let mut triangles = clusters();
         let straddler = 3;
-        triangles.insert(straddler, [Vec3::new(-8.0, -8.0, 0.0), Vec3::new(8.0, 8.0, 0.0), Vec3::new(8.0, 7.5, 0.0)]);
-        let tree = build(&triangles).expect("diagonal straddler causes profitable spatial splits");
-        assert!(tree.references.iter().filter(|&&id| id == straddler as u32).count() > 1);
+        triangles.insert(
+            straddler,
+            [
+                Vec3::new(-8.0, -8.0, 0.0),
+                Vec3::new(8.0, 8.0, 0.0),
+                Vec3::new(8.0, 7.5, 0.0),
+            ],
+        );
+        let tree = build_with_object(&triangles)
+            .expect("diagonal straddler causes profitable spatial splits");
+        assert!(
+            tree.references
+                .iter()
+                .filter(|&&id| id == straddler as u32)
+                .count()
+                > 1
+        );
         assert!(tree.references.len() <= triangles.len() + triangles.len() / DUPLICATION_DIVISOR);
         let mut leaves = Vec::new();
         let mut stack = vec![(0, 0)];
@@ -680,8 +894,8 @@ mod tests {
         for (x, y, expected) in [
             (-6.0, -6.02, Some(straddler as u32)),
             (6.0, 5.75, Some(straddler as u32)),
-            (-8.45, -7.98, Some(0)),
-            (8.05, 8.02, Some(1)),
+            (-7.45, -7.73, Some(0)),
+            (7.55, 6.895, Some(1)),
             (0.0, 1.0, None), // Inside the diagonal's source AABB, outside the triangle.
         ] {
             let origin = DVec3::new(x, y, 10.0);
@@ -691,8 +905,10 @@ mod tests {
             let mut stack = vec![0];
             while let Some(at) = stack.pop() {
                 let node = tree.nodes[at];
-                if x < f64::from(node.min.x) || x > f64::from(node.max.x)
-                    || y < f64::from(node.min.y) || y > f64::from(node.max.y)
+                if x < f64::from(node.min.x)
+                    || x > f64::from(node.max.x)
+                    || y < f64::from(node.min.y)
+                    || y > f64::from(node.max.y)
                     || origin.z < f64::from(node.min.z)
                 {
                     continue;
@@ -701,10 +917,15 @@ mod tests {
                 if node.count == 0 {
                     stack.extend([first, first + 1]);
                 } else {
-                    candidates.extend_from_slice(&tree.references[first..first + node.count as usize]);
+                    candidates
+                        .extend_from_slice(&tree.references[first..first + node.count as usize]);
                 }
             }
-            assert_eq!(closest(&triangles, candidates, origin), brute, "spatial ray at {origin:?}");
+            assert_eq!(
+                closest(&triangles, candidates, origin),
+                brute,
+                "spatial ray at {origin:?}"
+            );
         }
     }
 
@@ -713,28 +934,118 @@ mod tests {
         references: impl IntoIterator<Item = u32>,
         origin: DVec3,
     ) -> Option<(f64, u32)> {
-        references.into_iter().filter_map(|id| {
-            let [a, b, c] = triangles[id as usize].map(|p| p.as_dvec3());
-            let (ab, ac) = (b - a, c - a);
-            let direction = -DVec3::Z;
-            let p = direction.cross(ac);
-            let det = ab.dot(p);
-            if det == 0.0 {
-                return None;
+        references
+            .into_iter()
+            .filter_map(|id| {
+                let [a, b, c] = triangles[id as usize].map(|p| p.as_dvec3());
+                let (ab, ac) = (b - a, c - a);
+                let direction = -DVec3::Z;
+                let p = direction.cross(ac);
+                let det = ab.dot(p);
+                if det == 0.0 {
+                    return None;
+                }
+                let offset = origin - a;
+                let q = offset.cross(ab);
+                let u = offset.dot(p) / det;
+                let v = direction.dot(q) / det;
+                let t = ac.dot(q) / det;
+                (u >= 0.0 && v >= 0.0 && u + v <= 1.0 && t >= 0.0).then_some((t, id))
+            })
+            .min_by(|a, b| a.0.total_cmp(&b.0).then_with(|| a.1.cmp(&b.1)))
+    }
+
+    #[test]
+    fn parallel_subtrees_keep_every_source_and_hit() {
+        // Small triangles on a grid at staggered heights, crossed by long
+        // slivers: large enough that subtrees build on their own threads.
+        let mut triangles = Vec::new();
+        let side = 256;
+        for i in 0..side * side {
+            let (x, y) = ((i % side) as f32 * 0.25, (i / side) as f32 * 0.25);
+            let a = Vec3::new(x, y, (i % 7) as f32 * 0.01);
+            triangles.push([
+                a,
+                a + Vec3::new(0.2, 0.0, 0.0),
+                a + Vec3::new(0.0, 0.2, 0.0),
+            ]);
+        }
+        let extent = side as f32 * 0.25;
+        for k in 0..64 {
+            let offset = k as f32 * extent / 64.0;
+            let a = Vec3::new(0.0, offset, 1.0);
+            triangles.push([
+                a,
+                Vec3::new(extent, offset + 8.0, 1.0),
+                Vec3::new(extent, offset + 8.5, 1.0),
+            ]);
+        }
+        assert!(triangles.len() > 2 * PARALLEL_REFERENCES);
+        let tree = build_with_object(&triangles).expect("slivers make spatial splits profitable");
+        assert!(tree.references.len() <= triangles.len() + triangles.len() / DUPLICATION_DIVISOR);
+
+        // Every reference is in exactly one leaf, every source in some leaf,
+        // and each child's box lies inside its parent's.
+        let mut seen = vec![0u32; tree.references.len()];
+        let mut sources = vec![false; triangles.len()];
+        let mut stack = vec![0];
+        while let Some(at) = stack.pop() {
+            let node = tree.nodes[at];
+            if node.count == 0 {
+                for child in [node.first as usize, node.first as usize + 1] {
+                    let inner = tree.nodes[child];
+                    assert!(inner.min.cmpge(node.min).all() && inner.max.cmple(node.max).all());
+                    stack.push(child);
+                }
+            } else {
+                for r in node.first..node.first + node.count {
+                    seen[r as usize] += 1;
+                    sources[tree.references[r as usize] as usize] = true;
+                }
             }
-            let offset = origin - a;
-            let q = offset.cross(ab);
-            let u = offset.dot(p) / det;
-            let v = direction.dot(q) / det;
-            let t = ac.dot(q) / det;
-            (u >= 0.0 && v >= 0.0 && u + v <= 1.0 && t >= 0.0).then_some((t, id))
-        }).min_by(|a, b| a.0.total_cmp(&b.0).then_with(|| a.1.cmp(&b.1)))
+        }
+        assert!(seen.iter().all(|&n| n == 1));
+        assert!(sources.iter().all(|&s| s));
+
+        for k in 0..64u32 {
+            let t = f64::from(k) / 64.0;
+            let origin = DVec3::new(
+                t * f64::from(extent),
+                (t * 7.3).fract() * f64::from(extent),
+                10.0,
+            );
+            let brute = closest(&triangles, 0..triangles.len() as u32, origin);
+            let mut candidates = Vec::new();
+            let mut stack = vec![0];
+            while let Some(at) = stack.pop() {
+                let node = tree.nodes[at];
+                if origin.x < f64::from(node.min.x)
+                    || origin.x > f64::from(node.max.x)
+                    || origin.y < f64::from(node.min.y)
+                    || origin.y > f64::from(node.max.y)
+                {
+                    continue;
+                }
+                let first = node.first as usize;
+                if node.count == 0 {
+                    stack.extend([first, first + 1]);
+                } else {
+                    candidates
+                        .extend_from_slice(&tree.references[first..first + node.count as usize]);
+                }
+            }
+            assert_eq!(
+                closest(&triangles, candidates, origin),
+                brute,
+                "ray at {origin:?}"
+            );
+        }
     }
 
     #[test]
     fn disjoint_geometry_and_invalid_input_use_object_path() {
-        assert!(build(&clusters()).is_none());
-        assert!(build(&[[Vec3::NAN; 3]; 8]).is_none());
-        assert!(build(&[]).is_none());
+        assert!(build_with_object(&clusters()).is_none());
+        assert!(build(&[[Vec3::NAN; 3]; 8], &[]).is_none());
+        assert!(build(&[], &[]).is_none());
     }
 }

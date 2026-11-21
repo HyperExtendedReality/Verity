@@ -31,8 +31,9 @@
 //! `msgi` enables Ultra PBR / MSGI: one material-weighted diffuse/GGX ray per resolve texel.
 //! `--surface-cold-priority` shifts surface rays toward cold slots, and
 //! `--emitter-low-discrepancy` stratifies the emissive candidate batch.
-//! `--voxel-bricks` enables empty-brick skips in the voxel and residual methods.
+//! `--voxel-bricks` enables empty-brick counts with dense voxel storage.
 //! `--voxel-visibility=dda|sdf|roma` selects diffuse voxel tracing (default DDA).
+//! `--voxel-storage=dense|hash|dag` selects occupancy storage (default dense).
 //! `--voxel-source-history` tests rejection of stale screen/voxel history.
 //! `--surface-updates=N` and `--surface-rays=N` its texels shaded a frame and
 //! bounce rays each; `--surface-reach=M` caps software bounce rays.
@@ -42,10 +43,10 @@ use glam::Vec3;
 use std::{collections::HashMap, path::Path, sync::Arc, time::Instant};
 use verity_core::{PointLight, World};
 use verity_lux::{
-    Lux, Method,
+    GiStatus, Lux, Method,
     cascades::settings::{FinalGather, Settings},
     pxtgi::{Capture, PxtgiDebug, PxtgiReflections, PxtgiSettings},
-    voxel::{ScreenVoxelSettings, VoxelVisibility},
+    voxel::{ScreenVoxelSettings, VoxelStorage, VoxelVisibility},
 };
 use verity_render::{Renderer, Sun};
 use winit::{
@@ -80,6 +81,7 @@ enum Stage {
 struct Bench {
     dir: String,
     warm: u32,
+    reported_ready: bool,
     /// Frames to look away before saving the still view, testing how GI
     /// stands up to the camera turning around and back.
     turn: u32,
@@ -350,6 +352,12 @@ impl ApplicationHandler for Viewer {
                             Some("roma") => VoxelVisibility::Roma,
                             Some(_) => panic!("--voxel-visibility=dda|sdf|roma"),
                         },
+                        storage: match arg("voxel-storage").as_deref() {
+                            None | Some("dense") => VoxelStorage::Dense,
+                            Some("hash") => VoxelStorage::Hash,
+                            Some("dag") => VoxelStorage::Dag,
+                            Some(_) => panic!("--voxel-storage=dense|hash|dag"),
+                        },
                         source_aware_history: flag("--voxel-source-history"),
                         cell_size: arg("cell").map_or(0.125, |m| m.parse().expect("--cell=M")),
                         levels: arg("levels").map_or(5, |n| n.parse().expect("--levels=N")),
@@ -460,6 +468,25 @@ impl ApplicationHandler for Viewer {
                     let lux = renderer.extension_mut::<Lux>().expect("GI is installed");
                     let finished = lux.take_capture();
                     let times = lux.pass_times().to_vec();
+                    match lux.status() {
+                        GiStatus::Failed(error) => panic!("GI benchmark could not start: {error}"),
+                        GiStatus::Compiling { since }
+                            if self.frames == 1 || self.timer.elapsed().as_secs() >= 5 =>
+                        {
+                            eprintln!(
+                                "GI compiling Vulkan pipelines ({}s)…",
+                                since.elapsed().as_secs()
+                            );
+                            self.timer = Instant::now();
+                        }
+                        GiStatus::Ready { compile_time }
+                            if !bench.reported_ready && !times.is_empty() =>
+                        {
+                            eprintln!("GI pipelines ready in {:.2}s", compile_time.as_secs_f64());
+                            bench.reported_ready = true;
+                        }
+                        _ => {}
+                    }
                     let (done, capture) = bench.advance(&times, finished);
                     if capture {
                         lux.request_capture();
@@ -490,6 +517,7 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
         Bench {
             dir,
             warm,
+            reported_ready: false,
             turn: arg("turn").map_or(0, |n| n.parse().expect("--turn=N")),
             stage: Stage::Warm(warm),
             moving: false,

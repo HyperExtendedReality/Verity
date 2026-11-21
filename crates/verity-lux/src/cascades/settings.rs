@@ -1,6 +1,5 @@
-//! Quality controls and the buffer sizing and work budgets derived from them,
-//! ported from the Bevy implementation (`legacy/src/render.rs`). Sizes must
-//! match what the shaders index, so these stay verbatim.
+//! Quality controls and the buffer sizing and work budgets derived from them.
+//! Sizes must match what the shaders index.
 
 use bytemuck::{Pod, Zeroable};
 
@@ -44,6 +43,18 @@ pub enum FinalGather {
     MaterialSpace = 3,
 }
 
+impl FinalGather {
+    /// Trace one ray per resolve texel a frame instead of reading probes.
+    pub fn traced(self) -> bool {
+        self != Self::Probes
+    }
+}
+
+/// À-trous passes a traced gather needs at least. One ray a texel a frame is
+/// far noisier than the probes: on Sponza a single pass left about 0.5 of the
+/// mean bounce light as per-frame noise.
+const TRACED_FILTER_STEPS: u32 = 3;
+
 /// Split Radiance Cascades quality and lighting controls. Distances are in
 /// metres.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -69,6 +80,7 @@ pub struct Settings {
     /// À-trous passes over the shaded image. The probes are already smooth:
     /// on Sponza, three passes instead of one changed neither error nor flicker
     /// once warm, and cut error by at most 3% in GI's first second, for 0.22 ms.
+    /// A traced gather runs at least three; see [`Settings::filter_steps`].
     pub spatial_filter_steps: u32,
     pub emissive_samples: u32,
     /// Carry light past the first bounce, through last frame's probes.
@@ -166,6 +178,32 @@ impl Default for Settings {
 }
 
 impl Settings {
+    /// À-trous passes over the shaded image: none for the reference, at least
+    /// [`TRACED_FILTER_STEPS`] for a traced gather, and at most one per level.
+    pub fn filter_steps(&self) -> u32 {
+        if self.reference {
+            0
+        } else if self.final_gather.traced() {
+            self.spatial_filter_steps
+                .max(TRACED_FILTER_STEPS)
+                .min(LEVELS as u32)
+        } else {
+            self.spatial_filter_steps.min(LEVELS as u32)
+        }
+    }
+
+    /// The most a texel's history may weigh against this frame's sample. A
+    /// traced gather lets each texel's history length alone set it, so a still
+    /// view averages up to `history_frames` rays instead of about eight.
+    pub fn history_blend(&self) -> f32 {
+        if self.final_gather.traced() {
+            let frames = self.history_frames as f32;
+            self.temporal_blend.max(frames / (frames + 1.0))
+        } else {
+            self.temporal_blend
+        }
+    }
+
     /// For open ground hundreds of metres across.
     /// The defaults suit rooms. Outdoors, what they leave uncapped costs several
     /// times more, and with the budgets below their quarter-metre probes spread
@@ -252,9 +290,6 @@ pub struct Parameters {
     pub environment_info: [u32; 4],
     pub environment_rotation: [f32; 4],
     pub environment_scale: [f32; 4],
-    pub geometry_pages: [u32; 4],
-    pub scene_pages: [u32; 4],
-    pub scene_overlay: [u32; 4],
     pub dirty_min: [f32; 4],
     pub dirty_max: [f32; 4],
     pub source_history: [u32; 4],
@@ -482,6 +517,27 @@ mod tests {
     use super::*;
 
     #[test]
+    fn traced_gathers_filter_and_accumulate_more() {
+        let probes = Settings::default();
+        assert_eq!(probes.filter_steps(), probes.spatial_filter_steps);
+        assert_eq!(probes.history_blend(), probes.temporal_blend);
+        for gather in [FinalGather::Cosine, FinalGather::Guided, FinalGather::MaterialSpace] {
+            let traced = Settings {
+                final_gather: gather,
+                ..Settings::default()
+            };
+            assert_eq!(traced.filter_steps(), TRACED_FILTER_STEPS);
+            let frames = traced.history_frames as f32;
+            assert_eq!(traced.history_blend(), frames / (frames + 1.0));
+            let reference = Settings {
+                reference: true,
+                ..traced
+            };
+            assert_eq!(reference.filter_steps(), 0);
+        }
+    }
+
+    #[test]
     fn budgeted_reduces_surface_bounce_work() {
         assert_eq!(Settings::budgeted().surface_bounce_rays, 1);
         assert_eq!(Settings::default().surface_bounce_rays, 2);
@@ -491,7 +547,7 @@ mod tests {
     #[test]
     fn parameters_match_the_shader_block() {
         // 4 matrices, 34 vec4s and 23 pointers, no padding.
-        assert_eq!(std::mem::size_of::<Parameters>(), 4 * 64 + 34 * 16 + 23 * 8);
+        assert_eq!(std::mem::size_of::<Parameters>(), 4 * 64 + 31 * 16 + 23 * 8);
     }
 
     #[test]

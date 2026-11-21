@@ -30,6 +30,16 @@ fn every_gi_lighting_method_has_a_method() {
 }
 
 #[test]
+fn hardware_gi_is_offered_and_waits_for_the_gpu() {
+    let info = method_info(LightingMethod::HardwareGi).expect("a method");
+    assert!(METHODS.iter().any(|m| m.lighting == LightingMethod::HardwareGi));
+    assert!(!info.name.is_empty());
+    let lux = Lux::for_lighting(LightingMethod::HardwareGi).expect("a method");
+    // The profile, and so the method, is chosen when the renderer lends the GPU.
+    assert!(lux.hardware_profile().is_none());
+}
+
+#[test]
 fn methods_are_told_apart() {
     let methods: Vec<_> = METHODS.iter().chain(EXPERIMENTAL_METHODS).collect();
     for (i, a) in methods.iter().enumerate() {

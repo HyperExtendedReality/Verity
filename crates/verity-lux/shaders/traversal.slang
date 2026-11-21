@@ -16,7 +16,6 @@ static const uint MAX_LEAF_INSTANCES = 4096u;
 static const uint HIT_QUERY_UNSUPPORTED = 4u;
 // Ray-traced GI has no cascade query budget, and nothing resets its counters.
 static bool transportAdmissionBypass = false;
-#ifndef GI_TRAVERSAL_CHECK
 bool admitTransportQuery(uint admissionLimit) {
     if (transportAdmissionBypass) return true;
     uint attemptIndex = 2u * params.size.w + 5u;
@@ -42,116 +41,20 @@ uint ordinaryTransportAdmissionLimit() {
 bool admitTransportQuery() {
     return admitTransportQuery(ordinaryTransportAdmissionLimit());
 }
-#else
-bool admitTransportQuery(uint admissionLimit) { return true; }
-bool admitTransportQuery() { return admitTransportQuery(0u); }
-uint ordinaryTransportAdmissionLimit() { return 0u; }
-#endif
 
-#ifndef GI_TRAVERSAL_CHECK
-[[vk::binding(28, 0)]] Texture2DArray<uint4> geometryPageTexture;
 // Scene and geometry words are addressed by values that ultimately come from
 // shader-computed triangles and material records. A single stale or malformed
-// index must not become an out-of-range buffer/texture address: that faults the
-// GPU (device lost) instead of producing a wrong colour. Every read below is
-// therefore clamped to the bound buffer or page array.
-uint4 geometryInlineWord(uint index) {
+// index must not become an out-of-range buffer address: that faults the GPU
+// (device lost) instead of producing a wrong colour. Every read below is
+// therefore clamped to the bound buffer.
+uint4 geometryWord(uint index) {
     uint words = params.wordLengths.x;
     return words == 0u ? (uint4)0 : geometryWords[min(index, words - 1u)];
 }
-uint4 geometryPageWord(uint index) {
-    uint width, height, layers;
-    geometryPageTexture.GetDimensions(width, height, layers);
-    uint side = params.geometryPages.y;
-    if (side == 0u || layers == 0u) return (uint4)0;
-    uint pageWords = side * side;
-    uint layer = index / pageWords;
-    if (layer >= layers) return (uint4)0;
-    uint withinPage = index % pageWords;
-    return geometryPageTexture.Load(int4(withinPage % side, withinPage / side, layer, 0));
-}
-uint4 geometryWord(uint index) {
-    if (params.geometryPages.x == 0) return geometryInlineWord(index);
-    if (params.geometryPages.x != 2) return geometryPageWord(index);
-    uint4 header = geometryPageWord(0);
-    if (index < header.y || index >= header.y + header.w * header.z)
-        return geometryPageWord(index);
-    uint vertex = (index - header.y) / header.z;
-    uint field = (index - header.y) % header.z;
-    uint4 global = geometryInlineWord(0u);
-    uint count = global.x, low = 0, high = count;
-    [loop] while (low < high) {
-        uint middle = (low + high) >> 1;
-        uint4 range = geometryInlineWord(global.y + middle);
-        if (vertex >= range.x) low = middle + 1;
-        else high = middle;
-    }
-    if (low > 0) {
-        uint4 range = geometryInlineWord(global.y + low - 1);
-        if (vertex >= range.x && vertex < range.x + range.y)
-            return geometryPageWord(global.z + (range.z + vertex - range.x) * 5 + field);
-    }
-    return geometryPageWord(index);
-}
-#else
-uint4 geometryWord(uint index) { return geometryWords[index]; }
-#endif
-
-#ifndef GI_TRAVERSAL_CHECK
-[[vk::binding(29, 0)]] Texture2DArray<uint4> scenePageTexture;
-uint4 scenePageWord(uint index) {
-    uint width, height, layers;
-    scenePageTexture.GetDimensions(width, height, layers);
-    uint side = params.scenePages.y;
-    if (side == 0u || layers == 0u) return (uint4)0;
-    uint pageWords = side * side;
-    uint layer = index / pageWords;
-    if (layer >= layers) return (uint4)0;
-    uint withinPage = index % pageWords;
-    return scenePageTexture.Load(int4(withinPage % side, withinPage / side, layer, 0));
-}
-uint4 sceneInlineWord(uint index) {
+uint4 sceneWord(uint index) {
     uint words = params.wordLengths.y;
     return words == 0u ? (uint4)0 : sceneWords[min(index, words - 1u)];
 }
-uint4 sceneWord(uint index) {
-    if (params.scenePages.x == 0) return sceneInlineWord(index);
-    uint prefixWords = params.scenePages.z;
-    uint rangeCount = params.scenePages.w;
-    uint instanceBase = params.sceneOverlay.x;
-    uint dynamicInstanceWords = params.sceneOverlay.y;
-    uint staticBlasWords = params.sceneOverlay.z;
-    uint mutableBlasWords = params.sceneOverlay.w;
-    if (index < prefixWords) return sceneInlineWord(index);
-    uint nodeBase = prefixWords + rangeCount;
-    uint instanceOverlayBase = nodeBase + mutableBlasWords;
-    if (index >= instanceBase && index < instanceBase + dynamicInstanceWords)
-        return sceneInlineWord(instanceOverlayBase + index - instanceBase);
-    if (index < instanceBase) {
-        uint localWord = index - prefixWords;
-        uint low = 0, high = rangeCount;
-        [loop] while (low < high) {
-            uint middle = (low + high) >> 1;
-            uint4 range = sceneInlineWord(prefixWords + middle);
-            if (localWord >= range.x * 2) low = middle + 1;
-            else high = middle;
-        }
-        uint mutableBefore = 0;
-        if (low > 0) {
-            uint4 range = sceneInlineWord(prefixWords + low - 1);
-            uint rangeStart = range.x * 2;
-            uint rangeEnd = rangeStart + range.y * 2;
-            if (localWord < rangeEnd)
-                return sceneInlineWord(range.z + localWord - rangeStart);
-            mutableBefore = range.w + range.y;
-        }
-        return scenePageWord(localWord - mutableBefore * 2);
-    }
-    return scenePageWord(staticBlasWords + index - instanceBase - dynamicInstanceWords);
-}
-#else
-uint4 sceneWord(uint index) { return sceneWords[index]; }
-#endif
 
 uint3 triangleIndices(uint triangle, uint4 header) { return geometryWord(header.x + triangle).xyz; }
 uint3 triangleIndices(uint triangle) { return triangleIndices(triangle, geometryWord(0)); }
@@ -481,33 +384,24 @@ uint2 boundedTriangleSpan(uint first, uint count, uint4 geometry, out bool trunc
 
 // Immutable software BLAS arena, as packed by scene/wide.rs. A reference's
 // high nibble tags the bounds/leaf format; the remaining bits are local to
-// this mesh. Zero is unused, 0 is a branch, 1–8 are inline span counts, and
-// 9 denotes a full-sized span record.
+// this mesh. Zero is unused, 0 is an axis-aligned branch, 1–8 are inline span
+// counts, 9 is a full span, 10–12 are oriented branches, 13 is an indirect leaf.
 static const uint WIDE_KIND_SHIFT = 28u;
 static const uint WIDE_PAYLOAD = 0x0fffffffu;
 static const uint WIDE_INLINE_COUNT = 8u;
 static const uint WIDE_FULL_SPAN = 9u;
+static const uint WIDE_ORIENTED_XY = 10u;
+static const uint WIDE_INDIRECT_SPAN = 13u;
+static const float WIDE_RELATIVE_PAD = 9.5367431640625e-7; // 8 * f32 epsilon
+static const float WIDE_ABSOLUTE_PAD = 9.4039548065783e-38; // 8 * f32 min normal
 static const uint WIDE_RECORD_WORDS = 4u;
 static const uint WIDE_HEADER_WORDS = 2u;
+static const uint WIDE_ENHANCED = 0x80000000u;
 // The packer skips two levels of the depth-48 binary tree per wide level.
 // With four children, at most three deferred entries per level are live.
 static const uint WIDE_STACK_SIZE = 72u;
 
-uint wideSceneCapacity() {
-#ifdef GI_TRAVERSAL_CHECK
-    uint count, stride;
-    sceneWords.GetDimensions(count, stride);
-    return count;
-#else
-    if (params.scenePages.x == 0u) return params.wordLengths.y;
-    uint width, height, layers;
-    scenePageTexture.GetDimensions(width, height, layers);
-    uint side = params.scenePages.y;
-    uint pageWords = side * side * layers;
-    return params.sceneOverlay.x + params.sceneOverlay.y
-        + (pageWords - min(pageWords, params.sceneOverlay.z));
-#endif
-}
+uint wideSceneCapacity() { return params.wordLengths.y; }
 
 [ForceInline]
 float3 wideDecodeBound(float3 frameMin, float3 frameMax, float3 gridStep, uint3 bin) {
@@ -532,6 +426,70 @@ uint2 wideChildEntry(uint reference, uint shift, uint3 lower, uint3 upper,
     return uint2(0u, 0xffffffffu);
 }
 
+float3 wideProject(float3 p, uint u, uint v) {
+    precise float sum = p[u] + p[v], difference = p[v] - p[u];
+    precise float a = sum * asfloat(0x3f3504f3u);
+    precise float b = difference * asfloat(0x3f3504f3u);
+    p[u] = a;
+    p[v] = b;
+    return p;
+}
+
+// An upper bound on the time spent inside the mesh-space root. Unreliable
+// axes impose no constraint. The current hit limit is already an upper bound.
+float wideOrientedExit(float3 origin, float3 direction, BvhNode root, float limit) {
+    float exit = limit;
+    [unroll] for (uint axis = 0u; axis < 3u; ++axis) {
+        float d = direction[axis];
+        float magnitude = abs(d);
+        if (magnitude < 1.0e-30 || magnitude > 1.0e30 || !isfinite(d)) continue;
+        float endpoint = d > 0.0 ? root.maximum[axis] : root.minimum[axis];
+        float delta = endpoint - origin[axis];
+        // Inflate before division so a subnormal difference flushed to zero
+        // cannot become a significant underestimate after scaling.
+        float time = max(0.0, delta * (d > 0.0 ? 1.0 : -1.0) + WIDE_ABSOLUTE_PAD) / magnitude;
+        if (isfinite(delta) && isfinite(time))
+            exit = min(exit, time + abs(time) * WIDE_RELATIVE_PAD + WIDE_ABSOLUTE_PAD);
+    }
+    return exit;
+}
+
+uint2 wideOrientedChildEntry(uint reference, uint shift, uint3 lower, uint3 upper,
+                             float3 frameMin, float3 frameMax, float3 gridStep,
+                             float3 origin, float3 direction, float3 pad, float limit) {
+    if (reference == 0u) return uint2(0u, 0xffffffffu);
+    const uint2 keep = uint2(reference, 0u);
+    if (!all(isfinite(origin)) || !all(isfinite(direction)) || !all(isfinite(pad))) return keep;
+    float3 lo = wideDecodeBound(frameMin, frameMax, gridStep, (lower >> shift) & 255u);
+    float3 hi = wideDecodeBound(frameMin, frameMax, gridStep, (upper >> shift) & 255u);
+    // A second margin rounds expanded endpoints outwards, including large,
+    // nearly equal endpoints where adding the ray error alone could round in.
+    pad += max(abs(lo), abs(hi)) * WIDE_RELATIVE_PAD;
+    lo -= pad;
+    hi += pad;
+    if (!all(isfinite(lo)) || !all(isfinite(hi))) return keep;
+    float near = 0.0, far = limit;
+    [unroll] for (uint axis = 0u; axis < 3u; ++axis) {
+        float d = direction[axis];
+        if (d == 0.0) {
+            if (origin[axis] < lo[axis] || origin[axis] > hi[axis])
+                return uint2(0u, 0xffffffffu);
+        } else {
+            if (abs(d) < 1.0e-30 || abs(d) > 1.0e30) return keep;
+            // Expand both sides of the subtraction as well, before division.
+            float2 delta = float2(lo[axis], hi[axis]) - origin[axis];
+            if (!all(isfinite(delta))) return keep;
+            delta += float2(-WIDE_ABSOLUTE_PAD, WIDE_ABSOLUTE_PAD);
+            float2 time = delta / d;
+            if (!all(isfinite(time))) return keep;
+            float a = min(time.x, time.y), b = max(time.x, time.y);
+            near = max(near, a - abs(a) * WIDE_RELATIVE_PAD - WIDE_ABSOLUTE_PAD);
+            far = min(far, b + abs(b) * WIDE_RELATIVE_PAD + WIDE_ABSOLUTE_PAD);
+        }
+    }
+    return near <= far ? uint2(reference, asuint(near)) : uint2(0u, 0xffffffffu);
+}
+
 [ForceInline]
 void orderWideEntries(inout uint2 a, inout uint2 b) {
     if (a.y > b.y) {
@@ -541,8 +499,7 @@ void orderWideEntries(inout uint2 a, inout uint2 b) {
     }
 }
 
-// Leaf addressing is separate from bounds decoding. Noncontiguous references
-// can add a leaf kind without changing the ordinary span or triangle path.
+// Ordinary leaves use contiguous spans; indirect leaves keep their source IDs.
 bool wideLeafSpan(uint kind, uint payload, uint records, uint recordCount, out uint2 span) {
     span = uint2(payload, kind);
     if (kind <= WIDE_INLINE_COUNT) return true;
@@ -551,28 +508,14 @@ bool wideLeafSpan(uint kind, uint payload, uint records, uint recordCount, out u
     return span.y != 0u;
 }
 
-[ForceInline]
-Hit traceWideInstance(float3 origin, float3 direction, float3 worldDirection,
-                      uint instance, uint base, uint flags, uint4 geometry, uint4 geometryHeader,
-                      Hit hit, bool anyHit, bool shadow, float coneWidth, float coneSpread) {
-    uint capacity = wideSceneCapacity();
-    uint rootWord = geometry.w;
-    if (rootWord <= base || rootWord > capacity || capacity - rootWord < WIDE_HEADER_WORDS) {
-        hit.errors |= HIT_QUERY_UNSUPPORTED;
-        return hit;
-    }
-    uint4 a = sceneWord(rootWord), b = sceneWord(rootWord + 1u);
-    uint records = rootWord + WIDE_HEADER_WORDS;
-    uint recordCount = a.w;
-    uint current = b.w;
-    if (current == 0u || recordCount > (capacity - records) / WIDE_RECORD_WORDS) {
-        hit.errors |= HIT_QUERY_UNSUPPORTED;
-        return hit;
-    }
-    BvhNode root = (BvhNode)0;
-    root.minimum = asfloat(a.xyz); root.maximum = asfloat(b.xyz);
-    if (!intersectBox(origin, direction, root, hit.distance)) return hit;
-
+// Keep one wide walker per shader. Inlining separate enhanced/default walks
+// at each ray site makes the driver compile the full traversal repeatedly.
+[noinline]
+Hit traceWideRecords(
+    float3 origin, float3 direction, float3 worldDirection, BvhNode root,
+    uint records, uint recordCount, uint current,
+    uint instance, uint base, uint flags, uint4 geometry, uint4 geometryHeader,
+    Hit hit, bool anyHit, bool shadow, float coneWidth, float coneSpread) {
     TriangleRay ray = triangleRay(direction);
     uint2 stack[WIDE_STACK_SIZE];
     uint count = 0u, steps = 0u;
@@ -589,8 +532,10 @@ Hit traceWideInstance(float3 origin, float3 direction, float3 worldDirection,
         uint kind = current >> WIDE_KIND_SHIFT;
         uint payload = current & WIDE_PAYLOAD;
         current = 0u;
-        uint first = 0u, triangles = 0u;
-        if (kind == 0u) {
+        uint first = 0u, triangles = 0u, indirectAt = 0u;
+        uint4 ids = 0u;
+        bool oriented = kind - WIDE_ORIENTED_XY < 3u;
+        if (kind == 0u || oriented) {
             if (payload == 0u || payload > recordCount) {
                 hit.errors |= HIT_QUERY_UNSUPPORTED;
                 continue;
@@ -603,10 +548,27 @@ Hit traceWideInstance(float3 origin, float3 direction, float3 worldDirection,
             float3 grid = asfloat(asuint(extent) & 0xffffff00u);
             float3 gridStep = select(isfinite(grid), grid * (1.0 / 256.0), float3(0.0));
             uint3 lo = uint3(q.x, q.z, r.x), hi = uint3(q.y, q.w, r.y);
-            uint2 child0 = wideChildEntry(m.w,  0u, lo, hi, frameMin, frameMax, gridStep, origin, direction, hit.distance);
-            uint2 child1 = wideChildEntry(n.w,  8u, lo, hi, frameMin, frameMax, gridStep, origin, direction, hit.distance);
-            uint2 child2 = wideChildEntry(r.z, 16u, lo, hi, frameMin, frameMax, gridStep, origin, direction, hit.distance);
-            uint2 child3 = wideChildEntry(r.w, 24u, lo, hi, frameMin, frameMax, gridStep, origin, direction, hit.distance);
+            uint2 child0, child1, child2, child3;
+            if (!oriented) {
+                child0 = wideChildEntry(m.w,  0u, lo, hi, frameMin, frameMax, gridStep, origin, direction, hit.distance);
+                child1 = wideChildEntry(n.w,  8u, lo, hi, frameMin, frameMax, gridStep, origin, direction, hit.distance);
+                child2 = wideChildEntry(r.z, 16u, lo, hi, frameMin, frameMax, gridStep, origin, direction, hit.distance);
+                child3 = wideChildEntry(r.w, 24u, lo, hi, frameMin, frameMax, gridStep, origin, direction, hit.distance);
+            } else {
+                uint frame = kind - WIDE_ORIENTED_XY;
+                uint u = frame == 2u ? 1u : 0u, v = frame == 0u ? 1u : 2u;
+                float exit = wideOrientedExit(origin, direction, root, hit.distance);
+                float originError = WIDE_RELATIVE_PAD * max(abs(origin[u]), abs(origin[v])) + WIDE_ABSOLUTE_PAD;
+                float directionError = WIDE_RELATIVE_PAD * max(abs(direction[u]), abs(direction[v])) + WIDE_ABSOLUTE_PAD;
+                // Even the untouched axis may flush a subnormal direction.
+                float3 pad = WIDE_ABSOLUTE_PAD + exit * WIDE_ABSOLUTE_PAD;
+                pad[u] = pad[v] = originError + exit * directionError;
+                float3 o = wideProject(origin, u, v), d = wideProject(direction, u, v);
+                child0 = wideOrientedChildEntry(m.w,  0u, lo, hi, frameMin, frameMax, gridStep, o, d, pad, exit);
+                child1 = wideOrientedChildEntry(n.w,  8u, lo, hi, frameMin, frameMax, gridStep, o, d, pad, exit);
+                child2 = wideOrientedChildEntry(r.z, 16u, lo, hi, frameMin, frameMax, gridStep, o, d, pad, exit);
+                child3 = wideOrientedChildEntry(r.w, 24u, lo, hi, frameMin, frameMax, gridStep, o, d, pad, exit);
+            }
             orderWideEntries(child0, child1);
             orderWideEntries(child2, child3);
             orderWideEntries(child0, child2);
@@ -625,6 +587,18 @@ Hit traceWideInstance(float3 origin, float3 direction, float3 worldDirection,
             hit.errors |= 1u;
             first = geometry.y; triangles = geometry.z;
             count = 0u;
+        } else if (kind == WIDE_INDIRECT_SPAN) {
+            if (payload == 0u || payload > recordCount || geometry.z > 0xffffffffu - geometry.y) {
+                hit.errors |= HIT_QUERY_UNSUPPORTED;
+                continue;
+            }
+            indirectAt = records + (payload - 1u) * WIDE_RECORD_WORDS;
+            ids = sceneWord(indirectAt);
+            triangles = ids.x;
+            if (triangles == 0u || triangles > WIDE_INLINE_COUNT) {
+                hit.errors |= HIT_QUERY_UNSUPPORTED;
+                continue;
+            }
         } else {
             uint2 leaf;
             if (!wideLeafSpan(kind, payload, records, recordCount, leaf) || leaf.x > 0xffffffffu - geometry.y) {
@@ -633,10 +607,23 @@ Hit traceWideInstance(float3 origin, float3 direction, float3 worldDirection,
             }
             first = geometry.y + leaf.x; triangles = leaf.y;
         }
-        bool truncated;
-        uint2 range = boundedTriangleSpan(first, triangles, geometry, truncated);
-        if (truncated) hit.errors |= HIT_QUERY_UNSUPPORTED;
-        [loop] for (uint i = range.x; i < range.y; ++i) {
+        uint2 range = uint2(1u, triangles + 1u);
+        if (indirectAt == 0u) {
+            bool truncated;
+            range = boundedTriangleSpan(first, triangles, geometry, truncated);
+            if (truncated) hit.errors |= HIT_QUERY_UNSUPPORTED;
+        }
+        [loop] for (uint j = range.x; j < range.y; ++j) {
+            uint i = j;
+            if (indirectAt != 0u) {
+                if ((j & 3u) == 0u) ids = sceneWord(indirectAt + (j >> 2u));
+                uint source = ids[j & 3u];
+                if (source >= geometry.z) {
+                    hit.errors |= HIT_QUERY_UNSUPPORTED;
+                    continue;
+                }
+                i = geometry.y + source;
+            }
             if (shadow) {
                 if (occludedTriangle(origin, direction, ray, i, instance, flags, hit.distance, geometryHeader)) {
                     hit.triangle = i;
@@ -650,6 +637,31 @@ Hit traceWideInstance(float3 origin, float3 direction, float3 worldDirection,
         }
     }
     return hit;
+}
+
+[ForceInline]
+Hit traceWideInstance(float3 origin, float3 direction, float3 worldDirection,
+                      uint instance, uint base, uint flags, uint4 geometry, uint4 geometryHeader,
+                      Hit hit, bool anyHit, bool shadow, float coneWidth, float coneSpread) {
+    uint capacity = wideSceneCapacity();
+    uint rootWord = geometry.w;
+    if (rootWord <= base || rootWord > capacity || capacity - rootWord < WIDE_HEADER_WORDS) {
+        hit.errors |= HIT_QUERY_UNSUPPORTED;
+        return hit;
+    }
+    uint4 a = sceneWord(rootWord), b = sceneWord(rootWord + 1u);
+    uint records = rootWord + WIDE_HEADER_WORDS;
+    uint recordCount = a.w & ~WIDE_ENHANCED;
+    if (b.w == 0u || recordCount > (capacity - records) / WIDE_RECORD_WORDS) {
+        hit.errors |= HIT_QUERY_UNSUPPORTED;
+        return hit;
+    }
+    BvhNode root = (BvhNode)0;
+    root.minimum = asfloat(a.xyz); root.maximum = asfloat(b.xyz);
+    if (!intersectBox(origin, direction, root, hit.distance)) return hit;
+    return traceWideRecords(origin, direction, worldDirection, root, records, recordCount, b.w,
+                            instance, base, flags, geometry, geometryHeader,
+                            hit, anyHit, shadow, coneWidth, coneSpread);
 }
 
 Hit traceInstance(float3 origin, float3 direction, uint instance, Hit hit, bool anyHit,
@@ -743,13 +755,11 @@ Hit traceInstance(float3 origin, float3 direction, uint instance, Hit hit, bool 
     return hit;
 }
 #ifdef GI_RAY_QUERY
-// Hardware ray queries replace only the BVH walk. Every BLAS is non-opaque, so
-// each proposed triangle comes back as a candidate and is re-tested with the
-// software tests below: accepted hits keep the software distance,
-// barycentrics, culling, layer and alpha-coverage decisions. The TLAS custom
-// index is the packed instance index, and each BLAS covers that instance's
-// contiguous triangle range in order (`src/rt.rs`).
+// Geometry index is zero for an ordinary BLAS and the first local triangle
+// for a triangle cluster. Non-opaque candidates retain software hit tests.
+// Only visible, unconditionally opaque two-sided geometry can commit itself.
 [[vk::binding(50, 0)]] RaytracingAccelerationStructure sceneTlas;
+static const uint HARDWARE_OPAQUE = 4u; // params.sourceHistory.z
 
 [ForceInline]
 uint hardwareTriangle(uint instance, uint primitive, float3 origin, float3 direction,
@@ -770,17 +780,21 @@ uint hardwareTriangle(uint instance, uint primitive, float3 origin, float3 direc
 
 Hit hardwareClosestHit(float3 origin, float3 direction, Hit hit, bool anyHit,
                        float coneWidth, float coneSpread, uint4 geometryHeader) {
+    bool hasOpaque = (params.sourceHistory.z & HARDWARE_OPAQUE) != 0u;
+    if (hasOpaque && !(hit.distance > 0.000025)) return hit;
     RayDesc ray;
     ray.Origin = origin; ray.Direction = direction;
-    ray.TMin = 0.0; ray.TMax = hit.distance;
+    ray.TMin = hasOpaque ? asfloat(asuint(0.000025f) + 1u) : 0.0;
+    ray.TMax = hit.distance;
     RayQuery<RAY_FLAG_NONE> query;
     query.TraceRayInline(sceneTlas, RAY_FLAG_NONE, 0xffu, ray);
     [loop] while (query.Proceed()) {
         if (query.CandidateType() != CANDIDATE_NON_OPAQUE_TRIANGLE) continue;
         uint instance = query.CandidateInstanceID();
         uint base; uint4 record; float3 localOrigin, localDirection;
-        uint triangle = hardwareTriangle(instance, query.CandidatePrimitiveIndex(), origin,
-            direction, base, record, localOrigin, localDirection);
+        uint primitive = query.CandidateGeometryIndex() + query.CandidatePrimitiveIndex();
+        uint triangle = hardwareTriangle(instance, primitive, origin, direction,
+            base, record, localOrigin, localDirection);
         if (!instanceVisibleRecord(record)) continue;
         Hit candidate = traceTriangle(localOrigin, localDirection, triangleRay(localDirection),
             direction, coneWidth, coneSpread, triangle, instance, base, record.w,
@@ -791,27 +805,49 @@ Hit hardwareClosestHit(float3 origin, float3 direction, Hit hit, bool anyHit,
         query.CommitNonOpaqueTriangleHit();
         if (anyHit) query.Abort();
     }
+    if (hasOpaque && query.CommittedStatus() == COMMITTED_TRIANGLE_HIT) {
+        float t = query.CommittedRayT();
+        if (t > 0.000025 && t < hit.distance) {
+            uint instance = query.CommittedInstanceID();
+            uint primitive = query.CommittedGeometryIndex() + query.CommittedPrimitiveIndex();
+            uint triangle = sceneWord(instanceBase(instance) + 8).y + primitive;
+            // A committed non-opaque candidate already passed the software
+            // intersection, culling and alpha tests above. Keep its payload.
+            if (instance == hit.instance && triangle == hit.triangle) return hit;
+            float2 uv = query.CommittedTriangleBarycentrics();
+            hit.distance = t;
+            hit.instance = instance;
+            hit.triangle = triangle;
+            hit.barycentric = float3(1.0 - uv.x - uv.y, uv);
+            hit.footprint = 0;
+        }
+    }
     return hit;
 }
 
 bool hardwareOccluded(float3 origin, float3 direction, float limit, uint4 geometryHeader) {
+    bool hasOpaque = (params.sourceHistory.z & HARDWARE_OPAQUE) != 0u;
+    if (hasOpaque && !(limit > 0.000025)) return false;
     RayDesc ray;
     ray.Origin = origin; ray.Direction = direction;
-    ray.TMin = 0.0; ray.TMax = limit;
+    ray.TMin = hasOpaque ? asfloat(asuint(0.000025f) + 1u) : 0.0;
+    ray.TMax = limit;
     RayQuery<RAY_FLAG_NONE> query;
     query.TraceRayInline(sceneTlas, RAY_FLAG_NONE, 0xffu, ray);
     [loop] while (query.Proceed()) {
         if (query.CandidateType() != CANDIDATE_NON_OPAQUE_TRIANGLE) continue;
         uint instance = query.CandidateInstanceID();
         uint base; uint4 record; float3 localOrigin, localDirection;
-        uint triangle = hardwareTriangle(instance, query.CandidatePrimitiveIndex(), origin,
-            direction, base, record, localOrigin, localDirection);
+        uint primitive = query.CandidateGeometryIndex() + query.CandidatePrimitiveIndex();
+        uint triangle = hardwareTriangle(instance, primitive, origin, direction,
+            base, record, localOrigin, localDirection);
         if (!instanceVisibleRecord(record)) continue;
         if (occludedTriangle(localOrigin, localDirection, triangleRay(localDirection),
                              triangle, instance, record.w, limit, geometryHeader))
             return true;
     }
-    return false;
+    return hasOpaque && query.CommittedStatus() == COMMITTED_TRIANGLE_HIT
+        && query.CommittedRayT() > 0.000025 && query.CommittedRayT() < limit;
 }
 #endif
 Hit traceRayTracked(float3 origin, float3 direction, float limit,
@@ -1164,7 +1200,6 @@ bool traceOccluded(float3 origin, float3 direction, float limit,
 #endif
 }
 
-#ifndef GI_TRAVERSAL_CHECK
 // Deferred primary traces run hit shading twice. Recording stores each
 // visibility query instead of tracing it and answers "visible"; that answer
 // is discarded with the rest of the recording run. Queries depend only on
@@ -1211,7 +1246,6 @@ void traceVisibilityQuery(uint query) {
     heads[word + 9u].store(asuint(entry));
     heads[word + 10u].store(asuint(exit));
 }
-#endif
 
 bool traceOccludedTracked(float3 origin, float3 direction, float limit,
                           out bool querySupported, out DependencyContext dependency,
@@ -1219,7 +1253,6 @@ bool traceOccludedTracked(float3 origin, float3 direction, float limit,
     bool intersectsRoot;
     float entry, exit;
     bool blocked;
-#ifndef GI_TRAVERSAL_CHECK
     uint deferredQuery = visibilityQueries;
     if (visibilityMode != VISIBILITY_TRACE) ++visibilityQueries;
     if (visibilityMode == VISIBILITY_RECORD) {
@@ -1256,7 +1289,6 @@ bool traceOccludedTracked(float3 origin, float3 direction, float limit,
         }
     }
     if (!replayed)
-#endif
     blocked = traceOccluded(origin, direction, limit, querySupported, admissionLimit,
                             intersectsRoot, entry, exit);
     dependency = dependencyUnknown();

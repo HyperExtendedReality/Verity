@@ -21,9 +21,11 @@ pub(crate) enum Res {
     Accel(vk::AccelerationStructureKHR),
 }
 
-/// A 64x64 blue-noise tile from `build.rs`: four channels of ranks `0..4096`
-/// as u16 per texel, which the GI ray generators step each frame.
-pub(crate) const BLUE_NOISE: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/blue_noise.bin"));
+/// Shader sampling data: a 64×64 tile of four u16 ranks per texel, then Sobol columns.
+pub(crate) const SAMPLING_DATA: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/sampling_data.bin"));
+/// Blue-noise prefix for methods that do not use the Sobol sampler.
+pub(crate) const BLUE_NOISE: &[u8] = SAMPLING_DATA.split_at(64 * 64 * 8).0;
 
 pub(crate) unsafe fn write_set(
     device: &ash::Device,

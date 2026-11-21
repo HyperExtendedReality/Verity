@@ -57,19 +57,34 @@ impl fmt::Display for EncodeError {
         match *self {
             Self::NoTriangles => f.write_str("DGF1 requires at least one triangle"),
             Self::IncompleteTriangle { index_count } => {
-                write!(f, "DGF1 index count {index_count} is not a multiple of three")
+                write!(
+                    f,
+                    "DGF1 index count {index_count} is not a multiple of three"
+                )
             }
             Self::TooManyTriangles { triangle_count } => {
-                write!(f, "DGF1 triangle count {triangle_count} exceeds the 29-bit primitive index limit")
+                write!(
+                    f,
+                    "DGF1 triangle count {triangle_count} exceeds the 29-bit primitive index limit"
+                )
             }
             Self::IndexOutOfBounds { primitive, vertex } => {
-                write!(f, "DGF1 triangle {primitive} references missing vertex {vertex}")
+                write!(
+                    f,
+                    "DGF1 triangle {primitive} references missing vertex {vertex}"
+                )
             }
             Self::NonFinitePosition { vertex, axis } => {
-                write!(f, "DGF1 vertex {vertex} has a non-finite coordinate on axis {axis}")
+                write!(
+                    f,
+                    "DGF1 vertex {vertex} has a non-finite coordinate on axis {axis}"
+                )
             }
             Self::Inexact { primitive } => {
-                write!(f, "DGF1 cannot encode triangle {primitive} with exact coordinates")
+                write!(
+                    f,
+                    "DGF1 cannot encode triangle {primitive} with exact coordinates"
+                )
             }
         }
     }
@@ -90,15 +105,21 @@ impl std::error::Error for EncodeError {}
 /// coordinates DGF1 cannot represent exactly. Splits a block when the next
 /// triangle doesn't fit, but errors if that triangle cannot fit on its own.
 /// Unreferenced positions are not inspected.
-pub(crate) fn encode_exact(positions: &[[f32; 3]], indices: &[u32]) -> Result<DgfMesh, EncodeError> {
-    let mut triangles = indices.chunks_exact(3);
-    if !triangles.remainder().is_empty() {
-        return Err(EncodeError::IncompleteTriangle { index_count: indices.len() });
+pub(crate) fn encode_exact(
+    positions: &[[f32; 3]],
+    indices: &[u32],
+) -> Result<DgfMesh, EncodeError> {
+    let (triangles, remainder) = indices.as_chunks::<3>();
+    if !remainder.is_empty() {
+        return Err(EncodeError::IncompleteTriangle {
+            index_count: indices.len(),
+        });
     }
     let triangle_count = triangles.len();
     if triangle_count > MAX_PRIMITIVE_INDEX as usize + 1 {
         return Err(EncodeError::TooManyTriangles { triangle_count });
     }
+    let mut triangles = triangles.iter();
     let first = triangles.next().ok_or(EncodeError::NoTriangles)?;
     let mut block = BlockDraft::new(0, positions, first)?;
     let mut blocks = Vec::with_capacity(triangle_count.div_ceil(MAX_TRIANGLES));
@@ -130,7 +151,11 @@ struct GridBounds {
 
 impl GridBounds {
     fn empty() -> Self {
-        Self { min: [f32::INFINITY; 3], max: [f32::NEG_INFINITY; 3], exponent: MAX_EXPONENT }
+        Self {
+            min: [f32::INFINITY; 3],
+            max: [f32::NEG_INFINITY; 3],
+            exponent: MAX_EXPONENT,
+        }
     }
 
     fn include(
@@ -194,7 +219,11 @@ impl GridBounds {
             *axis_width += extra;
             padding -= extra;
         }
-        Some(Quantization { exponent: self.exponent, anchor, widths })
+        Some(Quantization {
+            exponent: self.exponent,
+            anchor,
+            widths,
+        })
     }
 }
 
@@ -228,7 +257,9 @@ impl BlockDraft {
         for &vertex in triangle {
             bounds.include(primitive, vertex, positions)?;
         }
-        let quantization = bounds.quantization().ok_or(EncodeError::Inexact { primitive })?;
+        let quantization = bounds
+            .quantization()
+            .ok_or(EncodeError::Inexact { primitive })?;
         // The first triangle implicitly references 0, 1, 2. A repeated source
         // index here gets its own identical vertex slot to preserve the corner.
         let mut source_indices = [0; MAX_VERTICES];
@@ -262,7 +293,10 @@ impl BlockDraft {
         let mut max_reused_index = self.max_reused_index;
         let mut local_indices = [0; 3];
         for (&vertex, local) in triangle.iter().zip(&mut local_indices) {
-            if let Some(slot) = self.source_indices[..num_vertices].iter().position(|&x| x == vertex) {
+            if let Some(slot) = self.source_indices[..num_vertices]
+                .iter()
+                .position(|&x| x == vertex)
+            {
                 *local = slot as u8;
                 max_reused_index = max_reused_index.max(*local);
             } else {
@@ -284,7 +318,8 @@ impl BlockDraft {
             return Ok(false);
         };
         let vertex_bits = (num_vertices * quantization.vertex_bits()).next_multiple_of(8);
-        let reuse_bits = (3 * num_triangles - num_vertices) * bits_needed(u32::from(max_reused_index));
+        let reuse_bits =
+            (3 * num_triangles - num_vertices) * bits_needed(u32::from(max_reused_index));
         if vertex_bits > MAX_FRONT_BITS
             || reuse_bits > MAX_REUSE_BITS
             || HEADER_BITS + vertex_bits + reuse_bits > first_index_start(num_triangles)
@@ -303,20 +338,26 @@ impl BlockDraft {
 
     fn finish(&self, positions: &[[f32; 3]]) -> [u8; BLOCK_SIZE] {
         let mut block = [0; BLOCK_SIZE];
-        let Quantization { exponent, anchor, widths } = self.quantization;
+        let Quantization {
+            exponent,
+            anchor,
+            widths,
+        } = self.quantization;
         let index_bits = bits_needed(u32::from(self.max_reused_index));
         // Counts and component widths are stored minus one. The zero GeomID
         // metadata, palette mode, and OMM count select non-opaque geometry 0.
         let header = [
-            MAGIC | ((index_bits as u32 - MIN_INDEX_BITS as u32) << 8)
-                | ((self.num_vertices as u32 - 1) << 10) | ((self.num_triangles as u32 - 1) << 16),
+            MAGIC
+                | ((index_bits as u32 - MIN_INDEX_BITS as u32) << 8)
+                | ((self.num_vertices as u32 - 1) << 10)
+                | ((self.num_triangles as u32 - 1) << 16),
             ((anchor[0] as u32) << 8) | u32::from(exponent),
             ((anchor[1] as u32) << 8) | ((widths[1] as u32 - 1) << 4) | (widths[0] as u32 - 1),
             ((anchor[2] as u32) << 8) | (widths[2] as u32 - 1),
             self.primitive_base,
         ];
-        for (word, dst) in header.into_iter().zip(block.chunks_exact_mut(4)) {
-            dst.copy_from_slice(&word.to_le_bytes());
+        for (word, dst) in header.into_iter().zip(block.as_chunks_mut::<4>().0) {
+            *dst = word.to_le_bytes();
         }
 
         let inverse_scale = inverse_scale(exponent);
@@ -483,7 +524,11 @@ mod tests {
         if next_vertex != num_vertices || reuse_bit != index_end {
             return None;
         }
-        Some(DecodedBlock { primitive_base, positions, triangles })
+        Some(DecodedBlock {
+            primitive_base,
+            positions,
+            triangles,
+        })
     }
 
     fn assert_round_trip(
@@ -519,7 +564,12 @@ mod tests {
 
     #[test]
     fn matches_the_dgf1_layout_for_signed_anchor_and_mixed_first_indices() {
-        let positions = [[-1.0, 0.0, 0.0], [0.0; 3], [-1.0, 1.0, 0.0], [0.0, 1.0, 0.0]];
+        let positions = [
+            [-1.0, 0.0, 0.0],
+            [0.0; 3],
+            [-1.0, 1.0, 0.0],
+            [0.0, 1.0, 0.0],
+        ];
         let indices = [0, 1, 2, 2, 1, 3];
         let mesh = encode_exact(&positions, &indices).expect("integer square");
         // Manually specified from the layout: anchor [-1, 0, 0], exponent 127,
@@ -527,8 +577,8 @@ mod tests {
         // triangle is RESTART with first flags [0, 0, 1] and reuse entries [2, 1].
         let mut expected = [0; 128];
         expected[..23].copy_from_slice(&[
-            0x06, 0x0c, 0x01, 0x00, 0x7f, 0xff, 0xff, 0xff, 0x01, 0x00, 0x00, 0x00,
-            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x10, 0x54, 0x0a,
+            0x06, 0x0c, 0x01, 0x00, 0x7f, 0xff, 0xff, 0xff, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x10, 0x54, 0x0a,
         ]);
         expected[127] = 0x08;
         assert_eq!(mesh.blocks, [expected]);
@@ -607,7 +657,8 @@ mod tests {
             [8454142.0, -8388608.0, 1.0],
             [8454140.0, -8388607.0, 0.0],
         ];
-        let mesh = encode_exact(&positions, &indices).expect("positive fixed points beyond anchor range");
+        let mesh =
+            encode_exact(&positions, &indices).expect("positive fixed points beyond anchor range");
         assert_round_trip(&mesh, &positions, &indices, &[1]);
         assert_eq!(read_bits(&mesh.blocks[0], 40, 24), 0x7f_ffff);
         assert_eq!(read_bits(&mesh.blocks[0], 72, 24), 0x80_0000);
@@ -617,7 +668,8 @@ mod tests {
             (f32::from_bits(232 << 23), f32::from_bits(0x7f7f_fffe), 232),
         ] {
             let positions = [[bound, 0.0, 0.0], [bound, unit, 0.0], [bound, 0.0, unit]];
-            let mesh = encode_exact(&positions, &indices).expect("legal endpoint of exponent range");
+            let mesh =
+                encode_exact(&positions, &indices).expect("legal endpoint of exponent range");
             assert_round_trip(&mesh, &positions, &indices, &[1]);
             assert_eq!(mesh.blocks[0][4], exponent);
         }
@@ -627,23 +679,36 @@ mod tests {
     fn preserves_repeated_corners_and_rejects_invalid_inputs() {
         let positions = [[0.0; 3], [1.0, 0.0, 0.0], [f32::NAN; 3]];
         let indices = [0, 0, 1, 1, 1, 0];
-        let mesh = encode_exact(&positions, &indices).expect("unreferenced positions do not matter");
+        let mesh =
+            encode_exact(&positions, &indices).expect("unreferenced positions do not matter");
         assert_round_trip(&mesh, &positions, &indices, &[2]);
         assert_eq!(mesh.num_vertices, 3);
-        assert_eq!(encode_exact(&positions, &[]).unwrap_err(), EncodeError::NoTriangles);
+        assert_eq!(
+            encode_exact(&positions, &[]).unwrap_err(),
+            EncodeError::NoTriangles
+        );
         assert_eq!(
             encode_exact(&positions, &[0, 1]).unwrap_err(),
             EncodeError::IncompleteTriangle { index_count: 2 }
         );
         assert_eq!(
             encode_exact(&positions, &[0, 1, 3]).unwrap_err(),
-            EncodeError::IndexOutOfBounds { primitive: 0, vertex: 3 }
+            EncodeError::IndexOutOfBounds {
+                primitive: 0,
+                vertex: 3
+            }
         );
         assert_eq!(
             encode_exact(&positions, &[0, 1, 2]).unwrap_err(),
             EncodeError::NonFinitePosition { vertex: 2, axis: 0 }
         );
-        for invalid in [-0.0, f32::from_bits(1), f32::from_bits(0x0080_0001), f32::MAX, 0.1] {
+        for invalid in [
+            -0.0,
+            f32::from_bits(1),
+            f32::from_bits(0x0080_0001),
+            f32::MAX,
+            0.1,
+        ] {
             let positions = [[0.0; 3], [1.0, 0.0, 0.0], [0.0, invalid, 0.0]];
             assert_eq!(
                 encode_exact(&positions, &[0, 1, 2]).unwrap_err(),
@@ -658,14 +723,17 @@ mod tests {
         let positions = [[0.0; 3], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]];
         let mesh = encode_exact(&positions, &[0, 1, 2, 2, 1, 0]).expect("valid triangles");
         for (byte, mask) in [
-            (21, 0x10), // Nonzero vertex padding.
-            (22, 0x07), // Reuse index 7 before its first use.
+            (21, 0x10),  // Nonzero vertex padding.
+            (22, 0x07),  // Reuse index 7 before its first use.
             (127, 0x80), // A non-RESTART control.
             (127, 0x20), // Too many first-use references.
         ] {
             let mut block = mesh.blocks[0];
             block[byte] |= mask;
-            assert!(decode_restart_block(&block).is_none(), "byte {byte}, mask {mask}");
+            assert!(
+                decode_restart_block(&block).is_none(),
+                "byte {byte}, mask {mask}"
+            );
         }
     }
 }

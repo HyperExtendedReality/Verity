@@ -48,10 +48,21 @@ pub(super) struct OrientedChildren {
 /// `child_spans` indexes triangles in `corners` and must match `child_bounds`
 /// in length and lane order. Returns `None` if a frame would not improve the
 /// area proxy enough or if coordinates cannot be projected safely.
+#[cfg(test)]
 pub(super) fn choose(
     corners: &[[Vec3; 3]],
     child_spans: &[Range<usize>],
     child_bounds: &[(Vec3, Vec3)],
+) -> Option<OrientedChildren> {
+    choose_indexed(corners, &[], child_spans, child_bounds)
+}
+
+/// Selects bounds over direct spans or indirect mesh-relative references.
+pub(super) fn choose_indexed(
+    corners: &[[Vec3; 3]],
+    references: &[u32],
+    child_spans: &[Range<usize>],
+    child_bounds: &[Bounds],
 ) -> Option<OrientedChildren> {
     let len = child_spans.len();
     if len == 0 || len > LANES || len != child_bounds.len() {
@@ -72,22 +83,29 @@ pub(super) fn choose(
     let mut candidates = [[EMPTY; LANES]; PLANES.len()];
     let mut costs = [0.0; PLANES.len()];
     for (lane, span) in child_spans.iter().enumerate() {
-        let triangles = corners.get(span.clone())?;
-        if triangles.is_empty() {
+        if span.is_empty() {
             return None;
         }
 
         let mut bounds = [EMPTY; PLANES.len()];
         let mut magnitude = Vec3::ZERO;
-        for &corner in triangles.iter().flatten() {
-            let abs = corner.abs();
-            if !corner.is_finite() || abs.max_element() > MAX_CORNER {
-                return None;
-            }
-            magnitude = magnitude.max(abs);
-            for ((min, max), point) in bounds.iter_mut().zip(project_unscaled(corner)) {
-                *min = min.min(point);
-                *max = max.max(point);
+        for index in span.clone() {
+            // Full source triangles also enclose the clipped spatial fragments.
+            let source = if references.is_empty() {
+                index
+            } else {
+                *references.get(index)? as usize
+            };
+            for &corner in corners.get(source)? {
+                let abs = corner.abs();
+                if !corner.is_finite() || abs.max_element() > MAX_CORNER {
+                    return None;
+                }
+                magnitude = magnitude.max(abs);
+                for ((min, max), point) in bounds.iter_mut().zip(project_unscaled(corner)) {
+                    *min = min.min(point);
+                    *max = max.max(point);
+                }
             }
         }
 
@@ -142,6 +160,74 @@ fn half_area((min, max): Bounds) -> f64 {
 }
 
 #[cfg(test)]
+pub(super) fn packed_entry(
+    frame: u32,
+    (min, max): Bounds,
+    (root_min, root_max): Bounds,
+    origin: Vec3,
+    direction: Vec3,
+    limit: f32,
+) -> Option<f32> {
+    let mut exit = limit;
+    for axis in 0..3 {
+        let d = direction[axis];
+        if !(1.0e-30..=1.0e30).contains(&d.abs()) {
+            continue;
+        }
+        let endpoint = if d > 0.0 {
+            root_max[axis]
+        } else {
+            root_min[axis]
+        };
+        let delta = endpoint - origin[axis];
+        let time = ((delta * d.signum() + ABSOLUTE_PAD).max(0.0)) / d.abs();
+        if delta.is_finite() && time.is_finite() {
+            exit = exit.min(time + rounding_pad(time.abs()));
+        }
+    }
+    let frame = frame as usize;
+    let [u, v] = PLANES[frame];
+    let error = |p: Vec3| rounding_pad(p[u].abs().max(p[v].abs()));
+    let mut pad = Vec3::splat(ABSOLUTE_PAD + exit * ABSOLUTE_PAD);
+    pad[u] = error(origin) + exit * error(direction);
+    pad[v] = pad[u];
+    let project = |p| {
+        let mut q = project_unscaled(p)[frame];
+        q[u] *= SCALE;
+        q[v] *= SCALE;
+        q
+    };
+    let (o, d) = (project(origin), project(direction));
+    pad += min.abs().max(max.abs()) * RELATIVE_PAD;
+    let (lo, hi) = (min - pad, max + pad);
+    if [o, d, pad, lo, hi].into_iter().any(|p| !p.is_finite()) {
+        return Some(0.0);
+    }
+    let mut near = 0.0_f32;
+    let mut far = exit;
+    for axis in 0..3 {
+        if d[axis] == 0.0 {
+            if !(lo[axis]..=hi[axis]).contains(&o[axis]) {
+                return None;
+            }
+        } else {
+            if !(1.0e-30..=1.0e30).contains(&d[axis].abs()) {
+                return Some(0.0);
+            }
+            let a = ((lo[axis] - o[axis]) - ABSOLUTE_PAD) / d[axis];
+            let b = ((hi[axis] - o[axis]) + ABSOLUTE_PAD) / d[axis];
+            if !a.is_finite() || !b.is_finite() {
+                return Some(0.0);
+            }
+            let (a, b) = (a.min(b), a.max(b));
+            near = near.max(a - rounding_pad(a.abs()));
+            far = far.min(b + rounding_pad(b.abs()));
+        }
+    }
+    (near <= far).then_some(near)
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -193,19 +279,13 @@ mod tests {
 
     #[test]
     fn extreme_corners_keep_the_unrotated_test() {
-        let a = [Vec3::ZERO, Vec3::splat(f32::MAX / 2.0), Vec3::new(f32::MAX / 2.0, 1.0, 2.0)];
+        let a = [
+            Vec3::ZERO,
+            Vec3::splat(f32::MAX / 2.0),
+            Vec3::new(f32::MAX / 2.0, 1.0, 2.0),
+        ];
         let corners = [a, a.map(|p| -p)];
         assert!(choose(&corners, &[0..1, 1..2], &corners.map(aabb)).is_none());
-    }
-
-    // This mirrors the shader arithmetic rather than calling `project`, so it
-    // also checks frame numbering and projection slots against the packed data.
-    fn shader_transform(mut p: Vec3, [u, v]: [usize; 2]) -> Vec3 {
-        let (a, b) = (p[u], p[v]);
-        let s = f32::from_bits(0x3f35_04f3);
-        p[u] = (a + b) * s;
-        p[v] = (b - a) * s;
-        p
     }
 
     #[test]
@@ -226,8 +306,9 @@ mod tests {
                 let corners = diagonal_children(frame, translation);
                 let oriented = choose(&corners, &[0..1, 1..2], &corners.map(aabb))
                     .expect("translated geometry still benefits from rotation");
-                let plane @ [u, v] = PLANES[oriented.frame as usize];
+                let [u, v] = PLANES[oriented.frame as usize];
                 for ([a, b, c], bounds) in corners.into_iter().zip(oriented.bounds) {
+                    let root = aabb([a, b, c]);
                     let edge = a + (b - a) * 0.5;
                     let inside = edge + (c - a) * 0.25;
                     for hit in [a, b, c, edge, inside] {
@@ -246,7 +327,12 @@ mod tests {
                                 origin.as_dvec3() + direction.as_dvec3() * f64::from(t),
                                 hit.as_dvec3()
                             );
-                            assert_hit_survives(bounds, plane, origin, direction, t);
+                            let entry =
+                                packed_entry(oriented.frame, bounds, root, origin, direction, t);
+                            assert!(
+                                entry.is_some_and(|entry| entry <= t),
+                                "projected slabs rejected {origin:?} + {t} * {direction:?}",
+                            );
                         }
                     }
                 }
@@ -254,40 +340,19 @@ mod tests {
         }
     }
 
-    fn assert_hit_survives(
-        (min, max): Bounds,
-        plane @ [u, v]: [usize; 2],
-        origin: Vec3,
-        direction: Vec3,
-        t: f32,
-    ) {
-        let o = shader_transform(origin, plane);
-        let d = shader_transform(direction, plane);
-        let pad = rounding_pad(origin[u].abs().max(origin[v].abs()))
-            + t * rounding_pad(direction[u].abs().max(direction[v].abs()));
-        let mut near: f32 = 0.0;
-        let mut far = t;
-        for axis in 0..3 {
-            let pad = if axis == u || axis == v { pad } else { 0.0 };
-            let lo = min[axis] - pad;
-            let hi = max[axis] + pad;
-            if d[axis] == 0.0 {
-                assert!(
-                    (lo..=hi).contains(&o[axis]),
-                    "parallel slab {axis} rejected {origin:?} + {t} * {direction:?}"
-                );
-            } else {
-                let inverse = d[axis].recip();
-                let entry = (lo - o[axis]) * inverse;
-                let exit = (hi - o[axis]) * inverse;
-                let last = entry.max(exit);
-                near = near.max(entry.min(exit));
-                far = far.min(last + last.abs() * (3.0 * f32::EPSILON));
-            }
+    #[test]
+    fn unsafe_ray_arithmetic_keeps_children_at_entry_zero() {
+        let bounds = (Vec3::ZERO, Vec3::ONE);
+        let root = (Vec3::splat(-f32::MAX), Vec3::splat(f32::MAX));
+        for (origin, direction, limit) in [
+            (Vec3::splat(f32::MAX), Vec3::NEG_Z, 4.0),
+            (Vec3::ZERO, Vec3::splat(1.0e-32), 4.0),
+            (Vec3::ZERO, Vec3::splat(1.0e-32), f32::INFINITY),
+        ] {
+            assert_eq!(
+                packed_entry(0, bounds, root, origin, direction, limit),
+                Some(0.0)
+            );
         }
-        assert!(
-            near <= t && t <= far,
-            "projected slabs rejected {origin:?} + {t} * {direction:?}: {near}..={far}"
-        );
     }
 }

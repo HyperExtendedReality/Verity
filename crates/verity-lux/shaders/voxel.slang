@@ -89,6 +89,7 @@ int levelAt(float3 p) {
 
 #include "voxel_sdf.slang"
 #include "voxel_roma.slang"
+#include "voxel_sparse.slang"
 
 float3 voxelNormalBytes(uint packed) {
     return float3(int3(int(packed << 24u), int(packed << 16u), int(packed << 8u)) >> 24);
@@ -142,6 +143,9 @@ uint walk(float3 o, float3 d, float reach) {
     float3 delta = abs(inv);
     int3 step = select(d >= 0.0, int3(1), int3(-1));
     int size = gridSize();
+    // f.reflection.x carries VoxelStorage in this method; origin.w is bounce links.
+    uint storage = uint(f.reflection.x);
+    bool skipBricks = storage != 0u || f.extra.w != 0.0;
     float travelled = 0.0;
     // Rays start beside a surface, which at this size can be inside the next
     // voxel over. Solid cells before the first empty one don't stop them.
@@ -162,11 +166,18 @@ uint walk(float3 o, float3 d, float reach) {
         int3 tried = int3(0x7fffffff);
         [loop] for (; i < MAX_VOXEL_STEPS;) {
             int3 world = c + low;
-            if (f.extra.w != 0.0) {
+            if (skipBricks) {
                 int3 brick = world >> 2;
                 if (any(brick != tried)) {
                     tried = brick;
-                    if (cells[brickIndex(l, brick)] == 0u) {
+                    bool empty;
+                    if (storage == 0u) {
+                        empty = cells[brickIndex(l, brick)] == 0u;
+                    } else {
+                        // Unpublished or stale sparse occupancy never authorizes a hop.
+                        empty = voxelSparseWorldBrickEmpty(storage, l, c);
+                    }
+                    if (empty) {
                         if (hopBrick(world, step, delta, end, size, c, next, t, i)) {
                             clear = true;
                             continue;
@@ -228,7 +239,8 @@ float3 voxelSeen(uint found, float3 d) {
 
 // The start of the renderer's `Globals` (lib/common.slang), through its sun
 // shadow cascades, and its shadow map: set 2 is the renderer's frame set.
-static const uint SHADOW_CASCADES = 4u;
+// Mirrors `scene::CASCADES` in verity-render; splits and texels pack four to a float4.
+static const uint SHADOW_CASCADES = 8u;
 struct RenderGlobals {
     float4x4 viewProj;
     float4x4 view;
@@ -241,8 +253,8 @@ struct RenderGlobals {
     float4 sunColor;
     float4x4 previousViewProj;
     float4x4 shadowViewProj[SHADOW_CASCADES];
-    float4 shadowSplits;
-    float4 shadowTexels;
+    float4 shadowSplits[SHADOW_CASCADES / 4u];
+    float4 shadowTexels[SHADOW_CASCADES / 4u];
     float4 sky; // w: sun shadows on
 };
 [[vk::binding(0, MATERIAL_SET)]] ConstantBuffer<RenderGlobals> renderGlobals;
@@ -259,7 +271,7 @@ float sunVisible(float3 x, float3 n, float3 o, float cell) {
         // The face, not the centre, which can sit under the surface it holds.
         float3 face = x + n * (0.5 * cell);
         [loop] for (uint c = 0u; c < SHADOW_CASCADES; c++) {
-            float3 biased = face + n * renderGlobals.shadowTexels[c] * 1.5;
+            float3 biased = face + n * renderGlobals.shadowTexels[c >> 2u][c & 3u] * 1.5;
             float4 clip = mul(renderGlobals.shadowViewProj[c], float4(biased, 1.0));
             float3 ndc = clip.xyz / clip.w;
             if (all(abs(ndc.xy) < 0.98) && ndc.z > 0.0 && ndc.z < 1.0)

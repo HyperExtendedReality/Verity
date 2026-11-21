@@ -431,7 +431,7 @@ impl Sah {
                 right_cost[i] = right.cost();
             }
             let mut left = Bin::EMPTY;
-            for plane in 1..self.bins {
+            for (plane, &suffix_cost) in right_cost[..self.bins].iter().enumerate().skip(1) {
                 let bin = bucket(axis, plane - 1);
                 if bin.count == 0 {
                     continue;
@@ -441,7 +441,7 @@ impl Sah {
                 if right_count == 0 {
                     break;
                 }
-                let cost = left.cost() + right_cost[plane];
+                let cost = left.cost() + suffix_cost;
                 let imbalance = left.count.abs_diff(right_count);
                 if best
                     .is_none_or(|(old, diff, _, _)| cost < old || (cost == old && imbalance < diff))

@@ -11,9 +11,6 @@
 //! To add a method, implement [`GiMethod`], add a [`Method`] variant and a registry
 //! entry, and give it a `LightingMethod` so scenes can name it. GI follows terrain through
 //! `RenderExtension::retained_changed`.
-//!
-//! `legacy/` keeps the original Bevy source of the cascades as a porting
-//! reference; it is not compiled.
 
 pub mod cage;
 pub mod cascades;
@@ -22,6 +19,7 @@ pub mod pxtgi;
 mod pxtgi_accel;
 mod rt;
 mod shared;
+pub mod tier;
 pub mod voxel;
 
 use cascades::{
@@ -33,6 +31,7 @@ use std::{
     any::Any,
     time::{Duration, Instant},
 };
+use tier::HardwareProfile;
 use verity_core::{LightingMethod, World};
 use verity_physics::PhysicsWorld;
 use verity_render::{
@@ -135,6 +134,14 @@ pub const METHODS: &[MethodInfo] = &[
         about: "The voxel copy's settled light, corrected where rays along the depth buffer see it differ.",
         // shortcut: shares ScreenVoxel's passes, flagged by settings; a variant of its own when it needs its own.
         method: || Method::ScreenVoxel(ScreenVoxelSettings::residual()),
+    },
+    MethodInfo {
+        lighting: LightingMethod::HardwareGi,
+        name: "GI for this GPU",
+        about: "Split GI with hardware rays on ray-tracing GPUs, its own BVH on other desktop GPUs, screen and voxel GI on mobile and low-memory GPUs.",
+        // `Lux::for_lighting` replaces this with the GPU's recommendation once
+        // it sees the device; see `Lux::for_hardware`.
+        method: || Method::SplitRadianceCascades(Settings::default()),
     },
 ];
 
@@ -275,6 +282,10 @@ pub fn method_info(lighting: LightingMethod) -> Option<&'static MethodInfo> {
 /// the geometry it should light.
 pub struct Lux {
     method: Box<dyn GiMethod>,
+    /// The device's profile, from the first hook that lends Lux the GPU.
+    hardware: Option<HardwareProfile>,
+    /// Replace `method` with the profile's recommendation once it is known.
+    adapt: bool,
 }
 
 impl Lux {
@@ -286,11 +297,56 @@ impl Lux {
             Method::Pxtgi(settings) => Box::new(Pxtgi::new(settings)),
             Method::ScreenVoxel(settings) => Box::new(ScreenVoxel::new(settings)),
         };
-        Self { method }
+        Self {
+            method,
+            hardware: None,
+            adapt: false,
+        }
+    }
+
+    /// GI chosen for the GPU it runs on: Split Radiance Cascades with
+    /// hardware rays on RTX and RDNA GPUs, the software BVH on other desktop
+    /// GPUs, and screen and voxel GI on mobile and low-memory GPUs. See
+    /// [`HardwareProfile::recommended_method`].
+    ///
+    /// The method is picked when the renderer first lends Lux the GPU, before
+    /// any geometry reaches it; [`Lux::hardware_profile`] says which.
+    pub fn for_hardware() -> Self {
+        Self {
+            adapt: true,
+            ..Self::new(Method::SplitRadianceCascades(Settings::default()))
+        }
+    }
+
+    /// The GPU's tier and acceleration choices, once the renderer has lent
+    /// Lux the GPU (after `Renderer::set_extension`).
+    pub fn hardware_profile(&self) -> Option<HardwareProfile> {
+        self.hardware
+    }
+
+    /// Detect the profile on the first GPU hook and, for
+    /// [`Lux::for_hardware`], start the method it recommends.
+    fn see_gpu(&mut self, gpu: &Gpu) {
+        if self.hardware.is_some() {
+            return;
+        }
+        let profile = HardwareProfile::detect(gpu);
+        if std::env::var_os("VERITY_LUX_ACCEL_DIAGNOSTICS").is_some_and(|value| value == "1") {
+            eprintln!("Lux hardware profile: {profile:?}");
+        }
+        self.hardware = Some(profile);
+        if self.adapt {
+            // The placeholder has not seen the GPU yet, so it owns nothing to destroy.
+            self.method = Self::new(profile.recommended_method()).method;
+        }
     }
 
     /// Lux for a scene's lighting, if it uses GI.
+    /// [`LightingMethod::HardwareGi`] gives [`Lux::for_hardware`].
     pub fn for_lighting(lighting: LightingMethod) -> Option<Self> {
+        if lighting == LightingMethod::HardwareGi {
+            return Some(Self::for_hardware());
+        }
         method_info(lighting).map(|info| Self::new((info.method)()))
     }
 
@@ -338,8 +394,17 @@ impl Lux {
         self.method.as_any_mut().downcast_mut()
     }
 
-    /// The method's status in a line, for showing to a person.
+    /// The method's status in a line, for showing to a person. GI chosen for
+    /// the GPU also names the tier it chose for.
     pub fn status_line(&self) -> String {
+        let line = self.method_status_line();
+        match self.hardware.filter(|_| self.adapt) {
+            Some(profile) => format!("{line} · {}", profile.describe()),
+            None => line,
+        }
+    }
+
+    fn method_status_line(&self) -> String {
         match self.status() {
             GiStatus::Compiling { since } => format!(
                 "GI compiling pipelines… {}s (hemisphere until ready)",
@@ -362,6 +427,7 @@ impl RenderExtension for Lux {
         material_base: u32,
         draw_base: u32,
     ) -> Result<()> {
+        self.see_gpu(gpu);
         (self.method).scene_loaded(gpu, scene, material_base, draw_base)
     }
 
@@ -371,14 +437,17 @@ impl RenderExtension for Lux {
         changes: &[RetainedChange],
         material: u32,
     ) -> Result<()> {
+        self.see_gpu(gpu);
         self.method.retained_changed(gpu, changes, material)
     }
 
     fn targets_changed(&mut self, gpu: &mut Gpu, targets: &Targets) -> Result<()> {
+        self.see_gpu(gpu);
         self.method.targets_changed(gpu, targets)
     }
 
     fn prepare(&mut self, gpu: &mut Gpu, viewport: [u32; 4]) -> Result<()> {
+        self.see_gpu(gpu);
         self.method.prepare(gpu, viewport)
     }
 

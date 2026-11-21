@@ -63,6 +63,12 @@ const VOXEL_ENTRIES: &[&str] = &[
     "voxelSdfY",
     "voxelSdfZ",
     "romaBuild",
+    "voxelSparseReset",
+    "voxelSparseHashClear",
+    "voxelSparseHashBuild",
+    "voxelSparseDagPrepare",
+    "voxelSparseDagIntern",
+    "voxelSparsePublish",
     "inject",
     "trace",
     "temporal",
@@ -119,15 +125,23 @@ fn main() {
                     .map(|&(file, entry, ray_query)| {
                         let (compiler, library, out) = (&compiler, &library, &out);
                         scope.spawn(move || {
+                            let mut defines = Vec::new();
+                            if ray_query {
+                                defines.push("GI_RAY_QUERY".into());
+                            }
+                            if file == "cascades" {
+                                // The Rust Split renderer uses the procedural sky and primary view.
+                                defines.push("GI_NATIVE_CASCADES".into());
+                            }
                             let settings = SlangSettings {
                                 entry_points: vec![entry.into()],
                                 stage: Some(SlangStage::Compute),
                                 include_paths: vec![library.clone()],
-                                defines: if ray_query {
-                                    vec!["GI_RAY_QUERY".into()]
-                                } else {
-                                    Vec::new()
-                                },
+                                // Slang's -O2 runs spirv-opt: the inlined
+                                // transport passes shrink to under half, which
+                                // the driver then has less to compile.
+                                optimization: Some(2),
+                                defines,
                                 ..SlangSettings::default()
                             };
                             let shader = compiler
@@ -151,15 +165,14 @@ fn main() {
     if !failures.is_empty() {
         panic!("slangc failed:\n{}", failures.join("\n"));
     }
-    write_blue_noise(&out.join("blue_noise.bin"));
+    write_sampling_data(&out.join("sampling_data.bin"));
 }
 
 /// Side of the blue-noise tile the GI ray generators index by `pixel & 63`.
 const NOISE: usize = 64;
 
-/// Four independent blue-noise channels, ranks `0..4096` as little-endian u16,
-/// interleaved per texel.
-fn write_blue_noise(path: &std::path::Path) {
+/// Interleaved little-endian blue-noise ranks, followed by Split's Sobol columns.
+fn write_sampling_data(path: &std::path::Path) {
     let n = NOISE * NOISE;
     let channels: Vec<Vec<u16>> = (1..=4).map(rank_channel).collect();
     for (c, ranks) in channels.iter().enumerate() {
@@ -186,10 +199,34 @@ fn write_blue_noise(path: &std::path::Path) {
             "blue noise channel {c}: neighbour difference {diff:.3} is white"
         );
     }
-    let bytes: Vec<u8> = (0..n)
-        .flat_map(|i| channels.iter().map(move |c| c[i]))
-        .flat_map(u16::to_le_bytes)
-        .collect();
+    const SOBOL_COLUMNS: usize = 33 * 5 * 32;
+    let mut bytes = Vec::with_capacity(n * 8 + SOBOL_COLUMNS * 4);
+    bytes.extend(
+        (0..n)
+            .flat_map(|i| channels.iter().map(move |c| c[i]))
+            .flat_map(u16::to_le_bytes),
+    );
+    let words = include_str!("shaders/nile_sobol.txt")
+        .lines()
+        .flat_map(|line| {
+            line.split("//")
+                .next()
+                .unwrap_or_default()
+                .split_whitespace()
+        });
+    for word in words {
+        let digits = word
+            .strip_prefix("0x")
+            .and_then(|s| s.strip_suffix("u,"))
+            .expect("expected hexadecimal Sobol direction column");
+        let value = u32::from_str_radix(digits, 16).expect("invalid Sobol direction column");
+        bytes.extend(value.to_le_bytes());
+    }
+    assert_eq!(
+        bytes.len(),
+        n * 8 + SOBOL_COLUMNS * 4,
+        "wrong Sobol table size"
+    );
     fs::write(path, bytes).unwrap();
 }
 

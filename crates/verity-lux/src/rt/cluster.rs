@@ -182,13 +182,17 @@ impl Dispatch {
                 c"vkCmdBuildClusterAccelerationStructureIndirectNV".as_ptr(),
             )?;
             Some(Self {
-                get_build_sizes: mem::transmute::<_, GetBuildSizes>(get),
-                cmd_build: mem::transmute::<_, CmdBuild>(cmd),
+                get_build_sizes: mem::transmute::<unsafe extern "system" fn(), GetBuildSizes>(get),
+                cmd_build: mem::transmute::<unsafe extern "system" fn(), CmdBuild>(cmd),
             })
         }
     }
 
-    fn sizes(&self, gpu: &Gpu, input: &InputInfo) -> vk::AccelerationStructureBuildSizesInfoKHR<'static> {
+    fn sizes(
+        &self,
+        gpu: &Gpu,
+        input: &InputInfo,
+    ) -> vk::AccelerationStructureBuildSizesInfoKHR<'static> {
         let mut sizes = vk::AccelerationStructureBuildSizesInfoKHR::default();
         // SAFETY: The cluster feature is enabled and input's op-specific
         // structure is live for the duration of this call.
@@ -238,7 +242,9 @@ impl ClusterMesh {
             if first_triangle >= limits.max_cluster_geometry_index
                 || first_triangle > MAX_PACKED_GEOMETRY_INDEX
             {
-                return Err("triangle cluster geometry index exceeds the device or ABI limit".into());
+                return Err(
+                    "triangle cluster geometry index exceeds the device or ABI limit".into(),
+                );
             }
             let first_vertex = mesh.vertices.len();
             local.clear();
@@ -327,6 +333,10 @@ fn align_up(size: u64, alignment: u64) -> Result<u64> {
     Ok(size & !(alignment - 1))
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "each allocation has distinct Vulkan usage, alignment and memory requirements"
+)]
 fn allocate(
     gpu: &mut Gpu,
     slot: &mut Buffer,
@@ -340,18 +350,23 @@ fn allocate(
     if !alignment.is_power_of_two() {
         return Err("invalid Vulkan triangle cluster alignment".into());
     }
-    let capacity = size.checked_add(alignment - 1).ok_or("triangle cluster buffer size overflow")?;
+    let capacity = size
+        .checked_add(alignment - 1)
+        .ok_or("triangle cluster buffer size overflow")?;
     if capacity.max(16) > max_buffer_size {
         return Err(format!("{name} exceeds the Vulkan maximum buffer size").into());
     }
     // SAFETY: The renderer lends out an allocator for this device. The caller
     // holds the allocation through command completion, even when this returns an error.
-    *slot = unsafe { gpu::create_buffer(gpu.device, gpu.allocator, name, capacity, usage, location) }?;
+    *slot =
+        unsafe { gpu::create_buffer(gpu.device, gpu.allocator, name, capacity, usage, location) }?;
     if slot.address == 0 {
         return Err(format!("{name} has no Vulkan device address").into());
     }
     let address = align_up(slot.address, alignment)?;
-    address.checked_add(size).ok_or("triangle cluster buffer address overflow")?;
+    address
+        .checked_add(size)
+        .ok_or("triangle cluster buffer address overflow")?;
     Ok(address)
 }
 
@@ -380,7 +395,9 @@ impl ClusterBlas {
         indices: &[[u32; 3]],
     ) -> Result<Self> {
         if !gpu.ray_features.cluster_acceleration {
-            return Err("Vulkan triangle cluster acceleration is not enabled on this device".into());
+            return Err(
+                "Vulkan triangle cluster acceleration is not enabled on this device".into(),
+            );
         }
         let dispatch =
             Dispatch::load(gpu).ok_or("Vulkan triangle cluster commands are unavailable")?;
@@ -394,13 +411,17 @@ impl ClusterBlas {
             p_next: (&raw mut buffer_limits).cast(),
             ..Default::default()
         };
-        let mut properties = vk::PhysicalDeviceProperties2::default();
-        properties.p_next = (&raw mut limits).cast();
+        let mut properties = vk::PhysicalDeviceProperties2 {
+            p_next: (&raw mut limits).cast(),
+            ..Default::default()
+        };
         // SAFETY: The output chain matches the structure tags, and the
         // renderer's physical device belongs to this instance.
         let format = unsafe {
-            gpu.instance.get_physical_device_properties2(gpu.physical, &mut properties);
-            gpu.instance.get_physical_device_format_properties(gpu.physical, VERTEX_FORMAT)
+            gpu.instance
+                .get_physical_device_properties2(gpu.physical, &mut properties);
+            gpu.instance
+                .get_physical_device_format_properties(gpu.physical, VERTEX_FORMAT)
         };
         if !format
             .buffer_features
@@ -435,18 +456,23 @@ impl ClusterBlas {
             flags: vk::BuildAccelerationStructureFlagsKHR::PREFER_FAST_TRACE,
             op_type: OpType::BuildTriangleCluster,
             op_mode: OpMode::ImplicitDestinations,
-            op_input: OpInput { triangle_clusters: &raw mut triangles },
+            op_input: OpInput {
+                triangle_clusters: &raw mut triangles,
+            },
         };
         let blas_input = InputInfo {
             max_acceleration_structure_count: 1,
             op_type: OpType::BuildBottomLevel,
             op_mode: OpMode::ExplicitDestinations,
-            op_input: OpInput { clusters_bottom_level: &raw mut bottom_level },
+            op_input: OpInput {
+                clusters_bottom_level: &raw mut bottom_level,
+            },
             ..triangles_input
         };
         let clas_sizes = dispatch.sizes(gpu, &triangles_input);
         let blas_sizes = dispatch.sizes(gpu, &blas_input);
-        if clas_sizes.acceleration_structure_size == 0 || blas_sizes.acceleration_structure_size == 0
+        if clas_sizes.acceleration_structure_size == 0
+            || blas_sizes.acceleration_structure_size == 0
         {
             return Err("Vulkan returned an empty triangle cluster or cluster BLAS size".into());
         }
@@ -464,7 +490,8 @@ impl ClusterBlas {
         let vertex_bytes = bytemuck::cast_slice(&mesh.vertices);
         let index_bytes = bytemuck::cast_slice(&mesh.indices);
         let indices_offset = vertex_bytes.len() as u64;
-        let triangle_records_offset = align_up(indices_offset + index_bytes.len() as u64, ADDRESS_SIZE)?;
+        let triangle_records_offset =
+            align_up(indices_offset + index_bytes.len() as u64, ADDRESS_SIZE)?;
         let triangle_records_size = u64::from(cluster_count) * size_of::<TriangleRecord>() as u64;
         let blas_record_offset = triangle_records_offset + triangle_records_size;
         let blas_address_offset = blas_record_offset + size_of::<BottomLevelRecord>() as u64;
@@ -486,7 +513,9 @@ impl ClusterBlas {
                 storage_size,
                 storage_alignment,
                 max_buffer_size,
-                STORAGE_USAGE | INPUT_USAGE | vk::BufferUsageFlags::ACCELERATION_STRUCTURE_STORAGE_KHR,
+                STORAGE_USAGE
+                    | INPUT_USAGE
+                    | vk::BufferUsageFlags::ACCELERATION_STRUCTURE_STORAGE_KHR,
                 MemoryLocation::GpuOnly,
             )?;
             let blas_address = clusters_address + blas_offset;
@@ -494,7 +523,10 @@ impl ClusterBlas {
                 gpu,
                 &mut scratch,
                 "GI triangle cluster scratch",
-                clas_sizes.build_scratch_size.max(blas_sizes.build_scratch_size).max(1),
+                clas_sizes
+                    .build_scratch_size
+                    .max(blas_sizes.build_scratch_size)
+                    .max(1),
                 u64::from(limits.cluster_scratch_byte_alignment),
                 max_buffer_size,
                 STORAGE_USAGE,
@@ -536,8 +568,14 @@ impl ClusterBlas {
                 upload.write_at(record_offset, bytemuck::bytes_of(&record));
                 record_offset += size_of::<TriangleRecord>();
             }
-            upload.write_at(base + blas_record_offset as usize, bytemuck::bytes_of(&blas_record));
-            upload.write_at(base + blas_address_offset as usize, bytemuck::bytes_of(&blas_address));
+            upload.write_at(
+                base + blas_record_offset as usize,
+                bytemuck::bytes_of(&blas_record),
+            );
+            upload.write_at(
+                base + blas_address_offset as usize,
+                bytemuck::bytes_of(&blas_address),
+            );
 
             let build_clusters = CommandsInfo {
                 s_type: COMMANDS_INFO_NV,
@@ -548,7 +586,11 @@ impl ClusterBlas {
                 dst_addresses_array: region(references_address, ADDRESS_SIZE, references_size),
                 dst_sizes_array: region(0, size_of::<u32>() as u64, 0),
                 // Zero stride means tightly packed in the op-specific record ABI.
-                src_infos_array: region(upload_address + triangle_records_offset, 0, triangle_records_size),
+                src_infos_array: region(
+                    upload_address + triangle_records_offset,
+                    0,
+                    triangle_records_size,
+                ),
                 src_infos_count: 0, // use max_acceleration_structure_count
                 address_resolution_flags: 0,
             };
@@ -585,7 +627,9 @@ impl ClusterBlas {
                         (build, as_write),
                         (
                             build,
-                            A::ACCELERATION_STRUCTURE_READ_KHR | as_write | A::INDIRECT_COMMAND_READ,
+                            A::ACCELERATION_STRUCTURE_READ_KHR
+                                | as_write
+                                | A::INDIRECT_COMMAND_READ,
                         ),
                     );
                     (dispatch.cmd_build)(cmd, &build_blas);

@@ -1,16 +1,164 @@
 # Validation
 
+## Experimental acceleration smoke checks
+
+- The focused Lux release suite covers AVX2 parity, packed wide and
+  oriented/spatial traversal against source geometry, retained edits, CPU
+  kd-tree and cage queries, and sparse occupancy.
+- Both NILE reference shader variants passed SPIR-V validation. The software
+  reference pass rendered stationary and moving HDR captures on AMD Radeon
+  Graphics. This smoke test does not measure convergence or denoising quality.
+- Vulkan smoke runs rendered stationary and moving HDR captures with
+  SDF + hash bricks and with ROMA + sparse DAG. These check integration,
+  not image parity or speed on a production scene.
+- On an RTX 4070 Laptop GPU, the hardware reference pass rendered 32 finite
+  HDR captures with two CLAS BLASes, one opacity-mapped BLAS, opaque commits
+  enabled, and a PTLAS updated in place. On AMD Radeon Graphics (Adrenalin
+  26.1.1), the indirect build produced three DGF BLASes and rendered 32
+  finite HDR captures. Both runs had the Vulkan validation layer enabled.
+
+## Hardware tiers and BVH layouts — November 20
+
+New Sponza Main at 640×360, one `--bench` run per row, Split GI time from
+the stationary and moving poses. RTX 4070 Laptop GPU (discrete) and AMD
+Radeon Graphics (RDNA 3 iGPU), selected with `VK_LOADER_DRIVERS_SELECT`.
+`VERITY_LUX_ACCEL_DIAGNOSTICS=1` printed the profile: both are
+`HardwareExtended`.
+
+| Run | RTX 4070 | RDNA 3 iGPU |
+| --- | ---: | ---: |
+| Software, plain four-wide BLAS | 27.95 / 28.62 ms | 39.05 / 41.37 ms |
+| Software, oriented bounds | 31.24 / 32.39 ms | 38.52 / 41.31 ms |
+| Software, spatial splits | 25.41 / 26.44 ms | 37.96 / 40.09 ms |
+| Software, both | 28.24 / 29.57 ms | 38.68 / 40.70 ms |
+| Hardware, core Vulkan structures | 1.87 / 2.02 ms | 12.16 / 12.75 ms |
+| Hardware, every vendor build requested | 2.06 / 2.20 ms | 12.53 / 13.19 ms |
+
+On the RTX the vendor run used 52 cluster BLASes, a partitioned TLAS and
+opaque commits. On the iGPU, DGF encoded no BLAS (52 conventional ones), so
+that row differs only by opaque commits. No Sponza material qualified for
+opacity micromaps. Hardware rays beat software by 3× even on the iGPU.
+
+Repeated plain software runs varied by about 1 ms within a session. Between
+sessions the RTX's software total moved by up to 5 ms (the two modes noted
+under October 29), so compare rows only within one session. A later session,
+interleaving runs, measured plain at 22.88–23.23 ms stationary and spatial at
+22.30–22.62 ms, a 2–3% gain.
+
+Spatial splits duplicate references, not geometry: packed words grew by
+0.4 MB of 299 MB on Main. Building them took far longer than the object BVH,
+since the builder ran on one thread per mesh. It now builds subtrees of
+32,768 references or more in parallel:
+
+| Asset | Object BVH | Spatial, serial | Spatial, parallel |
+| --- | ---: | ---: | ---: |
+| Main (3.68M triangles) | 0.70 s | 7.1–11.2 s | 3.85 s |
+| Curtains (1.99M) | 0.22 s | 11.3 s | 1.99 s |
+| Ivy Growth (5.07M) | 0.69 s | 49.4 s | 6.58 s |
+
+Gating spatial splits on overlap relative to the root (Stich et al. 2009,
+α = 10⁻⁵) instead of the node halved those times again (1.5, 1.2 and 2.0 s),
+but the trees made stationary software GI 20% slower (27.6–28.1 against
+22.9–23.2 ms), so the node-relative gate stays.
+
+The profile therefore keeps every switch off on every tier: the plain
+four-wide BLAS, and core Vulkan structures where there are ray queries.
+
+## Terrain: retained BLAS layout and hardware rays — November 20
+
+`examples/terrain.rs --landform valley --seed 7 --no-layers` with
+`VERITY_SMOKE=1`, which reports Split's GPU time at a landscape overview, a
+close-up, and after digging a trench under falling boxes (about 300 chunks,
+330–365k triangles). `--gi lux` uses `Settings::landscape()`.
+
+**Four-wide retained BLASes.** Retained meshes were packed in the static
+meshes' compressed four-wide layout, in their node slots, and checked against
+brute force through in-place edits and a move to the tail
+(`retained_blases_trace_like_brute_force_through_edits`). Software GI, ms per
+pose, two runs each:
+
+| Layout | RTX 4070 | RDNA 3 iGPU |
+| --- | --- | --- |
+| Binary (kept) | 4.90 / 5.25 / 6.14, 4.64 / 5.28 / 5.86 | 16.4 / 19.6 / 21.2, 14.4 / 17.3 / 19.0 |
+| Four-wide | 5.18 / 6.29 / 6.37, 5.93 / 6.74 / 6.54 | 23.0 / 20.7 / 22.7, 15.1 / 17.9 / 22.0 |
+
+Terrain chunks hold about 1,200 triangles, so their trees are two or three wide
+levels deep and quantized child bounds cost more than the steps they save.
+Retained BLASes stay binary.
+
+**Hardware rays lost the device.** With ray queries, every terrain run lost
+the Vulkan device on both GPUs, even with `VERITY_LUX_PASS_LIMIT=0`. A
+retained change rebuilt the BLASes and TLAS, destroyed the old ones and
+rewrote descriptor sets while earlier frames were still in flight; a full
+repack likewise destroyed the old word buffers. `retained_changed` now waits
+for the device first whenever it replaces GPU objects (every hardware update,
+and any full repack). PXTGI rebuilds its TLAS in the frame's own commands and
+was unaffected. After the fix, hardware GI on the same poses:
+
+| Run | RTX 4070 | RDNA 3 iGPU |
+| --- | --- | --- |
+| Hardware, `--gi lux` | 2.69 / 3.12 / 3.24 | 13.4 / 15.6 / 16.1 |
+| `--gi auto` (`Lux::for_hardware`) | 33.6 / 40.8 / 41.5 | 33.0 / 53.4 / 76.8 |
+
+Both GPUs profile as `HardwareExtended`. The `auto` rows use indoor probe
+spacing (`Settings::default()` on the discrete GPU, `budgeted()` on the
+iGPU) over a landscape, which is why they are slow: probe scale follows the
+scene, not the tier.
+
+## Pipeline compile time — November 20
+
+RTX 4070 Laptop GPU, software rays, New Sponza Main at 640×360, cold driver
+compiles of Split's passes (`VERITY_LUX_PROFILE_PIPELINES=1`). Passes compile
+in parallel, so a pass's time includes contention with the others.
+
+Slang 2026.17 (Vulkan SDK 1.4.363) inlines every helper into each entry point.
+Older compilers marked helpers `DontInline` (see October 29 below). With
+everything inlined, worldResolve was 2.3 MB of SPIR-V and surfaceUpdate
+5.4 MB. Attributing surfaceUpdate's instructions to source lines put about
+100,000 of its largest function's 115,000 instructions in the paged
+`sceneWord`/`geometryWord` resolution: a binary search plus a page-array fetch,
+inlined into every scene and geometry read. The native renderer never enables
+pages, so that code never runs.
+
+| Build | worldResolve | traceDeferred | surfaceUpdate | All passes |
+| --- | ---: | ---: | ---: | ---: |
+| Inlined, Slang default `-O1` | 163 s | 104 s | > 221 s (stopped) | — |
+| Inlined, `-O2` | 119 s | 84 s | > 10 min (stopped) | — |
+| Paged reads as `[noinline]` calls, `-O2` | 14 s | 15 s | 60 s | 73 s |
+
+The last row is the current build. surfaceUpdate shrank from 5.4 MB to
+0.77 MB, worldResolve to 0.35 MB and traceDeferred to 0.21 MB. The
+ray-query passes compile cold in 38 s (surfaceUpdate 24 s). With the cache
+from a previous run, all 24 passes take 0.03 s, and a whole `--bench` run
+finishes in 38 s.
+
+Also marking the traversal and shading hubs `[noinline]`, as older Slang
+did, compiled every pass in 59 s but cost GI time: 31.97 ms still and 30.26 ms
+moving, against 28.09 and 28.25 ms with them inlined. They stay inlined.
+Slang ignores `[noinline]` on a callee when the caller passes on its own
+`inout` struct parameter, so a hub must copy into a local first for the
+attribute to hold.
+
+Pipeline caches are now one file per pass, keyed by the device's pipeline
+cache UUID and that pass's SPIR-V. Each is saved as soon as its pass compiles,
+so an interrupted start keeps the passes it finished, editing one shader
+recompiles only that pass, and two GPUs no longer overwrite each other's cache.
+The whole-set cache saved nothing until every pass finished, so starts that
+were stopped before surfaceUpdate finished always began cold.
+
 ## Software BVH construction
 
-Lux builds the software BLAS and TLAS in native Rust with adaptive binned
-surface-area heuristics. [TinyBVH](https://github.com/jbikker/tinybvh/blob/main/tiny_bvh_base.h)
+The measurements below are for the native binary SAH builder, before AVX2
+dispatch and compressed wide software BLAS records. They do not measure
+the wide, oriented, spatial-split, or Vulkan extension paths.
+
+The builder uses adaptive binned surface-area heuristics. [TinyBVH](https://github.com/jbikker/tinybvh/blob/main/tiny_bvh_base.h)
 informed the three-axis bin sweep; [Embree](https://github.com/RenderKit/embree/blob/master/kernels/builders/bvh_builder_sah.h)
-informed the split-versus-leaf cost and depth handling. The binary layout
-and the BLAS leaf cap of eight follow the previous [obvhs fast preset](https://github.com/DGriffin91/obvhs/blob/main/src/lib.rs).
-Large BLAS subtrees build in parallel. The builder reorders triangles before
-charting but does not duplicate them, so raster lookup, charting, and the
-hardware ray-query path still consume the same triangle spans. No shader
-layout or native dependency is required.
+informed the split-versus-leaf cost and depth handling. The BLAS leaf cap of
+eight follows the previous [obvhs fast preset](https://github.com/DGriffin91/obvhs/blob/main/src/lib.rs).
+The builder reorders triangles before charting. Raster lookup, charting,
+and hardware ray queries share that order; optional spatial splits duplicate
+only software traversal references.
 
 Three interleaved release runs of `cargo run --release -p verity-lux --example
 build_sponza`, measuring median scene build and pack time without glTF load:

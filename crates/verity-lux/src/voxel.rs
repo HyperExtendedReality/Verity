@@ -34,6 +34,10 @@ use verity_render::{
     gpu::{self, Buffer, Image},
 };
 
+// CPU reference for the packed payloads built and consumed on the GPU.
+#[cfg(test)]
+mod sparse;
+
 const SLOTS: usize = 2;
 /// Cells along each side of a clipmap level. A power of two.
 const GRID: i32 = 128;
@@ -44,6 +48,13 @@ const ROMA_AXES: u32 = 16;
 const ROMA_WORD_BITS: u32 = u32::BITS;
 /// Clipmap levels at most; `MAX_LEVELS` in voxel.slang.
 const MAX_LEVELS: usize = 8;
+// GPU publication metadata and dispatch dimensions in voxel_sparse.slang.
+const SPARSE_HEADER_BYTES: u64 = (MAX_LEVELS * 8 * mem::size_of::<u32>()) as u64;
+const SPARSE_BRICK_SIDE: u32 = (GRID / OCCUPANCY_BRICK) as u32;
+const SPARSE_BRICKS: u32 = SPARSE_BRICK_SIDE.pow(3);
+const SPARSE_HASH_SLOTS: u32 = 2 * SPARSE_BRICKS;
+const SPARSE_DAG_DEPTH: u32 = SPARSE_BRICK_SIDE.ilog2();
+const SPARSE_THREADS: u32 = 64;
 /// Boxes of cells voxelized in a frame at most: three slabs a level.
 const MAX_JOBS: usize = 3 * MAX_LEVELS;
 /// Voxels the levels share.
@@ -98,6 +109,16 @@ struct HrcPush {
     first_page: u32,
 }
 
+/// `VoxelSparsePush` in voxel_sparse.slang.
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct SparsePush {
+    layout: u32,
+    clip_level: u32,
+    depth: u32,
+    reserved: u32,
+}
+
 /// How far HRC's sweep over every page's slices has got.
 #[derive(Clone, Copy, Default)]
 struct HrcSweep {
@@ -148,6 +169,18 @@ const SDF_PASSES: &[(&str, &[u8])] = &[
     spirv!("voxelSdfZ"),
 ];
 const ROMA_PASSES: &[(&str, &[u8])] = &[spirv!("romaBuild")];
+const HASH_PASSES: &[(&str, &[u8])] = &[
+    spirv!("voxelSparseReset"),
+    spirv!("voxelSparseHashClear"),
+    spirv!("voxelSparseHashBuild"),
+    spirv!("voxelSparsePublish"),
+];
+const DAG_PASSES: &[(&str, &[u8])] = &[
+    spirv!("voxelSparseReset"),
+    spirv!("voxelSparseDagPrepare"),
+    spirv!("voxelSparseDagIntern"),
+    spirv!("voxelSparsePublish"),
+];
 
 use vk::DescriptorType as D;
 /// Set 0: the frame and the voxels.
@@ -176,6 +209,8 @@ const SCENE_BINDINGS: &[(u32, D)] = &[
     (23, D::STORAGE_BUFFER),
     (24, D::STORAGE_BUFFER),
     (25, D::STORAGE_BUFFER),
+    (26, D::STORAGE_BUFFER),
+    (27, D::STORAGE_BUFFER),
     (30, D::STORAGE_BUFFER),
 ];
 /// Per slot: trace, temporal, three a-trous, composite.
@@ -193,6 +228,35 @@ pub enum VoxelVisibility {
     Sdf = 1,
     /// Trace diffuse rays along resampled ray-aligned occupancy maps.
     Roma = 2,
+}
+
+/// Occupancy storage for empty-brick skips; voxel IDs and lighting remain dense.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
+#[repr(u32)]
+pub enum VoxelStorage {
+    /// Use the original dense cells and optionally their coarse occupancy counts.
+    #[default]
+    Dense = 0,
+    /// Use a sparse hash of occupied 4³ bricks.
+    Hash = 1,
+    /// Use a sparse DAG sharing identical occupancy subtrees.
+    Dag = 2,
+}
+
+impl VoxelStorage {
+    fn payload_words(self) -> u32 {
+        match self {
+            Self::Dense => 0,
+            Self::Hash => 2 + 3 * SPARSE_HASH_SLOTS,
+            Self::Dag => {
+                let parent_words: u32 = (1..=SPARSE_DAG_DEPTH)
+                    .map(|depth| 8 * (SPARSE_BRICKS >> (3 * depth)))
+                    .sum();
+                1 + 2 * SPARSE_BRICKS + parent_words
+            }
+        }
+    }
 }
 
 /// Screen and voxel GI controls. Distances are in metres.
@@ -216,10 +280,12 @@ pub struct ScreenVoxelSettings {
     pub residual: bool,
     /// Reduce temporal reuse when the screen/voxel ray sources change.
     pub source_aware_history: bool,
-    /// Experimental empty-brick skips. Read when GI is installed.
+    /// Experimental empty-brick counts, used only with dense storage. Read on install.
     pub coarse_occupancy: bool,
     /// Diffuse voxel visibility. Read when GI is installed.
     pub visibility: VoxelVisibility,
+    /// Occupancy storage for brick skips, independent of diffuse visibility. Read on install.
+    pub storage: VoxelStorage,
     /// The level whose box Holographic Radiance Cascades light, at half its
     /// resolution, or none to bounce light with a ray a visit everywhere. Read
     /// when the GI is installed.
@@ -254,6 +320,7 @@ impl Default for ScreenVoxelSettings {
             source_aware_history: false,
             coarse_occupancy: false,
             visibility: VoxelVisibility::default(),
+            storage: VoxelStorage::default(),
             holographic: None,
             bounce_links: 0,
         }
@@ -389,6 +456,7 @@ pub struct ScreenVoxel {
     built: (f32, usize),
     built_occupancy: bool,
     built_visibility: VoxelVisibility,
+    built_storage: VoxelStorage,
     built_hrc_level: Option<u32>,
     built_links: u32,
     /// Where the triangles changed since the last voxelizing.
@@ -408,6 +476,8 @@ pub struct ScreenVoxel {
     large: Buffer,
     /// The selected diffuse visibility cache, if any.
     visibility_buffer: Buffer,
+    sparse_words: Buffer,
+    sparse_scratch: Buffer,
     /// HRC's medium, rays, cones, cone weights, and gathered light being summed
     /// and last summed: bindings 18 to 23 in holographic.slang.
     hrc: [Buffer; 6],
@@ -443,6 +513,7 @@ impl ScreenVoxel {
             built: (0.0, 0),
             built_occupancy: false,
             built_visibility: VoxelVisibility::default(),
+            built_storage: VoxelStorage::default(),
             built_hrc_level: None,
             built_links: 0,
             changed: None,
@@ -457,6 +528,8 @@ impl ScreenVoxel {
             free: Buffer::default(),
             large: Buffer::default(),
             visibility_buffer: Buffer::default(),
+            sparse_words: Buffer::default(),
+            sparse_scratch: Buffer::default(),
             hrc: Default::default(),
             hrc_sweep: HrcSweep::default(),
             no_capture: Buffer::default(),
@@ -523,7 +596,8 @@ impl ScreenVoxel {
     /// frame's `reset` pass.
     unsafe fn create_voxels(&mut self, gpu: &mut Gpu) -> Result<()> {
         let levels = self.levels();
-        self.built_occupancy = self.settings.coarse_occupancy;
+        self.built_occupancy =
+            self.built_storage == VoxelStorage::Dense && self.settings.coarse_occupancy;
         let bricks = if self.built_occupancy {
             ((GRID / OCCUPANCY_BRICK) as u64).pow(3)
         } else {
@@ -546,10 +620,22 @@ impl ScreenVoxel {
             VoxelVisibility::Roma => Some((
                 &mut self.visibility_buffer,
                 "voxel ray-aligned occupancy",
-                4 * levels as u64 * u64::from(ROMA_AXES) * grid.pow(2)
+                4 * levels as u64
+                    * u64::from(ROMA_AXES)
+                    * grid.pow(2)
                     * grid.div_ceil(u64::from(ROMA_WORD_BITS)),
             )),
         };
+        let sparse_words = (self.built_storage != VoxelStorage::Dense).then_some((
+            &mut self.sparse_words,
+            "voxel sparse occupancy",
+            SPARSE_HEADER_BYTES + 4 * levels as u64 * u64::from(self.built_storage.payload_words()),
+        ));
+        let sparse_scratch = (self.built_storage == VoxelStorage::Dag).then_some((
+            &mut self.sparse_scratch,
+            "voxel sparse DAG scratch",
+            4 * u64::from(12 + 6 * SPARSE_BRICKS),
+        ));
         self.built_links = self.settings.bounce_links.min(64);
         // Bound either way: a uint4 when off.
         let links = (pool * 2 * 4 * u64::from(self.built_links)).max(16);
@@ -568,6 +654,8 @@ impl ScreenVoxel {
         ]
         .into_iter()
         .chain(visibility)
+        .chain(sparse_words)
+        .chain(sparse_scratch)
         {
             gpu::destroy_buffer(gpu.device, gpu.allocator, mem::take(buffer));
             *buffer = gpu::create_buffer(
@@ -671,7 +759,11 @@ impl ScreenVoxel {
         (lows, jobs)
     }
 
-    unsafe fn create_pipelines(gpu: &mut Gpu, visibility: VoxelVisibility) -> Result<Pipelines> {
+    unsafe fn create_pipelines(
+        gpu: &mut Gpu,
+        visibility: VoxelVisibility,
+        storage: VoxelStorage,
+    ) -> Result<Pipelines> {
         let device = gpu.device;
         let set_layout = |bindings: &[(u32, D)]| {
             let bindings: Vec<_> = bindings
@@ -694,7 +786,7 @@ impl ScreenVoxel {
         // Set 2 is the renderer's frame set: materials and textures.
         let push = [vk::PushConstantRange::default()
             .stage_flags(vk::ShaderStageFlags::COMPUTE)
-            .size(mem::size_of::<HrcPush>() as u32)];
+            .size(mem::size_of::<HrcPush>().max(mem::size_of::<SparsePush>()) as u32)];
         let layout = device.create_pipeline_layout(
             &vk::PipelineLayoutCreateInfo::default()
                 .set_layouts(&[scene_layout, io_layout, gpu.frame_set_layout])
@@ -706,8 +798,13 @@ impl ScreenVoxel {
             VoxelVisibility::Sdf => SDF_PASSES,
             VoxelVisibility::Roma => ROMA_PASSES,
         };
+        let sparse_passes = match storage {
+            VoxelStorage::Dense => &[],
+            VoxelStorage::Hash => HASH_PASSES,
+            VoxelStorage::Dag => DAG_PASSES,
+        };
         let mut passes = HashMap::new();
-        for &(name, spirv) in PASSES.iter().chain(visibility_passes) {
+        for &(name, spirv) in PASSES.iter().chain(visibility_passes).chain(sparse_passes) {
             let entry = CString::new(name)?;
             let pipeline =
                 gpu::compute_pipeline(device, vk::PipelineCache::null(), layout, spirv, &entry)?;
@@ -869,6 +966,11 @@ impl ScreenVoxel {
             VoxelVisibility::Sdf => (inactive, cache),
             VoxelVisibility::Roma => (cache, inactive),
         };
+        let (sparse_words, sparse_scratch) = match self.built_storage {
+            VoxelStorage::Dense => (inactive, inactive),
+            VoxelStorage::Hash => (self.sparse_words.buffer, inactive),
+            VoxelStorage::Dag => (self.sparse_words.buffer, self.sparse_scratch.buffer),
+        };
         write_set(
             device,
             view.scene_sets[slot],
@@ -901,6 +1003,8 @@ impl ScreenVoxel {
                 (23, Res::Buffer(self.hrc[5].buffer)),
                 (24, Res::Buffer(roma)),
                 (25, Res::Buffer(sdf)),
+                (26, Res::Buffer(sparse_words)),
+                (27, Res::Buffer(sparse_scratch)),
                 (30, Res::Buffer(self.links.buffer)),
             ],
         );
@@ -1146,7 +1250,12 @@ impl ScreenVoxel {
             f32::from(u8::from(unbroken)),
             f32::from(u8::from(self.built_occupancy)),
         ];
-        data.reflection = [0.0, 0.0, self.built.1 as f32, self.built.0];
+        data.reflection = [
+            self.built_storage as u32 as f32,
+            0.0,
+            self.built.1 as f32,
+            self.built.0,
+        ];
         data.fade = [1.0; 4];
         // `tend_capture` above has settled every buffer.
         data.buffers[..2].copy_from_slice(&[view.lights[slot].address, self.blue_noise.address]);
@@ -1199,7 +1308,7 @@ impl ScreenVoxel {
         barrier();
 
         // A size, or none to read it from `large`.
-        let launch = |name: &'static str, set: vk::DescriptorSet, size: Option<[u32; 3]>| {
+        let run = |name: &'static str, set: vk::DescriptorSet, size: Option<[u32; 3]>| {
             device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, pipelines.passes[name]);
             device.cmd_bind_descriptor_sets(
                 cmd,
@@ -1214,6 +1323,9 @@ impl ScreenVoxel {
                 None => device.cmd_dispatch_indirect(cmd, self.large.buffer, 0),
             }
             barrier();
+        };
+        let launch = |name, set, size| {
+            run(name, set, size);
             timer.borrow_mut().stamp(device, cmd, slot, name);
         };
         let dispatch = |name, set, [x, y]: [u32; 2]| launch(name, set, Some([x, y, 1]));
@@ -1223,6 +1335,9 @@ impl ScreenVoxel {
         let levels = self.built.1 as u32;
         if self.reset {
             device.cmd_fill_buffer(cmd, self.cells.buffer, 0, vk::WHOLE_SIZE, 0);
+            if self.built_storage != VoxelStorage::Dense {
+                device.cmd_fill_buffer(cmd, self.sparse_words.buffer, 0, SPARSE_HEADER_BYTES, 0);
+            }
             let filled = [vk::MemoryBarrier2::default()
                 .src_stage_mask(S::ALL_TRANSFER)
                 .src_access_mask(A::TRANSFER_WRITE)
@@ -1248,6 +1363,62 @@ impl ScreenVoxel {
                 launch("accumulateLarge", sets[0], None);
             }
             dispatch("finalize", sets[0], cells);
+            if self.built_storage != VoxelStorage::Dense {
+                // A level can contribute several slabs; publish it once after all finalize.
+                let dirty = jobs.iter().fold(0u32, |mask, job| mask | (1 << job[0][3]));
+                let send = |push: &SparsePush| {
+                    device.cmd_push_constants(
+                        cmd,
+                        pipelines.layout,
+                        vk::ShaderStageFlags::COMPUTE,
+                        0,
+                        bytemuck::bytes_of(push),
+                    );
+                };
+                let build = |name, groups| run(name, sets[0], Some([groups, 1, 1]));
+                for clip_level in (0..levels).filter(|&level| dirty & (1 << level) != 0) {
+                    let mut push = SparsePush {
+                        layout: self.built_storage as u32,
+                        clip_level,
+                        depth: 0,
+                        reserved: 0,
+                    };
+                    send(&push);
+                    build("voxelSparseReset", 1);
+                    match self.built_storage {
+                        VoxelStorage::Dense => {
+                            unreachable!("dense storage cannot enter the sparse build")
+                        }
+                        VoxelStorage::Hash => {
+                            build(
+                                "voxelSparseHashClear",
+                                SPARSE_HASH_SLOTS.div_ceil(SPARSE_THREADS),
+                            );
+                            build(
+                                "voxelSparseHashBuild",
+                                SPARSE_BRICKS.div_ceil(SPARSE_THREADS),
+                            );
+                        }
+                        VoxelStorage::Dag => {
+                            for depth in 0..=SPARSE_DAG_DEPTH {
+                                push.depth = depth;
+                                send(&push);
+                                let nodes = SPARSE_BRICKS >> (3 * depth);
+                                build(
+                                    "voxelSparseDagPrepare",
+                                    (2 * nodes).div_ceil(SPARSE_THREADS),
+                                );
+                                build("voxelSparseDagIntern", nodes.div_ceil(SPARSE_THREADS));
+                            }
+                        }
+                    }
+                    build("voxelSparsePublish", 1);
+                }
+                // A full DAG rebuild has many dispatches, even before HRC; use one query.
+                timer
+                    .borrow_mut()
+                    .stamp(device, cmd, slot, "voxelSparseBuild");
+            }
             if self.built_visibility == VoxelVisibility::Sdf {
                 let lines = [grid.pow(2).div_ceil(64), levels];
                 for &(name, _) in SDF_PASSES {
@@ -1508,7 +1679,12 @@ impl RenderExtension for ScreenVoxel {
         unsafe {
             if self.pipelines.is_none() {
                 self.built_visibility = self.settings.visibility;
-                self.pipelines = Some(Self::create_pipelines(gpu, self.built_visibility)?);
+                self.built_storage = self.settings.storage;
+                self.pipelines = Some(Self::create_pipelines(
+                    gpu,
+                    self.built_visibility,
+                    self.built_storage,
+                )?);
                 self.timer = Some(PassTimer::new(gpu)?);
                 self.no_capture = gpu::create_buffer(
                     gpu.device,
@@ -1574,6 +1750,8 @@ impl RenderExtension for ScreenVoxel {
                 &mut self.free,
                 &mut self.large,
                 &mut self.visibility_buffer,
+                &mut self.sparse_words,
+                &mut self.sparse_scratch,
                 &mut self.no_capture,
                 &mut self.blue_noise,
             ]

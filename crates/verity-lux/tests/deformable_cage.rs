@@ -27,11 +27,19 @@ fn check_hit(pose: &CagePose, weights: Vec3, positions: &[Vec3; 5], expected_cel
     let point = rest + rest.z.abs() * (positions[apex] - REST[apex]);
     let origin = point - Vec3::Y * 3.0;
     let direction = Vec3::Y * 2.0;
-    let hit = pose.nearest_hit(origin, direction, 1.0..=2.0).expect("clipped triangle hit");
+    let hit = pose
+        .nearest_hit(origin, direction, 1.0..=2.0)
+        .expect("clipped triangle hit");
     assert_eq!(hit.primitive_id, TRIANGLE.primitive_id);
     assert_eq!(hit.cell_index, expected_cell);
-    assert!((hit.t - 1.5).abs() < 1e-12, "incorrect world-ray t: {hit:?}");
-    assert!(hit.barycentrics.abs_diff_eq(weights.as_dvec3(), 1e-12), "incorrect source weights: {hit:?}");
+    assert!(
+        (hit.t - 1.5).abs() < 1e-12,
+        "incorrect world-ray t: {hit:?}"
+    );
+    assert!(
+        hit.barycentrics.abs_diff_eq(weights.as_dvec3(), 1e-12),
+        "incorrect source weights: {hit:?}"
+    );
     assert!(pose.is_occluded(origin, direction, 1.0..=2.0));
     assert!(!pose.is_occluded(origin, direction, 0.0..=1.49));
 }
@@ -39,8 +47,12 @@ fn check_hit(pose: &CagePose, weights: Vec3, positions: &[Vec3; 5], expected_cel
 #[test]
 fn clips_one_source_triangle_across_two_independently_deformed_cells() {
     let asset = CageAsset::build(&REST, &CELLS, [TRIANGLE]).expect("valid two-cell cage");
-    let rest = asset.pose(&REST, InversionPolicy::Reject).expect("original pose");
-    let mut posed = asset.pose(&REST, InversionPolicy::Reject).expect("independent pose");
+    let rest = asset
+        .pose(&REST, InversionPolicy::Reject)
+        .expect("original pose");
+    let mut posed = asset
+        .pose(&REST, InversionPolicy::Reject)
+        .expect("independent pose");
     let mut deformed = REST;
     deformed[3] = Vec3::new(0.5, 0.25, 2.0);
     deformed[4] = Vec3::new(0.25, 0.5, -1.5);
@@ -58,7 +70,9 @@ fn clips_one_source_triangle_across_two_independently_deformed_cells() {
     posed.update(&second).expect("second deformation");
     for (cell, weights) in [UPPER, LOWER].into_iter().enumerate() {
         let point = rest_point(weights) + Vec3::new(1.0, 2.0, 4.0 + rest_point(weights).z.max(0.0));
-        let hit = posed.nearest_hit(point - Vec3::Y, Vec3::Y, 1.0..=1.0).expect("translated hit");
+        let hit = posed
+            .nearest_hit(point - Vec3::Y, Vec3::Y, 1.0..=1.0)
+            .expect("translated hit");
         assert_eq!(hit.cell_index, cell);
         assert_eq!(hit.t, 1.0);
         assert!(hit.barycentrics.abs_diff_eq(weights.as_dvec3(), 1e-12));
@@ -69,7 +83,9 @@ fn clips_one_source_triangle_across_two_independently_deformed_cells() {
 #[test]
 fn rejects_a_bad_pose_atomically_and_can_opt_in_to_inversion() {
     let asset = CageAsset::build(&REST, &CELLS, [TRIANGLE]).expect("valid cage");
-    let mut pose = asset.pose(&REST, InversionPolicy::Reject).expect("original pose");
+    let mut pose = asset
+        .pose(&REST, InversionPolicy::Reject)
+        .expect("original pose");
     let mut bad = REST;
     bad[3] *= 2.0;
     bad[4] = Vec3::new(0.25, 0.25, 1.0);
@@ -79,10 +95,14 @@ fn rejects_a_bad_pose_atomically_and_can_opt_in_to_inversion() {
     check_hit(&pose, UPPER, &REST, 0);
     check_hit(&pose, LOWER, &REST, 1);
 
-    let inverted = asset.pose(&bad, InversionPolicy::Allow).expect("explicitly allowed inversion");
+    let inverted = asset
+        .pose(&bad, InversionPolicy::Allow)
+        .expect("explicitly allowed inversion");
     let rest = rest_point(LOWER);
     let point = rest + rest.z.abs() * (bad[4] - REST[4]);
-    let hit = inverted.nearest_hit(point + Vec3::Y, Vec3::NEG_Y, 0.99..=1.01).expect("inverted fragment hit");
+    let hit = inverted
+        .nearest_hit(point + Vec3::Y, Vec3::NEG_Y, 0.99..=1.01)
+        .expect("inverted fragment hit");
     assert_eq!(hit.cell_index, 1);
     assert!(hit.barycentrics.abs_diff_eq(LOWER.as_dvec3(), 1e-12));
 
@@ -112,7 +132,9 @@ fn validates_rest_cell_indices_and_skips_geometry_outside_the_cage() {
         ],
     };
     let asset = CageAsset::build(&REST, &CELLS, [protruding]).expect("partially covered triangle");
-    let pose = asset.pose(&REST, InversionPolicy::Reject).expect("rest pose");
+    let pose = asset
+        .pose(&REST, InversionPolicy::Reject)
+        .expect("rest pose");
     assert!(pose.is_occluded(Vec3::new(0.25, 0.0, 0.25), Vec3::Y, 0.0..=1.0));
     // This point is in the source triangle and the cell AABB, but not the cell.
     assert!(!pose.is_occluded(Vec3::new(0.5, 0.0, 0.5), Vec3::Y, 0.0..=1.0));
@@ -124,7 +146,11 @@ fn nearest_and_any_hit_search_the_mini_blas_with_closed_range_limits() {
         let y = (i + 1) as f32 / 64.0;
         CageTriangle {
             primitive_id: 100 - i,
-            vertices: [Vec3::new(0.125, y, 0.125), Vec3::new(0.25, y, 0.125), Vec3::new(0.125, y, 0.25)],
+            vertices: [
+                Vec3::new(0.125, y, 0.125),
+                Vec3::new(0.25, y, 0.125),
+                Vec3::new(0.125, y, 0.25),
+            ],
         }
     });
     let duplicate = CageTriangle {
@@ -135,11 +161,16 @@ fn nearest_and_any_hit_search_the_mini_blas_with_closed_range_limits() {
             Vec3::new(0.125, 1.0 / 64.0, 0.25),
         ],
     };
-    let asset = CageAsset::build(&REST, &CELLS[..1], triangles.chain([duplicate])).expect("valid cage");
-    let pose = asset.pose(&REST, InversionPolicy::Reject).expect("rest pose");
+    let asset =
+        CageAsset::build(&REST, &CELLS[..1], triangles.chain([duplicate])).expect("valid cage");
+    let pose = asset
+        .pose(&REST, InversionPolicy::Reject)
+        .expect("rest pose");
     let origin = Vec3::new(0.15625, -1.0, 0.15625);
     let direction = Vec3::Y * 2.0;
-    let nearest = pose.nearest_hit(origin, direction, 0.0..=1.0).expect("nearest cell fragment");
+    let nearest = pose
+        .nearest_hit(origin, direction, 0.0..=1.0)
+        .expect("nearest cell fragment");
     assert_eq!(nearest.t, 65.0 / 128.0);
     assert_eq!(nearest.primitive_id, 1);
     assert_eq!(nearest.barycentrics, DVec3::new(0.5, 0.25, 0.25));

@@ -33,6 +33,10 @@ pub(crate) struct AlphaBounds {
 pub(crate) enum OpacityState {
     Transparent = 0,
     Opaque = 1,
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "Lux does not force two-state opacity")
+    )]
     UnknownTransparent = 2,
     UnknownOpaque = 3,
 }
@@ -77,7 +81,14 @@ pub(crate) enum TriangleOpacity<'a> {
     /// Exactly 4^level states in Vulkan micromap index order for the triangle's
     /// vertex order. Bounds used to generate these must also account for the
     /// difference between hardware and any shader-recomputed barycentrics.
-    Subdivided { level: u16, states: &'a [OpacityState] },
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "Lux only supplies whole-triangle alpha proofs")
+    )]
+    Subdivided {
+        level: u16,
+        states: &'a [OpacityState],
+    },
 }
 
 /// The micromap and per-primitive index input retained by its owning scene.
@@ -116,7 +127,9 @@ impl OpacityMicromap {
             .index_buffer(at(self.index_address))
             .index_stride(INDEX_BYTES);
         if let Some(storage) = &self.storage {
-            attachment = attachment.micromap(storage.handle).usage_counts(&self.usage);
+            attachment = attachment
+                .micromap(storage.handle)
+                .usage_counts(&self.usage);
         }
         // With only special indices Vulkan expressly permits a null micromap
         // handle and no usage counts. Every index in this case is a sentinel.
@@ -152,7 +165,8 @@ impl Micromaps {
             .push_next(&mut accel);
         // SAFETY: The device and extension preconditions apply; output nodes live through the call.
         unsafe {
-            gpu.instance.get_physical_device_properties2(gpu.physical, &mut properties);
+            gpu.instance
+                .get_physical_device_properties2(gpu.physical, &mut properties);
         }
         Self {
             loader: opacity_micromap::Device::new(gpu.instance, gpu.device),
@@ -184,8 +198,12 @@ impl Micromaps {
         pool: &mut vk::CommandPool,
         triangles: impl IntoIterator<Item = TriangleOpacity<'a>>,
     ) -> Result<Option<OpacityMicromap>> {
-        let Encoded { indices, triangles, data, usage } =
-            Encoded::new(triangles, self.max_subdivision_level)?;
+        let Encoded {
+            indices,
+            triangles,
+            data,
+            usage,
+        } = Encoded::new(triangles, self.max_subdivision_level)?;
         if indices.is_empty() {
             return Ok(None);
         }
@@ -260,9 +278,12 @@ impl Micromaps {
             .max(1)
             .checked_add(self.scratch_alignment - 1)
             .ok_or("opacity micromap scratch size overflow")?;
-        let triangle_offset = data.len().checked_next_multiple_of(SOURCE_ALIGNMENT)
+        let triangle_offset = data
+            .len()
+            .checked_next_multiple_of(SOURCE_ALIGNMENT)
             .ok_or("opacity micromap source offset overflow")?;
-        let size = triangle_offset.checked_add(size_of_val(triangles))
+        let size = triangle_offset
+            .checked_add(size_of_val(triangles))
             .and_then(|n| n.checked_add(SOURCE_ALIGNMENT - 1))
             .ok_or("opacity micromap source size overflow")?;
         // SAFETY: The caller guarantees the matching device/allocator. The
@@ -290,7 +311,8 @@ impl Micromaps {
             .triangle_array(at(source.address + (start + triangle_offset) as u64));
         // SAFETY: `source` remains live through the synchronous build. Both
         // addresses are 256-byte aligned and refer to ranges in the buffer.
-        let result = unsafe { self.build_with_source(gpu, pool, info, sizes.micromap_size, scratch_size) };
+        let result =
+            unsafe { self.build_with_source(gpu, pool, info, sizes.micromap_size, scratch_size) };
         // SAFETY: Submission has finished or failed, so no build uses the source.
         unsafe { gpu::destroy_buffer(gpu.device, gpu.allocator, source) };
         result
@@ -318,8 +340,10 @@ impl Micromaps {
         let result = (|| {
             // SAFETY: Device and allocator match and `size` came from the build query.
             let storage = unsafe { self.create_storage(gpu, size) }?;
-            let device_address = scratch.address + alignment_padding(scratch.address, self.scratch_alignment);
-            let info = info.dst_micromap(storage.handle)
+            let device_address =
+                scratch.address + alignment_padding(scratch.address, self.scratch_alignment);
+            let info = info
+                .dst_micromap(storage.handle)
                 .scratch_data(vk::DeviceOrHostAddressKHR { device_address });
             // SAFETY: Queue and pool are externally synchronized; source, scratch,
             // storage and host build descriptions remain valid through this submission.
@@ -333,7 +357,8 @@ impl Micromaps {
                         .dst_access_mask(vk::AccessFlags2::MICROMAP_READ_EXT);
                     gpu.device.cmd_pipeline_barrier2(
                         cmd,
-                        &vk::DependencyInfo::default().memory_barriers(std::slice::from_ref(&barrier)),
+                        &vk::DependencyInfo::default()
+                            .memory_barriers(std::slice::from_ref(&barrier)),
                     );
                 })
             };
@@ -401,7 +426,11 @@ impl Micromaps {
     unsafe fn destroy_storage(&self, gpu: &mut Gpu, storage: Storage) {
         // SAFETY: Handle and buffer belong to this device and no GPU work uses them.
         unsafe {
-            (self.loader.fp().destroy_micromap_ext)(self.loader.device(), storage.handle, std::ptr::null());
+            (self.loader.fp().destroy_micromap_ext)(
+                self.loader.device(),
+                storage.handle,
+                std::ptr::null(),
+            );
             gpu::destroy_buffer(gpu.device, gpu.allocator, storage.buffer);
         }
     }
@@ -442,12 +471,17 @@ impl Encoded {
             encoded.indices.try_reserve(1)?;
             encoded.indices.push(index);
         }
-        encoded.usage = counts.into_iter().enumerate().filter_map(|(level, count)| {
-            (count != 0).then(|| vk::MicromapUsageEXT::default()
-                .count(count)
-                .subdivision_level(level as u32)
-                .format(FORMAT.as_raw() as u32))
-        }).collect();
+        encoded.usage = counts
+            .into_iter()
+            .enumerate()
+            .filter(|&(_, count)| count != 0)
+            .map(|(level, count)| {
+                vk::MicromapUsageEXT::default()
+                    .count(count)
+                    .subdivision_level(level as u32)
+                    .format(FORMAT.as_raw() as u32)
+            })
+            .collect();
         Ok(encoded)
     }
 
@@ -465,14 +499,20 @@ impl Encoded {
             return Err("opacity micromap subdivision level exceeds addressable storage".into());
         };
         if states.len() != expected {
-            return Err(format!("opacity micromap level {level} requires {expected} states, got {}", states.len()).into());
+            return Err(format!(
+                "opacity micromap level {level} requires {expected} states, got {}",
+                states.len()
+            )
+            .into());
         }
         let first = states[0];
         if states[1..].iter().all(|&state| state == first) {
             return Ok(first.special_index());
         }
         if u32::from(level) > max_level {
-            return Err(format!("opacity micromap level {level} exceeds device limit {max_level}").into());
+            return Err(
+                format!("opacity micromap level {level} exceeds device limit {max_level}").into(),
+            );
         }
         let index = u32::try_from(self.triangles.len())?;
         if index >= OpacityState::UnknownOpaque.special_index() {
@@ -481,16 +521,22 @@ impl Encoded {
         let offset = u32::try_from(self.data.len())?;
         self.triangles.try_reserve(1)?;
         self.data.try_reserve(states.len().div_ceil(4))?;
-        self.triangles.push(vk::MicromapTriangleEXT::default()
-            .data_offset(offset)
-            .subdivision_level(level)
-            .format(FORMAT.as_raw() as u16));
+        self.triangles.push(
+            vk::MicromapTriangleEXT::default()
+                .data_offset(offset)
+                .subdivision_level(level)
+                .format(FORMAT.as_raw() as u16),
+        );
         counts[usize::from(level)] += 1;
         // 4^level states, LSB first, two bits per state. Level zero has
         // already been represented by a special index.
-        self.data.extend(states.chunks_exact(4).map(|states| {
-            states[0] as u8 | (states[1] as u8) << 2 | (states[2] as u8) << 4 | (states[3] as u8) << 6
-        }));
+        self.data
+            .extend(states.as_chunks::<4>().0.iter().map(|states| {
+                states[0] as u8
+                    | (states[1] as u8) << 2
+                    | (states[2] as u8) << 4
+                    | (states[3] as u8) << 6
+            }));
         Ok(index)
     }
 }
@@ -525,15 +571,31 @@ mod tests {
         use TriangleOpacity::{Subdivided, Uniform};
         let states = [Transparent, Opaque, UnknownTransparent, UnknownOpaque];
         let uniform = [Transparent; 4];
-        let encoded = Encoded::new([
-            Uniform(UnknownOpaque),
-            Subdivided { level: 1, states: &states },
-            Uniform(Opaque),
-            Subdivided { level: 1, states: &uniform },
-            Uniform(UnknownTransparent),
-            Subdivided { level: 1, states: &states },
-        ], 1).unwrap();
-        assert_eq!(encoded.indices, [u32::MAX - 3, 0, u32::MAX - 1, u32::MAX, u32::MAX - 2, 1]);
+        let encoded = Encoded::new(
+            [
+                Uniform(UnknownOpaque),
+                Subdivided {
+                    level: 1,
+                    states: &states,
+                },
+                Uniform(Opaque),
+                Subdivided {
+                    level: 1,
+                    states: &uniform,
+                },
+                Uniform(UnknownTransparent),
+                Subdivided {
+                    level: 1,
+                    states: &states,
+                },
+            ],
+            1,
+        )
+        .unwrap();
+        assert_eq!(
+            encoded.indices,
+            [u32::MAX - 3, 0, u32::MAX - 1, u32::MAX, u32::MAX - 2, 1]
+        );
         assert_eq!(encoded.data, [0b1110_0100, 0b1110_0100]);
         assert_eq!(encoded.triangles[1].data_offset, 1);
         assert_eq!(encoded.usage.len(), 1);
@@ -547,7 +609,25 @@ mod tests {
         use TriangleOpacity::{Subdivided, Uniform};
         let defaults = Encoded::new([Uniform(UnknownOpaque); 8], 1).unwrap();
         assert!(defaults.indices.is_empty());
-        assert!(Encoded::new([Subdivided { level: 1, states: &[Opaque] }], 1).is_err());
-        assert!(Encoded::new([Subdivided { level: 1, states: &[Opaque, Opaque, UnknownOpaque, Opaque] }], 0).is_err());
+        assert!(
+            Encoded::new(
+                [Subdivided {
+                    level: 1,
+                    states: &[Opaque]
+                }],
+                1
+            )
+            .is_err()
+        );
+        assert!(
+            Encoded::new(
+                [Subdivided {
+                    level: 1,
+                    states: &[Opaque, Opaque, UnknownOpaque, Opaque]
+                }],
+                0
+            )
+            .is_err()
+        );
     }
 }

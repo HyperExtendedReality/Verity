@@ -3,7 +3,8 @@
 //! `cargo run --release -p verity-lux --example terrain -- --landform island --seed 7 --gi pxtgi`
 //! Landforms: valley, island, archipelago, continent, mountains, plains.
 //! GI: none (the default), lux for Split Radiance Cascades, pxtgi, or voxel for
-//! screen and voxel GI.
+//! screen and voxel GI, or auto for whatever suits the GPU (`Lux::for_hardware`).
+//! `--software` makes lux trace its own BVH rather than hardware ray queries.
 //!
 //! Click to capture the mouse, then WASD to fly, Q/E to descend and rise, Shift
 //! to go faster, hold the left button to dig and the right to fill, F to throw
@@ -126,6 +127,7 @@ enum Gi {
     Lux,
     Pxtgi,
     Voxel,
+    Auto,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -152,6 +154,8 @@ struct Viewer {
     physics_time: f32,
     boxes: Vec<EntityHandle>,
     gi: Gi,
+    /// `--software`: Split GI walks Lux's own BVH instead of hardware rays.
+    software: bool,
     /// Terrain textures, or `None` for procedural ground.
     layers: Option<[TerrainLayer; TERRAIN_ROLES]>,
     sea_level: Option<f32>,
@@ -381,8 +385,12 @@ impl Viewer {
         let pages = (self.renderer.as_ref())
             .map(|r| r.terrain_texture_stats())
             .unwrap_or_default();
+        let gi_ms = (self.renderer.as_mut())
+            .and_then(|r| r.extension_mut::<Lux>())
+            .and_then(|lux| lux.gpu_time())
+            .map_or(0.0, |time| time.as_secs_f64() * 1000.0);
         println!(
-            "{:.2} ms a frame, worst {:.1} ms, drawing {} meshes, {} triangles, {} of {} pages wanted resident, {} uploaded",
+            "{:.2} ms a frame (GI {gi_ms:.2} ms GPU), worst {:.1} ms, drawing {} meshes, {} triangles, {} of {} pages wanted resident, {} uploaded",
             self.frame_seconds * 1000.0,
             self.worst_frame * 1000.0,
             drawn.0,
@@ -565,16 +573,22 @@ impl ApplicationHandler for Viewer {
                 {
                     eprintln!("terrain layers: {error}; the ground stays procedural");
                 }
-                renderer.set_shadow_distance(260.0);
+                renderer.set_shadow_distance(2000.0);
                 renderer.set_uncapped(self.smoke != Smoke::Off);
                 let method = match self.gi {
-                    Gi::None => None,
-                    Gi::Lux => Some(Method::SplitRadianceCascades(LuxSettings::landscape())),
+                    Gi::None | Gi::Auto => None,
+                    Gi::Lux => Some(Method::SplitRadianceCascades(LuxSettings {
+                        hardware_rays: !self.software,
+                        ..LuxSettings::landscape()
+                    })),
                     Gi::Pxtgi => Some(Method::Pxtgi(PxtgiSettings::default())),
                     Gi::Voxel => Some(Method::ScreenVoxel(ScreenVoxelSettings::default())),
                 };
-                let installed =
-                    method.map_or(Ok(()), |m| renderer.set_extension(Box::new(Lux::new(m))));
+                let lux = match self.gi {
+                    Gi::Auto => Some(Lux::for_hardware()),
+                    _ => method.map(Lux::new),
+                };
+                let installed = lux.map_or(Ok(()), |lux| renderer.set_extension(Box::new(lux)));
                 if let Err(error) = installed {
                     eprintln!("gi: {error}");
                     event_loop.exit();
@@ -707,6 +721,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         Some("lux") => Gi::Lux,
         Some("pxtgi") => Gi::Pxtgi,
         Some("voxel") => Gi::Voxel,
+        Some("auto") => Gi::Auto,
         Some(_) => return Err("unknown --gi".into()),
     };
 
@@ -778,6 +793,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         physics_time: 0.0,
         boxes: Vec::new(),
         gi,
+        software: args.iter().any(|a| a == "--software"),
         layers: if args.iter().any(|a| a == "--no-layers") {
             None
         } else {

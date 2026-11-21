@@ -35,10 +35,18 @@ float3 environmentRadianceUv(float2 uv) {
     return lerp(lerp(environmentTexel(base),environmentTexel(base+int2(1,0)),f.x),
                 lerp(environmentTexel(base+int2(0,1)),environmentTexel(base+int2(1,1)),f.x),f.y)*params.environmentScale.x;
 }
+// Use a literal for the native renderer so Slang removes the lat-long path
+// before emitting SPIR-V, even at its normal optimization level.
+#ifdef GI_NATIVE_CASCADES
+#define hasEnvironmentMap() false
+#else
+#define hasEnvironmentMap() (params.environmentInfo.w != 0u)
+#endif
+
 float3 environmentRadiance(float3 direction) {
     // Without a map, the renderer's ambient hemisphere (z is up), which it
     // leaves to GI while GI is on.
-    if (params.environmentInfo.w == 0)
+    if (!hasEnvironmentMap())
         return lerp(params.ground.xyz, params.environment.xyz, direction.z * 0.5 + 0.5);
     return environmentRadianceUv(environmentUv(direction));
 }
@@ -57,7 +65,7 @@ float environmentPdfUv(float2 uv) {
     return max(mass, 0.0) / max(environmentTexelSolidAngle(y), 1e-20);
 }
 float environmentPdf(float3 direction) {
-    if (params.environmentInfo.w == 0) return 1.0 / (4.0 * PI);
+    if (!hasEnvironmentMap()) return 1.0 / (4.0 * PI);
     return environmentPdfUv(environmentUv(direction));
 }
 
@@ -66,7 +74,7 @@ float environmentPdf(float3 direction) {
 bool sampleEnvironment(float4 random, out float3 direction, out float pdf, out float3 radiance,
                        out float2 uv) {
     uv = 0.0;
-    if (params.environmentInfo.w == 0) {
+    if (!hasEnvironmentMap()) {
         float y = 1.0 - 2.0 * saturate(random.x);
         float phi = 2.0 * PI * frac(random.y);
         float radius = sqrt(max(0.0, 1.0 - y * y));
@@ -156,13 +164,13 @@ float3 environmentResponseTracked(float3 position, float3 normal, float3 geometr
                              inout DependencyContext dependency, uint admissionLimit,
                              bool fullBsdf, SurfaceBsdf material, float2 ab) {
     querySupported = true;
-    if (count == 0 || (params.environmentInfo.w == 0
+    if (count == 0 || (!hasEnvironmentMap()
             && all(params.environment.xyz <= 0.0) && all(params.ground.xyz <= 0.0)))
         return 0.0;
 
     float3 sum = 0.0;
     uint seed = hashKey(int4(int3(floor(position / (params.tuning.x * 0.05))), 37), 16777216);
-    uint aliasCount = params.environmentInfo.w == 0 ? 0u : (count + 1u) / 2u;
+    uint aliasCount = hasEnvironmentMap() ? (count + 1u) / 2u : 0u;
     uint cosineCount = count - aliasCount;
     uint sampleFrame = sequenceBase;
     float aliasWeight = float(aliasCount) / float(count);
@@ -193,13 +201,13 @@ float3 environmentResponseTracked(float3 position, float3 normal, float3 geometr
         float cosine = max(0.0, dot(normal, lightDirection));
         if (cosine <= 0.0 || dot(geometricNormal, lightDirection) <= 0.0) continue;
         if (!aliasSample) {
-            if (params.environmentInfo.w == 0) radiance = environmentRadiance(lightDirection);
+            if (!hasEnvironmentMap()) radiance = environmentRadiance(lightDirection);
             else {
                 environmentSampleUv = environmentUv(lightDirection);
                 radiance = environmentRadianceUv(environmentSampleUv);
             }
         }
-        float aliasPdf = params.environmentInfo.w == 0 ? 1.0 / (4.0 * PI)
+        float aliasPdf = !hasEnvironmentMap() ? 1.0 / (4.0 * PI)
             : environmentPdfUv(environmentSampleUv);
         float cosinePdf = cosine / PI;
         float materialPdf = fullBsdf ? 0.5 * (cosinePdf

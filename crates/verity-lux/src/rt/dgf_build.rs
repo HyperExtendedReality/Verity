@@ -16,6 +16,7 @@ use super::{
 };
 
 const DGF1_ALIGNMENT: u64 = 128;
+const RANGE_BYTES: u32 = size_of::<vk::AccelerationStructureBuildRangeInfoKHR>() as u32;
 const COMPRESSED_DATA_DGF1: vk::BufferUsageFlags2KHR = vk::BufferUsageFlags2KHR::from_raw(1 << 33);
 const DENSE_GEOMETRY_TRIANGLES: vk::GeometryTypeKHR = vk::GeometryTypeKHR::from_raw(1_000_478_000);
 const DENSE_GEOMETRY_TRIANGLES_DATA: vk::StructureType = vk::StructureType::from_raw(1_000_478_001);
@@ -66,7 +67,7 @@ impl RayTracing {
         // SAFETY: The capability enables DGF and buffer usage flags 2. The
         // caller supplies the owning device and exclusive use of the pool/queue.
         unsafe {
-            let input = DgfInput::upload(gpu, bytes)?;
+            let input = DgfInput::upload(gpu, bytes, mesh.num_triangles)?;
             let result = self.build_dgf_blocks(gpu, pool, &mesh, input.address, data_size);
             input.destroy(gpu);
             result.map(Some)
@@ -146,14 +147,15 @@ impl RayTracing {
                         },
                     );
                     let result = submit(gpu, pool, |cmd| {
-                        // VUID-vkCmdBuildAccelerationStructuresKHR-pInfos-10906:
-                        // DGF requires a null entry, not a dummy range or a null array.
-                        let ranges = [ptr::null()];
-                        (self.loader.fp().cmd_build_acceleration_structures_khr)(
+                        // The current direct command requires a null range for DGF.
+                        // Early AMD drivers dereference it. The indirect command
+                        // uses a device-side range and the same compressed metadata.
+                        self.loader.cmd_build_acceleration_structures_indirect(
                             cmd,
-                            1,
-                            &info,
-                            ranges.as_ptr(),
+                            &[info],
+                            &[device_address + data_size],
+                            &[RANGE_BYTES],
+                            &[&[mesh.num_triangles]],
                         );
                         gpu::memory_barrier(
                             device,
@@ -162,7 +164,10 @@ impl RayTracing {
                                 vk::PipelineStageFlags2::ACCELERATION_STRUCTURE_BUILD_KHR,
                                 vk::AccessFlags2::ACCELERATION_STRUCTURE_WRITE_KHR,
                             ),
-                            (vk::PipelineStageFlags2::ALL_COMMANDS, vk::AccessFlags2::MEMORY_READ),
+                            (
+                                vk::PipelineStageFlags2::ALL_COMMANDS,
+                                vk::AccessFlags2::MEMORY_READ,
+                            ),
                         );
                     });
                     match result {
@@ -193,12 +198,13 @@ impl DgfInput {
     /// # Safety
     /// The device must have DGF and its usage-flags-2 dependency enabled, and
     /// `bytes` must contain a nonempty, complete sequence of DGF1 blocks.
-    unsafe fn upload(gpu: &mut Gpu, bytes: &[u8]) -> Result<Self> {
+    unsafe fn upload(gpu: &mut Gpu, bytes: &[u8], triangles: u32) -> Result<Self> {
         let device = gpu.device;
         let mut usage = vk::BufferUsageFlags2CreateInfoKHR::default().usage(
             COMPRESSED_DATA_DGF1
                 | vk::BufferUsageFlags2KHR::ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY
-                | vk::BufferUsageFlags2KHR::SHADER_DEVICE_ADDRESS,
+                | vk::BufferUsageFlags2KHR::SHADER_DEVICE_ADDRESS
+                | vk::BufferUsageFlags2KHR::INDIRECT_BUFFER,
         );
         // SAFETY: The enabled extension permits these usage flags. The
         // allocator was created for this device, and returns coherent mapped
@@ -206,7 +212,7 @@ impl DgfInput {
         unsafe {
             let buffer = device.create_buffer(
                 &vk::BufferCreateInfo::default()
-                    .size(bytes.len() as u64 + (DGF1_ALIGNMENT - 1))
+                    .size(bytes.len() as u64 + u64::from(RANGE_BYTES) + (DGF1_ALIGNMENT - 1))
                     .sharing_mode(vk::SharingMode::EXCLUSIVE)
                     .push_next(&mut usage),
                 None,
@@ -225,7 +231,8 @@ impl DgfInput {
                     return Err(error.into());
                 }
             };
-            if let Err(error) = device.bind_buffer_memory(buffer, allocation.memory(), allocation.offset())
+            if let Err(error) =
+                device.bind_buffer_memory(buffer, allocation.memory(), allocation.offset())
             {
                 device.destroy_buffer(buffer, None);
                 let _ = gpu.allocator.free(allocation);
@@ -241,7 +248,11 @@ impl DgfInput {
             let mapped = allocation
                 .mapped_slice_mut()
                 .expect("DGF input uses host-visible memory");
-            mapped[offset..offset + bytes.len()].copy_from_slice(bytes);
+            let range = offset + bytes.len();
+            mapped[offset..range].copy_from_slice(bytes);
+            // VkAccelerationStructureBuildRangeInfoKHR: count, then three zero offsets.
+            mapped[range..range + RANGE_BYTES as usize]
+                .copy_from_slice(bytemuck::bytes_of(&[triangles, 0, 0, 0]));
             Ok(Self {
                 buffer,
                 allocation,

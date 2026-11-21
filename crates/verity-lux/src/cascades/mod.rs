@@ -4,8 +4,7 @@
 //! G-buffer, rank and build the probe hierarchy, trace interval rays through
 //! the GI scene, merge them into the world cache, pack directional probes,
 //! resolve per-pixel irradiance, filter it temporally and spatially, and add
-//! diffuse GI times albedo to the HDR target. Bindings, sizes and pass order
-//! follow `legacy/src/render.rs`.
+//! diffuse GI times albedo to the HDR target.
 
 // Every function here is Vulkan calls; an unsafe fn body is one unsafe context.
 #![allow(unsafe_op_in_unsafe_fn)]
@@ -18,18 +17,19 @@ pub mod settings;
 pub mod surface;
 
 use self::{
-    accel::SceneAccel,
+    accel::{RayMaterials, RayOptions, SceneAccel},
     scene::{Emitter, GiScene, LAYER_MASK, MAX_EMITTERS, SurfaceWords},
     settings::*,
 };
 use crate::{
     GiMethod, GiStatus,
     pxtgi::{Capture, Readback},
-    shared::{BLUE_NOISE, PassTimer, Patch, Res, upload, upload_ranges, write_set},
+    shared::{PassTimer, Patch, Res, SAMPLING_DATA, upload, upload_ranges, write_set},
+    tier::HardwareProfile,
 };
 use ash::vk;
 use bytemuck::{Pod, Zeroable};
-use glam::{Mat4, Vec3};
+use glam::{Mat4, Vec2, Vec3};
 use gpu_allocator::MemoryLocation;
 use std::ops::Range;
 use std::{collections::HashMap, ffi::CString, mem, time::Instant};
@@ -213,8 +213,7 @@ const PASSES: &[(&str, &[u8], &[u8])] = &[
 ];
 
 use vk::DescriptorType as D;
-/// The cascades' set 0, as `compute_layout` in the legacy renderer (minus the
-/// atlas, the DFG texture and the hardware TLAS).
+/// The cascades' set 0, minus the hardware TLAS, which is added when present.
 /// Its buffers are pointers in `Parameters::buffers`.
 const MAIN_BINDINGS: &[(u32, D)] = &[
     (0, D::UNIFORM_BUFFER),
@@ -230,19 +229,17 @@ const MAIN_BINDINGS: &[(u32, D)] = &[
     (25, D::SAMPLED_IMAGE),
     (26, D::SAMPLED_IMAGE),
     (27, D::SAMPLED_IMAGE),
-    (28, D::SAMPLED_IMAGE),
-    (29, D::SAMPLED_IMAGE),
     (38, D::STORAGE_IMAGE),
     (39, D::SAMPLED_IMAGE),
     (40, D::SAMPLED_IMAGE),
     (47, D::SAMPLED_IMAGE),
 ];
 /// The scene TLAS, in set 0 only for the `GI_RAY_QUERY` passes.
-const TLAS_BINDING: (u32, D) = (50, D::ACCELERATION_STRUCTURE_KHR);
+const TLAS_BINDING: u32 = 50;
 
-fn main_bindings(ray_query: bool) -> Vec<(u32, D)> {
+fn main_bindings(tlas: Option<D>) -> Vec<(u32, D)> {
     let mut bindings = MAIN_BINDINGS.to_vec();
-    bindings.extend(ray_query.then_some(TLAS_BINDING));
+    bindings.extend(tlas.map(|kind| (TLAS_BINDING, kind)));
     bindings
 }
 
@@ -309,6 +306,19 @@ fn ambient_change(now: [Vec3; 2], before: [Vec3; 2]) -> SunChange {
 }
 
 /// How the sun and the point lights changed since the previous frame.
+/// Whether two clip matrices differ only by a TAA jitter: a translation in
+/// clip x and y of at most two pixels.
+fn same_pose_but_jitter(a: Mat4, b: Mat4, viewport: [u32; 4]) -> bool {
+    let offset = a * b.inverse();
+    let pixel = Vec2::new(
+        2.0 / viewport[2].max(1) as f32,
+        2.0 / viewport[3].max(1) as f32,
+    );
+    let shift = offset.w_axis.truncate().truncate();
+    let translation = Mat4::from_translation(shift.extend(0.0));
+    offset.abs_diff_eq(translation, 1e-4) && shift.abs().cmple(2.0 * pixel).all()
+}
+
 fn light_changes(lights: &[GiLight], previous: &[GiLight]) -> (SunChange, bool) {
     // The sun is the one directional record with light; the mask record has none.
     let sun = |ls: &[GiLight]| {
@@ -413,9 +423,6 @@ struct View {
     anchors: [Image; 2],
     /// 1x1 stand-ins: environment, SSAO, sun shadows, RTGI lit history.
     placeholder: Image,
-    /// 1x1x1 stand-in for the scene and geometry page arrays.
-    pages: Image,
-    pages_view: vk::ImageView,
     uniforms: [[Buffer; LEVELS + 2]; SLOTS],
     lights: [Buffer; SLOTS],
     pool: vk::DescriptorPool,
@@ -427,9 +434,58 @@ struct View {
 
 type CompiledPasses = std::result::Result<Vec<(&'static str, vk::Pipeline)>, String>;
 
-/// Where compiled pipelines persist between runs; drivers reject stale data.
-fn pipeline_cache_path() -> std::path::PathBuf {
-    std::env::temp_dir().join("verity-lux-pipelines.bin")
+const PIPELINE_CACHE_PREFIX: &str = "verity-lux-pass-";
+/// The whole-set caches earlier builds wrote; removed when found.
+const OLD_PIPELINE_CACHE_PREFIX: &str = "verity-lux-pipelines-";
+/// Per-pass cache files kept, newest first: several shader builds of every
+/// pass, for both trace modes and a second GPU.
+const PIPELINE_CACHES_KEPT: usize = 4 * 2 * 2 * PASSES.len();
+
+/// One pass's cache: keyed by the device's pipeline-cache UUID and the pass's
+/// own SPIR-V, so editing one shader recompiles only that pass, and two GPUs
+/// do not overwrite each other's entries.
+fn pipeline_cache_path(
+    dir: &std::path::Path,
+    device: [u8; 16],
+    name: &str,
+    spirv: &[u8],
+) -> std::path::PathBuf {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    device.hash(&mut hasher);
+    name.hash(&mut hasher);
+    spirv.hash(&mut hasher);
+    dir.join(format!(
+        "{PIPELINE_CACHE_PREFIX}{name}-{:016x}.bin",
+        hasher.finish()
+    ))
+}
+
+/// Delete all but the newest `PIPELINE_CACHES_KEPT` pass caches, and every
+/// whole-set cache from earlier builds.
+fn prune_pipeline_caches(dir: &std::path::Path) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    let mut caches = Vec::new();
+    for entry in entries.filter_map(Result::ok) {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if !name.ends_with(".bin") {
+            continue;
+        }
+        if name.starts_with(OLD_PIPELINE_CACHE_PREFIX) {
+            let _ = std::fs::remove_file(entry.path());
+        } else if name.starts_with(PIPELINE_CACHE_PREFIX)
+            && let Ok(modified) = entry.metadata().and_then(|m| m.modified())
+        {
+            caches.push((modified, entry.path()));
+        }
+    }
+    caches.sort_unstable_by_key(|&(modified, _)| std::cmp::Reverse(modified));
+    for (_, path) in caches.into_iter().skip(PIPELINE_CACHES_KEPT) {
+        let _ = std::fs::remove_file(path);
+    }
 }
 
 fn reference_pass(gather: FinalGather) -> &'static str {
@@ -439,28 +495,52 @@ fn reference_pass(gather: FinalGather) -> &'static str {
     }
 }
 
-/// Compile the requested passes in parallel through a disk-backed pipeline cache. The
-/// transport shaders are large: a cold driver compile takes minutes on one core.
+fn resolve_pass(gather: FinalGather) -> &'static str {
+    match gather {
+        FinalGather::Probes => "worldResolve",
+        FinalGather::Cosine | FinalGather::Guided => "guidedResolve",
+        FinalGather::MaterialSpace => "materialResolve",
+    }
+}
+
+/// The primary path always allocates deferred scratch. Fair and cold-priority
+/// admission both cap receiver tickets by the update budget (and grid size).
+fn trace_overflow_possible(grid: [u32; 2], budget: u32) -> bool {
+    (u64::from(grid[0]) * u64::from(grid[1])).min(u64::from(budget)) > DEFERRED_TRACE_RECEIVERS
+}
+
+fn pass_needed(name: &str, reference: bool, gather: FinalGather, trace_overflow: bool) -> bool {
+    if reference {
+        name == "clear" || name.starts_with("composite") || name == reference_pass(gather)
+    } else {
+        match name {
+            "reference" | "materialReference" => false,
+            "trace" => trace_overflow,
+            "worldResolve" | "guidedResolve" | "materialResolve" => name == resolve_pass(gather),
+            _ => true,
+        }
+    }
+}
+
+/// Compile the requested passes in parallel, each through a disk cache of its
+/// own. The transport shaders are large: a cold driver compile takes minutes
+/// on one core. Each pass saves its cache as soon as it compiles, so an
+/// interrupted start keeps what it finished, and separate caches let the
+/// driver compile without contending for one.
 fn compile_passes(
     device: ash::Device,
+    cache_uuid: [u8; 16],
     layout: vk::PipelineLayout,
     composite_layout: vk::PipelineLayout,
     ray_query: bool,
     include: impl Fn(&str) -> bool,
 ) -> CompiledPasses {
-    let initial = std::fs::read(pipeline_cache_path()).unwrap_or_default();
-    let cache = unsafe {
-        device.create_pipeline_cache(
-            &vk::PipelineCacheCreateInfo::default().initial_data(&initial),
-            None,
-        )
-    }
-    .or_else(|_| unsafe {
-        device.create_pipeline_cache(&vk::PipelineCacheCreateInfo::default(), None)
-    })
-    .map_err(|e| e.to_string())?;
+    let dir = std::env::temp_dir();
+    let profile = std::env::var_os("VERITY_LUX_PROFILE_PIPELINES").is_some();
+    let disable_driver_optimization = std::env::var_os("VERITY_LUX_TRIAL_NO_DRIVER_OPT").is_some();
+    let started = Instant::now();
     let results: Vec<_> = std::thread::scope(|scope| {
-        let device = &device;
+        let (device, dir) = (&device, &dir);
         let handles: Vec<_> = PASSES
             .iter()
             .filter(|&&(name, _, _)| include(name))
@@ -473,8 +553,65 @@ fn compile_passes(
                         layout
                     };
                     let entry = CString::new(name).map_err(|e| e.to_string())?;
+                    let cache_path = pipeline_cache_path(dir, cache_uuid, name, spirv);
+                    let initial = std::fs::read(&cache_path).unwrap_or_default();
+                    // SAFETY: the device outlives this scope; the cache is
+                    // destroyed below on every path.
+                    let cache = unsafe {
+                        device
+                            .create_pipeline_cache(
+                                &vk::PipelineCacheCreateInfo::default().initial_data(&initial),
+                                None,
+                            )
+                            .or_else(|_| {
+                                device.create_pipeline_cache(
+                                    &vk::PipelineCacheCreateInfo::default(),
+                                    None,
+                                )
+                            })
+                    }
+                    .map_err(|e| format!("{name}: {e}"))?;
+                    let start = profile.then(Instant::now);
                     // SAFETY: the SPIR-V was validated at build time; the layout outlives the pipeline.
-                    unsafe { gpu::compute_pipeline(device, cache, layout, spirv, &entry) }
+                    let result = unsafe {
+                        if disable_driver_optimization && spirv.len() > 170_000 {
+                            gpu::shader_module(device, spirv).and_then(|module| {
+                                let info = [vk::ComputePipelineCreateInfo::default()
+                                    .flags(vk::PipelineCreateFlags::DISABLE_OPTIMIZATION)
+                                    .stage(
+                                        vk::PipelineShaderStageCreateInfo::default()
+                                            .stage(vk::ShaderStageFlags::COMPUTE)
+                                            .module(module)
+                                            .name(&entry),
+                                    )
+                                    .layout(layout)];
+                                let result = device.create_compute_pipelines(cache, &info, None);
+                                device.destroy_shader_module(module, None);
+                                Ok(result.map_err(|(_, error)| error)?[0])
+                            })
+                        } else {
+                            gpu::compute_pipeline(device, cache, layout, spirv, &entry)
+                        }
+                    };
+                    // SAFETY: as above; nothing else uses this cache.
+                    unsafe {
+                        if result.is_ok()
+                            && let Ok(data) = device.get_pipeline_cache_data(cache)
+                            && data != initial
+                        {
+                            // A cache that fails to save only costs the next run a cold compile.
+                            let _ = std::fs::write(&cache_path, data);
+                        }
+                        device.destroy_pipeline_cache(cache, None);
+                    }
+                    if let Some(start) = start {
+                        let cached = if initial.is_empty() { "cold" } else { "cached" };
+                        eprintln!(
+                            "Lux pipeline {name}: {:.3}s ({cached})",
+                            start.elapsed().as_secs_f64()
+                        );
+                    }
+                    result
                         .map(|pipeline| (name, pipeline))
                         .map_err(|e| format!("{name}: {e}"))
                 })
@@ -488,13 +625,14 @@ fn compile_passes(
             })
             .collect()
     });
-    unsafe {
-        if let Ok(data) = device.get_pipeline_cache_data(cache) {
-            // A cache that fails to save only costs the next run a cold compile.
-            let _ = std::fs::write(pipeline_cache_path(), data);
-        }
-        device.destroy_pipeline_cache(cache, None);
+    if profile {
+        eprintln!(
+            "Lux pipelines: ray_query={ray_query}, {} passes in {:.3}s",
+            results.len(),
+            started.elapsed().as_secs_f64()
+        );
     }
+    prune_pipeline_caches(&dir);
     let (ok, failed): (Vec<_>, Vec<_>) = results.into_iter().partition(Result::is_ok);
     let ok: Vec<_> = ok.into_iter().map(Result::unwrap).collect();
     if let Some(Err(error)) = failed.into_iter().next() {
@@ -504,6 +642,13 @@ fn compile_passes(
         return Err(error);
     }
     Ok(ok)
+}
+
+/// The driver's pipeline-cache identity: caches from another device or driver
+/// version would be ignored, so they get files of their own.
+fn pipeline_cache_uuid(gpu: &Gpu) -> [u8; 16] {
+    // SAFETY: `gpu.physical` was enumerated from `gpu.instance`.
+    unsafe { gpu.instance.get_physical_device_properties(gpu.physical) }.pipeline_cache_uuid
 }
 
 /// Split Radiance Cascades GI. Install with `Renderer::set_extension` before
@@ -525,6 +670,9 @@ pub struct SplitRadianceCascades {
     blue_noise: Buffer,
     /// The scene for hardware ray queries, on GPUs with them.
     accel: Option<SceneAccel>,
+    /// The device's acceleration choices, read the first time GI sees the GPU.
+    hardware: Option<HardwareProfile>,
+    ray_materials: RayMaterials,
     instances: u32,
     pipelines: Option<Pipelines>,
     compile: Option<std::thread::JoinHandle<CompiledPasses>>,
@@ -558,6 +706,21 @@ pub struct SplitRadianceCascades {
 }
 
 impl SplitRadianceCascades {
+    /// The device's profile, detected once. Static meshes added from then on
+    /// use its software BVH layout.
+    fn hardware(&mut self, gpu: &Gpu) -> HardwareProfile {
+        *self.hardware.get_or_insert_with(|| {
+            let profile = HardwareProfile::detect(gpu);
+            self.scene.set_software_layout(profile.software);
+            profile
+        })
+    }
+
+    /// The device's acceleration profile, once the renderer has lent GI the GPU.
+    pub fn hardware_profile(&self) -> Option<HardwareProfile> {
+        self.hardware
+    }
+
     pub fn new(settings: Settings) -> Self {
         let mut scene = GiScene::default();
         scene.set_surface_texel(if settings.surface_cache {
@@ -575,6 +738,8 @@ impl SplitRadianceCascades {
             surface_hash_cells: 0,
             blue_noise: Buffer::default(),
             accel: None,
+            hardware: None,
+            ray_materials: RayMaterials::default(),
             instances: 0,
             pipelines: None,
             compile: None,
@@ -678,7 +843,7 @@ impl SplitRadianceCascades {
         Ok(())
     }
 
-    unsafe fn pipelines(gpu: &mut Gpu, ray_query: bool) -> Result<Pipelines> {
+    unsafe fn pipelines(gpu: &mut Gpu, tlas: Option<D>) -> Result<Pipelines> {
         let device = gpu.device;
         let set_layout = |bindings: &[(u32, D)]| {
             let bindings: Vec<_> = bindings
@@ -696,7 +861,7 @@ impl SplitRadianceCascades {
                 None,
             )
         };
-        let main = set_layout(&main_bindings(ray_query))?;
+        let main = set_layout(&main_bindings(tlas))?;
         let composite = set_layout(COMPOSITE_BINDINGS)?;
         // Set 1 is the renderer's frame set: materials, textures, DFG table.
         let layout = device.create_pipeline_layout(
@@ -792,21 +957,36 @@ impl SplitRadianceCascades {
         self.targets_changed(gpu, targets)
     }
 
-    /// Bring the acceleration structures, if any, up to the packed words; see
-    /// [`SceneAccel::update`]. Creates them on the first call on a GPU with
-    /// ray queries.
+    /// Update the hardware snapshot and report whether its descriptor changed.
     unsafe fn update_accel(
         &mut self,
         gpu: &mut Gpu,
         changed: Option<&[Range<usize>]>,
-    ) -> Result<()> {
-        if gpu.ray_query && self.settings.hardware_rays && self.accel.is_none() {
-            self.accel = Some(SceneAccel::new(gpu));
+    ) -> Result<bool> {
+        let options = RayOptions::from_profile(&self.hardware(gpu));
+        let words = self.scene.words();
+        if let Some(accel) = &mut self.accel {
+            return accel.update(
+                gpu,
+                &mut self.command_pool,
+                words,
+                &self.ray_materials,
+                changed,
+            );
         }
-        match &mut self.accel {
-            Some(accel) => accel.update(gpu, &mut self.command_pool, self.scene.words(), changed),
-            None => Ok(()),
+        if !gpu.ray_query || !self.settings.hardware_rays {
+            return Ok(false);
         }
+        let mut accel = SceneAccel::new(gpu, options);
+        let descriptor_changed = accel.update(
+            gpu,
+            &mut self.command_pool,
+            words,
+            &self.ray_materials,
+            None,
+        )?;
+        self.accel = Some(accel);
+        Ok(descriptor_changed)
     }
 
     /// Upload models added since the last upload. Earlier frames may still
@@ -1027,27 +1207,20 @@ impl SplitRadianceCascades {
             height: 1,
         };
         let placeholder = image("gi placeholder", rgba32f, one)?;
-        let pages = image("gi pages", vk::Format::R32G32B32A32_UINT, one)?;
-        let pages_view = device.create_image_view(
-            &vk::ImageViewCreateInfo::default()
-                .image(pages.image)
-                .view_type(vk::ImageViewType::TYPE_2D_ARRAY)
-                .format(vk::Format::R32G32B32A32_UINT)
-                .subresource_range(gpu::subresource(color)),
-            None,
-        )?;
 
         let count =
             |list: &[(u32, D)], kind: D| list.iter().filter(|(_, k)| *k == kind).count() as u32;
-        let main = main_bindings(self.accel.is_some());
+        let tlas = self.accel.as_ref().map(SceneAccel::descriptor_type);
+        let main = main_bindings(tlas);
         let sizes: Vec<_> = [
             D::UNIFORM_BUFFER,
             D::STORAGE_BUFFER,
             D::SAMPLED_IMAGE,
             D::STORAGE_IMAGE,
-            D::ACCELERATION_STRUCTURE_KHR,
+            // The selected acceleration structure descriptor is added below.
         ]
         .into_iter()
+        .chain(tlas)
         .map(|kind| {
             vk::DescriptorPoolSize::default().ty(kind).descriptor_count(
                 SLOTS as u32
@@ -1096,8 +1269,6 @@ impl SplitRadianceCascades {
             denoise_history,
             anchors,
             placeholder,
-            pages,
-            pages_view,
             uniforms: uniforms.try_into().ok().unwrap(),
             lights,
             pool,
@@ -1115,9 +1286,11 @@ impl SplitRadianceCascades {
         let image = |image: &Image| Res::View(image.view, general);
         let depth = Res::View(targets.depth, vk::ImageLayout::DEPTH_READ_ONLY_OPTIMAL);
         let placeholder = image(&view.placeholder);
+        let tlas = self.accel.as_ref().and_then(SceneAccel::khr_tlas);
+        let main = main_bindings(self.accel.as_ref().map(SceneAccel::descriptor_type));
         for slot in 0..SLOTS {
             let (p, q) = (slot, 1 - slot);
-            // `bind_compute` in the legacy renderer: (uniform, output, input,
+            // Per pass variant: (uniform, output, input,
             // sample input, metadata output, metadata input, receiver history
             // output, receiver history input, background output, background sample).
             let variant = |uniform: usize, views: [&Image; 9]| -> Vec<(u32, Res)> {
@@ -1146,8 +1319,6 @@ impl SplitRadianceCascades {
                     (25, image(history_in)),
                     (26, Res::View(targets.receiver, general)),
                     (27, Res::View(targets.gbuffer, general)),
-                    (28, Res::View(view.pages_view, general)),
-                    (29, Res::View(view.pages_view, general)),
                     (38, image(background_out)),
                     (39, image(background_sample)),
                     (40, image(&view.background[1 + q])),
@@ -1219,19 +1390,17 @@ impl SplitRadianceCascades {
                     ],
                 ));
             }
-            let main = main_bindings(self.accel.is_some());
             for (set, entries) in view.sets[slot].iter().zip(&mut contents) {
-                if let Some(accel) = &self.accel {
-                    entries.push((TLAS_BINDING.0, Res::Accel(accel.tlas())));
+                if let Some(tlas) = tlas {
+                    entries.push((TLAS_BINDING, Res::Accel(tlas)));
                 }
                 write_set(device, *set, &main, entries);
+                if let Some(accel) = &self.accel {
+                    accel.write_partitioned(device, *set, TLAS_BINDING);
+                }
             }
             // The reference writes the unfiltered image directly.
-            let steps = if self.settings.reference {
-                0
-            } else {
-                self.settings.spatial_filter_steps
-            };
+            let steps = self.settings.filter_steps();
             let display = &irr[composite_display_index(steps, p)];
             let display_history = if steps == 0 {
                 &meta[3 + p]
@@ -1272,7 +1441,6 @@ impl SplitRadianceCascades {
         view: View,
     ) {
         device.destroy_descriptor_pool(view.pool, None);
-        device.destroy_image_view(view.pages_view, None);
         let buffers = view
             .heads
             .into_iter()
@@ -1296,7 +1464,7 @@ impl SplitRadianceCascades {
             .chain(view.metadata)
             .chain(view.background)
             .chain(view.anchors)
-            .chain([view.denoise_history, view.placeholder, view.pages]);
+            .chain([view.denoise_history, view.placeholder]);
         for image in images {
             gpu::destroy_image(device, allocator, image);
         }
@@ -1355,7 +1523,17 @@ impl SplitRadianceCascades {
         // Lux's clip space is Y-up (wgpu); the renderer's is flipped for Vulkan.
         let flip = Mat4::from_scale(Vec3::new(1.0, -1.0, 1.0));
         let clip = flip * frame.view_proj;
-        let previous_clip = flip * frame.previous_view_proj;
+        // Last frame's camera through this frame's jitter, as the renderer's
+        // motion vectors see it: equal to `clip` when the view holds still.
+        let previous_pose = flip * frame.previous_view_proj;
+        // Last frame's own jittered clip, which its depth and history texels
+        // were rendered with. Reconstructing them through this frame's jitter
+        // instead puts each old point up to a pixel off; on grazing surfaces
+        // that fails the plane test and threw away screen history every frame.
+        let previous_clip = self
+            .previous_clip
+            .filter(|&actual| same_pose_but_jitter(actual, previous_pose, frame.viewport))
+            .unwrap_or(previous_pose);
         let camera_changed = self
             .previous_clip
             .is_none_or(|p| !p.abs_diff_eq(clip, 1e-6));
@@ -1437,19 +1615,10 @@ impl SplitRadianceCascades {
             environment: frame.sky.extend(1.0).to_array(),
             ground: frame.ground.extend(0.0).to_array(),
             history: [
-                settings.temporal_blend,
+                settings.history_blend(),
                 0.0,
                 f32::from(u8::from(history_valid)),
-                // Both clip matrices use the same jitter. Cap history only
-                // when the view actually moves, since glossy radiance shifts.
-                if !settings.reference
-                    && settings.final_gather == FinalGather::MaterialSpace
-                    && !clip.abs_diff_eq(previous_clip, 1e-6)
-                {
-                    settings.history_frames.min(4) as f32
-                } else {
-                    settings.history_frames as f32
-                },
+                settings.history_frames as f32,
             ],
             interval_history: [
                 settings.split_transmittance_blend,
@@ -1465,18 +1634,30 @@ impl SplitRadianceCascades {
                 settings.emissive_samples,
                 emitter_power.to_bits(),
             ],
+            // w: the view moved. Both clip matrices use the same jitter, so
+            // this is camera motion; MSGI then shortens glossy history.
             stability: [
                 f32::from(u8::from(history_valid)),
                 f32::from(u8::from(first || lights_changed)),
                 1.0,
-                1.0,
+                f32::from(u8::from(!clip.abs_diff_eq(previous_pose, 1e-6))),
             ],
             // The mask record follows the lights; bit 0 uses the G-buffer's occlusion byte.
             layers: [conventional + emitter_count, 1, 1, emitter_cutoff.to_bits()],
             environment_rotation: [0.0, 0.0, 0.0, 1.0],
             environment_scale: [1.0, 0.0, 0.0, 0.0],
-            // z bit 0: the sun moved a little, so the shaders blend its history rather than drop it.
-            source_history: [active, changed, u32::from(gradual_sun), 0],
+            // z bit 0: blend gradual sun changes; bit 2: hardware can commit opaque triangles.
+            source_history: [
+                active,
+                changed,
+                u32::from(gradual_sun)
+                    | (u32::from(
+                        self.accel
+                            .as_ref()
+                            .is_some_and(SceneAccel::opaque_instances),
+                    ) << 2),
+                0,
+            ],
             sampling: [
                 budget,
                 settings.sampling.max_traversal_queries,
@@ -1605,7 +1786,7 @@ impl SplitRadianceCascades {
                 .chain(&view.metadata)
                 .chain(&view.background)
                 .chain(&view.anchors)
-                .chain([&view.denoise_history, &view.placeholder, &view.pages]);
+                .chain([&view.denoise_history, &view.placeholder]);
             let transitions: Vec<_> = images
                 .clone()
                 .map(|image| {
@@ -1748,7 +1929,9 @@ impl SplitRadianceCascades {
                 1,
             );
             dispatch("traceResolve", compute[0], trace_groups, 1);
-            dispatch("trace", compute[0], trace_groups, 1);
+            if self.pass_limit.is_some() || trace_overflow_possible(view.grid, budget) {
+                dispatch("trace", compute[0], trace_groups, 1);
+            }
             // World cache and directional probes.
             dispatch("retain", compute[0], bucket_groups, 1);
             dispatch("reduce", compute[0], bucket_groups, 1);
@@ -1775,12 +1958,12 @@ impl SplitRadianceCascades {
             );
             dispatch("packProbes", compute[0], pack_x, pack_y);
             // Per-pixel irradiance, temporal history, spatial filtering.
-            let gather_pass = match settings.final_gather {
-                FinalGather::Probes => "worldResolve",
-                FinalGather::Cosine | FinalGather::Guided => "guidedResolve",
-                FinalGather::MaterialSpace => "materialResolve",
-            };
-            dispatch(gather_pass, world_resolve, shading_x, shading_y);
+            dispatch(
+                resolve_pass(settings.final_gather),
+                world_resolve,
+                shading_x,
+                shading_y,
+            );
             dispatch("temporal", temporal, shading_x, shading_y);
             // Only temporal results become history; filtered display values never feed back.
             let layers = vk::ImageSubresourceLayers::default()
@@ -1804,7 +1987,7 @@ impl SplitRadianceCascades {
             );
             compute_barrier();
             stamp("copyHistory");
-            for &set in denoise.iter().take(settings.spatial_filter_steps as usize) {
+            for &set in denoise.iter().take(settings.filter_steps() as usize) {
                 dispatch("denoise", set, shading_x, shading_y);
             }
         }
@@ -1895,12 +2078,14 @@ impl RenderExtension for SplitRadianceCascades {
 
     fn scene_loaded(
         &mut self,
-        _gpu: &mut Gpu,
+        gpu: &mut Gpu,
         scene: &SceneData,
         material_base: u32,
         _draw_base: u32,
     ) -> Result<()> {
+        let options = RayOptions::from_profile(&self.hardware(gpu));
         self.scene.add(scene, material_base);
+        self.ray_materials.add(gpu, options, scene, material_base);
         self.scene_changed = true;
         // Packing and uploading covers every model so far: doing it once when
         // GI next needs the scene, not per model, saved seconds on Sponza.
@@ -1918,7 +2103,15 @@ impl RenderExtension for SplitRadianceCascades {
         self.scene.set_retained(changes, material);
         // History stays: it refines toward the new geometry, where dropping it
         // would flash the whole view on every brush stroke.
-        let Some(ranges) = self.scene.refresh() else {
+        let ranges = self.scene.refresh();
+        // Frames in flight still read what this replaces: a full upload
+        // destroys the old buffers, and a hardware update destroys the old
+        // BLASes and TLAS and rewrites the descriptor sets. Freeing them under
+        // a running frame lost the device on terrain with hardware rays.
+        if ranges.is_none() || self.accel.is_some() {
+            unsafe { gpu.device.device_wait_idle()? };
+        }
+        let Some(ranges) = ranges else {
             return unsafe { self.upload_packed(gpu) };
         };
         let words = self.scene.words();
@@ -1942,12 +2135,11 @@ impl RenderExtension for SplitRadianceCascades {
                     },
                 ],
             )?;
-            if self.accel.is_some() {
-                self.update_accel(gpu, Some(&ranges.geometry))?;
-                // The TLAS was replaced.
-                if let Some(targets) = self.targets {
-                    self.write_sets(gpu.device, &targets);
-                }
+            if self.accel.is_some()
+                && self.update_accel(gpu, Some(&ranges.geometry))?
+                && let Some(targets) = self.targets
+            {
+                self.write_sets(gpu.device, &targets);
             }
             Ok(())
         }
@@ -1959,18 +2151,30 @@ impl RenderExtension for SplitRadianceCascades {
                 self.update_accel(gpu, None)?;
             }
             if self.pipelines.is_none() {
-                let ray_query = self.accel.is_some();
-                let pipelines = Self::pipelines(gpu, ray_query)?;
+                let tlas = self.accel.as_ref().map(SceneAccel::descriptor_type);
+                let ray_query = tlas.is_some();
+                let pipelines = Self::pipelines(gpu, tlas)?;
                 let device = gpu.device.clone();
+                let cache_uuid = pipeline_cache_uuid(gpu);
                 let (layout, composite_layout) = (pipelines.layout, pipelines.composite_layout);
-                // Compile optional resolve and reference kernels only on use.
+                let (reference, gather) = (self.settings.reference, self.settings.final_gather);
+                let extent = [targets.extent.width, targets.extent.height];
+                let trace_overflow = self.pass_limit.is_some()
+                    || trace_overflow_possible(
+                        resolution(extent, &self.settings),
+                        update_budget(&self.settings),
+                    );
+                // Reference dispatches no cascade transport. Do not wait for
+                // those unrelated driver compiles before the first sample.
                 self.compile = Some(std::thread::spawn(move || {
-                    compile_passes(device, layout, composite_layout, ray_query, |name| {
-                        !matches!(
-                            name,
-                            "guidedResolve" | "materialResolve" | "reference" | "materialReference"
-                        )
-                    })
+                    compile_passes(
+                        device,
+                        cache_uuid,
+                        layout,
+                        composite_layout,
+                        ray_query,
+                        |name| pass_needed(name, reference, gather, trace_overflow),
+                    )
                 }));
                 self.status = GiStatus::Compiling {
                     since: Instant::now(),
@@ -2000,7 +2204,7 @@ impl RenderExtension for SplitRadianceCascades {
             }
             if self.blue_noise.buffer == vk::Buffer::null() {
                 let mut blue_noise = mem::take(&mut self.blue_noise);
-                self.upload(gpu, &mut blue_noise, "gi blue noise", BLUE_NOISE)?;
+                self.upload(gpu, &mut blue_noise, "gi sampling tables", SAMPLING_DATA)?;
                 self.blue_noise = blue_noise;
             }
             if let Some(view) = self.view.take() {
@@ -2032,33 +2236,47 @@ impl RenderExtension for SplitRadianceCascades {
             unsafe { self.switch_tracing(gpu, &targets)? };
         }
         self.poll_compile();
-        if !self.active() || self.view.is_none() || frame.viewport[2] == 0 || frame.viewport[3] == 0
-        {
+        let Some(view) = &self.view else {
+            return Ok(());
+        };
+        if !self.active() || frame.viewport[2] == 0 || frame.viewport[3] == 0 {
             return Ok(());
         }
-        // Compile these passes only when a view actually requests them.
-        let optional_pass = if self.settings.reference {
-            Some(reference_pass(self.settings.final_gather))
+        let (reference, gather) = (self.settings.reference, self.settings.final_gather);
+        let pipelines = self.pipelines.as_ref().expect("ready GI has pipelines");
+        let missing = |name: &str| !pipelines.passes.contains_key(name);
+        let trace_overflow = self.pass_limit.is_some()
+            || trace_overflow_possible(view.grid, update_budget(&self.settings));
+        let needs_compile = if reference {
+            missing(reference_pass(gather))
         } else {
-            match self.settings.final_gather {
-                FinalGather::Probes => None,
-                FinalGather::Cosine | FinalGather::Guided => Some("guidedResolve"),
-                FinalGather::MaterialSpace => Some("materialResolve"),
-            }
+            missing("seed") || missing(resolve_pass(gather)) || (trace_overflow && missing("trace"))
         };
-        if let Some(pass) = optional_pass
-            && let Some(pipelines) = self.pipelines.as_ref()
-            && !pipelines.passes.contains_key(pass)
-        {
+        if needs_compile {
+            // A settings change may switch render modes without replacing the
+            // descriptor layouts. Compile just the newly needed passes.
+            let passes: Vec<_> = PASSES
+                .iter()
+                .map(|&(name, _, _)| name)
+                .filter(|&name| {
+                    missing(name) && pass_needed(name, reference, gather, trace_overflow)
+                })
+                .collect();
             let device = gpu.device.clone();
+            let cache_uuid = pipeline_cache_uuid(gpu);
             let (layout, composite_layout) = (pipelines.layout, pipelines.composite_layout);
             self.status = GiStatus::Compiling {
                 since: Instant::now(),
             };
             self.compile = Some(std::thread::spawn(move || {
-                compile_passes(device, layout, composite_layout, hardware, |name| {
-                    name == pass
-                })
+                compile_passes(
+                    device,
+                    cache_uuid,
+                    layout,
+                    composite_layout,
+                    hardware,
+                    |name| passes.contains(&name),
+                )
             }));
             return Ok(());
         }
@@ -2104,6 +2322,85 @@ impl RenderExtension for SplitRadianceCascades {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn jitter_alone_keeps_the_previous_pose() {
+        let viewport = [0, 0, 640, 360];
+        let camera = Mat4::perspective_infinite_reverse_rh(1.0, 16.0 / 9.0, 0.1)
+            * Mat4::look_at_rh(Vec3::new(4.0, 0.0, 1.7), Vec3::new(-4.0, 1.5, 2.5), Vec3::Z);
+        let jitter = |x: f32, y: f32| {
+            Mat4::from_translation(Vec3::new(2.0 * x / 640.0, 2.0 * y / 360.0, 0.0))
+        };
+        let (a, b) = (jitter(0.4, -0.3) * camera, jitter(-0.2, 0.1) * camera);
+        assert!(same_pose_but_jitter(a, b, viewport));
+        // A camera that moved, or a jump of many pixels, is a different pose.
+        let moved = Mat4::from_translation(Vec3::new(0.0, 0.05, 0.0));
+        assert!(!same_pose_but_jitter(a, b * moved, viewport));
+        assert!(!same_pose_but_jitter(jitter(40.0, 0.0) * camera, b, viewport));
+    }
+
+    #[test]
+    fn bounded_transport_omits_immediate_trace_not_deferred_passes() {
+        let gather = FinalGather::MaterialSpace;
+        let cap = DEFERRED_TRACE_RECEIVERS as u32;
+        assert!(!trace_overflow_possible([128, 64], u32::MAX));
+        assert!(!trace_overflow_possible([192, 108], cap));
+        assert!(trace_overflow_possible([192, 108], cap + 1));
+        for grid in [[128, 64], [192, 108]] {
+            let overflow = trace_overflow_possible(grid, cap + 1);
+            assert_eq!(pass_needed("trace", false, gather, overflow), overflow);
+            assert!(!pass_needed("trace", true, gather, overflow));
+            for name in [
+                "traceDeferred",
+                "traceRecord",
+                "traceVisibility",
+                "traceResolve",
+            ] {
+                assert!(pass_needed(name, false, gather, overflow));
+            }
+        }
+    }
+
+    #[test]
+    fn compile_only_the_active_final_gather() {
+        let names = ["worldResolve", "guidedResolve", "materialResolve"];
+        for (gather, expected) in [
+            (FinalGather::Probes, "worldResolve"),
+            (FinalGather::Cosine, "guidedResolve"),
+            (FinalGather::Guided, "guidedResolve"),
+            (FinalGather::MaterialSpace, "materialResolve"),
+        ] {
+            assert_eq!(resolve_pass(gather), expected);
+            for name in names {
+                assert_eq!(pass_needed(name, false, gather, false), name == expected);
+                assert!(!pass_needed(name, true, gather, false));
+            }
+        }
+    }
+
+    #[test]
+    fn pipeline_caches_are_per_pass_device_and_shader() -> std::io::Result<()> {
+        let dir =
+            std::env::temp_dir().join(format!("verity-lux-cache-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir)?;
+        let result = (|| {
+            let a = pipeline_cache_path(&dir, [0; 16], "seed", &[1, 2, 3]);
+            assert_eq!(a, pipeline_cache_path(&dir, [0; 16], "seed", &[1, 2, 3]));
+            assert_ne!(a, pipeline_cache_path(&dir, [1; 16], "seed", &[1, 2, 3]));
+            assert_ne!(a, pipeline_cache_path(&dir, [0; 16], "seed", &[1, 2, 4]));
+            assert_ne!(a, pipeline_cache_path(&dir, [0; 16], "trace", &[1, 2, 3]));
+            let old = dir.join(format!("{OLD_PIPELINE_CACHE_PREFIX}0123456789abcdef.bin"));
+            let unrelated = dir.join("other.bin");
+            for path in [&a, &old, &unrelated] {
+                std::fs::write(path, b"x")?;
+            }
+            prune_pipeline_caches(&dir);
+            assert!(a.exists() && unrelated.exists() && !old.exists());
+            Ok(())
+        })();
+        std::fs::remove_dir_all(dir)?;
+        result
+    }
 
     #[test]
     fn emitter_records_pick_in_proportion_to_power() {

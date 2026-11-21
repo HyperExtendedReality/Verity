@@ -5,6 +5,7 @@
 [ForceInline] bool3 isfinite(float3 value) { return (asuint(value) & 0x7f800000u) != 0x7f800000u; }
 [ForceInline] bool4 isfinite(float4 value) { return (asuint(value) & 0x7f800000u) != 0x7f800000u; }
 
+
 // Equal-area direction mapping: Split RC Algorithm 2. +Y is the polar axis.
 static const float PI = 3.14159265358979323846;
 static const uint CASCADES = 4;
@@ -44,9 +45,6 @@ struct Parameters {
     uint4 environmentInfo; // alias-record offset, width, height, enabled
     float4 environmentRotation; // world-to-environment quaternion
     float4 environmentScale; // HDR intensity, secondary enabled, secondary pass, reserved
-    uint4 geometryPages; // geometry mode (0 buffer, 1 pages, 2 pages + deformed overlay), side
-    uint4 scenePages; // paged scene texture enable, layer width, prefix words, animated ranges
-    uint4 sceneOverlay; // instance base/words, immutable BLAS words, mutable BLAS words
     float4 dirtyMin; // changed scene union bounds.xyz; w > 0 means bounds are valid
     float4 dirtyMax; // w > 0 means the host proved bounded geometry-history reuse safe
     uint4 sourceHistory; // active radiance sources, then source changes; z/w reserved
@@ -458,19 +456,49 @@ float3 deferredDiffuseAlbedo(uint4 packed) {
 
 // Matches FinalGather::MaterialSpace, including when other experiment bits are set.
 bool materialSpaceGather(Parameters p) { return (p.ownerSequence.y & 3u) == 3u; }
+// Cosine, guided and material gathers: one traced ray per resolve texel a
+// frame, so each raw sample is far noisier than an interpolated probe.
+bool tracedGather(Parameters p) { return (p.ownerSequence.y & 3u) != 0u; }
 
 float3 deferredShadingNormal(uint4 packed) {
     return decodeNormal(float2(packed.w & 4095u,(packed.w >> 12) & 4095u)/4095.0);
 }
 
-// Pre-shaded lighting cannot be shared across a discontinuity in the BSDF.
-bool materialSpaceCompatible(uint4 a, uint4 b) {
+// The receiver's total reflectance, view-independent: its diffuse albedo under
+// the dielectric layer plus specular reflectance at normal incidence (thin
+// G-buffer: F0 = 0.16 r², tinted; metals reflect their base color). MSGI stores
+// its BSDF-weighted lighting divided by the anchor's value, and the composite
+// multiplies by each pixel's own. Half-resolution resolve, temporal and spatial
+// filters then share lighting across texture detail without blurring it. Any
+// positive function is exact at the anchor; this one tracks the BSDF closely
+// enough that the ratio keeps per-pixel albedo and the diffuse/specular mix.
+float3 materialSpaceAlbedo(uint4 packed) {
+    float metallic = float((packed.z >> 8) & 255u) / 255.0;
+    float3 base = deferredBaseColor(packed);
+    float3 tint = pow(float3((packed.yyy >> uint3(0u, 8u, 16u)) & 255u) / 255.0, float3(2.2));
+    float sqrtF0 = 0.4 * float(packed.z & 255u) / 255.0;
+    float3 dielectric = tint * (sqrtF0 * sqrtF0);
+    float3 specular = lerp(dielectric, base, metallic);
+    return max(base * (1.0 - metallic) * (1.0 - dielectric) + specular, 0.02);
+}
+
+// Lighting cannot be shared across a discontinuity in the BSDF lobes. MSGI's
+// lighting is divided by `materialSpaceAlbedo`, so base color only moves the
+// diffuse/specular mix: rough surfaces accept wide texture variation, glossy
+// ones (where the two lobes see different light) a narrow one.
+// `aNormal` is `deferredShadingNormal(a)`, decoded once by the caller.
+bool materialSpaceCompatible(uint4 a, float3 aNormal, uint4 b) {
     uint3 x = (a.xxx >> uint3(0u, 8u, 16u)) & 255u;
     uint3 y = (b.xxx >> uint3(0u, 8u, 16u)) & 255u;
+    uint roughness = a.x >> 24u;
+    int colorTolerance = 16 + int((roughness * 48u) / 255u);
     return a.y == b.y && (a.z & 65535u) == (b.z & 65535u)
-        && abs(int(a.x >> 24u) - int(b.x >> 24u)) <= 6
-        && all(abs(int3(x) - int3(y)) <= 16)
-        && dot(deferredShadingNormal(a), deferredShadingNormal(b)) > 0.985;
+        && abs(int(roughness) - int(b.x >> 24u)) <= 6
+        && all(abs(int3(x) - int3(y)) <= colorTolerance)
+        && dot(aNormal, deferredShadingNormal(b)) > 0.985;
+}
+bool materialSpaceCompatible(uint4 a, uint4 b) {
+    return materialSpaceCompatible(a, deferredShadingNormal(a), b);
 }
 // Move along the oriented geometric normal by both the application's world
 // bias and a coordinate-relative representable offset (Ray Tracing Gems Ch. 6).

@@ -202,6 +202,15 @@ bool dirtyRawCacheEntry(Entry entry) {
     return dependencyIntersectsDirty(entryDependency(entry));
 }
 
+// Rust Split runs only the primary view and does not capture secondary seeds.
+#ifdef GI_NATIVE_CASCADES
+#define splitSecondaryPass() false
+#define splitCapturesHits() false
+#else
+#define splitSecondaryPass() (params.environmentScale.z > 0.5)
+#define splitCapturesHits() (params.environmentScale.y > 0.5)
+#endif
+
 uint mergeVisibilityAdmissionLimit() {
     return params.sampling.y;
 }
@@ -210,7 +219,7 @@ void splitLodBlend(float3 position, out uint lowLod, out uint highLod,
                    out float blend) {
     // Both sparse compute and full-resolution composite use the same LOD.
     splitLodBlendForParameters(position, params, lowLod, highLod, blend);
-    if (params.environmentScale.z > 0.5) {
+    if (splitSecondaryPass()) {
         lowLod = min(lowLod + 2u, MAX_PROBE_LOD);
         highLod = min(highLod + 2u, MAX_PROBE_LOD);
         if (lowLod == highLod) blend = 0.0;
@@ -355,7 +364,7 @@ uint findIrradianceProbe(int4 key, bool previous) {
                         previousEntries[index].mergedDependencyMax);
                     if (dependencyIntersectsDirty(entryBounds)) return EMPTY;
                     uint page = (((params.frame.x + 1u) & 1u)
-                        + (params.environmentScale.z > 0.5 ? 2u : 0u))
+                        + (splitSecondaryPass() ? 2u : 0u))
                         * directoryCapacity + slot;
                     DependencyContext packedDependency = probeDependency(
                         directionalProbes[page].dependencyMin,
@@ -568,7 +577,7 @@ void clear(uint3 thread : SV_DispatchThreadID) {
         heads[traceArgsHead(params) + 1u].store(1u);
         heads[traceArgsHead(params) + 2u].store(1u);
         uint headWords = params.lengths.z;
-        if (params.environmentScale.z <= 0.5 && headWords >= deferredTraceEnd(params)) {
+        if (!splitSecondaryPass() && headWords >= deferredTraceEnd(params)) {
             heads[deferredQueryCountHead(params)].store(0u);
             heads[deferredQueryArgsHead(params)].store(0u);
             heads[deferredQueryArgsHead(params) + 1u].store(1u);
@@ -578,7 +587,7 @@ void clear(uint3 thread : SV_DispatchThreadID) {
     // Both head clears run before transport. The second one preserves shared
     // query/owner counters; only the first needs to clear sparse output images,
     // which otherwise incurs a redundant full-image write on every frame.
-    if (params.ownerSequence.z != 0u && params.environmentScale.z <= 0.5) {
+    if (params.ownerSequence.z != 0u && !splitSecondaryPass()) {
         uint clearThreads = max(params.size.w, directorySlots);
         uint workgroupThreads = max(((clearThreads + 63u) / 64u) * 64u, 64u);
         uint resolveCount = giResolveExtent(params).x * giResolveExtent(params).y;
@@ -758,7 +767,7 @@ bool reserveColdUpdate() {
 bool splitSampleSurface(uint2 pixel, out float3 position, out float3 normal) {
     position = 0.0;
     normal = 0.0;
-    if (params.environmentScale.z > 0.5) {
+    if (splitSecondaryPass()) {
         if (params.environmentScale.w <= 0.5) return false;
         float4 hit = previousIrradiance.Load(int3(pixel, 0));
         if (!(hit.w >= 1.0) || !all(isfinite(hit))) return false;
@@ -806,7 +815,7 @@ void seed(uint3 thread : SV_DispatchThreadID) {
     }
     bool coldPriority = coldPriorityEnabled(params);
     // The preceding primary window chose these hits; cap them independently of the current window.
-    bool secondary = params.environmentScale.z > 0.5;
+    bool secondary = splitSecondaryPass();
     bool selectedRay = secondary
         ? ((params.ownerSequence.w & 0x40000000u) == 0u
             && (params.sampling.x == 0u || reserveColdUpdate()))
@@ -1004,7 +1013,7 @@ void prefix(uint3 thread : SV_DispatchThreadID) {
 void generateDirections(uint3 thread : SV_DispatchThreadID) {
     if (any(thread.xy >= params.size.xy)) return;
     uint sample = thread.x + thread.y * params.size.x;
-    if (params.environmentScale.y > 0.5 && params.environmentScale.z <= 0.5)
+    if (splitCapturesHits() && !splitSecondaryPass())
         irradiance.Store(int2(thread.xy), 0.0);
     bool selected = false;
     [unroll] for (uint variant = 0u; variant < 2u; ++variant) {
@@ -1170,7 +1179,7 @@ void deposit(uint first, float3 samplePosition, float3 rayOrigin,
         storeEntryDependency(entry, intervalDependency);
         storeEntryMergedDependency(entry, intervalDependency);
         float4 lightHitBounds = terminates && hit.triangle != EMPTY
-            ? (params.environmentScale.y > 0.5 ? unknownLightHitBounds()
+            ? (splitCapturesHits() ? unknownLightHitBounds()
                 : lightHitBoundsAt(rayOrigin + direction * hit.distance))
             : emptyLightHitBounds();
         entry.boundaryInterval = lightHitBounds;
@@ -1273,7 +1282,7 @@ void finishTransportVariant(uint2 pixel, uint first, uint lod, float3 surfacePos
         direction, hit, radianceSupported, outgoingDependency,
         mergeVisibilityAdmissionLimit());
     if (!radianceSupported) return;
-    if (params.environmentScale.y > 0.5 && params.environmentScale.z <= 0.5
+    if (splitCapturesHits() && !splitSecondaryPass()
         && hit.triangle != EMPTY && (hit.errors & HIT_QUERY_UNSUPPORTED) == 0u) {
         HitAttributes attributes = hitAttributes(hit);
         float3 hitNormal = attributes.geometricNormal;
@@ -1294,7 +1303,7 @@ void finishTransportVariant(uint2 pixel, uint first, uint lod, float3 surfacePos
 
 // The deferred scratch exists only in primary cache heads sized for it.
 bool deferredTraceAvailable() {
-    if (params.environmentScale.z > 0.5 || params.history.y > 0.5) return false;
+    if (splitSecondaryPass() || params.history.y > 0.5) return false;
     uint words = params.lengths.z;
     return words >= deferredTraceEnd(params);
 }
@@ -1979,7 +1988,7 @@ void packProbes(uint3 groupId : SV_GroupID, uint lane : SV_GroupIndex) {
 
     uint directoryCapacity = probeDirectoryCapacity(params);
     uint output = ((params.frame.x & 1u)
-        + (params.environmentScale.z > 0.5 ? 2u : 0u))
+        + (splitSecondaryPass() ? 2u : 0u))
         * directoryCapacity + packProbeSlot;
     if (lane < 36u) {
         uint x = lane % 6u;
@@ -2016,7 +2025,7 @@ void packProbes(uint3 groupId : SV_GroupID, uint lane : SV_GroupIndex) {
                     mergedDependencyOf(source));
         }
         storeProbeDependency(directionalProbes[output], packedDependency);
-        if (params.environmentScale.z > 0.5) {
+        if (splitSecondaryPass()) {
             directionalProbes[output].cacheKey = int4(packProbeKey.xyz,
                 int(uint(packProbeKey.w) & PROBE_LOD));
             directionalProbes[output].cacheGeneration = uint4(params.frame.x, 1u, 0u, 0u);

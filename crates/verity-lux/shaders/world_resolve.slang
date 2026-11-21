@@ -228,10 +228,18 @@ float emitterPdf(Hit hit, float3 direction);
 bool materialGatherIncoming(Hit hit, float3 position, float3 direction, out TransportRadiance light);
 float2 rtgiGatherNoise(uint2 pixel);
 
-float materialGgxProbability(SurfaceBsdf material, float2 ab) {
+// The material's directional reflectance under uniform light, split into
+// its diffuse (under the dielectric layer) and specular lobes.
+void materialReflectance(SurfaceBsdf material, float2 ab, out float3 diffuse,
+                         out float3 specular) {
     float3 dielectric = bsdfSpecularEnergy(material, ab);
-    float3 diffuse = bsdfDiffuseColor(material) * (1.0 - dielectric);
-    float3 specular = lerp(dielectric, material.baseColor, material.metallic);
+    diffuse = bsdfDiffuseColor(material) * (1.0 - dielectric);
+    specular = lerp(dielectric, material.baseColor, material.metallic);
+}
+
+float materialGgxProbability(SurfaceBsdf material, float2 ab) {
+    float3 diffuse, specular;
+    materialReflectance(material, ab, diffuse, specular);
     const float3 luma = float3(0.2126, 0.7152, 0.0722);
     float total = dot(diffuse + specular, luma);
     return total > 0.0 ? clamp(dot(specular, luma) / total, 0.1, 0.95) : 0.5;
@@ -333,6 +341,8 @@ void resolveWorld(uint3 thread, bool traceGather, bool materialGather) {
             bool traced = false;
             bool materialSample = false;
             float3 listedEmission = 0.0;
+            // What a cold-cache fallback reflects of the probes' light.
+            float3 fallbackReflectance = materialGather ? deferredDiffuseAlbedo(deferred) : 1.0;
             if (traceGather) {
                 uint seed = transportHash(at ^ transportHash(params.frame.x ^ 0xc017ae7u));
                 if (materialGather) {
@@ -343,6 +353,12 @@ void resolveWorld(uint3 thread, bool traceGather, bool materialGather) {
                     if (materialSample) {
                         float2 ab = bsdfDfg(material.perceptualRoughness, nDotV);
                         float ggxProbability = materialGgxProbability(material, ab);
+                        // Treat the probes' light as uniform, so both lobes
+                        // reflect it; dropping the specular one darkened glossy
+                        // and metal receivers wherever a ray hit a cold cache.
+                        float3 diffuseReflectance, specularReflectance;
+                        materialReflectance(material, ab, diffuseReflectance, specularReflectance);
+                        fallbackReflectance = diffuseReflectance + specularReflectance;
                         traced = traceMaterialGather(position, normal, geometric, view, material, ab,
                             ggxProbability, rtgiGatherNoise(thread.xy), transportRandom(seed, 0u),
                             diffuse, background, listedEmission);
@@ -371,14 +387,20 @@ void resolveWorld(uint3 thread, bool traceGather, bool materialGather) {
                     normal, true, false, true, (SurfaceBsdf)0, 0.0, 0.5, state);
             }
             // Unsupported queries fall back to diffuse probes in the same
-            // (material-weighted) units, without guessing a glossy value.
+            // (material-weighted) units.
             if (materialGather && !traced) {
-                float3 albedo = deferredDiffuseAlbedo(deferred);
-                diffuse *= albedo;
-                background *= albedo;
+                diffuse *= fallbackReflectance;
+                background *= fallbackReflectance;
             }
             diffuse += listedEmission;
             background += listedEmission;
+            // Store BSDF-weighted light per unit reflectance; the composite
+            // multiplies each full-resolution pixel by its own reflectance.
+            if (materialGather) {
+                float3 reflectance = materialSpaceAlbedo(deferred);
+                diffuse /= reflectance;
+                background /= reflectance;
+            }
             supported = coverage > 0.0 && all(isfinite(diffuse));
         }
     }

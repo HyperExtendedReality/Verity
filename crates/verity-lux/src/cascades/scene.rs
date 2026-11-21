@@ -15,11 +15,16 @@
 //! After the instances come the shared layer mask, the glTF instance reverse
 //! map, and the immutable compressed wide BLAS arena. Instance word 8 is
 //! `(binary root, first triangle, triangle count, wide root word or zero)`.
+//! `VERITY_LUX_ORIENTED_BLAS=1` enables selective rotated child bounds;
+//! `VERITY_LUX_SPATIAL_BLAS=1` enables profitable static spatial splits. Both
+//! preserve geometry word ordering and leave retained BLASes binary, which
+//! measured faster than wide for small terrain chunks ([`RetainedBlas`]).
 
 use super::{
     bvh,
     surface::{self, Charts},
 };
+use crate::tier::SoftwareLayout;
 use glam::{Affine3A, Mat4, UVec2, UVec3, UVec4, Vec3};
 use rayon::prelude::*;
 use std::{collections::BTreeMap, mem, ops::Range};
@@ -28,6 +33,8 @@ use verity_render::{
     asset::{AlphaMode, SceneData},
 };
 
+mod oriented;
+mod spatial;
 mod wide;
 
 pub const VERTEX_WORDS: u32 = 5;
@@ -88,6 +95,10 @@ struct Instance {
 
 /// One retained mesh's BLAS, with its indices and nodes relative to itself, so
 /// it can be replaced without touching the others.
+///
+/// Its nodes stay binary and uncompressed. Packing terrain chunks (about 1,200
+/// triangles each) in the four-wide layout static meshes use made software GI
+/// slower on both an RTX 4070 and an RDNA 3 iGPU (docs/validation.md).
 struct RetainedBlas {
     triangles: Vec<Triangle>,
     nodes: Vec<BvhNode>,
@@ -200,6 +211,8 @@ pub struct GiScene {
     charts: Vec<(u32, Charts)>,
     /// Surface cache texel size in metres; zero leaves every instance out.
     surface_texel: f32,
+    /// How static meshes' software trees are laid out.
+    software_layout: SoftwareLayout,
     /// Instances the words can hold, and nodes reserved for a TLAS over them, so
     /// BLAS and instance addresses survive it being rebuilt.
     instance_room: u32,
@@ -223,6 +236,13 @@ impl GiRanges {
     }
 }
 
+/// Stable instance identity, independent of TLAS ordering and retained slots.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) enum InstanceIdentity {
+    Static(u32),
+    Retained(u64),
+}
+
 /// The packed buffers and what they hold.
 #[derive(Default)]
 pub struct GiWords {
@@ -230,6 +250,7 @@ pub struct GiWords {
     pub scene_words: Vec<UVec4>,
     pub triangles: u32,
     pub instances: u32,
+    pub(crate) instance_ids: Vec<InstanceIdentity>,
     pub surface: SurfaceWords,
     /// Emissive triangles in world space, for next-event estimation.
     pub emitters: Vec<Emitter>,
@@ -289,6 +310,22 @@ impl GiScene {
     /// material words hold `material_base` plus the primitive's material, an
     /// index into the renderer's material buffer.
     pub fn add(&mut self, scene: &SceneData, material_base: u32) {
+        let SoftwareLayout { oriented, spatial } = self.software_layout;
+        self.add_with_static_bounds(scene, material_base, StaticBounds { oriented, spatial });
+    }
+
+    /// Lay out the software BVH of static meshes added from now on; see
+    /// [`crate::tier::HardwareProfile`].
+    pub fn set_software_layout(&mut self, layout: SoftwareLayout) {
+        self.software_layout = layout;
+    }
+
+    fn add_with_static_bounds(
+        &mut self,
+        scene: &SceneData,
+        material_base: u32,
+        options: StaticBounds,
+    ) {
         let vertex_base = (self.vertex_words.len() / VERTEX_WORDS as usize) as u32;
         // Per primitive: static BLAS address, triangle span, and local bounds.
         let mut spans = Vec::with_capacity(scene.primitives.len());
@@ -321,14 +358,14 @@ impl GiScene {
                     .collect();
                 let nodes = bvh::build_mesh(&mut local, |t| (t.min, t.max));
                 let root = nodes.first().map(|n| (n.min, n.max));
-                let words = wide::pack(&nodes);
-                drop(nodes);
+                // Keep the object tree's source order even if traversal uses the
+                // spatial tree: hardware, surface charts and emitters share IDs.
                 // Blended and double-sided surfaces (foliage, glass) have no
                 // single outward side to cache; their hits read world probes.
                 let material = &scene.materials[primitive.material as usize];
                 let charted = !material.double_sided && material.alpha_mode != AlphaMode::Blend;
-                let charts = charted.then(|| {
-                    let corners: Vec<[Vec3; 3]> = local
+                let corners: Vec<[Vec3; 3]> = if charted || options.oriented || options.spatial {
+                    local
                         .iter()
                         .map(|t| {
                             t.indices.to_array().map(|i| {
@@ -336,9 +373,24 @@ impl GiScene {
                                 Vec3::new(p[0], p[1], p[2])
                             })
                         })
-                        .collect();
-                    surface::chart(&corners)
-                });
+                        .collect()
+                } else {
+                    Vec::new()
+                };
+                let oriented = options.oriented.then_some(corners.as_slice());
+                let spatial = options
+                    .spatial
+                    .then(|| spatial::build(&corners, &nodes))
+                    .flatten();
+                let words = if let Some(spatial) = spatial {
+                    wide::pack_static(&spatial.nodes, oriented, &spatial.references)
+                } else if oriented.is_some() {
+                    wide::pack_static(&nodes, oriented, &[])
+                } else {
+                    wide::pack(&nodes)
+                };
+                drop(nodes);
+                let charts = charted.then(|| surface::chart(&corners));
                 (local, words, root, charts)
             })
             .collect();
@@ -526,6 +578,7 @@ impl GiScene {
             scene_words,
             triangles: 0,
             instances: count as u32,
+            instance_ids: Vec::new(),
             surface,
             // `write_top` lists them.
             emitters: Vec::new(),
@@ -645,14 +698,16 @@ impl GiScene {
     /// Returns the ranges of `scene_words` written.
     fn write_top(&mut self) -> [Range<usize>; 3] {
         // Each glTF instance keeps its load order through the sort.
-        let mut instances: Vec<(u32, Instance)> =
-            (0u32..).zip(self.instances.iter().copied()).collect();
-        instances.extend(self.retained.values().map(|blas| {
+        let mut instances: Vec<(InstanceIdentity, Instance)> = (0u32..)
+            .map(InstanceIdentity::Static)
+            .zip(self.instances.iter().copied())
+            .collect();
+        instances.extend(self.retained.iter().map(|(&key, blas)| {
             let slot = blas.slot.expect("laid out by pack");
             let top = blas.nodes[0];
             // Retained vertices are in world space.
             (
-                u32::MAX,
+                InstanceIdentity::Retained(key),
                 Instance {
                     world_from_local: Affine3A::IDENTITY,
                     local_from_world: Affine3A::IDENTITY,
@@ -672,6 +727,10 @@ impl GiScene {
         }));
         let tlas = build_tree(&mut instances, |(_, i)| (i.min, i.max));
         self.packed.instances = instances.len() as u32;
+        self.packed.instance_ids.clear();
+        self.packed
+            .instance_ids
+            .extend(instances.iter().map(|&(id, _)| id));
         self.packed.emitters = self.emitters(&instances);
         let wide_base = self.wide_base(self.packed.scene_words[0].x) as u32;
         let words = &mut self.packed.scene_words;
@@ -714,8 +773,8 @@ impl GiScene {
         for word in &mut words[slots..slots + count] {
             *word = UVec4::ZERO;
         }
-        for (index, &(order, _)) in instances.iter().enumerate() {
-            if order != u32::MAX {
+        for (index, &(identity, _)) in instances.iter().enumerate() {
+            if let InstanceIdentity::Static(order) = identity {
                 words[slots + order as usize / 4][order as usize % 4] = index as u32;
             }
         }
@@ -723,7 +782,7 @@ impl GiScene {
     }
 
     /// The emissive triangles of `instances`, numbered as traversal numbers them.
-    fn emitters(&self, instances: &[(u32, Instance)]) -> Vec<Emitter> {
+    fn emitters(&self, instances: &[(InstanceIdentity, Instance)]) -> Vec<Emitter> {
         let position = |vertex: u32| {
             let word = self.vertex_words[(vertex * VERTEX_WORDS) as usize];
             Vec3::new(
@@ -775,6 +834,12 @@ impl GiScene {
         }
         emitters
     }
+}
+
+#[derive(Clone, Copy)]
+struct StaticBounds {
+    oriented: bool,
+    spatial: bool,
 }
 
 /// One retained mesh's triangles, vertices and nodes, into its slot. Returns the
@@ -937,14 +1002,15 @@ mod tests {
                         continue;
                     };
                     blas_stack.push((root, entry));
-                    Some(records)
+                    Some((records, (min, max)))
                 };
                 while let Some((index, entry)) = blas_stack.pop() {
                     let cutoff = best.map_or(limit, |b| b.0);
                     if entry > cutoff {
                         continue;
                     }
-                    let (first, count) = if let Some(records) = records {
+                    let mut indirect = None;
+                    let (first, count) = if let Some((records, root)) = records {
                         match packed::reference(records, index) {
                             Reference::Branch(at) => {
                                 blas_stack.extend(packed::children(records, at).filter_map(
@@ -953,6 +1019,26 @@ mod tests {
                                     },
                                 ));
                                 continue;
+                            }
+                            Reference::Oriented(at, frame) => {
+                                blas_stack.extend(packed::children(records, at).filter_map(
+                                    |(min, max, link)| {
+                                        oriented::packed_entry(
+                                            frame,
+                                            (min, max),
+                                            root,
+                                            o,
+                                            d,
+                                            cutoff,
+                                        )
+                                        .map(|entry| (link, entry))
+                                    },
+                                ));
+                                continue;
+                            }
+                            Reference::Indirect(at, count) => {
+                                indirect = Some((records, at));
+                                (0, count)
                             }
                             Reference::Span(first, count) => (mesh_first + first, count),
                         }
@@ -967,7 +1053,10 @@ mod tests {
                         }
                         (first, count)
                     };
-                    for triangle in first..first + count {
+                    for item in first..first + count {
+                        let triangle = indirect.map_or(item, |(records, at)| {
+                            mesh_first + packed::source(records, at, item)
+                        });
                         let [a, b, c, _] = geometry[1 + triangle as usize].to_array();
                         if let Some(t) = hit(o, d, position(a), position(b), position(c))
                             && t < best.map_or(limit, |b| b.0)
@@ -1074,6 +1163,138 @@ mod tests {
             });
         }
         scene
+    }
+
+    fn static_fixture(corners: &[[Vec3; 3]]) -> SceneData {
+        let mut scene = SceneData::default();
+        for &p in corners.iter().flatten() {
+            scene.indices.push(scene.vertices.len() as u32);
+            scene.vertices.push(Vertex {
+                position: p.extend(0.0).to_array(),
+                normal: [0.0, 0.0, 1.0, 0.0],
+                tangent: [0.0; 4],
+                color: [1.0; 4],
+            });
+        }
+        scene.primitives.push(Primitive {
+            first_index: 0,
+            index_count: scene.indices.len() as u32,
+            base_vertex: 0,
+            material: 0,
+        });
+        scene.materials.push(MaterialData::default());
+        scene.draws.push(Draw {
+            transform: Mat4::IDENTITY,
+            primitive: 0,
+        });
+        scene
+    }
+
+    fn static_words(scene: &SceneData, oriented: bool, spatial: bool) -> GiWords {
+        let mut gi = GiScene::default();
+        gi.add_with_static_bounds(scene, 0, StaticBounds { oriented, spatial });
+        gi.pack();
+        gi.packed
+    }
+
+    fn static_root(words: &GiWords) -> (u32, &[UVec4]) {
+        let base = words.scene_words[0].y as usize;
+        let wide = words.scene_words[base + 8].w as usize;
+        let (_, _, root, records) = packed::root(&words.scene_words, wide);
+        (root, records)
+    }
+
+    #[test]
+    fn rotated_static_bounds_preserve_source_ids_and_tight_hits() {
+        for offset in [Vec3::ZERO, Vec3::new(-262144.0, 262144.0, 4096.0)] {
+            let corners: Vec<_> = (0..16)
+                .map(|layer| {
+                    let base = offset + Vec3::Z * (4.0 * layer as f32);
+                    [
+                        Vec3::ZERO,
+                        Vec3::new(128.0, 128.0, 0.0),
+                        Vec3::new(64.5, 63.5, 2.0),
+                    ]
+                    .map(|p| p + base)
+                })
+                .collect();
+            let scene = static_fixture(&corners);
+            let baseline = static_words(&scene, false, false);
+            let rotated = static_words(&scene, true, false);
+            let (root, records) = static_root(&rotated);
+            assert!(matches!(
+                packed::reference(records, root),
+                Reference::Oriented(_, 0)
+            ));
+            assert_eq!(baseline.geometry_words, rotated.geometry_words);
+            for layer in [0, 3, 15] {
+                let origin = offset + Vec3::new(64.125, 63.875, 4.0 * layer as f32 + 3.0);
+                let expected = trace_words(&baseline, origin, Vec3::NEG_Z);
+                assert!(expected.is_some());
+                assert_eq!(trace_words(&rotated, origin, Vec3::NEG_Z), expected);
+                assert!(
+                    trace_words_with_limit(&rotated, origin, Vec3::NEG_Z, 2.49, true).is_none()
+                );
+                assert!(
+                    trace_words_with_limit(&rotated, origin, Vec3::NEG_Z, 2.51, true).is_some()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn spatial_static_leaves_index_original_geometry_in_both_modes() {
+        let straddler = [
+            Vec3::new(-8.0, -8.0, 0.0),
+            Vec3::new(8.0, 8.0, 0.0),
+            Vec3::new(8.0, 7.5, 0.0),
+        ];
+        let mut corners = vec![straddler];
+        for i in 0..8 {
+            for (x, y) in [(-7.5, -7.75), (7.5, 6.875)] {
+                let a = Vec3::new(x, y + 0.125 * i as f32, 0.0);
+                corners.push([a, a + Vec3::X * 0.5, a + Vec3::Y * 0.0625]);
+            }
+        }
+        let scene = static_fixture(&corners);
+        let baseline = static_words(&scene, false, false);
+        let original = baseline.geometry_words[1..=corners.len()]
+            .iter()
+            .position(|word| word.x == 0)
+            .expect("straddler was packed") as u32;
+        for oriented in [false, true] {
+            let spatial = static_words(&scene, oriented, true);
+            assert_eq!(baseline.geometry_words, spatial.geometry_words);
+            let (root, records) = static_root(&spatial);
+            let mut pending = vec![root];
+            let mut duplicates = 0;
+            while let Some(link) = pending.pop() {
+                match packed::reference(records, link) {
+                    Reference::Branch(at) | Reference::Oriented(at, _) => {
+                        pending.extend(packed::children(records, at).map(|(_, _, link)| link));
+                    }
+                    Reference::Indirect(at, count) => {
+                        duplicates += (0..count)
+                            .filter(|&i| packed::source(records, at, i) == original)
+                            .count();
+                    }
+                    Reference::Span(..) => {
+                        panic!("spatial leaf must preserve an indirect source ID")
+                    }
+                }
+            }
+            assert!(duplicates > 1, "expected more than one fragment reference");
+            for (x, y, hits) in [(-6.0, -6.02, true), (6.0, 5.75, true), (0.0, 1.0, false)] {
+                let origin = Vec3::new(x, y, 10.0);
+                let expected = trace_words(&baseline, origin, Vec3::NEG_Z);
+                assert_eq!(expected.is_some(), hits);
+                assert_eq!(trace_words(&spatial, origin, Vec3::NEG_Z), expected);
+                assert_eq!(
+                    trace_words_with_limit(&spatial, origin, Vec3::NEG_Z, 11.0, true).is_some(),
+                    hits
+                );
+            }
+        }
     }
 
     #[test]
@@ -1233,6 +1454,145 @@ mod tests {
             }
         }
         assert!(hits > 100, "too few hits ({hits})");
+    }
+
+    /// A terrain-like retained grid of `n` × `n` cells, its heights from `seed`.
+    fn heightfield(n: u32, seed: u32, offset: Vec3) -> RetainedMesh {
+        let mut state = seed;
+        let mut vertices = Vec::new();
+        for z in 0..=n {
+            for x in 0..=n {
+                let p = offset + Vec3::new(x as f32, random(&mut state) * 3.0, z as f32);
+                vertices.push(Vertex {
+                    position: p.extend(0.0).to_array(),
+                    normal: [0.0, 1.0, 0.0, 0.0],
+                    tangent: [0.0; 4],
+                    color: [1.0; 4],
+                });
+            }
+        }
+        let at = |x: u32, z: u32| z * (n + 1) + x;
+        let mut indices = Vec::new();
+        for z in 0..n {
+            for x in 0..n {
+                let [a, b, c, d] = [at(x, z), at(x + 1, z), at(x, z + 1), at(x + 1, z + 1)];
+                indices.extend([a, c, b, b, c, d]);
+            }
+        }
+        let (min, max) = vertices.iter().fold(
+            (Vec3::INFINITY, Vec3::NEG_INFINITY),
+            |(lo, hi), v: &Vertex| {
+                let p = Vec3::from_slice(&v.position[..3]);
+                (lo.min(p), hi.max(p))
+            },
+        );
+        RetainedMesh {
+            vertices,
+            indices,
+            bounds: (min, max),
+            plain: false,
+        }
+    }
+
+    fn brute_force(meshes: &[&RetainedMesh], origin: Vec3, direction: Vec3) -> Option<f32> {
+        meshes
+            .iter()
+            .flat_map(|mesh| {
+                mesh.indices
+                    .as_chunks::<3>()
+                    .0
+                    .iter()
+                    .filter_map(move |tri| {
+                        let p =
+                            tri.map(|i| Vec3::from_slice(&mesh.vertices[i as usize].position[..3]));
+                        hit(origin, direction, p[0], p[1], p[2])
+                    })
+            })
+            .min_by(f32::total_cmp)
+    }
+
+    #[test]
+    fn retained_blases_trace_like_brute_force_through_edits() {
+        let mut gi = GiScene::default();
+        gi.add(&soup(), 0);
+        let near = heightfield(24, 3, Vec3::new(-12.0, -6.0, -12.0));
+        let far = heightfield(16, 5, Vec3::new(14.0, -6.0, -8.0));
+        gi.set_retained(
+            &[
+                RetainedChange {
+                    key: 1,
+                    mesh: Some(&near),
+                },
+                RetainedChange {
+                    key: 2,
+                    mesh: Some(&far),
+                },
+            ],
+            7,
+        );
+        gi.pack();
+        let check = |gi: &GiScene, meshes: &[&RetainedMesh], seed: u32| {
+            let words = gi.words();
+            let [_, base, count, stride] = words.scene_words[0].to_array();
+            for i in 0..count {
+                let mesh = words.scene_words[(base + i * stride) as usize + 8];
+                assert!(
+                    (mesh.x == 0) != (mesh.w == 0),
+                    "each BLAS has exactly one root"
+                );
+            }
+            let mut seed = seed;
+            let mut hits = 0;
+            for _ in 0..1500 {
+                let origin = Vec3::new(
+                    random(&mut seed) * 50.0 - 15.0,
+                    10.0,
+                    random(&mut seed) * 30.0 - 14.0,
+                );
+                let direction =
+                    Vec3::new(random(&mut seed) - 0.5, -1.0, random(&mut seed) - 0.5).normalize();
+                // Only the retained meshes lie below y = -2; stop rays above
+                // them hitting the static soup first.
+                let start = origin + direction * ((origin.y + 2.0) / -direction.y);
+                let expected = brute_force(meshes, start, direction);
+                let found = trace_words(words, start, direction).map(|h| h.0);
+                match (expected, found) {
+                    (Some(e), Some(f)) => {
+                        assert!((e - f).abs() < 1e-3 * e.max(1.0), "{e} vs {f}");
+                        hits += 1;
+                    }
+                    (None, None) => {}
+                    other => panic!("retained BLAS disagrees with brute force: {other:?}"),
+                }
+            }
+            assert!(hits > 500, "too few hits ({hits})");
+        };
+        check(&gi, &[&near, &far], 13);
+
+        // A same-sized edit rewrites its slot in place.
+        let edited = heightfield(24, 17, Vec3::new(-12.0, -6.0, -12.0));
+        gi.set_retained(
+            &[RetainedChange {
+                key: 1,
+                mesh: Some(&edited),
+            }],
+            7,
+        );
+        let ranges = gi.refresh().expect("same-sized edit fits its slot");
+        assert!(!ranges.scene.is_empty());
+        check(&gi, &[&edited, &far], 19);
+
+        // Growing past the slot moves the mesh to the tail.
+        let grown = heightfield(40, 23, Vec3::new(-12.0, -6.0, -12.0));
+        gi.set_retained(
+            &[RetainedChange {
+                key: 1,
+                mesh: Some(&grown),
+            }],
+            7,
+        );
+        gi.refresh();
+        check(&gi, &[&grown, &far], 29);
     }
 
     #[test]

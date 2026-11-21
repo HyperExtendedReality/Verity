@@ -96,7 +96,8 @@ void compositeAnchors(uint3 thread : SV_DispatchThreadID) {
 
 float compositeCandidateWeight(int2 samplePixel, uint2 targetIdentity,
                                float3 targetPosition, float3 targetNormal,
-                               uint4 targetMaterial, float invTolerance, out float3 value) {
+                               uint4 targetMaterial, float3 targetShading,
+                               float invTolerance, out float3 value) {
     value = 0.0;
     uint2 extent = giResolveExtent(params);
     if (any(samplePixel < 0) || any(samplePixel >= int2(extent))) return 0.0;
@@ -115,7 +116,7 @@ float compositeCandidateWeight(int2 samplePixel, uint2 targetIdentity,
     if (materialSpaceGather(params)) {
         uint scale = giResolveScale(params);
         uint2 local = min(uint2(samplePixel) * scale + scale / 2u, params.viewport.zw - 1u);
-        if (!materialSpaceCompatible(targetMaterial,
+        if (!materialSpaceCompatible(targetMaterial, targetShading,
                 gbuffer.Load(int3(params.viewport.xy + local, 0)))) return 0.0;
     }
     value = irradiance.Load(int3(samplePixel, 0)).xyz;
@@ -127,7 +128,8 @@ float3 reconstructCompositeGi(uint2 pixel, float depth, uint4 deferred) {
     if (!(depth > 0.0) || !isfinite(depth)
         || (targetRaster.z & 0x80000000u) == 0u
         || (deferred.w & (1u << 24u)) != 0u) return 0.0;
-    float3 normal = receiverGeometricNormal(targetRaster.z, deferredShadingNormal(deferred));
+    float3 shadingNormal = deferredShadingNormal(deferred);
+    float3 normal = receiverGeometricNormal(targetRaster.z, shadingNormal);
     float3 position = worldPosition(float2(pixel) + 0.5, depth, params);
     if (!all(isfinite(position))) return 0.0;
 
@@ -155,7 +157,7 @@ float3 reconstructCompositeGi(uint2 pixel, float depth, uint4 deferred) {
         if (!(weight > 0.0)) continue;
         float3 candidate;
         weight *= compositeCandidateWeight(samplePixel, targetRaster.xy,
-            position, normal, deferred, invTolerance, candidate);
+            position, normal, deferred, shadingNormal, invTolerance, candidate);
         if (!(weight > 0.0)) {
             rejectedTaps |= 1u << tap;
             continue;
@@ -180,16 +182,19 @@ float3 reconstructCompositeGi(uint2 pixel, float depth, uint4 deferred) {
                 if (!(weight > 0.0)) continue;
                 float3 candidate;
                 weight *= compositeCandidateWeight(samplePixel, targetRaster.xy,
-                    position, normal, deferred, invTolerance, candidate);
+                    position, normal, deferred, shadingNormal, invTolerance, candidate);
                 sum += candidate * weight;
                 support += weight;
             }
         }
     }
-    if (support > 1e-6) return sum / support;
+    if (support > 1e-6) {
+        float3 value = sum / support;
+        // MSGI anchors hold light per unit reflectance (see materialSpaceAlbedo).
+        return materialSpaceGather(params) ? value * materialSpaceAlbedo(deferred) : value;
+    }
     // A facet smaller than the resolve grid can have no compatible anchor at
     // all. Resolve its actual shading normal from the live world probes.
-    float3 shadingNormal = deferredShadingNormal(deferred);
     if (!all(isfinite(shadingNormal)) || dot(shadingNormal, shadingNormal) <= 0.01)
         return 0.0;
     float coverage, backgroundCoverage, anyCoverage;

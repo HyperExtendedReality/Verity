@@ -3,8 +3,7 @@
 use std::{
     collections::{HashMap, HashSet},
     ffi::c_void,
-    mem,
-    ptr,
+    mem, ptr,
 };
 
 use ash::vk;
@@ -126,7 +125,8 @@ impl Commands {
         // SAFETY: These are SDK device commands and the logical device enabled PTLAS.
         let (sizes, build) = unsafe {
             let load = |name: &std::ffi::CStr| {
-                gpu.instance.get_device_proc_addr(gpu.device.handle(), name.as_ptr())
+                gpu.instance
+                    .get_device_proc_addr(gpu.device.handle(), name.as_ptr())
             };
             (
                 load(c"vkGetPartitionedAccelerationStructuresBuildSizesNV")
@@ -250,8 +250,8 @@ impl Grid {
             if axis.cells == 1 {
                 continue;
             }
-            let cell = ((position - axis.center) * axis.cells_per_unit
-                + f64::from(axis.cells / 2)) as u32;
+            let cell =
+                ((position - axis.center) * axis.cells_per_unit + f64::from(axis.cells / 2)) as u32;
             // The outer cells are open-ended, so crossing the old scene bounds
             // alone does not discard the existing partition or instance layout.
             partition = partition * axis.cells + cell.min(axis.cells - 1);
@@ -321,7 +321,9 @@ impl Workspace {
         self.seen.reserve(records.len());
         for record in records {
             if !self.seen.insert(record.stable_id) {
-                return Err(format!("duplicate PTLAS instance identity {}", record.stable_id).into());
+                return Err(
+                    format!("duplicate PTLAS instance identity {}", record.stable_id).into(),
+                );
             }
             // NV uses 0x10 for explicit AABBs, not the KHR micromap instance flag.
             let flags = record.flags.as_raw();
@@ -381,13 +383,14 @@ impl Workspace {
         self.writes.clear();
         self.written_ids.clear();
         self.retired.clear();
-        self.retired.extend(slots.by_id.iter().filter_map(|(&id, old)| {
-            (!self.seen.contains(&id)).then_some(Retired {
-                id,
-                index: old.instance_index,
-                partition: old.partition_index,
-            })
-        }));
+        self.retired
+            .extend(slots.by_id.iter().filter_map(|(&id, old)| {
+                (!self.seen.contains(&id)).then_some(Retired {
+                    id,
+                    index: old.instance_index,
+                    partition: old.partition_index,
+                })
+            }));
         let mut changes = SlotChanges {
             free_left: slots.free.len(),
             retired_used: 0,
@@ -464,21 +467,32 @@ impl Storage {
             .max(1)
             .checked_add(PTLAS_ALIGNMENT - 1)
             .ok_or("PTLAS scratch buffer size overflow")?;
-        let upload_size =
-            (WRITES_OFFSET + 7) as u64 + u64::from(limits.slots) * size_of::<WriteInstance>() as u64;
+        let upload_size = (WRITES_OFFSET + 7) as u64
+            + u64::from(limits.slots) * size_of::<WriteInstance>() as u64;
         let mut storage = Self::default();
         // SAFETY: The buffers are allocated on the same device as the allocator in Gpu.
         let result: Result<()> = (|| unsafe {
             storage.accel = gpu::create_buffer(
-                gpu.device, gpu.allocator, "gi partitioned tlas", accel_size,
-                vk::BufferUsageFlags::ACCELERATION_STRUCTURE_STORAGE_KHR, MemoryLocation::GpuOnly,
+                gpu.device,
+                gpu.allocator,
+                "gi partitioned tlas",
+                accel_size,
+                vk::BufferUsageFlags::ACCELERATION_STRUCTURE_STORAGE_KHR,
+                MemoryLocation::GpuOnly,
             )?;
             storage.scratch = gpu::create_buffer(
-                gpu.device, gpu.allocator, "gi partitioned tlas scratch", scratch_size,
-                vk::BufferUsageFlags::STORAGE_BUFFER, MemoryLocation::GpuOnly,
+                gpu.device,
+                gpu.allocator,
+                "gi partitioned tlas scratch",
+                scratch_size,
+                vk::BufferUsageFlags::STORAGE_BUFFER,
+                MemoryLocation::GpuOnly,
             )?;
             storage.upload = gpu::create_buffer(
-                gpu.device, gpu.allocator, "gi partitioned tlas ops", upload_size,
+                gpu.device,
+                gpu.allocator,
+                "gi partitioned tlas ops",
+                upload_size,
                 vk::BufferUsageFlags::ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_KHR,
                 MemoryLocation::CpuToGpu,
             )?;
@@ -518,8 +532,10 @@ impl Storage {
             },
         };
         self.upload.write_at(offset, bytemuck::bytes_of(&cmd));
-        self.upload.write_at(offset + COUNT_OFFSET, bytemuck::bytes_of(&1u32));
-        self.upload.write_at(offset + WRITES_OFFSET, bytemuck::cast_slice(writes));
+        self.upload
+            .write_at(offset + COUNT_OFFSET, bytemuck::bytes_of(&1u32));
+        self.upload
+            .write_at(offset + WRITES_OFFSET, bytemuck::cast_slice(writes));
         let info = BuildInfo {
             s_type: BUILD_INFO_NV,
             p_next: ptr::null_mut(),
@@ -535,22 +551,28 @@ impl Storage {
         let read = vk::AccessFlags2::ACCELERATION_STRUCTURE_READ_KHR;
         let write = vk::AccessFlags2::ACCELERATION_STRUCTURE_WRITE_KHR;
         let before = [vk::MemoryBarrier2::default()
-            .src_stage_mask(all).src_access_mask(read | write)
-            .dst_stage_mask(build).dst_access_mask(read | write)];
+            .src_stage_mask(all)
+            .src_access_mask(read | write)
+            .dst_stage_mask(build)
+            .dst_access_mask(read | write)];
         let after = [vk::MemoryBarrier2::default()
-            .src_stage_mask(build).src_access_mask(write)
-            .dst_stage_mask(all).dst_access_mask(read)];
+            .src_stage_mask(build)
+            .src_access_mask(write)
+            .dst_stage_mask(all)
+            .dst_access_mask(read)];
         // SAFETY: Allocation and the SDK layout above keep all required addresses live,
         // non-overlapping (except in-place source/destination), and aligned. Queue submission
         // makes the coherent host writes visible and waits before the upload can be reused.
         unsafe {
             submit(gpu, pool, |cmd| {
                 gpu.device.cmd_pipeline_barrier2(
-                    cmd, &vk::DependencyInfo::default().memory_barriers(&before),
+                    cmd,
+                    &vk::DependencyInfo::default().memory_barriers(&before),
                 );
                 (commands.build)(cmd, &info);
                 gpu.device.cmd_pipeline_barrier2(
-                    cmd, &vk::DependencyInfo::default().memory_barriers(&after),
+                    cmd,
+                    &vk::DependencyInfo::default().memory_barriers(&after),
                 );
             })
         }
@@ -600,10 +622,15 @@ impl PartitionedTlas {
             p_next: ptr::null_mut(),
             max_partition_count: 0,
         };
-        let mut properties = vk::PhysicalDeviceProperties2::default();
-        properties.p_next = ptr::from_mut(&mut partitions).cast();
+        let mut properties = vk::PhysicalDeviceProperties2 {
+            p_next: ptr::from_mut(&mut partitions).cast(),
+            ..Default::default()
+        };
         // SAFETY: The enabled extension defines the output chain structure and this physical device.
-        unsafe { gpu.instance.get_physical_device_properties2(gpu.physical, &mut properties) };
+        unsafe {
+            gpu.instance
+                .get_physical_device_properties2(gpu.physical, &mut properties)
+        };
         let max_partitions = partitions.max_partition_count;
         if max_partitions == 0 {
             return Err("PTLAS driver reported no supported partitions".into());
@@ -616,7 +643,15 @@ impl PartitionedTlas {
         let storage = unsafe { Self::build_storage(gpu, pool, &commands, limits, &work.writes) }?;
         let mut slots = Slots::default();
         Self::reset_slots(&mut slots, records, &work.writes, count);
-        Ok(Some(Self { commands, max_partitions, storage, grid, limits, slots, work }))
+        Ok(Some(Self {
+            commands,
+            max_partitions,
+            storage,
+            grid,
+            limits,
+            slots,
+            work,
+        }))
     }
 
     /// The aligned Vulkan device address for an NV PTLAS descriptor write.
@@ -642,7 +677,10 @@ impl PartitionedTlas {
             acceleration_structures: &address,
         };
         let mut write = vk::WriteDescriptorSet::default()
-            .dst_set(set).dst_binding(binding).descriptor_type(DESCRIPTOR_TYPE).descriptor_count(1);
+            .dst_set(set)
+            .dst_binding(binding)
+            .descriptor_type(DESCRIPTOR_TYPE)
+            .descriptor_count(1);
         write.p_next = ptr::from_ref(&extension).cast();
         // SAFETY: Caller guarantees a valid, idle binding. The SDK extension and its address
         // remain alive for the duration of this Vulkan call.
@@ -663,7 +701,9 @@ impl PartitionedTlas {
         records: &[PartitionInstance],
     ) -> Result<bool> {
         let count = self.work.validate(records)?;
-        if count > self.limits.slots || self.work.bin(&self.grid, records) > self.limits.per_partition {
+        if count > self.limits.slots
+            || self.work.bin(&self.grid, records) > self.limits.per_partition
+        {
             let grid = Grid::fit(records, count, self.max_partitions);
             let capacity = if count > self.limits.slots {
                 headroom(count, 16)
@@ -691,7 +731,14 @@ impl PartitionedTlas {
         // SAFETY: The current buffer is a previously built PTLAS on this GPU, and writes
         // describe disjoint slots within its unchanged build limits.
         unsafe {
-            self.storage.write(gpu, pool, &self.commands, self.limits, src, &self.work.writes)
+            self.storage.write(
+                gpu,
+                pool,
+                &self.commands,
+                self.limits,
+                src,
+                &self.work.writes,
+            )
         }?;
         self.work.commit(&mut self.slots, changes);
         Ok(false)
@@ -723,9 +770,19 @@ impl PartitionedTlas {
         limits
     }
 
-    fn reset_slots(slots: &mut Slots, records: &[PartitionInstance], writes: &[WriteInstance], count: u32) {
+    fn reset_slots(
+        slots: &mut Slots,
+        records: &[PartitionInstance],
+        writes: &[WriteInstance],
+        count: u32,
+    ) {
         slots.by_id.clear();
-        slots.by_id.extend(records.iter().map(|record| record.stable_id).zip(writes.iter().copied()));
+        slots.by_id.extend(
+            records
+                .iter()
+                .map(|record| record.stable_id)
+                .zip(writes.iter().copied()),
+        );
         slots.free.clear();
         slots.next = count;
     }
@@ -790,7 +847,10 @@ mod tests {
         assert_eq!(work.writes.len(), 2);
         assert_eq!(work.writes[0].instance_index, 1);
         assert_eq!(work.writes[0].instance_id, 0);
-        assert_eq!(work.writes[0].partition_index, slots.by_id[&500].partition_index);
+        assert_eq!(
+            work.writes[0].partition_index,
+            slots.by_id[&500].partition_index
+        );
         assert_eq!(work.writes[1].instance_index, 0);
         assert_eq!(work.writes[1].instance_id, 1);
         work.commit(&mut slots, changes);
@@ -806,11 +866,26 @@ mod tests {
         let mut work = Workspace::default();
         let limits = PartitionedTlas::prepare_full(&mut work, &grid, &records, 2, 16);
         assert_eq!(work.writes.len(), 16);
-        assert_ne!(work.writes[0].partition_index, work.writes[1].partition_index);
-        assert!(work.writes[2..].iter().all(|write| write.acceleration_structure == 0));
-        assert!(work.writes.iter().enumerate().all(|(i, write)| write.instance_index as usize == i));
+        assert_ne!(
+            work.writes[0].partition_index,
+            work.writes[1].partition_index
+        );
+        assert!(
+            work.writes[2..]
+                .iter()
+                .all(|write| write.acceleration_structure == 0)
+        );
+        assert!(
+            work.writes
+                .iter()
+                .enumerate()
+                .all(|(i, write)| write.instance_index as usize == i)
+        );
         for partition in 0..limits.partitions {
-            let writes = work.writes.iter().filter(|write| write.partition_index == partition);
+            let writes = work
+                .writes
+                .iter()
+                .filter(|write| write.partition_index == partition);
             assert!(writes.count() <= limits.per_partition as usize);
         }
         let mut slots = Slots::default();
@@ -821,7 +896,10 @@ mod tests {
         let changes = work.sparse_writes(&slots, &[survivor]);
         assert_eq!(work.writes.len(), 1);
         assert_eq!(work.writes[0].instance_index, 0);
-        assert_eq!(work.writes[0].partition_index, slots.by_id[&30].partition_index);
+        assert_eq!(
+            work.writes[0].partition_index,
+            slots.by_id[&30].partition_index
+        );
         assert_eq!(work.writes[0].acceleration_structure, 0);
         work.commit(&mut slots, changes);
         assert!(!slots.by_id.contains_key(&30));
@@ -832,7 +910,10 @@ mod tests {
         let changes = work.sparse_writes(&slots, &records);
         assert_eq!(work.writes.len(), 1);
         assert_eq!(work.writes[0].instance_index, 0);
-        assert_eq!(work.writes[0].partition_index, slots.by_id[&41].partition_index);
+        assert_eq!(
+            work.writes[0].partition_index,
+            slots.by_id[&41].partition_index
+        );
         assert_ne!(work.writes[0].acceleration_structure, 0);
         work.commit(&mut slots, changes);
         assert_eq!(slots.by_id[&65].instance_index, 0);

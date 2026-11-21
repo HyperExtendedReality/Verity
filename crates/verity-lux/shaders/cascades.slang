@@ -12,7 +12,6 @@
     Atomic<uint>* surfaceHashKeysBuffer; uint4* surfaceHashRecordsBuffer;
 #include "common.slang"
 #include "wave_batch.slang"
-#include "nile.slang"
 // The renderer's frame set (materials, textures, DFG table) is bound at set 1.
 #define MATERIAL_SET 1
 #include "materials.slang"
@@ -35,6 +34,7 @@
 #define mergeList params.mergeListBuffer
 // build.rs's 64x64 blue-noise tile: four u16 ranks per texel.
 #define blueNoiseRanks params.blueNoiseRanksBuffer
+#include "nile.slang"
 // See surface_cache.slang.
 #define surfaceTriangles params.surfaceTrianglesBuffer
 #define surfaceIslands params.surfaceIslandsBuffer
@@ -306,13 +306,26 @@ float3 emitterLight(float3 position, float3 normal, float3 geometric, float3 vie
                           transportHash(state ^ 0x967a889bu));
         }
         float total = 0.0, chosen = 0.0;
+        // A material receiver resamples by its full BSDF, not only the cosine:
+        // on a glossy surface the chosen point lands in the specular lobe.
+        // Build the lobe once for every candidate; the target only needs to be
+        // positive wherever the integrand is, so it stays unbiased.
+        Brdf lobe = (Brdf)0;
+        float3 unitView = bsdfUnitOrZero(view);
+        if (!receiver) {
+            lobe = make_brdf(bsdfBaseColor(material), bsdfMetallic(material),
+                bsdfPerceptualRoughness(material), bsdfSpecular(material),
+                dot(normal, unitView), all(isfinite(ab)) ? ab : float2(0.0, 0.0));
+        }
         [loop] for (uint i = 0u; i < EMITTER_CANDIDATES; ++i) {
             float3 sample;
             if (lowDiscrepancy) sample = emitterR3(i, shift);
             else sample = emitterRandomSample(state);
             float3 t, d, e; float c, p;
             if (!emitterCandidate(position, normal, geometric, sample, t, d, c, e, p)) continue;
-            float wanted = dot(e, float3(0.2126, 0.7152, 0.0722)) * c;
+            float3 shaped = receiver ? e
+                : e * (brdf_value(lobe, normal, unitView, d) * PI);
+            float wanted = dot(shaped, float3(0.2126, 0.7152, 0.0722)) * c;
             float w = wanted / p;
             if (!(w > 0.0) || !isfinite(w)) continue;
             total += w;
@@ -512,7 +525,7 @@ TransportRadiance outgoingTransportRadianceTracked(float3 origin, float3 directi
     float3 baseColor = materialBaseColor(hit).rgb;
     // Secondary rays already account for direct emitters through hit-point NEE.
     // Listed emitters reach the receiver through its own sample (worldResolve).
-    if (params.environmentScale.z <= 0.5 && !surfaceShading && !emitterListed(hit))
+    if (!splitSecondaryPass() && !surfaceShading && !emitterListed(hit))
         radiance.emissive = hitEmission(hit, baseColor);
     if ((sceneWord(instanceBase(hit.instance) + 6u).w & 16u) != 0u)
         return clampOutgoingTransportRadiance(radiance);
@@ -545,7 +558,7 @@ TransportRadiance outgoingTransportRadianceTracked(float3 origin, float3 directi
     if (fromSurface) {
         indirect = cached.bounce;
         dependencyUnion(dependency, cached.dependency);
-        if (hit.distance >= surfaceFarDistance || params.environmentScale.z > 0.5) {
+        if (hit.distance >= surfaceFarDistance || splitSecondaryPass()) {
             float3 diffuse = bsdfDiffuseColor(material) * (1.0 - bsdfSpecularEnergy(material, ab));
             radiance.background = cached.direct.background + indirect.background * diffuse;
             radiance.emissive += cached.direct.emissive + indirect.emissive * diffuse;
@@ -579,7 +592,7 @@ TransportRadiance outgoingTransportRadianceTracked(float3 origin, float3 directi
     // The ambient hemisphere is smooth: one ray, and the cache averages them.
     if (!skyFromCache)
         environment = environmentResponseTracked(position, normal, geometricNormal, view,
-            roughness, params.environmentInfo.w == 0 ? 1u : directSamples,
+            roughness, hasEnvironmentMap() ? directSamples : 1u,
             directSequence ^ 0xE17A0002u, environmentSupported,
             dependency, admissionLimit, true, material, ab);
     float3 directional, punctual;
@@ -682,6 +695,7 @@ void temporal(uint3 thread : SV_DispatchThreadID) {
     uint2 full = params.viewport.xy + fullLocal;
     bool materialGather = materialSpaceGather(params);
     uint4 currentMaterial = materialGather ? gbuffer.Load(int3(full, 0)) : uint4(0u);
+    float3 currentShading = materialGather ? deferredShadingNormal(currentMaterial) : 0.0;
     float4 receiver = splitRasterMetadata(full);
     float depth = depthTexture.Load(int3(full, 0));
     if (depth <= 0 || receiverHistoryLength(receiver) == 0) {
@@ -736,7 +750,7 @@ void temporal(uint3 thread : SV_DispatchThreadID) {
         uint2 otherLocal = min(uint2(neighbor) * resolveFactor + resolveFactor / 2u,
                                params.viewport.zw - 1u);
         uint2 otherFull = params.viewport.xy + otherLocal;
-        if (materialGather && !materialSpaceCompatible(currentMaterial,
+        if (materialGather && !materialSpaceCompatible(currentMaterial, currentShading,
                 gbuffer.Load(int3(otherFull, 0)))) continue;
         float otherDepth = depthTexture.Load(int3(otherFull, 0));
         if (otherDepth <= 0) continue;
@@ -847,6 +861,14 @@ void temporal(uint3 thread : SV_DispatchThreadID) {
             }
     }
     float historyCapacity = max(params.history.w, 0.0);
+    // Glossy light moves with the view; diffuse light does not. While the
+    // camera moves, keep a short history only where the material is glossy,
+    // instead of starving every rough surface of samples.
+    if (materialGather && params.stability.w > 0.5) {
+        float roughness = float(currentMaterial.x >> 24u) / 255.0;
+        historyCapacity = min(historyCapacity,
+            lerp(4.0, historyCapacity, smoothstep(0.3, 0.7, roughness)));
+    }
     float3 stableBackground = backgroundSupported ? backgroundSample.xyz : 0.0;
     float backgroundLength = backgroundSupported
         ? (persistentWorldIntervals(params) ? backgroundFreshness : 1.0) : 0.0;
@@ -926,18 +948,28 @@ void temporal(uint3 thread : SV_DispatchThreadID) {
             float historyLuminance = luminance(history.xyz);
             float currentLuminance = luminance(center.xyz);
             float delta = historyLuminance - currentLuminance;
-            float change = abs(luminance(clipped) - currentLuminance)
-                           / max(max(luminance(clipped), luminance(center.xyz)), 0.001);
-            float reactiveWeight = !gradualSun && params.stability.y > 0 && completeObservation
-                ? 1.0 - change * change : 1.0;
-            float referenceLuminance = max(max(historyLuminance, currentLuminance), 0.001);
+            // A traced gather's single ray routinely differs from its history
+            // by more than any light change would: judge a change by the
+            // same-surface neighbourhood mean, against that mean's noise.
+            bool traced = tracedGather(params) && count >= 2.0;
+            float observed = traced ? luminance(mean) : currentLuminance;
+            float change = abs(luminance(clipped) - observed)
+                           / max(max(luminance(clipped), observed), 0.001);
+            float referenceLuminance = max(max(historyLuminance, observed), 0.001);
             float relativeHistoryNoise = sqrt(max(metadata.w, 0.0)) / referenceLuminance;
+            float relativeMeanNoise = sqrt(luminance(variance) / count) / referenceLuminance;
+            float reactiveChange = traced ? saturate(change - 3.0 * relativeMeanNoise) : change;
+            float reactiveWeight = !gradualSun && params.stability.y > 0 && completeObservation
+                ? 1.0 - reactiveChange * reactiveChange : 1.0;
             // A global scene-change flag also covers moving geometry. Only
             // discard this receiver's accumulated history when its own signal
             // differs by more than 3 sigma of retained temporal noise. The 5%
             // floor filters rounding/TAA jitter; the 25% cap keeps clear light
-            // steps responsive even when their prior estimate was noisy.
-            float radiometricThreshold = clamp(3.0 * relativeHistoryNoise, 0.05, 0.25);
+            // steps responsive even when their prior estimate was noisy. A
+            // traced gather has no such cap: its noise is the signal's scale.
+            float radiometricThreshold = traced
+                ? max(3.0 * max(relativeHistoryNoise, relativeMeanNoise), 0.05)
+                : clamp(3.0 * relativeHistoryNoise, 0.05, 0.25);
             bool radiometricStep = currentFreshness > 0.0
                 && completeObservation
                 && !gradualSun && params.stability.y > 0.5
@@ -1002,6 +1034,7 @@ void denoise(uint3 thread : SV_DispatchThreadID) {
     uint2 full = params.viewport.xy + fullLocal;
     bool materialGather = materialSpaceGather(params);
     uint4 currentMaterial = materialGather ? gbuffer.Load(int3(full, 0)) : uint4(0u);
+    float3 currentShading = materialGather ? deferredShadingNormal(currentMaterial) : 0.0;
     float depth = centerHasLighting ? center.w : depthTexture.Load(int3(full, 0));
     if (depth <= 0.0 || !isfinite(depth)) {
         irradiance.Store(pixel, 0.0); receiverHistory.Store(pixel, 0.0); return;
@@ -1051,7 +1084,7 @@ void denoise(uint3 thread : SV_DispatchThreadID) {
             uint2 otherLocal = min(uint2(otherPixel) * resolveFactor + resolveFactor / 2u,
                                    params.viewport.zw - 1u);
             uint2 otherFull = params.viewport.xy + otherLocal;
-            if (materialGather && !materialSpaceCompatible(currentMaterial,
+            if (materialGather && !materialSpaceCompatible(currentMaterial, currentShading,
                     gbuffer.Load(int3(otherFull, 0)))) continue;
             float3 otherPosition = worldPosition(float2(otherFull) + 0.5, value.w, params);
             if (dot(geometricNormal, otherNormal) < 0.95) continue;
@@ -2392,7 +2425,10 @@ void renderReference(uint3 thread, bool materialReceiver) {
         total += float4(sum / float(REFERENCE_PATHS), 1.0);
     }
     referenceSum[at] = total;
-    irradiance.Store(int2(thread.xy), float4(total.w > 0.0 ? total.xyz / total.w : 0.0, depth));
+    float3 mean = total.w > 0.0 ? total.xyz / total.w : 0.0;
+    // The composite remodulates material-space lighting per pixel, as for MSGI.
+    if (materialReceiver) mean /= materialSpaceAlbedo(deferred);
+    irradiance.Store(int2(thread.xy), float4(mean, depth));
     receiverHistory.Store(int2(thread.xy),
         receiverWithScreenHistorySupportMask(splitRasterMetadata(full), 1u));
 }

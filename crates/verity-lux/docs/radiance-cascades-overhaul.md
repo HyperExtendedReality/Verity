@@ -4,7 +4,7 @@ This page records an earlier implementation plan and status. Its descriptions
 of Hybrid, near-field sampling, secondary feedback, owner-specific cache records,
 and layouts are historical, not the current source or public API. The current
 crate provides Split Radiance Cascades and an optional secondary multi-bounce
-cache; see [`rendering-boundaries.md`](rendering-boundaries.md) and
+cache; see
 [`validation.md`](validation.md) for current behavior and validation.
 
 At the revision documented here, the persistent directional-record pack,
