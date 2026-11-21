@@ -115,14 +115,15 @@ pub(crate) struct TaaPass {
     /// `sets[k]` reads `history[k]` and writes the other.
     sets: [vk::DescriptorSet; 2],
     history: Vec<gpu::Image>,
-    /// SMAA's edges, then its blend weights; both sets bind them.
-    // shortcut: made with the history in every temporal mode, two RGBA8
-    // images of waste outside SMAA; create them on demand if memory is tight.
+    /// SMAA's edges and blend weights, swapping roles with the sets; the
+    /// TAA tiers keep each history texel's length in frames in them.
     smaa: Vec<gpu::Image>,
     size: [u32; 2],
     /// False until the history images are laid out.
     ready: bool,
     history_valid: bool,
+    /// Frames accumulated since the history was last reset.
+    history_frames: u32,
     parity: usize,
 }
 
@@ -135,6 +136,7 @@ impl TaaPass {
             D::SAMPLER,
             D::STORAGE_IMAGE,
             D::STORAGE_IMAGE,
+            D::SAMPLED_IMAGE,
         ];
         let bindings: Vec<_> = (kinds.iter().enumerate())
             .map(|(i, &kind)| {
@@ -152,7 +154,7 @@ impl TaaPass {
         let layouts = [frame_layout, self.set_layout];
         let push = [vk::PushConstantRange::default()
             .stage_flags(vk::ShaderStageFlags::COMPUTE)
-            .size(16)];
+            .size(32)];
         self.layout = device.create_pipeline_layout(
             &vk::PipelineLayoutCreateInfo::default()
                 .set_layouts(&layouts)
@@ -274,7 +276,9 @@ impl TaaPass {
                     .image_layout(vk::ImageLayout::GENERAL)]
             };
             let (read, write) = (image(self.history[k].view), image(self.history[1 - k].view));
-            let (edges, weights) = (image(self.smaa[0].view), image(self.smaa[1].view));
+            // Swapped each frame: the TAA tiers write their history lengths through
+            // the edges binding and read last frame's through the weights binding.
+            let (edges, weights) = (image(self.smaa[k].view), image(self.smaa[1 - k].view));
             device.update_descriptor_sets(
                 &[
                     vk::WriteDescriptorSet::default()
@@ -296,6 +300,12 @@ impl TaaPass {
                         .dst_set(self.sets[k])
                         .dst_binding(1)
                         .descriptor_type(vk::DescriptorType::STORAGE_IMAGE)
+                        .image_info(&write),
+                    // The same image, sampled: SMAA T2x's last frame.
+                    vk::WriteDescriptorSet::default()
+                        .dst_set(self.sets[k])
+                        .dst_binding(5)
+                        .descriptor_type(vk::DescriptorType::SAMPLED_IMAGE)
                         .image_info(&write),
                 ],
                 &[],
@@ -321,6 +331,7 @@ impl TaaPass {
         mode: AntiAliasing,
         multisampled: bool,
         sharpening: f32,
+        jitter: [f32; 2],
     ) -> Result<()> {
         if !mode.temporal() || viewport[2] == 0 || viewport[3] == 0 {
             self.history_valid = false;
@@ -374,6 +385,9 @@ impl TaaPass {
             A::SHADER_STORAGE_WRITE | A::COLOR_ATTACHMENT_WRITE,
         );
         let smaa = mode == AntiAliasing::Smaa;
+        if !self.history_valid {
+            self.history_frames = 0;
+        }
         let params = [
             // Bit 0: the desktop tier; bit 1: edges already multisampled; bit 2: SMAA T2x.
             u32::from(mode != AntiAliasing::Mobile)
@@ -381,6 +395,11 @@ impl TaaPass {
                 | u32::from(smaa) << 2,
             u32::from(self.history_valid),
             sharpening.to_bits(),
+            self.history_frames,
+            // This frame's jitter, for the reconstruction filter.
+            jitter[0].to_bits(),
+            jitter[1].to_bits(),
+            0,
             0,
         ];
         device.cmd_bind_descriptor_sets(
@@ -422,6 +441,7 @@ impl TaaPass {
         device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, self.apply);
         device.cmd_dispatch(cmd, groups[0], groups[1], 1);
         self.history_valid = true;
+        self.history_frames = self.history_frames.saturating_add(1);
         Ok(())
     }
 

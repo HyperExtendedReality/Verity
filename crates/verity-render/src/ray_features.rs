@@ -1,6 +1,6 @@
 use crate::extension::RayFeatures;
 use ash::vk;
-use std::ffi::{c_char, c_void, CStr};
+use std::ffi::{CStr, c_char, c_void};
 use std::ptr;
 
 const CLUSTER: &CStr = c"VK_NV_cluster_acceleration_structure";
@@ -50,6 +50,7 @@ pub(super) unsafe fn probe(
     instance: &ash::Instance,
     physical: vk::PhysicalDevice,
     has: impl Fn(&CStr) -> bool,
+    indirect_build: bool,
 ) -> RayFeatures {
     let opacity = has(ash::ext::opacity_micromap::NAME);
     let cluster = has(CLUSTER);
@@ -57,7 +58,9 @@ pub(super) unsafe fn probe(
     // DGF depends on KHR acceleration structures plus Vulkan 1.4 OR
     // extended_flags OR maintenance5. On our Vulkan 1.3 path, use maintenance5
     // for the buffer usage flags required by DGF, even on a 1.4 adapter.
-    let dense = has(DENSE) && has(ash::khr::maintenance5::NAME);
+    // The indirect command also avoids a crash on early DGF drivers when
+    // recording the direct command with its now-required null range pointer.
+    let dense = indirect_build && has(DENSE) && has(ash::khr::maintenance5::NAME);
     if !(opacity || cluster || partitioned || dense) {
         return RayFeatures::default();
     }
@@ -77,7 +80,9 @@ pub(super) unsafe fn probe(
         features = features.push_next(&mut partitioned_feature);
     }
     if dense {
-        features = features.push_next(&mut dense_feature).push_next(&mut maintenance5);
+        features = features
+            .push_next(&mut dense_feature)
+            .push_next(&mut maintenance5);
     }
     // SAFETY: The device came from this instance. Each advertised extension's
     // output struct is initialized and remains live until the query returns.
@@ -86,7 +91,8 @@ pub(super) unsafe fn probe(
         opacity_micromap: micromap.micromap != vk::FALSE,
         cluster_acceleration: cluster_feature.supported != vk::FALSE,
         partitioned_acceleration: partitioned_feature.supported != vk::FALSE,
-        dense_geometry: dense_feature.supported != vk::FALSE && maintenance5.maintenance5 != vk::FALSE,
+        dense_geometry: dense_feature.supported != vk::FALSE
+            && maintenance5.maintenance5 != vk::FALSE,
     }
 }
 
@@ -142,7 +148,9 @@ impl EnableChain {
             info = info.push_next(&mut self.partitioned);
         }
         if enabled.dense_geometry {
-            info = info.push_next(&mut self.dense).push_next(&mut self.maintenance5);
+            info = info
+                .push_next(&mut self.dense)
+                .push_next(&mut self.maintenance5);
         }
         info
     }

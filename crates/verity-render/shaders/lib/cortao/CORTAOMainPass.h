@@ -285,7 +285,8 @@ cortao_uint cortao_computeRayOcclusion(
 				
 				//Manually check each ray against hte occluder's angular size.
 				occluderRayBits = 0u;
-				for(cortao_uint j = 0u; j < CORTAO_RAY_COUNT; j++) {
+				//Verity: unrolled, so the ray directions fold to constants instead of a sin, cos and sqrt per ray per sample.
+				cortao_unroll for(cortao_uint j = 0u; j < CORTAO_RAY_COUNT; j++) {
 					cortao_half3 rayDirection = cortao_rayDirection(j);
 					if(dot(rayDirection, hemisphereDirection) > occluderCosAngle) {
 						occluderRayBits |= 1u << j; 

@@ -19,14 +19,25 @@
 // back to HDR applies contrast-adaptive sharpening (AMD CAS) to undo the
 // resampling blur. Motion comes from the resolve, per object; the sky, with
 // no surface there, is reprojected through the camera.
+//
+// This frame's colour is reconstructed at the pixel centre from the
+// neighbourhood with a Blackman-Harris window around the jittered sample
+// positions (Karis 2014), so it does not wobble with the jitter where history
+// is rejected. The variance clip tightens with speed, where stale history
+// shows as ghosting, and stays wide when still, where clipping shows as flicker.
+//
+// Every pass reads its 3x3 neighbourhoods from a group-shared tile, each
+// texel loaded and converted once per group instead of once per neighbour.
 
 #include "lib/common.slang"
 
 struct Params {
     /// x: bit 0 for the desktop tier, bit 1 when MSAA already smoothed the
     /// edges, bit 2 for SMAA T2x (see `smaa.slang`); y: 1 when the history is valid;
-    /// z: sharpening from 0 to 1, as float bits.
+    /// z: sharpening from 0 to 1, as float bits; w: frames in the history.
     uint4 frame;
+    /// xy: this frame's sub-pixel jitter in pixels (`taa.rs`).
+    float4 jitter;
 };
 [[vk::push_constant]] ConstantBuffer<Params> params;
 
@@ -38,6 +49,13 @@ struct Params {
 // above, y: above pulls from here, z: pull from the left, w: left pulls from here).
 [[vk::binding(3, 1)]] [[vk::image_format("rgba8")]] RWTexture2D<float4> smaa_edges;
 [[vk::binding(4, 1)]] [[vk::image_format("rgba8")]] RWTexture2D<float4> smaa_weights;
+/// `accumulated`, sampled: in SMAA T2x's apply pass, last frame's result.
+[[vk::binding(5, 1)]] Texture2D<float4> previous_smaa;
+// The TAA tiers reuse SMAA's two images, which swap each frame (`taa.rs`),
+// for each history texel's length in frames / 255 (r): written through the
+// edges binding, read back next frame through the weights binding.
+#define length_out smaa_edges
+#define length_in smaa_weights
 
 /// Weight of this frame against a still, matching history.
 static const float CURRENT_WEIGHT = 0.1;
@@ -52,6 +70,14 @@ static const float DISOCCLUSION = 0.1;
 static const float SHARPEST = 0.2;
 /// Largest finite rgba16f value: the sky's linear depth.
 static const float FAR_DEPTH = 65000.0;
+/// Variance clip width in standard deviations when still and at `FAST_PIXELS`.
+static const float STILL_GAMMA = 1.25;
+static const float MOVING_GAMMA = 0.75;
+/// Blackman-Harris window, approximated as exp(-x² * this) (Karis 2014).
+static const float FILTER_FALLOFF = 2.29;
+static const uint GROUP = 8u;
+/// Longest history length counted, in frames; it fits an 8-bit channel.
+static const float MAX_LENGTH = 255.0;
 
 static const int2 OFFSETS[9] = {
     int2(0, 0), int2(1, 0), int2(-1, 0), int2(0, 1), int2(0, -1),
@@ -76,6 +102,34 @@ float3 from_ycocg(float3 c) {
     return float3(c.x + c.y - c.z, c.x + c.z, c.x - c.y - c.z);
 }
 
+/// This group's pixels and a one-pixel border: compressed YCoCg colour and
+/// reverse-Z depth.
+static const uint TILE = GROUP + 2u;
+groupshared float4 tile[TILE * TILE];
+
+/// Fill `tile` from HDR or, with `from_history`, from the history (both
+/// clamped to the viewport); depth only when `with_depth`. Every thread in the
+/// group must call it, before any returns.
+void load_tile(uint2 group, uint index, bool from_history, bool with_depth) {
+    float4 viewport = globals.viewport;
+    int2 origin = int2(viewport.xy);
+    int2 last = int2(viewport.zw) - 1;
+    int2 corner = int2(group * GROUP) - 1;
+    for (uint i = index; i < TILE * TILE; i += GROUP * GROUP) {
+        int2 p = clamp(corner + int2(i % TILE, i / TILE), int2(0, 0), last);
+        float3 c = from_history ? history.Load(int3(p, 0)).rgb : hdr.Load(int3(origin + p, 0)).rgb;
+        float d = with_depth ? scene_depth.Load(int3(origin + p, 0)) : 0.0;
+        tile[i] = float4(to_ycocg(compress(c)), d);
+    }
+    GroupMemoryBarrierWithGroupSync();
+}
+
+/// The tile entry `offset` from this thread's pixel.
+float4 tile_at(uint2 thread, int2 offset) {
+    int2 t = int2(thread) + 1 + offset;
+    return tile[t.y * TILE + t.x];
+}
+
 /// Whether no history texel around `history_uv` saw this pixel's surface
 /// (reverse-Z `own` depth) at the depth the camera expects there. Any of 3x3
 /// counts, and the histories hold each pixel's own depth, so a sub-pixel pole
@@ -90,7 +144,7 @@ bool disoccluded(float own, int2 local, float2 history_uv, bool smaa) {
     int2 texel = int2(floor(history_uv * viewport.zw));
     for (uint i = 0u; i < 9u; ++i) {
         int2 p = clamp(texel + OFFSETS[i], int2(0, 0), last);
-        float seen = smaa ? accumulated[p].a : history.Load(int3(p, 0)).a;
+        float seen = smaa ? previous_smaa.Load(int3(p, 0)).a : history.Load(int3(p, 0)).a;
         if (abs(seen - expected) <= DISOCCLUSION * expected)
             return false;
     }
@@ -105,6 +159,14 @@ float3 clip_box(float3 lo, float3 hi, float3 value) {
     float3 units = abs(offset / extent);
     float largest = max(units.x, max(units.y, units.z));
     return largest > 1.0 ? centre + offset / largest : value;
+}
+
+/// Frames the history holds at `uv`, at most the frames since its reset
+/// (the stored lengths are stale or undefined beyond that).
+float history_frames(float2 uv) {
+    int2 last = int2(globals.viewport.zw) - 1;
+    int2 p = clamp(int2(uv * globals.viewport.zw), int2(0, 0), last);
+    return min(round(length_in[p].r * 255.0), float(params.frame.w));
 }
 
 /// Bicubic Catmull-Rom from five bilinear taps, the corners dropped.
@@ -133,44 +195,58 @@ float3 catmull_rom(float2 uv, float2 size) {
 /// Blend this frame's HDR into the history; writes the next history.
 [shader("compute")]
 [numthreads(8, 8, 1)]
-void resolveMain(uint3 id: SV_DispatchThreadID) {
+void resolveMain(
+    uint3 id: SV_DispatchThreadID,
+    uint3 group: SV_GroupID,
+    uint3 thread: SV_GroupThreadID,
+    uint index: SV_GroupIndex
+) {
     float4 viewport = globals.viewport;
-    if (any(float2(id.xy) >= viewport.zw))
-        return;
     if ((params.frame.x & 4u) != 0u) {
-        smaa_blend(int2(id.xy));
+        if (all(float2(id.xy) < viewport.zw))
+            smaa_blend(int2(id.xy));
         return;
     }
+    load_tile(group.xy, index, false, true);
+    if (any(float2(id.xy) >= viewport.zw))
+        return;
     bool desktop = (params.frame.x & 1u) != 0u;
     float still_weight = (params.frame.x & 2u) != 0u ? MSAA_WEIGHT : CURRENT_WEIGHT;
     int2 origin = int2(viewport.xy);
     int2 last = int2(viewport.zw) - 1;
     int2 local = int2(id.xy);
     float4 current = hdr.Load(int3(origin + local, 0));
-    float3 color = compress(current.rgb);
+    float2 jitter = params.jitter.xy;
 
-    // Neighbourhood moments and box, and the nearest surface (reverse-Z: largest depth).
+    // Neighbourhood moments and box, this frame's colour reconstructed at the
+    // pixel centre, and the nearest surface (reverse-Z: largest depth).
     float3 m1 = 0.0;
     float3 m2 = 0.0;
     float3 lo = 1.0e9;
     float3 hi = -1.0e9;
+    float3 filtered = 0.0;
+    float filter_sum = 0.0;
     float depth = -1.0;
     int2 nearest = local;
     uint count = desktop ? 9u : 5u;
     for (uint i = 0u; i < count; ++i) {
-        int2 p = clamp(local + OFFSETS[i], int2(0, 0), last);
-        float3 c = compress(hdr.Load(int3(origin + p, 0)).rgb);
-        c = to_ycocg(c);
+        float4 s = tile_at(thread.xy, OFFSETS[i]);
+        float3 c = s.rgb;
         m1 += c;
         m2 += c * c;
         lo = min(lo, c);
         hi = max(hi, c);
-        float d = scene_depth.Load(int3(origin + p, 0));
-        if (d > depth) {
-            depth = d;
-            nearest = p;
+        // The neighbour's sample lies at its offset less the jitter.
+        float2 d = float2(OFFSETS[i]) - jitter;
+        float w = exp(-FILTER_FALLOFF * dot(d, d));
+        filtered += c * w;
+        filter_sum += w;
+        if (s.a > depth) {
+            depth = s.a;
+            nearest = clamp(local + OFFSETS[i], int2(0, 0), last);
         }
     }
+    float3 color = from_ycocg(filtered / filter_sum);
 
     // Reproject in homogeneous space: sky at depth 0 is a point at infinity
     // and still lands where the camera's rotation puts it.
@@ -183,9 +259,11 @@ void resolveMain(uint3 id: SV_DispatchThreadID) {
     float2 history_uv = (float2(local) + 0.5) / viewport.zw - motion;
 
     // Reverse-Z with an infinite far plane: view depth is near / depth.
-    float own = scene_depth.Load(int3(origin + local, 0));
+    float own = tile_at(thread.xy, int2(0, 0)).a;
     float linear_depth = own > 0.0 ? min(globals.projection.z / own, FAR_DEPTH) : FAR_DEPTH;
     float3 result = color;
+    // Frames the new history holds, in effect: one where it restarts.
+    float frames = 1.0;
     bool valid = params.frame.y != 0u && (depth > 0.0 || previous.w > 0.0)
         && all(history_uv >= 0.0) && all(history_uv <= 1.0);
     if (valid) {
@@ -193,19 +271,23 @@ void resolveMain(uint3 id: SV_DispatchThreadID) {
             ? catmull_rom(history_uv, viewport.zw)
             : history.SampleLevel(clamp_sampler, history_uv, 0).rgb;
         float3 old = to_ycocg(compress(sampled));
+        float speed = saturate(length(motion * viewport.zw) / FAST_PIXELS);
         float3 kept;
         if (desktop) {
             float3 mean = m1 / 9.0;
-            float3 sigma = sqrt(max(m2 / 9.0 - mean * mean, 0.0));
+            float3 sigma = sqrt(max(m2 / 9.0 - mean * mean, 0.0)) * lerp(STILL_GAMMA, MOVING_GAMMA, speed);
             kept = clip_box(max(lo, mean - sigma), min(hi, mean + sigma), old);
         } else {
             kept = clamp(old, lo, hi);
         }
-        float speed = length(motion * viewport.zw);
         // The clip alone answers history that showed something else; raising
         // this frame's weight by how far it moved also threw away sub-pixel
         // features each frame the jitter missed them, so they shimmered.
-        float weight = lerp(still_weight, MOVING_WEIGHT, saturate(speed / FAST_PIXELS));
+        float weight = lerp(still_weight, MOVING_WEIGHT, speed);
+        // A young history averages evenly: with only the fixed weight, its
+        // first, noisy frame would linger as 0.9^n of the image for many
+        // frames, after a reset and wherever a disocclusion restarted it.
+        weight = max(weight, 1.0 / (history_frames(history_uv) + 1.0));
         // Reactive mask: passes without motion vectors write alpha 1 + r to
         // keep at most 1 - r of the history.
         weight = max(weight, saturate(current.a - 1.0));
@@ -213,31 +295,39 @@ void resolveMain(uint3 id: SV_DispatchThreadID) {
         if (own > 0.0 && disoccluded(own, local, history_uv, false))
             weight = 1.0;
         result = lerp(from_ycocg(kept), color, weight);
+        frames = 1.0 / weight;
     }
     result = clamp(result, 0.0, 1.0 - 1.0e-4);
     accumulated[id.xy] = float4(expand(result), linear_depth);
+    length_out[id.xy] = float4(min(round(frames), MAX_LENGTH) / 255.0, 0.0, 0.0, 0.0);
 }
 
 /// Copy the new history into the HDR target for the composite, sharpened
 /// with contrast-adaptive sharpening; HDR keeps its alpha.
 [shader("compute")]
 [numthreads(8, 8, 1)]
-void applyMain(uint3 id: SV_DispatchThreadID) {
+void applyMain(
+    uint3 id: SV_DispatchThreadID,
+    uint3 group: SV_GroupID,
+    uint3 thread: SV_GroupThreadID,
+    uint index: SV_GroupIndex
+) {
     float4 viewport = globals.viewport;
+    bool smaa = (params.frame.x & 4u) != 0u;
+    load_tile(group.xy, index, true, smaa);
     if (any(float2(id.xy) >= viewport.zw))
         return;
     int2 local = int2(id.xy);
-    if ((params.frame.x & 4u) != 0u) {
-        smaa_temporal(local);
+    if (smaa) {
+        smaa_temporal(local, thread.xy);
         return;
     }
-    int2 last = int2(viewport.zw) - 1;
-    float3 centre = compress(history.Load(int3(local, 0)).rgb);
+    float3 centre = from_ycocg(tile_at(thread.xy, int2(0, 0)).rgb);
     float3 cross = 0.0;
     float3 lo = centre;
     float3 hi = centre;
     for (uint i = 1u; i < 5u; ++i) {
-        float3 c = compress(history.Load(int3(clamp(local + OFFSETS[i], int2(0, 0), last), 0)).rgb);
+        float3 c = from_ycocg(tile_at(thread.xy, OFFSETS[i]).rgb);
         cross += c;
         lo = min(lo, c);
         hi = max(hi, c);
@@ -248,7 +338,8 @@ void applyMain(uint3 id: SV_DispatchThreadID) {
     //float3 sharpened = saturate((centre + cross * w) / (1.0 + 4.0 * w));
     float3 sharpened = clamp((centre + cross * w) / (1.0 + 4.0 * w), lo, hi);
     uint2 pixel = id.xy + uint2(viewport.xy);
-    hdr_output[pixel] = float4(expand(sharpened), hdr_output[pixel].a);
+    // Nothing reads HDR alpha after this, and next frame rewrites it: no read back.
+    hdr_output[pixel] = float4(expand(sharpened), 1.0);
 }
 
 // SMAA T2x (Jimenez et al. 2012): morphological anti-aliasing of each frame,
@@ -297,22 +388,40 @@ float4 smaa_weight(int2 p) {
     return smaa_weights[p];
 }
 
+/// Luma of this group's pixels with two pixels of border before and one after.
+static const uint LUMA_TILE = GROUP + 3u;
+groupshared float luma_tile[LUMA_TILE * LUMA_TILE];
+
+float tile_luma(uint2 thread, int2 offset) {
+    int2 t = int2(thread) + 2 + offset;
+    return luma_tile[t.y * LUMA_TILE + t.x];
+}
+
 [shader("compute")]
 [numthreads(8, 8, 1)]
-void smaaEdgesMain(uint3 id: SV_DispatchThreadID) {
+void smaaEdgesMain(
+    uint3 id: SV_DispatchThreadID,
+    uint3 group: SV_GroupID,
+    uint3 thread: SV_GroupThreadID,
+    uint index: SV_GroupIndex
+) {
+    int2 corner = int2(group.xy * GROUP) - 2;
+    for (uint i = index; i < LUMA_TILE * LUMA_TILE; i += GROUP * GROUP)
+        luma_tile[i] = smaa_luma(corner + int2(i % LUMA_TILE, i / LUMA_TILE));
+    GroupMemoryBarrierWithGroupSync();
     if (any(float2(id.xy) >= globals.viewport.zw))
         return;
-    int2 p = int2(id.xy);
-    float l = smaa_luma(p);
-    float2 near = float2(smaa_luma(p - int2(1, 0)), smaa_luma(p - int2(0, 1)));
+    uint2 t = thread.xy;
+    float l = tile_luma(t, int2(0, 0));
+    float2 near = float2(tile_luma(t, int2(-1, 0)), tile_luma(t, int2(0, -1)));
     float2 delta = abs(l - near);
     float2 edges = step(SMAA_THRESHOLD, delta);
     if (all(edges == 0.0)) {
         smaa_edges[id.xy] = 0.0;
         return;
     }
-    float2 far = float2(smaa_luma(p + int2(1, 0)), smaa_luma(p + int2(0, 1)));
-    float2 farther = float2(smaa_luma(p - int2(2, 0)), smaa_luma(p - int2(0, 2)));
+    float2 far = float2(tile_luma(t, int2(1, 0)), tile_luma(t, int2(0, 1)));
+    float2 farther = float2(tile_luma(t, int2(-2, 0)), tile_luma(t, int2(0, -2)));
     float2 strongest = max(abs(l - far), abs(near - farther));
     float largest = max(max(delta.x, delta.y), max(strongest.x, strongest.y));
     edges *= step(largest, SMAA_LOCAL_CONTRAST * delta);
@@ -434,39 +543,30 @@ void smaa_blend(int2 local) {
     accumulated[local] = float4(expand(color), linear_depth);
 }
 
-/// Last frame's SMAA result, bilinear, read from the image this pass may write.
+/// Last frame's SMAA result, bilinear.
 float4 smaa_previous(float2 uv) {
-    int2 last = int2(globals.viewport.zw) - 1;
-    float2 position = uv * globals.viewport.zw - 0.5;
-    int2 base = int2(floor(position));
-    float2 f = position - float2(base);
-    float4 c00 = accumulated[clamp(base, int2(0, 0), last)];
-    float4 c10 = accumulated[clamp(base + int2(1, 0), int2(0, 0), last)];
-    float4 c01 = accumulated[clamp(base + int2(0, 1), int2(0, 0), last)];
-    float4 c11 = accumulated[clamp(base + int2(1, 1), int2(0, 0), last)];
-    return lerp(lerp(c00, c10, f.x), lerp(c01, c11, f.x), f.y);
+    return previous_smaa.SampleLevel(clamp_sampler, uv, 0);
 }
 
 /// Mix this frame's SMAA result (in `history`) with last frame's (in
 /// `accumulated`) into HDR.
-void smaa_temporal(int2 local) {
+void smaa_temporal(int2 local, uint2 thread) {
     float4 viewport = globals.viewport;
     int2 origin = int2(viewport.xy);
     int2 last = int2(viewport.zw) - 1;
-    float3 current = compress(history.Load(int3(local, 0)).rgb);
+    float4 centre = tile_at(thread, int2(0, 0));
+    float3 current = from_ycocg(centre.rgb);
     float3 lo = 1.0e9;
     float3 hi = -1.0e9;
     float depth = -1.0;
     int2 nearest = local;
     for (uint i = 0u; i < 9u; ++i) {
-        int2 p = clamp(local + OFFSETS[i], int2(0, 0), last);
-        float3 c = to_ycocg(compress(history.Load(int3(p, 0)).rgb));
-        lo = min(lo, c);
-        hi = max(hi, c);
-        float d = scene_depth.Load(int3(origin + p, 0));
-        if (d > depth) {
-            depth = d;
-            nearest = p;
+        float4 s = tile_at(thread, OFFSETS[i]);
+        lo = min(lo, s.rgb);
+        hi = max(hi, s.rgb);
+        if (s.a > depth) {
+            depth = s.a;
+            nearest = clamp(local + OFFSETS[i], int2(0, 0), last);
         }
     }
     float2 nearest_uv = (float2(nearest) + 0.5) / viewport.zw;
@@ -485,7 +585,7 @@ void smaa_temporal(int2 local) {
         float weight = 0.5 * (1.0 - saturate(speed / SMAA_FAST_PIXELS));
         // Reactive mask, as in the TAA resolve.
         weight = min(weight, 1.0 - saturate(alpha - 1.0));
-        float own = scene_depth.Load(int3(origin + local, 0));
+        float own = centre.a;
         if (own > 0.0 && disoccluded(own, local, history_uv, true))
             weight = 0.0;
         result = lerp(current, kept, weight);

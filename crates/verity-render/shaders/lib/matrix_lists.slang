@@ -8,7 +8,10 @@ static const uint MATRIX_LIST_IMPOSTER = 3;
 /// Then each shadow layer's clusters and bricks: sun cascades, then point faces.
 static const uint MATRIX_LIST_LAYERS = 4;
 static const uint MATRIX_SHADOW_LAYERS = CASCADES + MAX_POINT_SHADOWS * POINT_SHADOW_FACES;
-static const uint MATRIX_LISTS = MATRIX_LIST_LAYERS + MATRIX_SHADOW_LAYERS * 2;
+/// Then each sun cascade's imposter casters: instances seen only as imposters
+/// cast through their card, not their coarsest bricks.
+static const uint MATRIX_LIST_SHADOW_IMPOSTERS = MATRIX_LIST_LAYERS + MATRIX_SHADOW_LAYERS * 2;
+static const uint MATRIX_LISTS = MATRIX_LIST_SHADOW_IMPOSTERS + CASCADES;
 /// Words before the per-pass dispatch arguments: one draw command per list.
 static const uint MATRIX_PASS_WORDS = MATRIX_LISTS * 4;
 /// Items in each half of the queue.
@@ -21,8 +24,11 @@ static const uint MATRIX_CASCADE_CLUSTERS = 1u << 17;
 static const uint MATRIX_CASCADE_BRICKS = 1u << 19;
 static const uint MATRIX_FACE_CLUSTERS = 1u << 15;
 static const uint MATRIX_FACE_BRICKS = 1u << 16;
+static const uint MATRIX_CASCADE_IMPOSTERS = 1u << 16;
 
 uint matrix_list_capacity(uint list) {
+    if (list >= MATRIX_LIST_SHADOW_IMPOSTERS)
+        return MATRIX_CASCADE_IMPOSTERS;
     if (list < MATRIX_LIST_LAYERS)
         return list == MATRIX_LIST_VOXELS ? MATRIX_BRICK_LIST : MATRIX_CLUSTER_LIST;
     bool bricks = (list & 1) != 0;
@@ -33,6 +39,10 @@ uint matrix_list_capacity(uint list) {
 
 uint matrix_list_base(uint list) {
     uint main = 3 * MATRIX_CLUSTER_LIST + MATRIX_BRICK_LIST;
+    if (list >= MATRIX_LIST_SHADOW_IMPOSTERS)
+        return main + CASCADES * (MATRIX_CASCADE_CLUSTERS + MATRIX_CASCADE_BRICKS)
+            + (MATRIX_SHADOW_LAYERS - CASCADES) * (MATRIX_FACE_CLUSTERS + MATRIX_FACE_BRICKS)
+            + (list - MATRIX_LIST_SHADOW_IMPOSTERS) * MATRIX_CASCADE_IMPOSTERS;
     if (list < MATRIX_LIST_LAYERS)
         return list <= MATRIX_LIST_VOXELS ? list * MATRIX_CLUSTER_LIST : main - MATRIX_CLUSTER_LIST;
     uint layer = (list - MATRIX_LIST_LAYERS) / 2;

@@ -14,34 +14,34 @@
 //! bindlessly by material index.
 
 pub mod asset;
+mod embedded;
 pub mod extension;
 pub mod gpu;
-mod embedded;
-mod retained;
 mod gpu_culling;
 mod meshlets;
 mod profiler;
 mod ray_features;
+mod retained;
 mod scene;
 mod shadows;
 mod upload;
 mod virtual_texture;
 
 pub use asset::{Sun, TextureFormat};
-pub use matrix::MatrixStats;
-pub use extension::{FrameContext, Gpu, RayFeatures, RenderExtension, RetainedChange, Targets};
 pub use embedded::{Dent, EmbeddedInstanceId, EmbeddedModel, EmbeddedModelId, MAX_DENTS};
-pub use retained::RetainedMesh;
-pub use scene::{entity_matrix, Camera, DeformingMesh, GpuMaterial, Vertex, UP};
-pub use upload::SceneStats;
-pub use virtual_texture::{TerrainLayer, TerrainRole, TerrainTextureStats, TERRAIN_ROLES};
+pub use extension::{FrameContext, Gpu, RayFeatures, RenderExtension, RetainedChange, Targets};
+pub use matrix::MatrixStats;
 pub use profiler::GPU_STAGE_NAMES;
+pub use retained::RetainedMesh;
+pub use scene::{Camera, DeformingMesh, GpuMaterial, UP, Vertex, entity_matrix};
+pub use upload::SceneStats;
+pub use virtual_texture::{TERRAIN_ROLES, TerrainLayer, TerrainRole, TerrainTextureStats};
 
-use ash::{vk, Entry};
+use ash::{Entry, vk};
 use gpu::{Buffer, Image};
 use gpu_allocator::{
-    vulkan::{Allocator, AllocatorCreateDesc},
     AllocationSizes, AllocatorDebugSettings, MemoryLocation,
+    vulkan::{Allocator, AllocatorCreateDesc},
 };
 use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
 use std::{
@@ -82,8 +82,8 @@ macro_rules! spirv {
     };
 }
 
-pub mod breaker;
 mod ao;
+pub mod breaker;
 mod clouds;
 mod matrix;
 mod taa;
@@ -101,10 +101,22 @@ pub struct UiFrame {
 /// CPU time spent in the renderer. GPU work runs asynchronously and is not
 /// measured by these stages.
 pub const RENDER_STAGE_NAMES: [&str; 16] = [
-    "Swapchain setup", "Wait for frame", "Acquire image", "Prepare and upload",
-    "Record geometry uploads", "Record scene", "Record GI", "Record water",
-    "Record composite and UI", "Submit", "Present", "  Scene setup and light bins",
-    "  Shadows", "  Depth and occlusion", "  Visibility", "  Resolve",
+    "Swapchain setup",
+    "Wait for frame",
+    "Acquire image",
+    "Prepare and upload",
+    "Record geometry uploads",
+    "Record scene",
+    "Record GI",
+    "Record water",
+    "Record composite and UI",
+    "Submit",
+    "Present",
+    "  Scene setup and light bins",
+    "  Shadows",
+    "  Depth and occlusion",
+    "  Visibility",
+    "  Resolve",
 ];
 
 #[derive(Clone, Copy, Default)]
@@ -376,6 +388,8 @@ pub struct Renderer {
     retained: retained::Retained,
     clear_color: [f32; 4],
     shadow_distance: f32,
+    /// The sun's angular radius in radians; see `set_sun_angular_radius`.
+    sun_angular_radius: f32,
     embedded: Option<embedded::Embedded>,
     terrain_layers: Option<virtual_texture::TerrainLayers>,
     /// This frame's embedded draws, in draw order.
@@ -594,6 +608,7 @@ impl Renderer {
                 retained: Default::default(),
                 clear_color: CLEAR_COLOR,
                 shadow_distance: scene::SHADOW_DISTANCE,
+                sun_angular_radius: scene::SUN_ANGULAR_RADIUS,
                 embedded: None,
                 terrain_layers: None,
                 embedded_bounds: Vec::new(),
@@ -1053,7 +1068,8 @@ impl Renderer {
                 buffer.write(&[0; 16]);
             }
         }
-        self.matrix = matrix::Matrix::new(device, allocator, layout, self.depth_format, msaa_samples)?;
+        self.matrix =
+            matrix::Matrix::new(device, allocator, layout, self.depth_format, msaa_samples)?;
         // Appending the cube also writes every frame's buffer descriptors.
         let (vertices, indices) = scene::cube();
         self.append_geometry(&vertices, &indices)?;
@@ -1103,11 +1119,13 @@ impl Renderer {
             })
             .collect();
         for frame in &self.frames {
-            let mut writes = vec![vk::WriteDescriptorSet::default()
-                .dst_set(frame.set)
-                .dst_binding(11)
-                .descriptor_type(vk::DescriptorType::SAMPLER)
-                .image_info(&sampler)];
+            let mut writes = vec![
+                vk::WriteDescriptorSet::default()
+                    .dst_set(frame.set)
+                    .dst_binding(11)
+                    .descriptor_type(vk::DescriptorType::SAMPLER)
+                    .image_info(&sampler),
+            ];
             writes.push(
                 vk::WriteDescriptorSet::default()
                     .dst_set(frame.set)
@@ -1164,10 +1182,18 @@ impl Renderer {
         };
     }
 
-    /// How far from the camera the sun casts shadows, in metres. A longer reach
-    /// spreads the same shadow map over more ground, so close shadows soften.
+    /// How far from the camera the sun casts shadows, in metres; 1 km unless
+    /// set. Cascades split geometrically, so close shadows keep their detail
+    /// however far this reaches.
     pub fn set_shadow_distance(&mut self, distance: f32) {
         self.shadow_distance = distance;
+    }
+
+    /// The sun's angular radius in radians, which sets how fast its shadows
+    /// soften away from their casters: 0.00465 (the real sun) unless set,
+    /// 0 for hard shadows.
+    pub fn set_sun_angular_radius(&mut self, radians: f32) {
+        self.sun_angular_radius = radians.clamp(0.0, 0.2);
     }
 
     /// The color behind the scene, in the swapchain's encoding.
@@ -1311,7 +1337,8 @@ impl Renderer {
     }
 
     /// How far ambient occlusion looks for occluders, in world units; 0
-    /// turns it off. 1 by default.
+    /// turns it off. 1 by default. It stays off while a GI extension is
+    /// active, as GI traces its own short-range occlusion.
     pub fn set_ambient_occlusion(&mut self, radius: f32) {
         self.ao_radius = radius.max(0.0);
     }
@@ -1370,7 +1397,15 @@ impl Renderer {
 
     /// Point every frame's set at the current render targets.
     unsafe fn write_image_descriptors(&self) {
-        let (Some(visibility), Some(hdr), Some(gbuffer), Some(receiver), Some(motion), Some(depth), Some(ao)) = (
+        let (
+            Some(visibility),
+            Some(hdr),
+            Some(gbuffer),
+            Some(receiver),
+            Some(motion),
+            Some(depth),
+            Some(ao),
+        ) = (
             &self.swap.visibility,
             &self.swap.hdr,
             &self.swap.gbuffer,
@@ -1378,7 +1413,8 @@ impl Renderer {
             &self.swap.motion,
             &self.swap.depth,
             &self.swap.ao,
-        ) else {
+        )
+        else {
             return;
         };
         let storage = |binding, view: vk::ImageView| {
@@ -1838,8 +1874,12 @@ impl Renderer {
             }
             if self.profiling && !self.gpu_timer_attempted {
                 self.gpu_timer_attempted = true;
-                self.gpu_timer =
-                    profiler::GpuTimer::new(&self.instance, device, self.physical, self.queue_family);
+                self.gpu_timer = profiler::GpuTimer::new(
+                    &self.instance,
+                    device,
+                    self.physical,
+                    self.queue_family,
+                );
             }
             if let Some(timer) = &mut self.gpu_timer {
                 timer.poll(device, frame_index);
@@ -1896,7 +1936,10 @@ impl Renderer {
             )?;
             let gpu_timing = self.gpu_timer.as_ref().filter(|_| self.profiling).is_some();
             if gpu_timing {
-                self.gpu_timer.as_ref().unwrap().begin(&self.device, command, frame_index);
+                self.gpu_timer
+                    .as_ref()
+                    .unwrap()
+                    .begin(&self.device, command, frame_index);
             }
             if let Some(embedded) = &mut self.embedded {
                 embedded.record(&self.device, command, frame_index);
@@ -1962,6 +2005,7 @@ impl Renderer {
                 self.anti_aliasing,
                 self.swap.visibility_msaa.is_some(),
                 self.sharpening,
+                taa::jitter(self.frame_number, self.anti_aliasing),
             )?;
             self.gpu_stamp(command, 8);
             profile.mark(&mut timing, 7);
@@ -2054,8 +2098,11 @@ impl Renderer {
     /// draw index, and remember this frame's models for the next.
     fn track_instance_motion(&mut self) {
         self.motion_data.clear();
-        self.previous_models =
-            instance_motion(&self.previous_models, &self.instance_data, &mut self.motion_data);
+        self.previous_models = instance_motion(
+            &self.previous_models,
+            &self.instance_data,
+            &mut self.motion_data,
+        );
         for &(instance, first) in &self.deforming_motion {
             self.motion_data[instance].info = [1, first, 0, 0];
         }
@@ -2109,7 +2156,12 @@ impl Renderer {
         }
         self.frame_indices.truncate(self.model_indices_len);
         let mut ranges = std::collections::HashMap::<(usize, usize), (u32, u32)>::new();
-        for (index, (draw, range)) in self.model_draws.iter().zip(&self.model_index_ranges).enumerate() {
+        for (index, (draw, range)) in self
+            .model_draws
+            .iter()
+            .zip(&self.model_index_ranges)
+            .enumerate()
+        {
             let Some((first, index_count)) = *range else {
                 continue;
             };
@@ -2168,8 +2220,10 @@ impl Renderer {
         self.deforming_motion.clear();
         for (slot, mesh) in self.deforming.iter().enumerate() {
             // A mesh whose vertex count changed has no usable last frame: it holds still.
-            self.deforming_motion
-                .push((self.instance_data.len(), self.previous_positions.len() as u32));
+            self.deforming_motion.push((
+                self.instance_data.len(),
+                self.previous_positions.len() as u32,
+            ));
             match self.previous_deforming.get(slot) {
                 Some(last) if last.len() == mesh.vertices.len() => {
                     self.previous_positions.extend_from_slice(last)
@@ -2267,6 +2321,12 @@ impl Renderer {
         if self.frame_clouds.is_some() && self.frame_sun.is_some() {
             globals.cloud_shadow = clouds::shadow_region(self.camera.eye);
         }
+        // Soft shadows sample a rotated disk per pixel; TAA averages the
+        // rotation over frames, and without it the noise holds still.
+        if self.anti_aliasing.temporal() {
+            globals.shadow_filter[0] = (self.frame_number % 1024) as f32;
+        }
+        globals.shadow_filter[1] = self.sun_angular_radius.tan();
         for (slot, light) in self.frame_lights.iter().take(MAX_POINT_SHADOWS).enumerate() {
             if light.radius.is_finite()
                 && light.radius > 0.0
@@ -2313,7 +2373,8 @@ impl Renderer {
             let record = &self.instance_data[instance];
             let model = glam::Mat4::from_cols_array_2d(&record.model);
             let start = jobs.len();
-            let masked = self.material_data[record.draw[2] as usize].textures[3] & scene::ALPHA_MASK != 0;
+            let masked =
+                self.material_data[record.draw[2] as usize].textures[3] & scene::ALPHA_MASK != 0;
             let mut bounds: Option<(glam::Vec3, glam::Vec3)> = None;
             if primitive == NO_PRIMITIVE {
                 // Unculled: its bounds change every frame.
@@ -2521,7 +2582,11 @@ impl Renderer {
         // Chunks of meshlets, so a few huge draws still spread across threads.
         const CHUNK: usize = 1024;
         // GPU culling takes over draws, which then keep no runs here.
-        let key = (self.frame_view_proj.0, self.model_generation, self.culling_active);
+        let key = (
+            self.frame_view_proj.0,
+            self.model_generation,
+            self.culling_active,
+        );
         if self.meshlet_runs_key != Some(key) {
             self.meshlet_runs.clear();
             self.meshlet_runs_key = Some(key);
@@ -2538,8 +2603,14 @@ impl Renderer {
             cached.draw = Some((primitive, model));
             cached.runs.clear();
             let culled_on_gpu = self.culling_active
-                && self.culling_ranges.get(instance).is_some_and(Option::is_some);
-            let meshlets = self.primitive_meshlets.get(primitive).and_then(Option::as_ref);
+                && self
+                    .culling_ranges
+                    .get(instance)
+                    .is_some_and(Option::is_some);
+            let meshlets = self
+                .primitive_meshlets
+                .get(primitive)
+                .and_then(Option::as_ref);
             if let Some(meshlets) = meshlets.filter(|_| !culled_on_gpu) {
                 let model = glam::Mat4::from_cols_array_2d(&model);
                 chunks.extend(meshlets.chunks(CHUNK).map(|chunk| (instance, chunk, model)));
@@ -2847,12 +2918,8 @@ impl Renderer {
                 );
                 device.cmd_draw(cmd, count, 1, 0, 0);
             }
-            self.matrix.record_draws(
-                device,
-                cmd,
-                self.pipeline_layout,
-                matrix::Target::Depth,
-            );
+            self.matrix
+                .record_draws(device, cmd, self.pipeline_layout, matrix::Target::Depth);
             device.cmd_end_rendering(cmd);
             barrier(
                 &[gpu::image_barrier(
@@ -2896,10 +2963,23 @@ impl Renderer {
         split(2);
 
         // Visibility: depth plus (instance, triangle) IDs.
-        let msaa = self.swap.visibility_msaa.as_ref().zip(self.swap.depth_msaa.as_ref());
+        let msaa = self
+            .swap
+            .visibility_msaa
+            .as_ref()
+            .zip(self.swap.depth_msaa.as_ref());
         if let Some((ids, depths)) = msaa {
             let attachment = |image, aspect, stage, access, layout| {
-                gpu::image_barrier(image, aspect, S::ALL_COMMANDS, A::NONE, stage, access, L::UNDEFINED, layout)
+                gpu::image_barrier(
+                    image,
+                    aspect,
+                    S::ALL_COMMANDS,
+                    A::NONE,
+                    stage,
+                    access,
+                    L::UNDEFINED,
+                    layout,
+                )
             };
             barrier(
                 &[
@@ -3155,7 +3235,9 @@ impl Renderer {
                 (ao.image, ao.view),
                 [projection.x_axis.x, projection.y_axis.y],
                 scene::NEAR,
-                self.ao_radius,
+                // Active GI traces its own short-range occlusion; screen-space
+                // AO on top would darken contacts twice. Off (cleared to 1) then.
+                if self.extension.as_ref().is_some_and(|e| e.active()) { 0.0 } else { self.ao_radius },
                 seed,
             )?;
             device.cmd_bind_descriptor_sets(
@@ -3536,7 +3618,12 @@ unsafe fn pick_device(
                 && query.ray_query != 0;
             let ray_features = if ray_query {
                 // SAFETY: The current physical device was enumerated from this instance.
-                ray_features::probe(instance, physical, has)
+                ray_features::probe(
+                    instance,
+                    physical,
+                    has,
+                    accel.acceleration_structure_indirect_build != vk::FALSE,
+                )
             } else {
                 RayFeatures::default()
             };
@@ -3561,7 +3648,8 @@ unsafe fn pick_device(
                 .dynamic_rendering(true)
                 .synchronization2(true);
             let mut accel = vk::PhysicalDeviceAccelerationStructureFeaturesKHR::default()
-                .acceleration_structure(true);
+                .acceleration_structure(true)
+                .acceleration_structure_indirect_build(ray_features.dense_geometry);
             let mut query = vk::PhysicalDeviceRayQueryFeaturesKHR::default().ray_query(true);
             let mut optional_ray_features = ray_features::EnableChain::new();
             let mut info = vk::DeviceCreateInfo::default()
@@ -3769,7 +3857,8 @@ mod motion_tests {
     #[test]
     fn moved_instance_maps_points_back_to_last_frame() {
         let at = |x: f32, slot: u32| {
-            let mut instance = scene::instance(Mat4::from_translation(Vec3::new(x, 0.0, 0.0)), 0, 7, 0);
+            let mut instance =
+                scene::instance(Mat4::from_translation(Vec3::new(x, 0.0, 0.0)), 0, 7, 0);
             instance.draw[3] = slot;
             instance
         };

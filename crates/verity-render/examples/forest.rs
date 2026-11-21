@@ -228,6 +228,7 @@ impl Viewer {
         renderer.set_matrix_enabled(!self.options.exact);
         renderer.set_matrix_debug(self.options.debug);
         renderer.set_uncapped(true);
+        renderer.set_profiling(true);
         renderer.set_shadow_distance(self.options.shadows as f32);
         renderer.set_clear_color([0.45, 0.6, 0.8, 1.0]);
         renderer.set_ambient(Vec3::new(0.35, 0.42, 0.55), Vec3::new(0.1, 0.1, 0.06));
@@ -306,8 +307,12 @@ impl ApplicationHandler for Viewer {
                 self.frames.0 += 1;
                 let elapsed = self.frames.1.elapsed();
                 if elapsed >= Duration::from_secs(2) {
+                    let gpu = renderer.profile().and_then(|p| p.gpu_ms).map_or(String::new(), |ms| {
+                        // Shadows and Resolve, in `GPU_STAGE_NAMES` order.
+                        format!(" gpu: shadows {:.2} ms, resolve {:.2} ms", ms[2], ms[5])
+                    });
                     println!(
-                        "{:.2} ms/frame {:?}",
+                        "{:.2} ms/frame{gpu} {:?}",
                         elapsed.as_secs_f64() * 1000.0 / self.frames.0 as f64,
                         renderer.matrix_stats()
                     );
@@ -354,7 +359,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             leaves: number(&args, "--leaves", 20_000),
             exact: args.iter().any(|a| a == "--exact"),
             debug: args.iter().any(|a| a == "--debug"),
-            shadows: number(&args, "--shadows", 60),
+            shadows: number(&args, "--shadows", 1000),
             spacing: number(&args, "--spacing", 11),
             model: args
                 .iter()

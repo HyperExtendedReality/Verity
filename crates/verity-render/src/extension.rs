@@ -2,7 +2,7 @@
 //! written direct lighting and the thin G-buffer, before tonemapping. Global
 //! illumination (verity-lux) is one.
 
-use crate::{asset::SceneData, RetainedMesh, Sun};
+use crate::{RetainedMesh, Sun, asset::SceneData};
 use ash::vk;
 use glam::{Mat4, Vec3};
 use gpu_allocator::vulkan::Allocator;
@@ -23,7 +23,7 @@ pub struct RayFeatures {
     pub cluster_acceleration: bool,
     /// `VK_NV_partitioned_acceleration_structure` with its feature enabled.
     pub partitioned_acceleration: bool,
-    /// `VK_AMDX_dense_geometry_format` and its buffer usage flag dependency.
+    /// `VK_AMDX_dense_geometry_format` with usage flags 2 and indirect AS builds enabled.
     pub dense_geometry: bool,
 }
 

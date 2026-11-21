@@ -11,7 +11,8 @@ static const uint CLUSTER_COUNT = CLUSTER_X * CLUSTER_Y * CLUSTER_Z;
 /// 32-bit light masks per cluster: MAX_LIGHTS / 32.
 static const uint LIGHT_WORDS = 32;
 static const uint NO_INSTANCE = 0xffffffff;
-static const uint CASCADES = 4;
+/// Mirrors `scene::CASCADES`; a multiple of four (splits pack into float4s).
+static const uint CASCADES = 8;
 static const float SHADOW_SIZE = 2048.0;
 static const uint MAX_POINT_SHADOWS = 4;
 static const uint POINT_SHADOW_FACES = 6;
@@ -74,10 +75,10 @@ struct Globals {
     float4x4 previous_view_proj;
     /// World to shadow clip space per sun cascade.
     float4x4 shadow_view_proj[CASCADES];
-    /// View distance where each cascade ends.
-    float4 shadow_splits;
-    /// World size of one shadow texel per cascade.
-    float4 shadow_texels;
+    /// View distance where each cascade's slice ends; read with `shadow_split`.
+    float4 shadow_splits[CASCADES / 4];
+    /// World size of one shadow texel per cascade; read with `shadow_texel`.
+    float4 shadow_texels[CASCADES / 4];
     /// Sky hemisphere radiance; w: 1 when the sun casts shadows.
     float4 sky;
     /// Ground hemisphere radiance.
@@ -85,6 +86,12 @@ struct Globals {
     float4x4 point_shadow_view_proj[MAX_POINT_SHADOWS * POINT_SHADOW_FACES];
     /// Cloud shadow map: world xy of its corner, its size; w: 1 when in use.
     float4 cloud_shadow;
+    /// Sun shadow filtering: x: frame index for the noise (0 without TAA);
+    /// y: tangent of the sun's angular radius; z: farthest occluder distance
+    /// the blocker search is sized for.
+    float4 shadow_filter;
+    /// x: one bit per shadow layer (cascades, then point faces) this frame redraws.
+    uint4 shadow_redraw;
     // GPU pointers to this frame's arrays; set in `upload_frame` (lib.rs).
     Instance* instances;
     Light* lights;
@@ -119,6 +126,16 @@ struct Globals {
 [[vk::binding(16)]] Texture2DArray<float> shadow_map;
 [[vk::binding(17)]] SamplerComparisonState shadow_sampler;
 [[vk::binding(18)]] Texture2DArray<float> point_shadow_map;
+
+/// View distance where sun cascade `c`'s slice ends.
+float shadow_split(uint c) {
+    return globals.shadow_splits[c >> 2][c & 3];
+}
+
+/// World size of one texel of sun cascade `c`.
+float shadow_texel(uint c) {
+    return globals.shadow_texels[c >> 2][c & 3];
+}
 
 /// Vertex of an instance's triangle corner, through its index range.
 Vertex instance_vertex(Instance instance, uint corner) {

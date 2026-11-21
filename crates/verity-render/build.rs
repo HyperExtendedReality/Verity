@@ -13,6 +13,7 @@ const ENTRY_POINTS: &[(&str, &str, SlangStage)] = &[
     ("depth_prepass", "fragmentMain", SlangStage::Fragment),
     ("ao_prepass", "prepassMain", SlangStage::Compute),
     ("ao_trace", "traceMain", SlangStage::Compute),
+    ("ao_trace", "lutMain", SlangStage::Compute),
     ("ao_filter", "filterMain", SlangStage::Compute),
     ("resolve", "resolveMain", SlangStage::Compute),
     ("resolve", "resolveMsaaMain", SlangStage::Compute),
@@ -52,6 +53,8 @@ const ENTRY_POINTS: &[(&str, &str, SlangStage)] = &[
     ("matrix_imposters", "fragmentMain", SlangStage::Fragment),
     ("matrix_imposters_depth", "vertexMain", SlangStage::Vertex),
     ("matrix_imposters_depth", "fragmentMain", SlangStage::Fragment),
+    ("matrix_imposters_shadow", "vertexMain", SlangStage::Vertex),
+    ("matrix_imposters_shadow", "fragmentMain", SlangStage::Fragment),
     ("matrix_bake", "vertexMain", SlangStage::Vertex),
     ("matrix_bake", "fragmentMain", SlangStage::Fragment),
 ];

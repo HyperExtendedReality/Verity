@@ -216,9 +216,13 @@ VertexOutput vertexMain(uint vertex: SV_VertexID, uint entry: SV_InstanceID) {
     MatrixInstance instance = globals.matrix_instances[index];
     float3 center = instance.sphere.xyz;
     float radius = instance.sphere.w;
+#if MATRIX_TARGET == TARGET_SHADOW
+    // Sun cascades are orthographic: the card faces the light itself.
+    float3 toward = -globals.sun_direction.xyz;
+#else
     float3 offset = globals.eye.xyz - center;
-    float distance = length(offset);
-    float3 toward = offset / max(distance, 1.0e-4);
+    float3 toward = offset / max(length(offset), 1.0e-4);
+#endif
     float3 right = normalize(cross(abs(toward.z) > 0.999 ? float3(1, 0, 0) : float3(0, 0, 1), toward));
     float3 up = cross(toward, right);
     uint corner = uint[6](0, 1, 2, 0, 2, 3)[vertex];
@@ -226,9 +230,14 @@ VertexOutput vertexMain(uint vertex: SV_VertexID, uint entry: SV_InstanceID) {
     // The card sits at the front of the bounds, so hits only ever lie behind it.
     float3 world = center + toward * radius + (right * square.x + up * square.y) * radius;
     VertexOutput output;
-    output.position = mul(globals.view_proj, float4(world, 1.0));
+    output.position = to_clip(float4(world, 1.0));
     output.world = world;
+#if MATRIX_TARGET == TARGET_SHADOW
+    // The card's width in shadow texels picks the atlas mip.
+    output.pixels = 2.0 * radius / shadow_texel(draw.cascade);
+#else
     output.pixels = matrix_pixels(instance);
+#endif
     output.instance = index;
     output.fade = imposter_fade(instance);
     return output;
@@ -236,17 +245,26 @@ VertexOutput vertexMain(uint vertex: SV_VertexID, uint entry: SV_InstanceID) {
 
 bool imposterHit(VertexOutput input, out float depth) {
     depth = 0.0;
-    if (!imposter_pixel(input.position.xy, input.fade))
-        return false;
     MatrixInstance instance = globals.matrix_instances[input.instance];
     MatrixAsset asset = globals.matrix_assets[instance.info.x];
-    float3 direction = normalize(input.world - globals.eye.xyz);
-    ImposterHit hit = imposter_sample(instance, asset, globals.eye.xyz, direction, input.pixels);
+#if MATRIX_TARGET == TARGET_SHADOW
+    // Selection lists only instances wholly shown as imposters, so no dither.
+    // Parallel light: start each ray well back along it, so every pixel picks
+    // the frames facing the sun.
+    float3 direction = globals.sun_direction.xyz;
+    float3 eye = input.world - direction * (64.0 * instance.sphere.w);
+#else
+    if (!imposter_pixel(input.position.xy, input.fade))
+        return false;
+    float3 eye = globals.eye.xyz;
+    float3 direction = normalize(input.world - eye);
+#endif
+    ImposterHit hit = imposter_sample(instance, asset, eye, direction, input.pixels);
     if (hit.alpha < IMPOSTER_ALPHA)
         return false;
-    float3 origin = mul(instance.inverse, float4(globals.eye.xyz, 1.0)).xyz;
+    float3 origin = mul(instance.inverse, float4(eye, 1.0)).xyz;
     float3 ray = normalize(mul(instance.inverse, float4(direction, 0.0)).xyz);
-    float4 clip = mul(globals.view_proj, mul(instance.base.model, float4(origin + ray * hit.distance, 1.0)));
+    float4 clip = to_clip(mul(instance.base.model, float4(origin + ray * hit.distance, 1.0)));
     depth = clip.z / clip.w;
     return true;
 }
@@ -264,6 +282,15 @@ FragmentOutput fragmentMain(VertexOutput input) {
         discard;
     output.id = uint2(input.instance, MATRIX_IMPOSTER << MATRIX_KIND_SHIFT);
     return output;
+}
+#elif MATRIX_TARGET == TARGET_SHADOW
+// Shadow maps keep near depth small, so hits behind the card only grow it.
+[shader("fragment")]
+float fragmentMain(VertexOutput input): SV_DepthGreaterEqual {
+    float depth;
+    if (!imposterHit(input, depth))
+        discard;
+    return depth;
 }
 #else
 [shader("fragment")]

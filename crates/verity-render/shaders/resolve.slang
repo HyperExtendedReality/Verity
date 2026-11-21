@@ -50,8 +50,6 @@ float4 sample_material(uint texture, float2 uv, float2 dx, float2 dy, float4 fal
     return textures[NonUniformResourceIndex(texture)].SampleGrad(material_sampler, uv, dx, dy);
 }
 
-/// Sun visibility from the cascade covering view distance `depth`, with a
-/// 3x3 hardware-PCF filter and a fade over the last tenth of the range.
 /// Sunlight let through the clouds above `position`; see clouds.slang.
 [[vk::binding(32, MATERIAL_SET)]] Texture2D<float> cloud_shadow_map;
 
@@ -70,23 +68,133 @@ float cloud_shadow(float3 position) {
 /// Ambient light reaching each pixel, 0 to 1; see ao.rs. 1 while AO is off.
 [[vk::binding(36, MATERIAL_SET)]] Texture2D<float> ambient_occlusion;
 
-float sun_shadow(float3 position, float3 normal, float depth) {
-    float range = globals.shadow_splits[CASCADES - 1];
+/// Occlusion with the light that bounces between the occluding surfaces put
+/// back, so bright albedo darkens less (Jimenez et al. 2016, GTAO). Lux's
+/// composite applies the same fit to its SSAO.
+float3 multi_bounce_occlusion(float occlusion, float3 albedo) {
+    float3 a = 2.0404 * albedo - 0.3324;
+    float3 b = -4.7951 * albedo + 0.6417;
+    float3 c = 2.7552 * albedo + 0.6903;
+    return max(float3(occlusion), ((occlusion * a + b) * occlusion + c) * occlusion);
+}
+
+/// Share of the reflected ambient that escapes, from AO: glossy lobes seen
+/// head-on lose less than the cosine-weighted AO says (Lagarde and de
+/// Rousiers 2014). `roughness` is perceptual.
+float specular_occlusion(float nv, float occlusion, float roughness) {
+    float alpha = roughness * roughness;
+    return saturate(pow(nv + occlusion, exp2(-16.0 * alpha - 1.0)) - 1.0 + occlusion);
+}
+
+/// Taps of the blocker search and of the filter, on a Vogel disk.
+static const uint SHADOW_SEARCH_TAPS = 12;
+static const uint SHADOW_FILTER_TAPS = 16;
+/// Share of a cascade's half-width at its edge where it hands pixels over to
+/// the next one, and the widest filter in texels, which stays inside that band.
+static const float SHADOW_HANDOVER = 0.08;
+static const float SHADOW_MAX_RADIUS = 48.0;
+
+/// Interleaved gradient noise (Jimenez 2014): a per-pixel value in [0, 1)
+/// whose neighbors differ enough for TAA to average it away.
+float gradient_noise(float2 pixel) {
+    return frac(52.9829189 * frac(dot(pixel, float2(0.06711056, 0.00583715))));
+}
+
+/// Tap `i` of `count` on a unit Vogel disk turned by `angle`: even coverage
+/// for any count, and a different pattern per pixel once turned.
+float2 vogel_disk(uint i, uint count, float angle) {
+    float r = sqrt((float(i) + 0.5) / float(count));
+    float theta = float(i) * 2.39996323 + angle;
+    return r * float2(cos(theta), sin(theta));
+}
+
+/// Sun visibility at `position` (view distance `depth`, geometric normal
+/// `normal`) with soft shadows that widen with distance from their caster,
+/// as the sun's disk makes them (PCSS, Fernando 2005).
+///
+/// The finest cascade whose map holds the point is used, not the one its
+/// distance falls in: cascades are spheres around their slices and often
+/// reach further. Near a map's edge pixels pass to the next cascade with
+/// rising odds, so the seam dissolves under TAA. Each tap compares against
+/// the receiver's plane, not its center (Isidoro 2006), which keeps acne off
+/// slopes however wide the filter. Shadows fade out over the last tenth of
+/// the range.
+float sun_shadow(float3 position, float3 normal, float depth, uint2 pixel) {
+    float range = shadow_split(CASCADES - 1);
     if (globals.sky.w == 0.0 || depth >= range)
         return 1.0;
-    uint cascade = 0;
-    while (cascade < CASCADES - 1 && depth > globals.shadow_splits[cascade])
-        ++cascade;
-    // Offsetting along the normal by a texel or two keeps acne off grazing surfaces.
-    float3 biased = position + normal * globals.shadow_texels[cascade] * 1.5;
-    float4 clip = mul(globals.shadow_view_proj[cascade], float4(biased, 1.0));
-    float3 ndc = clip.xyz / clip.w;
+    float2 seed = float2(pixel) + 5.588238 * globals.shadow_filter.x;
+    float handover_noise = gradient_noise(seed);
+    float angle = 6.28318531 * gradient_noise(seed + float2(47.0, 17.0));
+
+    // A slice's own cascade always holds it; the one before often does too.
+    uint first = 0;
+    while (first < CASCADES - 1 && depth > shadow_split(first))
+        ++first;
+    first = first > 0 ? first - 1 : 0;
+    uint cascade = CASCADES;
+    for (uint c = first; c < CASCADES; ++c) {
+        // Orthographic: w is 1.
+        float3 ndc = mul(globals.shadow_view_proj[c], float4(position, 1.0)).xyz;
+        float edge = max(abs(ndc.x), abs(ndc.y));
+        if (edge >= 1.0 || ndc.z <= 0.0 || ndc.z >= 1.0)
+            continue;
+        cascade = c;
+        float handover = saturate((edge - (1.0 - 2.0 * SHADOW_HANDOVER)) / SHADOW_HANDOVER);
+        if (handover_noise >= handover)
+            break;
+    }
+    if (cascade == CASCADES)
+        return 1.0;
+
+    float4x4 m = globals.shadow_view_proj[cascade];
+    float texel = shadow_texel(cascade);
+    // A texel along the normal keeps the lookup off the surface it shades.
+    float3 ndc = mul(m, float4(position + normal * texel, 1.0)).xyz;
     float2 uv = ndc.xy * 0.5 + 0.5;
+    float meters_per_uv = texel * SHADOW_SIZE;
+    // Rows of an orthographic light transform are orthogonal axes scaled by
+    // the projection, so the normal in clip space is each row's dot / its
+    // squared length. Its plane gives map depth as a function of uv.
+    float3 r0 = m[0].xyz, r1 = m[1].xyz, r2 = m[2].xyz;
+    float3 n = float3(dot(r0, normal) / dot(r0, r0), dot(r1, normal) / dot(r1, r1), dot(r2, normal) / dot(r2, r2));
+    float depth_per_meter = length(r2);
+    float nz = n.z >= 0.0 ? max(n.z, 1.0e-6) : min(n.z, -1.0e-6);
+    // Steeper than 4:1 against the light only adds bias where acne cannot form.
+    float steepest = 4.0 * depth_per_meter * meters_per_uv;
+    float2 slope = clamp(-2.0 * n.xy / nz, -steepest, steepest);
+
+    // Blocker search: how far the occluders above this point sit from it.
+    float tan_sun = globals.shadow_filter.y;
+    float search = clamp(globals.shadow_filter.z * tan_sun / texel, 2.0, SHADOW_MAX_RADIUS) / SHADOW_SIZE;
+    float blocker_sum = 0.0;
+    uint blockers = 0;
+    [unroll] for (uint i = 0; i < SHADOW_SEARCH_TAPS; ++i) {
+        float2 offset = vogel_disk(i, SHADOW_SEARCH_TAPS, angle) * search;
+        int2 tap = clamp(int2((uv + offset) * SHADOW_SIZE), 0, int(SHADOW_SIZE) - 1);
+        float stored = shadow_map.Load(int4(tap, cascade, 0));
+        if (stored < ndc.z + dot(slope, offset)) {
+            blocker_sum += stored;
+            ++blockers;
+        }
+    }
+    float fade = saturate((range - depth) / (0.1 * range));
+    if (blockers == 0)
+        return 1.0;
+
+    // Penumbra half-width: the sun's angular radius over the blocker distance,
+    // and at least a texel so cascade texels never show as stairs.
+    float distance = max(ndc.z - blocker_sum / float(blockers), 0.0) / depth_per_meter;
+    float radius = clamp(distance * tan_sun / texel, 1.0, SHADOW_MAX_RADIUS) / SHADOW_SIZE;
+    if (blockers == SHADOW_SEARCH_TAPS && radius <= search)
+        return 1.0 - fade;
     float lit = 0.0;
-    for (int y = -1; y <= 1; ++y)
-        for (int x = -1; x <= 1; ++x)
-            lit += shadow_map.SampleCmpLevelZero(shadow_sampler, float3(uv + float2(x, y) / SHADOW_SIZE, cascade), ndc.z);
-    return lerp(1.0, lit / 9.0, saturate((range - depth) / (0.1 * range)));
+    [unroll] for (uint i = 0; i < SHADOW_FILTER_TAPS; ++i) {
+        float2 offset = vogel_disk(i, SHADOW_FILTER_TAPS, angle) * radius;
+        lit += shadow_map.SampleCmpLevelZero(
+            shadow_sampler, float3(uv + offset, cascade), ndc.z + dot(slope, offset));
+    }
+    return lerp(1.0, lit / float(SHADOW_FILTER_TAPS), fade);
 }
 // The first four lights have six depth-array layers each. Unshadowed lights
 // still contribute direct lighting; the face projection matches the raster pass.
@@ -354,25 +462,26 @@ float3 shade(uint2 id, uint2 pixel, uint2 hit, bool primary) {
     // light, so dark GI-lit interiors meter like the sky; meter GI's own
     // irradiance if interiors come out too dark.
     float3 diffuse_light = hemisphere;
-    // shortcut: AO also stands in for specular occlusion of the ambient.
-    float occlusion = ambient_occlusion.Load(int3(pixel, 0));
     if (globals.counts.z == 0) {
-        result = (brdf.diffuse_color + brdf.albedo) * hemisphere * occlusion;
+        // AO runs only without GI; GI traces its own occlusion (see ao.rs).
+        float occlusion = saturate(ambient_occlusion.Load(int3(pixel, 0)));
+        result = (brdf.diffuse_color * multi_bounce_occlusion(occlusion, brdf.diffuse_color)
+            + brdf.albedo * specular_occlusion(nv, occlusion, s.roughness)) * hemisphere;
         // The hemisphere behind the surface, through it.
         result += transmitted * PI * lerp(globals.ground.rgb, globals.sky.rgb, -s.normal.z * 0.5 + 0.5);
     } else if ((globals.counts.z & 2) != 0) {
         float3 mirrored = reflect(-s.view, s.normal);
-        result = brdf.albedo * lerp(globals.ground.rgb, globals.sky.rgb, mirrored.z * 0.5 + 0.5) * occlusion;
+        result = brdf.albedo * lerp(globals.ground.rgb, globals.sky.rgb, mirrored.z * 0.5 + 0.5);
     }
     if (globals.sun_direction.w > 0.0) {
         float3 l = -globals.sun_direction.xyz;
-        float3 sun = globals.sun_color.rgb * sun_shadow(s.position, face, depth) * cloud_shadow(s.position);
+        float3 sun = globals.sun_color.rgb * sun_shadow(s.position, face, depth, pixel) * cloud_shadow(s.position);
         result += evaluate_brdf(brdf, s, l) * sun;
         diffuse_light += sun * max(dot(s.normal, l), 0.0) / PI;
         // Sun behind a leaf, shadowed on the side it lights.
         float behind = -dot(s.normal, l);
         if (transmits > 0.0 && behind > 0.0)
-            result += transmitted * behind * globals.sun_color.rgb * sun_shadow(s.position, -face, depth) * cloud_shadow(s.position);
+            result += transmitted * behind * globals.sun_color.rgb * sun_shadow(s.position, -face, depth, pixel) * cloud_shadow(s.position);
     }
     uint2 tile = min(uint2(float2(id.xy) / viewport.zw * float2(CLUSTER_X, CLUSTER_Y)), uint2(CLUSTER_X - 1, CLUSTER_Y - 1));
     uint first = cluster_index(uint3(tile, depth_slice(depth))) * LIGHT_WORDS;

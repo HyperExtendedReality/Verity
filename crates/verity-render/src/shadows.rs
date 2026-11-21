@@ -7,23 +7,44 @@
 //! A sun cascade's projection already reaches `SHADOW_CASTER_REACH` toward the
 //! sun and the shadow pipeline does not clamp depth, so the cull is exact.
 //!
-//! Outer cascades (from index 2) may wait a frame: when both would redraw,
-//! they take turns, and one that waits keeps the projection it was drawn with
-//! so the resolve samples it where it was rendered. A cascade waits only while
-//! its old map still covers the camera's slice, and never two frames running.
+//! Outer cascades (from index 2) redraw on a schedule: each pair of cascades
+//! refreshes half as often as the pair before it, staggered so every frame
+//! draws about the same number of layers. One that waits keeps the projection
+//! it was drawn with so the resolve samples it where it was rendered, and
+//! waits only while its old map still covers the camera's slice.
+//!
+//! Casters under half a texel of a cascade are left out of it: their shadow
+//! would be smaller than what the cascade can show.
 
 use crate::{
     meshlets, scene, Renderer, EMBEDDED_PRIMITIVE, NO_PRIMITIVE,
 };
-use glam::Mat4;
+use glam::{Mat4, Vec3};
 use verity_matrix::Bounds;
 
 const LAYERS: usize = scene::CASCADES + scene::MAX_POINT_SHADOWS * scene::POINT_SHADOW_FACES;
-/// The first cascade allowed to wait a frame.
+/// The first cascade allowed to wait.
 const FIRST_LAZY_CASCADE: usize = 2;
+/// The longest a cascade waits between redraws, in frames.
+const MAX_PERIOD: u64 = 8;
+/// A caster whose bounding radius is under this many texels skips a cascade.
+const SMALL_CASTER_TEXELS: f32 = 0.5;
 
 /// A cascade's projection and texel size as drawn, and the model generation then.
 type Drawn = ([[f32; 4]; 4], f32, u64);
+
+/// How often a cascade redraws while it would every frame, and on which frame
+/// of that period: pairs of cascades double the period, the two of a pair
+/// take opposite halves, and pairs with the same phase shift by one.
+fn schedule(cascade: usize) -> (u64, u64) {
+    if cascade < FIRST_LAZY_CASCADE {
+        return (1, 0);
+    }
+    let pair = (cascade / 2) as u32;
+    let period = (1u64 << pair).min(MAX_PERIOD);
+    let phase = (cascade % 2) as u64 * (period / 2) + u64::from(pair.saturating_sub(2));
+    (period, phase % period)
+}
 
 #[derive(Default)]
 pub(crate) struct ShadowLayers {
@@ -33,10 +54,9 @@ pub(crate) struct ShadowLayers {
     calls: Vec<Vec<(u32, u32)>>,
     keys: Vec<Vec<u8>>,
     redraw: Vec<bool>,
-    /// Per cascade: the projection and texel size its map was drawn with, the
-    /// model generation then, and whether it waited last frame.
+    /// Per cascade: the projection and texel size its map was drawn with, and
+    /// the model generation then.
     drawn: [Option<Drawn>; scene::CASCADES],
-    waited: [bool; scene::CASCADES],
     /// Each primitive's bounds, from its meshlets, for `bounds_generation`.
     bounds: Vec<Option<Bounds>>,
     bounds_generation: Option<u64>,
@@ -54,6 +74,18 @@ impl ShadowLayers {
     pub(crate) fn calls(&self, layer: usize) -> &[(u32, u32)] {
         self.calls.get(layer).map_or(&[], Vec::as_slice)
     }
+}
+
+/// World radius of a caster's bounds as placed by `model`.
+fn radius(model: Mat4, bounds: &Bounds) -> f32 {
+    let half = (Vec3::from_array(bounds.max) - Vec3::from_array(bounds.min)).length() * 0.5;
+    let scale = model
+        .x_axis
+        .truncate()
+        .length()
+        .max(model.y_axis.truncate().length())
+        .max(model.z_axis.truncate().length());
+    half * scale
 }
 
 /// Whether the map drawn with `clip` still holds every corner of a slice.
@@ -132,9 +164,16 @@ impl Renderer {
                 key.extend_from_slice(bytemuck::bytes_of(&clip));
                 key.extend_from_slice(&generation.to_ne_bytes());
                 let clip = Mat4::from_cols_array_2d(&clip);
+                let smallest = if layer < scene::CASCADES {
+                    globals.shadow_texels[layer] * SMALL_CASTER_TEXELS
+                } else {
+                    0.0
+                };
                 for &(instance, count) in &self.shadow_calls {
                     let placed = caster(instance);
-                    if placed.is_some_and(|(model, bounds)| !meshlets::visible(&bounds, clip, model)) {
+                    if placed.is_some_and(|(model, bounds)| {
+                        radius(model, &bounds) < smallest || !meshlets::visible(&bounds, clip, model)
+                    }) {
                         continue;
                     }
                     calls.push((instance, count));
@@ -161,18 +200,16 @@ impl Renderer {
             scene::cascades(&self.camera, aspect, sun.direction, self.shadow_distance)
         });
         for cascade in 0..scene::CASCADES {
-            let turn = (self.frame_number + cascade as u64).is_multiple_of(2);
-            let wait = cascade >= FIRST_LAZY_CASCADE
-                && s.redraw[cascade]
+            let (period, phase) = schedule(cascade);
+            let turn = (self.frame_number + phase).is_multiple_of(period);
+            let wait = s.redraw[cascade]
                 && !turn
-                && !s.waited[cascade]
                 && s.drawn[cascade].is_some_and(|(clip, _, drawn_generation)| {
                     drawn_generation == generation
                         && cascades.as_ref().is_some_and(|c| {
                             covers(Mat4::from_cols_array_2d(&clip), &c.corners[cascade])
                         })
                 });
-            s.waited[cascade] = wait;
             if wait {
                 let (clip, texel, _) = s.drawn[cascade].unwrap();
                 globals.shadow_view_proj[cascade] = clip;
@@ -188,6 +225,9 @@ impl Renderer {
                 ));
             }
         }
+        globals.shadow_redraw[0] = (0..LAYERS)
+            .filter(|&layer| s.redraw[layer])
+            .fold(0, |mask, layer| mask | 1 << layer);
     }
 }
 
@@ -195,6 +235,23 @@ impl Renderer {
 mod tests {
     use super::*;
     use glam::Vec3;
+
+    #[test]
+    fn outer_cascades_share_out_their_redraws_evenly() {
+        let mut per_frame = [0usize; MAX_PERIOD as usize];
+        for cascade in 0..scene::CASCADES {
+            let (period, phase) = schedule(cascade);
+            assert!(period <= MAX_PERIOD && phase < period, "cascade {cascade}");
+            for (frame, count) in per_frame.iter_mut().enumerate() {
+                if (frame as u64 + phase).is_multiple_of(period) {
+                    *count += 1;
+                }
+            }
+        }
+        let (low, high) = (per_frame.iter().min().unwrap(), per_frame.iter().max().unwrap());
+        assert!(high - low <= 1, "redraws per frame {per_frame:?}");
+        assert!(*high <= 4, "redraws per frame {per_frame:?}");
+    }
 
     #[test]
     fn a_cascade_covers_its_own_slice_but_not_a_distant_one() {

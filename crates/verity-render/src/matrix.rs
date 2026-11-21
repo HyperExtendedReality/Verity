@@ -30,7 +30,9 @@ const LIST_VOXELS: usize = 2;
 const LIST_IMPOSTER: usize = 3;
 const LIST_LAYERS: usize = 4;
 const SHADOW_LAYERS: usize = scene::CASCADES + scene::MAX_POINT_SHADOWS * scene::POINT_SHADOW_FACES;
-const LISTS: usize = LIST_LAYERS + SHADOW_LAYERS * 2;
+/// Then each sun cascade's imposter casters.
+const LIST_SHADOW_IMPOSTERS: usize = LIST_LAYERS + SHADOW_LAYERS * 2;
+const LISTS: usize = LIST_SHADOW_IMPOSTERS + scene::CASCADES;
 const QUEUE: u64 = 1 << 20;
 const CLUSTER_LIST: u32 = 1 << 19;
 const BRICK_LIST: u32 = 1 << 21;
@@ -38,6 +40,7 @@ const CASCADE_CLUSTERS: u32 = 1 << 17;
 const CASCADE_BRICKS: u32 = 1 << 19;
 const FACE_CLUSTERS: u32 = 1 << 15;
 const FACE_BRICKS: u32 = 1 << 16;
+const CASCADE_IMPOSTERS: u32 = 1 << 16;
 const PASS_WORDS: usize = LISTS * 4;
 /// Enough for 8^16 groups; the tree depth is checked at load.
 const MAX_PASSES: usize = 16;
@@ -53,6 +56,7 @@ fn list_vertices(list: usize) -> u32 {
         LIST_ONE_SIDED | LIST_TWO_SIDED => CLUSTER_VERTICES,
         LIST_VOXELS => BRICK_VERTICES,
         LIST_IMPOSTER => CARD_VERTICES,
+        _ if list >= LIST_SHADOW_IMPOSTERS => CARD_VERTICES,
         _ if list.is_multiple_of(2) => CLUSTER_VERTICES,
         _ => BRICK_VERTICES,
     }
@@ -71,6 +75,7 @@ fn list_capacity(list: usize) -> u32 {
     let bricks = list % 2 == 1;
     match list {
         LIST_VOXELS => BRICK_LIST,
+        _ if list >= LIST_SHADOW_IMPOSTERS => CASCADE_IMPOSTERS,
         _ if list < LIST_LAYERS => CLUSTER_LIST,
         _ if (list - LIST_LAYERS) / 2 < scene::CASCADES => {
             if bricks {
@@ -96,6 +101,8 @@ pub struct MatrixStats {
     pub imposters: u32,
     pub shadow_clusters: u32,
     pub shadow_bricks: u32,
+    /// Instances cast into sun cascades through their imposter card.
+    pub shadow_imposters: u32,
 }
 
 #[repr(C)]
@@ -185,6 +192,7 @@ pub(crate) struct Matrix {
     voxels_shadow: vk::Pipeline,
     imposters: vk::Pipeline,
     imposters_depth: vk::Pipeline,
+    imposters_shadow: vk::Pipeline,
     /// Visibility pipelines for multisampled attachments; null without MSAA.
     multisampled: [vk::Pipeline; 3],
     bake: vk::Pipeline,
@@ -403,6 +411,18 @@ impl Matrix {
                 None,
             ),
         )?;
+        self.imposters_shadow = gpu::graphics_pipeline(
+            device,
+            layout,
+            &raster(
+                spirv!("matrix_imposters_shadow.vertexMain"),
+                spirv!("matrix_imposters_shadow.fragmentMain"),
+                None,
+                less,
+                none,
+                Some((1.25, 1.75)),
+            ),
+        )?;
         if let Some(samples) = msaa_samples {
             let shaders: [(&[u8], &[u8], _); 3] = [
                 (spirv!("matrix_clusters.vertexMain"), spirv!("matrix_clusters.fragmentMain"), None),
@@ -442,6 +462,7 @@ impl Matrix {
             self.voxels_shadow,
             self.imposters,
             self.imposters_depth,
+            self.imposters_shadow,
             self.bake,
         ]
         .into_iter()
@@ -614,13 +635,14 @@ impl Matrix {
     pub(crate) fn read_stats(&mut self, frame: usize) {
         let words: &[u32] = bytemuck::cast_slice(self.readback[frame].read());
         let count = |list: usize| words[list * 4 + 1];
-        let layers = |first: usize| (first..LISTS).step_by(2).map(count).sum();
+        let layers = |first: usize| (first..LIST_SHADOW_IMPOSTERS).step_by(2).map(count).sum();
         self.stats = MatrixStats {
             clusters: count(LIST_ONE_SIDED) + count(LIST_TWO_SIDED),
             bricks: count(LIST_VOXELS),
             imposters: count(LIST_IMPOSTER),
             shadow_clusters: layers(LIST_LAYERS),
             shadow_bricks: layers(LIST_LAYERS + 1),
+            shadow_imposters: (LIST_SHADOW_IMPOSTERS..LISTS).map(count).sum(),
         };
     }
 
@@ -782,6 +804,10 @@ impl Matrix {
         let list = LIST_LAYERS + layer as usize * 2;
         self.draw_list(device, cmd, layout, self.clusters_shadow, list, layer);
         self.draw_list(device, cmd, layout, self.voxels_shadow, list + 1, layer);
+        if (layer as usize) < scene::CASCADES {
+            let imposters = LIST_SHADOW_IMPOSTERS + layer as usize;
+            self.draw_list(device, cmd, layout, self.imposters_shadow, imposters, layer);
+        }
     }
 }
 

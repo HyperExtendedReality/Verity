@@ -22,7 +22,9 @@ static const uint ITEM_VISIBLE = 1u << 31;
 static const uint ITEM_SHADOW = 1u << 30;
 /// Take the coarsest cut whatever the distance: a distant caster needs no detail.
 static const uint ITEM_COARSE = 1u << 29;
-static const uint ITEM_INSTANCE = ITEM_COARSE - 1;
+/// Cast into point faces only: sun cascades take the instance's imposter.
+static const uint ITEM_NO_SUN = 1u << 28;
+static const uint ITEM_INSTANCE = ITEM_NO_SUN - 1;
 
 /// Largest allowed projected error, in pixels.
 static const float ERROR_PIXELS = 1.0;
@@ -84,10 +86,26 @@ void push_layer(uint layer, uint instance, uint cluster, uint first_brick, uint 
 
 /// Add a cluster to the lists of every shadow layer it can reach. `sphere` is in
 /// world space. Without this every layer would draw every caster.
-void push_shadow_layers(uint instance, uint cluster, uint first_brick, uint brick_count, bool triangles, float4 sphere) {
-    if (globals.sun_direction.w > 0.0) {
+/// Whether any shadowed point light reaches a world-space sphere.
+bool point_shadow_reaches(float4 sphere) {
+    uint lit = min(globals.counts.x, MAX_POINT_SHADOWS);
+    for (uint light = 0; light < lit; ++light) {
+        float4 reach = globals.lights[light].position_radius;
+        float3 offset = sphere.xyz - reach.xyz;
+        float range = reach.w + sphere.w;
+        if (reach.w > 0.0 && dot(offset, offset) <= range * range)
+            return true;
+    }
+    return false;
+}
+
+void push_shadow_layers(uint instance, uint cluster, uint first_brick, uint brick_count, bool triangles, float4 sphere, bool sun) {
+    // Layers that keep last frame's map draw nothing, so they need no list.
+    uint redraw = globals.shadow_redraw.x;
+    if (sun && globals.sun_direction.w > 0.0) {
         for (uint cascade = 0; cascade < CASCADES; ++cascade) {
-            if (sphere_inside(globals.shadow_view_proj[cascade], sphere.xyz, sphere.w))
+            if ((redraw & (1u << cascade)) != 0
+                && sphere_inside(globals.shadow_view_proj[cascade], sphere.xyz, sphere.w))
                 push_layer(cascade, instance, cluster, first_brick, brick_count, triangles);
         }
     }
@@ -100,7 +118,8 @@ void push_shadow_layers(uint instance, uint cluster, uint first_brick, uint bric
             continue;
         for (uint face = 0; face < POINT_SHADOW_FACES; ++face) {
             uint layer = light * POINT_SHADOW_FACES + face;
-            if (sphere_inside(globals.point_shadow_view_proj[layer], sphere.xyz, sphere.w))
+            if ((redraw & (1u << (CASCADES + layer))) != 0
+                && sphere_inside(globals.point_shadow_view_proj[layer], sphere.xyz, sphere.w))
                 push_layer(CASCADES + layer, instance, cluster, first_brick, brick_count, triangles);
         }
     }
@@ -119,7 +138,7 @@ void instanceMain(uint3 id: SV_DispatchThreadID) {
     uint flags = 0;
     if (sphere_visible(center, radius))
         flags |= ITEM_VISIBLE;
-    if (distance - radius < globals.shadow_splits[CASCADES - 1])
+    if (distance - radius < shadow_split(CASCADES - 1))
         flags |= ITEM_SHADOW;
     if (flags == 0)
         return;
@@ -130,6 +149,20 @@ void instanceMain(uint3 id: SV_DispatchThreadID) {
         flags = (flags & ~ITEM_VISIBLE) | ITEM_COARSE;
         if ((flags & ITEM_SHADOW) == 0)
             return;
+        // Seen only as an imposter, it casts as one into the sun cascades:
+        // one card instead of its coarsest bricks.
+        uint redraw = globals.shadow_redraw.x;
+        if (globals.sun_direction.w > 0.0) {
+            for (uint cascade = 0; cascade < CASCADES; ++cascade) {
+                if ((redraw & (1u << cascade)) != 0
+                    && sphere_inside(globals.shadow_view_proj[cascade], center, radius))
+                    push_entries(MATRIX_LIST_SHADOW_IMPOSTERS + cascade, uint2(id.x, 0), 1);
+            }
+        }
+        // Point lights still need its geometry.
+        if (!point_shadow_reaches(float4(center, radius)))
+            return;
+        flags |= ITEM_NO_SUN;
     }
     for (uint root = 0; root < asset.root_count; ++root)
         push_item(0, uint2(id.x | flags, asset.first_root + root));
@@ -178,6 +211,6 @@ void nodeMain(uint3 id: SV_DispatchThreadID) {
         }
         if ((item.x & ITEM_SHADOW) != 0)
             push_shadow_layers(index, cluster_index, cluster.first_brick, cluster.brick_count,
-                cluster.triangle_count > 0, float4(center, radius));
+                cluster.triangle_count > 0, float4(center, radius), (item.x & ITEM_NO_SUN) == 0);
     }
 }

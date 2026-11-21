@@ -22,20 +22,28 @@ pub const ALPHA_BLEND: u32 = 2;
 /// Shade with `shaders/lib/terrain.slang`, not the material's factors.
 pub const TERRAIN_SURFACE: u32 = 4;
 /// Sun shadow cascades, their square resolution and how far they reach.
-pub const CASCADES: usize = 4;
+/// The shader packs splits and texel sizes four to a vector, so keep this a
+/// multiple of four.
+pub const CASCADES: usize = 8;
 pub const SHADOW_SIZE: u32 = 2048;
 /// Maximum number of point lights with shadow maps, in light submission order.
 pub const MAX_POINT_SHADOWS: usize = 4;
 pub const POINT_SHADOW_SIZE: u32 = 512;
 pub const POINT_SHADOW_FACES: usize = 6;
-pub const SHADOW_DISTANCE: f32 = 150.0;
-/// The cascades before the last split this much, so near shadows keep their
-/// texels however far the last cascade reaches.
-const DETAIL_DISTANCE: f32 = 60.0;
-/// How far behind each cascade (toward the sun) occluders still cast.
+pub const SHADOW_DISTANCE: f32 = 1000.0;
+/// Where the first cascade ends at most. Splits grow geometrically from here,
+/// which keeps shadow texels about the size of screen pixels at every
+/// distance (logarithmic splits are optimal for perspective aliasing).
+const FIRST_SPLIT: f32 = 4.0;
+/// How far behind each cascade (toward the sun) occluders still cast, at
+/// least; wide cascades reach twice their radius.
 const SHADOW_CASTER_REACH: f32 = 100.0;
-/// Blend between logarithmic (1) and uniform (0) cascade splits.
-const SPLIT_LAMBDA: f32 = 0.75;
+/// The sun's angular radius in radians, which sets how fast shadows soften
+/// with distance from their caster.
+pub const SUN_ANGULAR_RADIUS: f32 = 0.004_65;
+/// Occluders further than this from a receiver do not widen the blocker
+/// search, which would otherwise get too sparse to find thin casters.
+pub const SHADOW_SEARCH_DISTANCE: f32 = 24.0;
 
 #[derive(Clone, Copy, Debug)]
 pub struct Camera {
@@ -72,9 +80,9 @@ pub struct Globals {
     pub previous_view_proj: [[f32; 4]; 4],
     /// World to shadow clip space per sun cascade.
     pub shadow_view_proj: [[[f32; 4]; 4]; CASCADES],
-    /// View distance where each cascade ends.
+    /// View distance where each cascade's slice ends; the map often reaches further.
     pub shadow_splits: [f32; CASCADES],
-    /// World size of one shadow texel per cascade, for normal-offset bias.
+    /// World size of one shadow texel per cascade, for bias and filter sizes.
     pub shadow_texels: [f32; CASCADES],
     /// Linear radiance of the sky hemisphere; w: 1 when the sun casts shadows.
     pub sky: [f32; 4],
@@ -84,6 +92,13 @@ pub struct Globals {
     pub point_shadow_view_proj: [[[f32; 4]; 4]; MAX_POINT_SHADOWS * POINT_SHADOW_FACES],
     /// Cloud shadow map: world xy of its corner, its size; w: 1 when in use.
     pub cloud_shadow: [f32; 4],
+    /// Sun shadow filtering: x: frame index for the noise (0 without TAA),
+    /// y: tangent of the sun's angular radius, z: farthest occluder distance
+    /// the blocker search sizes for.
+    pub shadow_filter: [f32; 4],
+    /// x: one bit per shadow layer (cascades, then point faces) this frame
+    /// redraws, so Matrix lists casters only for those.
+    pub shadow_redraw: [u32; 4],
     // GPU pointers to this frame's arrays, set in `upload_frame`.
     pub instances: DeviceAddress<Instance>,
     pub lights: DeviceAddress<Light>,
@@ -95,9 +110,14 @@ pub struct Globals {
     pub matrix: [vk::DeviceAddress; crate::matrix::BINDINGS],
 }
 
-// The std140 size of `Globals` in common.slang: 4 + 4 + 24 matrices, 11 vec4s,
+// The std140 size of `Globals` in common.slang: 4 + 8 + 24 matrices, 15 vec4s,
 // then 6 + 11 pointers. A field added on one side only fails here.
-const _: () = assert!(std::mem::size_of::<Globals>() == (4 + 4 + 24) * 64 + 11 * 16 + 17 * 8);
+const _: () = assert!(CASCADES.is_multiple_of(4));
+const _: () = assert!(
+    std::mem::size_of::<Globals>() == (4 + CASCADES + 24) * 64 + (11 + CASCADES / 2) * 16 + 17 * 8
+);
+// `shadow_redraw.x` has a bit per shadow layer.
+const _: () = assert!(CASCADES + MAX_POINT_SHADOWS * POINT_SHADOW_FACES <= 32);
 
 /// The sun's shadow cascades for one camera.
 #[derive(Clone, Copy, Debug)]
@@ -109,24 +129,51 @@ pub struct Cascades {
     pub corners: [[Vec3; 8]; CASCADES],
 }
 
-/// Fit sun cascades to the camera frustum: practical splits, one bounding
-/// sphere per slice (stable under rotation) and texel-snapped centers
+/// Where each cascade's slice of the view ends: geometric from the first split
+/// to `distance`, so each cascade's texels grow with distance as fast as the
+/// screen's pixels do.
+pub fn cascade_splits(distance: f32) -> [f32; CASCADES] {
+    let distance = distance.max(4.0 * NEAR);
+    let first = (distance / (1u32 << (CASCADES - 1)) as f32).clamp(2.0 * NEAR, FIRST_SPLIT);
+    let ratio = (distance / first).powf(1.0 / (CASCADES - 1) as f32);
+    std::array::from_fn(|i| {
+        if i == CASCADES - 1 {
+            distance
+        } else {
+            first * ratio.powi(i as i32)
+        }
+    })
+}
+
+/// The smallest sphere holding a frustum slice from `near` to `far`, as its
+/// center's distance along the view axis and its radius; `k2` is the squared
+/// tangent of the slice's half-diagonal angle. Tighter than a sphere around
+/// the corners' centroid, and as stable: it does not change as the camera turns.
+fn slice_sphere(near: f32, far: f32, k2: f32) -> (f32, f32) {
+    if k2 >= (far - near) / (far + near) {
+        // Wide slices: the far rectangle's circumcircle already holds the near one.
+        (far, far * k2.sqrt())
+    } else {
+        let center = 0.5 * (far + near) * (1.0 + k2);
+        let radius = 0.5
+            * ((far - near).powi(2)
+                + 2.0 * (far * far + near * near) * k2
+                + (far + near).powi(2) * k2 * k2)
+                .sqrt();
+        (center, radius)
+    }
+}
+
+/// Fit sun cascades to the camera frustum: geometric splits, the smallest
+/// sphere around each slice (stable under rotation) and texel-snapped centers
 /// (stable under translation).
 pub fn cascades(camera: &Camera, aspect: f32, sun_direction: Vec3, distance: f32) -> Cascades {
     let world_from_view = Mat4::look_at_rh(camera.eye, camera.target, UP).inverse();
+    let forward = world_from_view.transform_vector3(Vec3::NEG_Z).normalize();
     let tan_y = (camera.vertical_fov * 0.5).tan();
     let tan_x = tan_y * aspect;
-    let detail = distance.min(DETAIL_DISTANCE);
-    let splits: [f32; CASCADES] = std::array::from_fn(|i| {
-        if i == CASCADES - 1 {
-            return distance;
-        }
-        let distance = detail;
-        let t = (i + 1) as f32 / CASCADES as f32;
-        let logarithmic = NEAR * (distance / NEAR).powf(t);
-        let uniform = NEAR + (distance - NEAR) * t;
-        SPLIT_LAMBDA * logarithmic + (1.0 - SPLIT_LAMBDA) * uniform
-    });
+    let k2 = tan_x * tan_x + tan_y * tan_y;
+    let splits = cascade_splits(distance);
     let direction = sun_direction.normalize();
     // Any up vector works that is not parallel to the light.
     let up = if direction.z.abs() > 0.99 {
@@ -147,28 +194,15 @@ pub fn cascades(camera: &Camera, aspect: f32, sun_direction: Vec3, distance: f32
         ) {
             *corner = world_from_view.transform_point3(Vec3::new(x * tan_x * z, y * tan_y * z, -z));
         }
-        let center = corners.iter().copied().sum::<Vec3>() / corners.len() as f32;
+        let (along, radius) = slice_sphere(near, splits[i], k2);
+        let center = camera.eye + forward * along;
         // Quantized so floating-point noise never changes the cascade's size.
-        let radius = (corners
-            .iter()
-            .map(|c| c.distance(center))
-            .fold(0.0, f32::max)
-            * 16.0)
-            .ceil()
-            / 16.0;
-        let light_view = Mat4::look_at_rh(
-            center - direction * (radius + SHADOW_CASTER_REACH),
-            center,
-            up,
-        );
-        let mut projection = Mat4::orthographic_rh(
-            -radius,
-            radius,
-            -radius,
-            radius,
-            0.0,
-            2.0 * radius + SHADOW_CASTER_REACH,
-        );
+        let radius = (radius * 16.0).ceil() / 16.0;
+        // Wide cascades see distant terrain, which can shade them from far off.
+        let reach = SHADOW_CASTER_REACH.max(2.0 * radius);
+        let light_view = Mat4::look_at_rh(center - direction * (radius + reach), center, up);
+        let mut projection =
+            Mat4::orthographic_rh(-radius, radius, -radius, radius, 0.0, 2.0 * radius + reach);
         // Snap the world origin to whole texels so edges do not crawl.
         let half = SHADOW_SIZE as f32 * 0.5;
         let origin = (projection * light_view)
@@ -398,6 +432,7 @@ pub fn globals(
         ground: lighting.ground.extend(0.0).to_array(),
         point_shadow_view_proj: [[[0.0; 4]; 4]; MAX_POINT_SHADOWS * POINT_SHADOW_FACES],
         cloud_shadow: [0.0; 4],
+        shadow_filter: [0.0, SUN_ANGULAR_RADIUS.tan(), SHADOW_SEARCH_DISTANCE, 0.0],
         ..Zeroable::zeroed()
     }
 }
@@ -786,6 +821,38 @@ mod tests {
                     );
                     assert!((0.0..=1.0).contains(&p.z), "cascade {i} depth {}", p.z);
                 }
+            }
+        }
+    }
+
+    #[test]
+    fn cascade_texels_grow_with_distance_like_screen_pixels() {
+        let camera = Camera::default();
+        for distance in [60.0, SHADOW_DISTANCE, 4000.0] {
+            let c = cascades(&camera, 16.0 / 9.0, Vec3::new(-0.3, -1.0, -0.6), distance);
+            assert!(c.splits.windows(2).all(|w| w[0] < w[1]), "{:?}", c.splits);
+            // A shadow texel per metre of view distance at each slice's far
+            // end: the same in every cascade, so detail never drops off.
+            let density: Vec<f32> = (1..CASCADES).map(|i| c.texels[i] / c.splits[i]).collect();
+            let (low, high) = density
+                .iter()
+                .fold((f32::MAX, 0.0f32), |(l, h), &d| (l.min(d), h.max(d)));
+            assert!(high / low < 1.6, "uneven texel density at {distance} m: {density:?}");
+        }
+        // At the default reach a far texel is about one 1080p pixel wide.
+        let c = cascades(&camera, 16.0 / 9.0, Vec3::new(-0.3, -1.0, -0.6), SHADOW_DISTANCE);
+        let pixel = 2.0 * (camera.vertical_fov * 0.5).tan() / 1080.0;
+        assert!(c.texels[CASCADES - 1] / SHADOW_DISTANCE < 1.5 * pixel);
+        assert!(c.texels[0] < 0.005, "near texels {} m", c.texels[0]);
+    }
+
+    #[test]
+    fn slice_sphere_holds_both_ends_of_its_slice() {
+        for (near, far, k2) in [(0.1, 4.0, 0.7), (4.0, 9.0, 0.7), (400.0, 1000.0, 0.7), (1.0, 2.0, 0.05)] {
+            let (center, radius) = slice_sphere(near, far, k2);
+            for z in [near, far] {
+                let corner = ((z - center) * (z - center) + z * z * k2).sqrt();
+                assert!(corner <= radius * 1.0001, "{near}..{far}: {corner} > {radius}");
             }
         }
     }

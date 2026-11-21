@@ -1,7 +1,8 @@
 //! Screen-space ambient occlusion with CORTAO; see `shaders/lib/ao.slang`.
 //! Runs between the visibility pass and the resolve, over the scene
 //! viewport, and leaves its result in the swapchain-sized image the resolve
-//! samples to darken the hemisphere ambient.
+//! samples to darken the hemisphere ambient. Only without GI: an active GI
+//! extension traces its own contact occlusion, so the output is cleared to 1.
 
 use crate::{gpu, Result};
 use ash::vk;
@@ -17,6 +18,9 @@ const MAX_SLOPE_COMPENSATION: f32 = 4.0;
 const BACKFACE_THRESHOLD: f32 = 0.5;
 const FILTER_DEPTH_SENSITIVITY: f32 = 512.0;
 const FILTER_NORMAL_SENSITIVITY: f32 = 128.0;
+/// Texels on each side of CORTAO's occluder table; `AO_LUT_SIZE` in
+/// `shaders/lib/ao.slang`.
+const LUT_SIZE: u32 = 32;
 
 /// The push constants of each pass: CORTAO's parameter structs, as words.
 /// `projection` is the projection's x and y scale (y negative: Vulkan's
@@ -65,19 +69,23 @@ pub(crate) struct AoPass {
     layout: vk::PipelineLayout,
     pool: vk::DescriptorPool,
     samplers: [vk::Sampler; 2],
-    pipelines: [vk::Pipeline; 3],
+    /// Prepass, trace, filter, and the occluder table's fill.
+    pipelines: [vk::Pipeline; 4],
     set: vk::DescriptorSet,
+    /// Which rays an occluder covers, by direction and size; see `ao_trace.slang`.
+    lut: Option<gpu::Image>,
+    lut_filled: bool,
     /// Linear depth with a dithered normal in its low bits, mip-mapped.
     packed: Option<gpu::Image>,
     mip_views: Vec<vk::ImageView>,
-    /// Occlusion before the filter.
+    /// Occlusion before the filter, half float.
     raw: Option<gpu::Image>,
     /// The viewport size and output view the set was written for.
     key: ([u32; 2], vk::ImageView),
 }
 
 impl AoPass {
-    unsafe fn init(&mut self, device: &ash::Device, frame_layout: vk::DescriptorSetLayout) -> Result<()> {
+    unsafe fn init(&mut self, device: &ash::Device, allocator: &mut Allocator, frame_layout: vk::DescriptorSetLayout) -> Result<()> {
         use vk::DescriptorType as D;
         let kinds = [
             (D::STORAGE_IMAGE, MIPS),
@@ -87,6 +95,8 @@ impl AoPass {
             (D::STORAGE_IMAGE, 1),
             (D::SAMPLER, 1),
             (D::SAMPLER, 1),
+            (D::STORAGE_IMAGE, 1),
+            (D::SAMPLED_IMAGE, 1),
         ];
         let bindings: Vec<_> = (kinds.iter().enumerate())
             .map(|(i, &(kind, count))| {
@@ -151,10 +161,26 @@ impl AoPass {
             })
             .collect();
         device.update_descriptor_sets(&writes, &[]);
-        let entries: [(&[u8], &std::ffi::CStr); 3] = [
+        let usage = vk::ImageUsageFlags::STORAGE | vk::ImageUsageFlags::SAMPLED;
+        let lut = gpu::create_volume(device, allocator, "ao occluder table", vk::Format::R32_UINT, LUT_SIZE, usage)?;
+        let info = [vk::DescriptorImageInfo::default().image_view(lut.view).image_layout(vk::ImageLayout::GENERAL)];
+        self.lut = Some(lut);
+        self.lut_filled = false;
+        device.update_descriptor_sets(
+            &[7, 8].map(|binding| {
+                vk::WriteDescriptorSet::default()
+                    .dst_set(self.set)
+                    .dst_binding(binding)
+                    .descriptor_type(if binding == 7 { D::STORAGE_IMAGE } else { D::SAMPLED_IMAGE })
+                    .image_info(&info)
+            }),
+            &[],
+        );
+        let entries: [(&[u8], &std::ffi::CStr); 4] = [
             (spirv!("ao_prepass.prepassMain"), c"prepassMain"),
             (spirv!("ao_trace.traceMain"), c"traceMain"),
             (spirv!("ao_filter.filterMain"), c"filterMain"),
+            (spirv!("ao_trace.lutMain"), c"lutMain"),
         ];
         for (pipeline, (code, entry)) in self.pipelines.iter_mut().zip(entries) {
             *pipeline = gpu::compute_pipeline(device, vk::PipelineCache::null(), self.layout, code, entry)?;
@@ -195,7 +221,7 @@ impl AoPass {
         }
         let packed_view = packed.view;
         self.packed = Some(packed);
-        let raw = gpu::create_image(device, allocator, "ao raw", vk::Format::R32_SFLOAT, extent, 1, usage, color)?;
+        let raw = gpu::create_image(device, allocator, "ao raw", vk::Format::R16_SFLOAT, extent, 1, usage, color)?;
         let raw_view = raw.view;
         self.raw = Some(raw);
 
@@ -265,7 +291,7 @@ impl AoPass {
             return Ok(());
         }
         if self.set == vk::DescriptorSet::null() {
-            if let Err(error) = self.init(device, frame_layout) {
+            if let Err(error) = self.init(device, allocator, frame_layout) {
                 self.destroy(device, allocator);
                 return Err(error);
             }
@@ -286,6 +312,15 @@ impl AoPass {
         ]);
         let (prepass, trace, filter) = params(size, projection, near, radius, seed);
         device.cmd_bind_descriptor_sets(cmd, vk::PipelineBindPoint::COMPUTE, self.layout, 0, &[frame_set, self.set], &[]);
+        if !self.lut_filled {
+            self.lut_filled = true;
+            let lut = self.lut.as_ref().unwrap().image;
+            barrier(&[discard(lut, 1)]);
+            device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, self.pipelines[3]);
+            let groups = LUT_SIZE / 4;
+            device.cmd_dispatch(cmd, groups, groups, groups);
+            // The barrier after the prepass makes the table visible to the trace.
+        }
         let [width, height] = size;
         let passes: [(&[u32], [u32; 2]); 3] = [
             (&prepass, [width.div_ceil(8), height.div_ceil(8)]),
@@ -293,7 +328,7 @@ impl AoPass {
             // A thread per 2x2 block, centred on odd pixels up to the far edge.
             (&filter, [(width / 2 + 1).div_ceil(8), (height / 2 + 1).div_ceil(8)]),
         ];
-        for (&pipeline, (words, groups)) in self.pipelines.iter().zip(passes) {
+        for (&pipeline, (words, groups)) in self.pipelines[..3].iter().zip(passes) {
             device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, pipeline);
             device.cmd_push_constants(cmd, self.layout, vk::ShaderStageFlags::COMPUTE, 0, bytemuck::cast_slice(words));
             device.cmd_dispatch(cmd, groups[0], groups[1], 1);
@@ -313,6 +348,9 @@ impl AoPass {
 
     pub unsafe fn destroy(&mut self, device: &ash::Device, allocator: &mut Allocator) {
         self.destroy_images(device, allocator);
+        if let Some(lut) = self.lut.take() {
+            gpu::destroy_image(device, allocator, lut);
+        }
         for pipeline in self.pipelines {
             device.destroy_pipeline(pipeline, None);
         }
@@ -329,6 +367,53 @@ impl AoPass {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use glam::Vec3;
+
+    /// CORTAO's ray `i` of 16, as `cortao_rayDirection`.
+    fn ray(i: u32) -> Vec3 {
+        let angle = i as f32 * std::f32::consts::PI * (3.0 - 5f32.sqrt());
+        let r = ((i as f32 + 0.5) / 16.0).sqrt();
+        Vec3::new(angle.cos() * r, angle.sin() * r, (1.0 - r * r).sqrt())
+    }
+
+    /// Rays within the cone of `cos_angle` around `direction`.
+    fn covered(direction: Vec3, cos_angle: f32) -> u32 {
+        (0..16).filter(|&j| ray(j).dot(direction) > cos_angle).fold(0, |bits, j| bits | 1 << j)
+    }
+
+    /// Looking an occluder up in the table, the way the trace encodes it and
+    /// `lutMain` decodes its texels, covers nearly the rays the analytic test does.
+    #[test]
+    fn occluder_table_matches_analytic_test() {
+        let (mut wrong, mut total) = (0u32, 0u32);
+        let mut seed = 1u32;
+        let mut random = || {
+            seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            (seed >> 8) as f32 / (1 << 24) as f32
+        };
+        for _ in 0..20_000 {
+            let z = random() * 1.98 - 0.98;
+            let phi = random() * std::f32::consts::TAU;
+            let s = (1.0 - z * z).sqrt();
+            let direction = Vec3::new(s * phi.cos(), s * phi.sin(), z);
+            let radius = random() * 1.6;
+            let exact = covered(direction, (1.0 - radius * radius * 0.5).max(0.0));
+            // The trace's lookup coordinates, then the nearest texel's centre.
+            let scale = 1.0 / (direction.z * 8.0 + 8.0).sqrt();
+            let coords = Vec3::new(direction.x * scale + 0.5, direction.y * scale + 0.5, radius * 0.5f32.sqrt());
+            let texel = (coords * LUT_SIZE as f32).floor().clamp(Vec3::ZERO, Vec3::splat(LUT_SIZE as f32 - 1.0));
+            let centre = (texel + 0.5) / LUT_SIZE as f32;
+            let encoded = centre.truncate() * 4.0 - 2.0;
+            let f = encoded.length_squared();
+            let decoded = (encoded * (1.0 - f * 0.25).max(0.0).sqrt()).extend(1.0 - f * 0.5);
+            let r = centre.z * 2f32.sqrt();
+            let table = if f <= 4.0 { covered(decoded, (1.0 - r * r * 0.5).max(0.0)) } else { 0 };
+            wrong += (exact ^ table).count_ones();
+            total += 16;
+        }
+        let share = wrong as f32 / total as f32;
+        assert!(share < 0.03, "{share} of rays differ");
+    }
 
     /// The trace's projection and unprojection undo each other, as CORTAO's
     /// `populateMainPassParameters` arranges, for Vulkan's flipped y.
