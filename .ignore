@@ -1,0 +1,3 @@
+# Ripgrep-based search (Grep, Glob) reads this file over .gitignore; git ignores it.
+# Keep debug output searchable although git ignores it.
+!/tmp/

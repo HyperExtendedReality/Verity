@@ -9,3 +9,6 @@
 # Local agent tool state
 /.agent-guard/
 /.pi/harness/
+
+# Debug output (gigabytes). Kept searchable for agents by .ignore.
+/tmp/
